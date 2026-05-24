@@ -29,6 +29,7 @@ test("codex provider normalization strips route suffixes and keeps only configur
     requestFormat: "not-valid",
     reasoning: "xhigh",
     promptCachingEnabled: true,
+    nativeWebSearchEnabled: false,
   });
 
   assert.equal(provider.name, "Codex");
@@ -36,6 +37,7 @@ test("codex provider normalization strips route suffixes and keeps only configur
   assert.equal(provider.apiKey, "key");
   assert.equal(provider.requestFormat, "openai-responses");
   assert.equal(provider.promptCachingEnabled, false);
+  assert.equal(provider.nativeWebSearchEnabled, false);
   assert.deepEqual(provider.activeModels, ["gpt-5"]);
   assert.deepEqual(
     provider.models.map((model) => model.id),
@@ -60,6 +62,7 @@ test("claude provider normalization defaults routing, caching, and model limits"
   assert.equal(provider.baseUrl, "https://api.anthropic.com/v1");
   assert.equal(provider.requestFormat, undefined);
   assert.equal(provider.promptCachingEnabled, true);
+  assert.equal(provider.nativeWebSearchEnabled, true);
   assert.equal(provider.models[0].contextWindow, 200_000);
   assert.equal(provider.models[0].maxOutputToken, 32_000);
 });
@@ -75,6 +78,7 @@ test("gemini provider normalization keeps native routing and model limits", () =
     activeModels: ["gemini-3.5-flash"],
     requestFormat: "openai-responses",
     promptCachingEnabled: true,
+    nativeWebSearchEnabled: false,
   });
 
   assert.equal(provider.name, "Gemini");
@@ -83,6 +87,7 @@ test("gemini provider normalization keeps native routing and model limits", () =
   assert.equal(provider.apiKey, "key");
   assert.equal(provider.requestFormat, undefined);
   assert.equal(provider.promptCachingEnabled, false);
+  assert.equal(provider.nativeWebSearchEnabled, false);
   assert.deepEqual(provider.activeModels, ["gemini-3.5-flash"]);
   assert.equal(provider.models[0].contextWindow, 1_048_576);
   assert.equal(provider.models[0].maxOutputToken, 65_536);
@@ -246,6 +251,7 @@ test("gateway settings sync payload redacts provider api keys", () => {
   const payload = sync.buildGatewaySettingsSyncPayload(appSettings);
   assert.equal(payload.customProviders[0].apiKey, undefined);
   assert.equal(payload.customProviders[0].apiKeyConfigured, true);
+  assert.equal(payload.customProviders[0].nativeWebSearchEnabled, true);
   assert.equal(payload.providerApiKeyUpdates, undefined);
 
   const updatePayload = sync.buildGatewaySettingsSyncPayload(appSettings, {
@@ -280,6 +286,7 @@ test("gateway settings sync applies redacted providers without clearing local ap
         type: "codex",
         baseUrl: "https://api.openai.com/v1",
         apiKeyConfigured: true,
+        nativeWebSearchEnabled: false,
         models: ["gpt-5.4"],
         activeModels: ["gpt-5.4"],
       },
@@ -287,6 +294,7 @@ test("gateway settings sync applies redacted providers without clearing local ap
   });
   assert.equal(redacted.customProviders[0].name, "Renamed");
   assert.equal(redacted.customProviders[0].apiKey, "old-key");
+  assert.equal(redacted.customProviders[0].nativeWebSearchEnabled, false);
 
   const updated = sync.applyGatewaySettingsSyncPayload(current, {
     customProviders: [

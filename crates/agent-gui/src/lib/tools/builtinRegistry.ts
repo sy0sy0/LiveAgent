@@ -55,6 +55,7 @@ export type DelegateToolRuntimeConfig = {
     requestFormat?: CodexRequestFormat;
     reasoning?: ReasoningLevel;
     promptCachingEnabled?: boolean;
+    nativeWebSearchEnabled?: boolean;
     modelConfig?: ProviderModelConfig;
   };
   conversationId?: string;

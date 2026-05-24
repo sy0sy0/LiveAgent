@@ -1140,6 +1140,7 @@ fn sanitize_provider_summary(provider: &Value) -> Result<Value, String> {
         "requestFormat",
         "reasoning",
         "promptCachingEnabled",
+        "nativeWebSearchEnabled",
     ] {
         if let Some(value) = source.get(key) {
             payload.insert(key.to_string(), value.clone());
@@ -1206,12 +1207,14 @@ mod tests {
                 "baseUrl": "https://api.example.com",
                 "apiKey": "secret-key",
                 "models": [],
-                "activeModels": []
+                "activeModels": [],
+                "nativeWebSearchEnabled": false
             }
         ])))
         .expect("sanitize provider summaries");
 
         assert_eq!(result[0]["id"], "provider-a");
+        assert_eq!(result[0]["nativeWebSearchEnabled"], false);
         assert_eq!(result[0]["apiKey"], Value::Null);
         assert_eq!(result[0]["baseUrl"], Value::Null);
     }

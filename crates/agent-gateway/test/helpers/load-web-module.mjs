@@ -3,7 +3,6 @@ import path from "node:path";
 import vm from "node:vm";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
-import ts from "typescript";
 
 const DEFAULT_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".css"];
 
@@ -100,6 +99,7 @@ export function createWebModuleLoader(options = {}) {
     ? path.resolve(options.rootDir)
     : path.resolve(new URL("../../web", import.meta.url).pathname);
   const requireFromRoot = createRequire(path.join(rootDir, "package.json"));
+  const ts = requireFromRoot("typescript");
   const cache = new Map();
   const mocks = new Map([
     ...Object.entries(createDefaultMocks()),
@@ -170,6 +170,7 @@ export function createWebModuleLoader(options = {}) {
         allowSyntheticDefaultImports: true,
         moduleResolution: ts.ModuleResolutionKind.Node10 ?? ts.ModuleResolutionKind.NodeJs,
         resolveJsonModule: true,
+        ignoreDeprecations: "6.0",
       },
       reportDiagnostics: true,
     });

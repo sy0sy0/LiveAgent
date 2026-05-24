@@ -113,6 +113,24 @@ function parsePositiveInteger(input: string): number | null {
   return normalized > 0 ? normalized : null;
 }
 
+function ProviderToggleCard(props: {
+  checked: boolean;
+  label: string;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <label className="inline-flex h-full min-h-11 w-full items-center justify-center gap-2.5 rounded-lg border px-3 py-2.5 text-sm">
+      <input
+        type="checkbox"
+        className="h-4 w-4 shrink-0 rounded border-border"
+        checked={props.checked}
+        onChange={(e) => props.onChange(e.currentTarget.checked)}
+      />
+      <span className="whitespace-nowrap font-medium leading-none">{props.label}</span>
+    </label>
+  );
+}
+
 function ModelSettingsModal({ model, onClose, onSave }: ModelSettingsModalProps) {
   const { t } = useLocale();
   const [contextWindow, setContextWindow] = useState(String(model.contextWindow));
@@ -227,6 +245,9 @@ function ProviderModal({ providerType, initialData, onSave, onClose }: ModalProp
   );
   const [promptCachingEnabled, setPromptCachingEnabled] = useState(
     initialData?.promptCachingEnabled ?? providerType === "claude_code",
+  );
+  const [nativeWebSearchEnabled, setNativeWebSearchEnabled] = useState(
+    initialData?.nativeWebSearchEnabled ?? true,
   );
   const [fetchingModels, setFetchingModels] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -362,6 +383,7 @@ function ProviderModal({ providerType, initialData, onSave, onClose }: ModalProp
             ? "high"
           : reasoning,
       promptCachingEnabled: providerType === "claude_code" ? promptCachingEnabled : false,
+      nativeWebSearchEnabled,
     });
     requestClose();
   }
@@ -449,26 +471,22 @@ function ProviderModal({ providerType, initialData, onSave, onClose }: ModalProp
 
           {providerType === "claude_code" ? (
             <div className="space-y-4">
-              <div className="settings-form-grid grid gap-4 md:grid-cols-2">
-                <label className="flex h-full items-start gap-3 rounded-xl border px-3 py-3 text-sm">
-                  <input
-                    type="checkbox"
-                    className="mt-0.5 h-4 w-4 rounded border-border"
-                    checked={promptCachingEnabled}
-                    onChange={(e) => setPromptCachingEnabled(e.currentTarget.checked)}
-                  />
-                  <div className="font-medium">{t("settings.promptCaching")}</div>
-                </label>
-
-                <label className="flex h-full items-start gap-3 rounded-xl border px-3 py-3 text-sm">
-                  <input
-                    type="checkbox"
-                    className="mt-0.5 h-4 w-4 rounded border-border"
-                    checked={claudeThinkingEnabled}
-                    onChange={(e) => setClaudeThinkingEnabled(e.currentTarget.checked)}
-                  />
-                  <div className="font-medium">{t("settings.thinkingEnabled")}</div>
-                </label>
+              <div className="grid grid-cols-3 gap-3">
+                <ProviderToggleCard
+                  checked={promptCachingEnabled}
+                  label={t("settings.promptCaching")}
+                  onChange={setPromptCachingEnabled}
+                />
+                <ProviderToggleCard
+                  checked={claudeThinkingEnabled}
+                  label={t("settings.thinkingEnabled")}
+                  onChange={setClaudeThinkingEnabled}
+                />
+                <ProviderToggleCard
+                  checked={nativeWebSearchEnabled}
+                  label={t("settings.nativeWebSearch")}
+                  onChange={setNativeWebSearchEnabled}
+                />
               </div>
 
               <div className="space-y-1.5">
@@ -496,7 +514,7 @@ function ProviderModal({ providerType, initialData, onSave, onClose }: ModalProp
           ) : null}
 
           {providerType === "codex" ? (
-            <div className="settings-form-grid grid gap-4 md:grid-cols-2">
+            <div className="settings-form-grid grid gap-4 md:grid-cols-3">
               <div className="space-y-1.5">
                 <Label>{t("settings.requestFormat")}</Label>
                 <Select
@@ -535,27 +553,39 @@ function ProviderModal({ providerType, initialData, onSave, onClose }: ModalProp
                   </Select>
                 </div>
               ) : null}
+              <ProviderToggleCard
+                checked={nativeWebSearchEnabled}
+                label={t("settings.nativeWebSearch")}
+                onChange={setNativeWebSearchEnabled}
+              />
             </div>
           ) : null}
 
           {providerType === "gemini" ? (
-            <div className="space-y-1.5">
-              <Label>{t("settings.reasoning")}</Label>
-              <Select
-                value={reasoning === "xhigh" ? "high" : reasoning}
-                onValueChange={(value) => setReasoning(value as ReasoningLevel)}
-              >
-                <SelectTrigger className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {providerReasoningLevels.map((value) => (
-                    <SelectItem key={value} value={value}>
-                      {t(REASONING_I18N_KEYS[value])}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+            <div className="settings-form-grid grid gap-4 md:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label>{t("settings.reasoning")}</Label>
+                <Select
+                  value={reasoning === "xhigh" ? "high" : reasoning}
+                  onValueChange={(value) => setReasoning(value as ReasoningLevel)}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {providerReasoningLevels.map((value) => (
+                      <SelectItem key={value} value={value}>
+                        {t(REASONING_I18N_KEYS[value])}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <ProviderToggleCard
+                checked={nativeWebSearchEnabled}
+                label={t("settings.nativeWebSearch")}
+                onChange={setNativeWebSearchEnabled}
+              />
             </div>
           ) : null}
 

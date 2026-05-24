@@ -296,10 +296,11 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
     let compactionRequested = false;
     let protectionCompactionStatusText: string | null = null;
     let streamAttempt = 0;
+    const nativeWebSearchEnabled = runtime.nativeWebSearchEnabled !== false;
     const nativeWebSearchStatus = resolveProviderNativeWebSearchStatus({
       providerId,
       api: runtimeModel.api,
-      enabled: true,
+      enabled: nativeWebSearchEnabled,
     });
 
     while (!finalAssistant) {
@@ -316,7 +317,7 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
           context: contextWithSkills,
           workdir: conversationCwd,
           sessionId,
-          nativeWebSearch: true,
+          nativeWebSearch: nativeWebSearchEnabled,
           onTextDelta: (delta) => {
             nativeWebSearchStatusController.noteVisibleActivity();
             gatewayBridgeEvents.queueToken(delta, { round: textRound });

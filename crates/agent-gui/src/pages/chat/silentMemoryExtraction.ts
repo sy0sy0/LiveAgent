@@ -119,6 +119,7 @@ export type SilentMemoryExtractionRuntimeConfig = {
   requestFormat?: CodexRequestFormat;
   reasoning?: ReasoningLevel;
   promptCachingEnabled?: boolean;
+  nativeWebSearchEnabled?: boolean;
   modelConfig?: ProviderModelConfig;
 };
 

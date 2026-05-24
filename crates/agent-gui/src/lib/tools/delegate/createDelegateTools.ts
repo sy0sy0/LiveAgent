@@ -1007,6 +1007,7 @@ export function createDelegateTools(params: {
               context: buildRequestContext(subagentState),
               workdir: childWorkdir,
               sessionId: subagentSessionId,
+              nativeWebSearch: params.runtime.nativeWebSearchEnabled !== false,
               tools: childTools,
               subagentScheduler,
               executeToolCall: (childToolCall, childSignal) => {

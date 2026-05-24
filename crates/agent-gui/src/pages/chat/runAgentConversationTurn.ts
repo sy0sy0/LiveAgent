@@ -623,6 +623,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
     let midStreamCompactionRequested = false;
     let midStreamCompactionStatusText: string | null = null;
     let sawToolCallInRound = false;
+    const nativeWebSearchEnabled = runtime.nativeWebSearchEnabled !== false;
     const agentContext = withSubagentRuntimeContext(
       pendingAgentContext ??
         buildPreparedContext(getNextConversationState(), combinedTools, {
@@ -640,7 +641,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
         context: agentContext,
         workdir: effectiveWorkdir,
         sessionId,
-        nativeWebSearch: true,
+        nativeWebSearch: nativeWebSearchEnabled,
         tools: combinedTools,
         subagentScheduler,
         executeToolCall: combinedExecutor,

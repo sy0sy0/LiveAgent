@@ -9,6 +9,7 @@ export type DelegateRuntime = {
   requestFormat?: CodexRequestFormat;
   reasoning?: ReasoningLevel;
   promptCachingEnabled?: boolean;
+  nativeWebSearchEnabled?: boolean;
   modelConfig?: ProviderModelConfig;
 };
 

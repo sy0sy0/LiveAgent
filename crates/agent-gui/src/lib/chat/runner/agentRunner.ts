@@ -576,6 +576,7 @@ export async function runAssistantWithTools(params: {
     requestFormat?: CodexRequestFormat;
     reasoning?: ReasoningLevel;
     promptCachingEnabled?: boolean;
+    nativeWebSearchEnabled?: boolean;
     modelConfig?: ProviderModelConfig;
   };
   context: Context;

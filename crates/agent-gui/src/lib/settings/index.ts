@@ -175,6 +175,7 @@ export type CustomProvider = {
   requestFormat?: CodexRequestFormat;
   reasoning: ReasoningLevel;
   promptCachingEnabled: boolean;
+  nativeWebSearchEnabled: boolean;
 };
 
 export type Theme = "light" | "dark";
@@ -319,6 +320,7 @@ export function getBuiltinCustomProviders(): CustomProvider[] {
       activeModels: [],
       reasoning: "off",
       promptCachingEnabled: true,
+      nativeWebSearchEnabled: true,
     },
     {
       id: "builtin-codex",
@@ -331,6 +333,7 @@ export function getBuiltinCustomProviders(): CustomProvider[] {
       requestFormat: "openai-responses",
       reasoning: "off",
       promptCachingEnabled: false,
+      nativeWebSearchEnabled: true,
     },
     {
       id: "builtin-gemini",
@@ -342,6 +345,7 @@ export function getBuiltinCustomProviders(): CustomProvider[] {
       activeModels: [],
       reasoning: "off",
       promptCachingEnabled: false,
+      nativeWebSearchEnabled: true,
     },
   ];
 }
@@ -717,6 +721,7 @@ export function normalizeCustomProvider(input: unknown): CustomProvider {
     reasoning: normalizeReasoningLevel(obj.reasoning),
     promptCachingEnabled:
       type === "claude_code" ? obj.promptCachingEnabled !== false : false,
+    nativeWebSearchEnabled: obj.nativeWebSearchEnabled !== false,
   };
 }
 

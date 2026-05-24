@@ -16,6 +16,7 @@ type RuntimeDebugInput = {
   requestFormat?: CodexRequestFormat;
   reasoning?: ReasoningLevel;
   promptCachingEnabled?: boolean;
+  nativeWebSearchEnabled?: boolean;
 };
 
 export type StreamDebugLogger = {
@@ -142,6 +143,7 @@ export function buildRuntimeDebugInfo(runtime: RuntimeDebugInput) {
     requestFormat: runtime.requestFormat,
     reasoning: runtime.reasoning,
     promptCachingEnabled: runtime.promptCachingEnabled,
+    nativeWebSearchEnabled: runtime.nativeWebSearchEnabled,
     hasApiKey: runtime.apiKey.trim().length > 0,
   };
 }

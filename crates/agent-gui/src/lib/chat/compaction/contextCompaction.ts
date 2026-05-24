@@ -136,6 +136,7 @@ export type ProviderRuntimeConfig = {
   requestFormat?: CodexRequestFormat;
   reasoning?: ReasoningLevel;
   promptCachingEnabled?: boolean;
+  nativeWebSearchEnabled?: boolean;
   modelConfig?: ProviderModelConfig;
 };
 

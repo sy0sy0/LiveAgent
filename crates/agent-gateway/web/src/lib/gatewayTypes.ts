@@ -29,6 +29,7 @@ export type GatewayProviderSummary = {
   requestFormat?: CodexRequestFormat;
   reasoning: ReasoningLevel;
   promptCachingEnabled: boolean;
+  nativeWebSearchEnabled: boolean;
 };
 
 export type ChatCheckpointPayload = {

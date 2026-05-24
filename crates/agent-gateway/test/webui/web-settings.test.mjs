@@ -30,7 +30,7 @@ test("getWebDefaultSettings enables remote settings from the gateway token", () 
   installWindow("https://gateway.example");
 
   const settings = webSettings.getWebDefaultSettings(" token ");
-  assert.equal(settings.system.executionMode, "agent-dev");
+  assert.equal(settings.system.executionMode, "tools");
   assert.equal(settings.system.workdir, "");
   assert.equal(settings.remote.enabled, true);
   assert.equal(settings.remote.gatewayUrl, "https://gateway.example");
@@ -112,4 +112,21 @@ test("web cron task normalization preserves finite and exhausted run counts", ()
     remainingExecutions: "-1",
   });
   assert.equal(invalid.remainingExecutions, undefined);
+});
+
+test("web provider normalization keeps native web search toggle", () => {
+  const enabledByDefault = settings.normalizeCustomProvider({
+    id: "provider-enabled",
+    type: "codex",
+    baseUrl: "https://api.openai.com/v1",
+  });
+  assert.equal(enabledByDefault.nativeWebSearchEnabled, true);
+
+  const disabled = settings.normalizeCustomProvider({
+    id: "provider-disabled",
+    type: "gemini",
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+    nativeWebSearchEnabled: false,
+  });
+  assert.equal(disabled.nativeWebSearchEnabled, false);
 });
