@@ -175,21 +175,14 @@ jobs:
           mkdir -p dist
           msi_path="$(find target crates/agent-gui/src-tauri/target -type f -name '*.msi' -path '*bundle*' -print -quit 2>/dev/null || true)"
           exe_path="$(find target crates/agent-gui/src-tauri/target -type f -name '*.exe' -path '*bundle*' -print -quit 2>/dev/null || true)"
-          nsis_zip_path="$(find target crates/agent-gui/src-tauri/target -type f -name '*.exe.zip' -path '*bundle*' -print -quit 2>/dev/null || true)"
-          msi_zip_path="$(find target crates/agent-gui/src-tauri/target -type f -name '*.msi.zip' -path '*bundle*' -print -quit 2>/dev/null || true)"
           test -n "$msi_path"
           test -n "$exe_path"
-          test -n "$nsis_zip_path"
-          test -f "$nsis_zip_path.sig"
+          test -f "$msi_path.sig"
+          test -f "$exe_path.sig"
           cp "$msi_path" "dist/LiveAgent-${RELEASE_TAG}-Windows-x64.msi"
+          cp "$msi_path.sig" "dist/LiveAgent-${RELEASE_TAG}-Windows-x64.msi.sig"
           cp "$exe_path" "dist/LiveAgent-${RELEASE_TAG}-Windows-x64-Setup.exe"
-          cp "$nsis_zip_path" "dist/LiveAgent-${RELEASE_TAG}-Windows-x64-nsis.zip"
-          cp "$nsis_zip_path.sig" "dist/LiveAgent-${RELEASE_TAG}-Windows-x64-nsis.zip.sig"
-          if [ -n "$msi_zip_path" ]; then
-            test -f "$msi_zip_path.sig"
-            cp "$msi_zip_path" "dist/LiveAgent-${RELEASE_TAG}-Windows-x64-msi.zip"
-            cp "$msi_zip_path.sig" "dist/LiveAgent-${RELEASE_TAG}-Windows-x64-msi.zip.sig"
-          fi
+          cp "$exe_path.sig" "dist/LiveAgent-${RELEASE_TAG}-Windows-x64-Setup.exe.sig"
           test "$(find dist -type f | wc -l)" -gt 0
 
       - uses: actions/upload-artifact@v7
@@ -257,27 +250,18 @@ jobs:
           appimage_path="$(find crates/agent-gui/src-tauri/target target -type f -name '*.AppImage' -path '*bundle*' -print -quit 2>/dev/null || true)"
           deb_path="$(find crates/agent-gui/src-tauri/target target -type f -name '*.deb' -path '*bundle*' -print -quit 2>/dev/null || true)"
           rpm_path="$(find crates/agent-gui/src-tauri/target target -type f -name '*.rpm' -path '*bundle*' -print -quit 2>/dev/null || true)"
-          appimage_updater_path="$(find crates/agent-gui/src-tauri/target target -type f -name '*.AppImage.tar.gz' -path '*bundle*' -print -quit 2>/dev/null || true)"
-          deb_updater_path="$(find crates/agent-gui/src-tauri/target target -type f -name '*.deb.tar.gz' -path '*bundle*' -print -quit 2>/dev/null || true)"
-          rpm_updater_path="$(find crates/agent-gui/src-tauri/target target -type f -name '*.rpm.tar.gz' -path '*bundle*' -print -quit 2>/dev/null || true)"
           test -n "$appimage_path"
           test -n "$deb_path"
           test -n "$rpm_path"
-          test -n "$appimage_updater_path"
-          test -n "$deb_updater_path"
-          test -n "$rpm_updater_path"
-          test -f "$appimage_updater_path.sig"
-          test -f "$deb_updater_path.sig"
-          test -f "$rpm_updater_path.sig"
+          test -f "$appimage_path.sig"
+          test -f "$deb_path.sig"
+          test -f "$rpm_path.sig"
           cp "$appimage_path" "dist/LiveAgent-${RELEASE_TAG}-Linux-x86_64.AppImage"
+          cp "$appimage_path.sig" "dist/LiveAgent-${RELEASE_TAG}-Linux-x86_64.AppImage.sig"
           cp "$deb_path" "dist/LiveAgent-${RELEASE_TAG}-Linux-x86_64.deb"
+          cp "$deb_path.sig" "dist/LiveAgent-${RELEASE_TAG}-Linux-x86_64.deb.sig"
           cp "$rpm_path" "dist/LiveAgent-${RELEASE_TAG}-Linux-x86_64.rpm"
-          cp "$appimage_updater_path" "dist/LiveAgent-${RELEASE_TAG}-Linux-x86_64.AppImage.tar.gz"
-          cp "$appimage_updater_path.sig" "dist/LiveAgent-${RELEASE_TAG}-Linux-x86_64.AppImage.tar.gz.sig"
-          cp "$deb_updater_path" "dist/LiveAgent-${RELEASE_TAG}-Linux-x86_64.deb.tar.gz"
-          cp "$deb_updater_path.sig" "dist/LiveAgent-${RELEASE_TAG}-Linux-x86_64.deb.tar.gz.sig"
-          cp "$rpm_updater_path" "dist/LiveAgent-${RELEASE_TAG}-Linux-x86_64.rpm.tar.gz"
-          cp "$rpm_updater_path.sig" "dist/LiveAgent-${RELEASE_TAG}-Linux-x86_64.rpm.tar.gz.sig"
+          cp "$rpm_path.sig" "dist/LiveAgent-${RELEASE_TAG}-Linux-x86_64.rpm.sig"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -307,12 +291,53 @@ jobs:
           RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          prerelease_args=()
+          is_prerelease=false
           if [[ "$RELEASE_TAG" =~ -(alpha|beta|rc|pre|preview|next) ]]; then
-            prerelease_args+=(--prerelease)
+            is_prerelease=true
           fi
-          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
-            gh release create "$RELEASE_TAG" "${prerelease_args[@]}" --title "LiveAgent $RELEASE_TAG" --notes "Automated LiveAgent release."
-          gh release upload "$RELEASE_TAG" release-artifacts/* --clobber
-          node scripts/release/create-tauri-updater-manifest.mjs release-artifacts release-artifacts/latest.json
+
+          notes_path="$RUNNER_TEMP/liveagent-release-notes.md"
+          if ! gh api "repos/$GH_REPO/releases/generate-notes" \
+            -f tag_name="$RELEASE_TAG" \
+            --jq ".body" > "$notes_path"; then
+            printf 'LiveAgent %s\n' "$RELEASE_TAG" > "$notes_path"
+          fi
+          if [ ! -s "$notes_path" ]; then
+            printf 'LiveAgent %s\n' "$RELEASE_TAG" > "$notes_path"
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            edit_args=(--title "LiveAgent $RELEASE_TAG" --notes-file "$notes_path")
+            if [ "$is_prerelease" = true ]; then
+              edit_args+=(--prerelease)
+            else
+              edit_args+=(--prerelease=false --latest)
+            fi
+            gh release edit "$RELEASE_TAG" "${edit_args[@]}"
+          else
+            create_args=(--verify-tag --title "LiveAgent $RELEASE_TAG" --notes-file "$notes_path")
+            if [ "$is_prerelease" = true ]; then
+              create_args+=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" "${create_args[@]}"
+          fi
+
+          mapfile -t signature_assets < <(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name | select(endswith(".sig"))')
+          for asset in "${signature_assets[@]}"; do
+            gh release delete-asset "$RELEASE_TAG" "$asset" --yes
+          done
+
+          rm -rf public-release-assets
+          mkdir -p public-release-assets
+          find release-artifacts -maxdepth 1 -type f ! -name '*.sig' ! -name latest.json -exec cp {} public-release-assets/ \;
+
+          shopt -s nullglob
+          public_assets=(public-release-assets/*)
+          if [ "${#public_assets[@]}" -eq 0 ]; then
+            echo "No public release assets were found."
+            exit 1
+          fi
+          gh release upload "$RELEASE_TAG" "${public_assets[@]}" --clobber
+
+          node scripts/release/create-tauri-updater-manifest.mjs release-artifacts release-artifacts/latest.json "$notes_path"
           gh release upload "$RELEASE_TAG" release-artifacts/latest.json --clobber

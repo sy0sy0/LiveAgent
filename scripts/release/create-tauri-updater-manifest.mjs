@@ -3,10 +3,12 @@
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
-const [assetDir, outputPath] = process.argv.slice(2);
+const [assetDir, outputPath, notesPath] = process.argv.slice(2);
 
 if (!assetDir || !outputPath) {
-  console.error("Usage: create-tauri-updater-manifest.mjs <asset-dir> <output-path>");
+  console.error(
+    "Usage: create-tauri-updater-manifest.mjs <asset-dir> <output-path> [notes-file]",
+  );
   process.exit(1);
 }
 
@@ -29,16 +31,24 @@ const platforms = {};
 function targetForArtifact(filename) {
   if (/macOS-x64\.app\.tar\.gz$/i.test(filename)) return "darwin-x86_64-app";
   if (/macOS-aarch64\.app\.tar\.gz$/i.test(filename)) return "darwin-aarch64-app";
+  if (/Windows-x64-Setup\.exe$/i.test(filename)) return "windows-x86_64-nsis";
+  if (/Windows-x64\.msi$/i.test(filename)) return "windows-x86_64-msi";
   if (/Windows-x64-nsis\.zip$/i.test(filename)) return "windows-x86_64-nsis";
   if (/Windows-x64-msi\.zip$/i.test(filename)) return "windows-x86_64-msi";
-  if (/Linux-x86_64\.AppImage\.tar\.gz$/i.test(filename)) return "linux-x86_64-appimage";
-  if (/Linux-x86_64\.deb\.tar\.gz$/i.test(filename)) return "linux-x86_64-deb";
-  if (/Linux-x86_64\.rpm\.tar\.gz$/i.test(filename)) return "linux-x86_64-rpm";
+  if (/Linux-x86_64\.AppImage$/i.test(filename)) return "linux-x86_64-appimage";
+  if (/Linux-x86_64\.deb$/i.test(filename)) return "linux-x86_64-deb";
+  if (/Linux-x86_64\.rpm$/i.test(filename)) return "linux-x86_64-rpm";
   return null;
 }
 
 function releaseAssetUrl(filename) {
   return `https://github.com/${repository}/releases/download/${encodeURIComponent(releaseTag)}/${encodeURIComponent(filename)}`;
+}
+
+function releaseNotes() {
+  if (!notesPath) return `LiveAgent ${releaseTag}`;
+  const notes = readFileSync(notesPath, "utf8").trim();
+  return notes || `LiveAgent ${releaseTag}`;
 }
 
 for (const file of files) {
@@ -75,7 +85,7 @@ if (Object.keys(platforms).length === 0) {
 
 const manifest = {
   version: releaseTag.replace(/^v/i, ""),
-  notes: `LiveAgent ${releaseTag}`,
+  notes: releaseNotes(),
   pub_date: new Date().toISOString(),
   platforms,
 };

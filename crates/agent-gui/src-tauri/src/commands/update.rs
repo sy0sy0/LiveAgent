@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use reqwest::header::{ACCEPT, USER_AGENT};
+use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Url};
 use tauri_plugin_updater::UpdaterExt;
@@ -72,7 +73,7 @@ fn update_repository() -> String {
         .unwrap_or_else(|| DEFAULT_UPDATE_REPOSITORY.to_string())
 }
 
-fn updater_public_key() -> Option<String> {
+fn updater_public_key_override() -> Option<String> {
     std::env::var("LIVEAGENT_UPDATER_PUBLIC_KEY")
         .ok()
         .or_else(|| option_env!("LIVEAGENT_UPDATER_PUBLIC_KEY").map(str::to_string))
@@ -80,12 +81,11 @@ fn updater_public_key() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn requested_channel(include_prerelease: bool) -> AppUpdateChannel {
-    if include_prerelease {
-        AppUpdateChannel::Prerelease
-    } else {
-        AppUpdateChannel::Stable
-    }
+fn github_api_token() -> Option<String> {
+    std::env::var("LIVEAGENT_UPDATE_GITHUB_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn release_channel(release: &SelectedRelease) -> AppUpdateChannel {
@@ -100,24 +100,24 @@ fn version_from_tag(tag_name: &str) -> String {
     tag_name.trim().trim_start_matches('v').to_string()
 }
 
-fn unconfigured_response(
+fn no_update_response(
     app: &AppHandle,
-    include_prerelease: bool,
     repository: String,
+    channel: AppUpdateChannel,
 ) -> AppUpdateCheckResponse {
     AppUpdateCheckResponse {
-        configured: false,
+        configured: true,
         available: false,
         current_version: current_version(app),
         version: None,
         date: None,
         body: None,
-        channel: requested_channel(include_prerelease),
+        channel,
         release_tag: None,
         release_name: None,
         release_url: None,
         repository,
-        message: Some("Updater public key is not configured.".to_string()),
+        message: None,
     }
 }
 
@@ -146,34 +146,10 @@ fn response_for_release(
     }
 }
 
-async fn select_release_manifest(
-    repository: &str,
+fn selected_release_from_releases(
+    releases: Vec<GitHubRelease>,
     include_prerelease: bool,
-) -> Result<SelectedRelease, String> {
-    let url = format!("https://api.github.com/repos/{repository}/releases?per_page=30");
-    let releases = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|error| format!("failed to create GitHub client: {error}"))?
-        .get(url)
-        .header(USER_AGENT, "LiveAgent-Updater")
-        .header(ACCEPT, "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|error| format!("failed to query GitHub releases: {error}"))?;
-
-    if !releases.status().is_success() {
-        return Err(format!(
-            "GitHub release lookup failed with status {}",
-            releases.status()
-        ));
-    }
-
-    let releases = releases
-        .json::<Vec<GitHubRelease>>()
-        .await
-        .map_err(|error| format!("failed to parse GitHub releases: {error}"))?;
-
+) -> Option<SelectedRelease> {
     for release in releases {
         if release.draft {
             continue;
@@ -187,7 +163,7 @@ async fn select_release_manifest(
             .iter()
             .find(|asset| asset.name == UPDATE_MANIFEST_ASSET)
         {
-            return Ok(SelectedRelease {
+            return Some(SelectedRelease {
                 tag_name: release.tag_name,
                 name: release.name,
                 prerelease: release.prerelease,
@@ -198,23 +174,65 @@ async fn select_release_manifest(
         }
     }
 
-    if include_prerelease {
-        Err("No stable or pre-release updater manifest was found.".to_string())
-    } else {
-        Err("No stable updater manifest was found.".to_string())
+    None
+}
+
+async fn select_release_manifest(
+    repository: &str,
+    include_prerelease: bool,
+) -> Result<Option<SelectedRelease>, String> {
+    let url = format!("https://api.github.com/repos/{repository}/releases?per_page=30");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|error| format!("failed to create GitHub client: {error}"))?;
+
+    let mut request = client
+        .get(url)
+        .header(USER_AGENT, "LiveAgent-Updater")
+        .header(ACCEPT, "application/vnd.github+json");
+    if let Some(token) = github_api_token() {
+        request = request.header(AUTHORIZATION, format!("Bearer {token}"));
     }
+
+    let releases = request
+        .send()
+        .await
+        .map_err(|error| format!("failed to query GitHub releases: {error}"))?;
+
+    if !releases.status().is_success() {
+        let status = releases.status();
+        let body = releases.text().await.unwrap_or_default();
+        if status == StatusCode::FORBIDDEN && body.contains("API rate limit exceeded") {
+            return Err(
+                "GitHub release lookup hit the unauthenticated API rate limit. Set LIVEAGENT_UPDATE_GITHUB_TOKEN for local testing.".to_string(),
+            );
+        }
+
+        return Err(format!("GitHub release lookup failed with status {status}"));
+    }
+
+    let releases = releases
+        .json::<Vec<GitHubRelease>>()
+        .await
+        .map_err(|error| format!("failed to parse GitHub releases: {error}"))?;
+
+    Ok(selected_release_from_releases(releases, include_prerelease))
 }
 
 fn build_updater(
     app: &AppHandle,
-    public_key: &str,
     manifest_url: &str,
 ) -> Result<tauri_plugin_updater::Updater, String> {
     let manifest_url = Url::parse(manifest_url)
         .map_err(|error| format!("invalid updater manifest URL: {error}"))?;
 
-    app.updater_builder()
-        .pubkey(public_key.to_string())
+    let mut builder = app.updater_builder();
+    if let Some(public_key) = updater_public_key_override() {
+        builder = builder.pubkey(public_key);
+    }
+
+    builder
         .endpoints(vec![manifest_url])
         .map_err(|error| format!("invalid updater endpoint: {error}"))?
         .timeout(Duration::from_secs(60))
@@ -222,18 +240,25 @@ fn build_updater(
         .map_err(|error| format!("failed to initialize updater: {error}"))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn app_update_check(
     app: AppHandle,
     include_prerelease: bool,
 ) -> Result<AppUpdateCheckResponse, String> {
     let repository = update_repository();
-    let Some(public_key) = updater_public_key() else {
-        return Ok(unconfigured_response(&app, include_prerelease, repository));
-    };
 
-    let release = select_release_manifest(&repository, include_prerelease).await?;
-    let updater = build_updater(&app, &public_key, &release.manifest_url)?;
+    let Some(release) = select_release_manifest(&repository, include_prerelease).await? else {
+        return Ok(no_update_response(
+            &app,
+            repository,
+            if include_prerelease {
+                AppUpdateChannel::Prerelease
+            } else {
+                AppUpdateChannel::Stable
+            },
+        ));
+    };
+    let updater = build_updater(&app, &release.manifest_url)?;
     let update = updater
         .check()
         .await
@@ -253,18 +278,25 @@ pub async fn app_update_check(
     })
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn app_update_install(
     app: AppHandle,
     include_prerelease: bool,
 ) -> Result<AppUpdateCheckResponse, String> {
     let repository = update_repository();
-    let Some(public_key) = updater_public_key() else {
-        return Ok(unconfigured_response(&app, include_prerelease, repository));
-    };
 
-    let release = select_release_manifest(&repository, include_prerelease).await?;
-    let updater = build_updater(&app, &public_key, &release.manifest_url)?;
+    let Some(release) = select_release_manifest(&repository, include_prerelease).await? else {
+        return Ok(no_update_response(
+            &app,
+            repository,
+            if include_prerelease {
+                AppUpdateChannel::Prerelease
+            } else {
+                AppUpdateChannel::Stable
+            },
+        ));
+    };
+    let updater = build_updater(&app, &release.manifest_url)?;
     let update = updater
         .check()
         .await
@@ -293,4 +325,60 @@ pub async fn app_update_install(
         date,
         body,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn release(tag_name: &str, prerelease: bool, has_manifest: bool) -> GitHubRelease {
+        GitHubRelease {
+            tag_name: tag_name.to_string(),
+            name: Some(format!("LiveAgent {tag_name}")),
+            draft: false,
+            prerelease,
+            html_url: Some(format!(
+                "https://github.com/Stack-Cairn/LiveAgent/releases/tag/{tag_name}"
+            )),
+            published_at: Some("2026-05-25T12:27:41Z".to_string()),
+            assets: if has_manifest {
+                vec![GitHubAsset {
+                    name: UPDATE_MANIFEST_ASSET.to_string(),
+                    browser_download_url: format!(
+                        "https://github.com/Stack-Cairn/LiveAgent/releases/download/{tag_name}/latest.json"
+                    ),
+                }]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    #[test]
+    fn stable_channel_ignores_prerelease_only_manifest() {
+        let selected = selected_release_from_releases(vec![release("v0.1.1", true, true)], false);
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn prerelease_channel_can_select_prerelease_manifest() {
+        let selected = selected_release_from_releases(vec![release("v0.1.1", true, true)], true)
+            .expect("pre-release manifest should be selected");
+        assert_eq!(selected.tag_name, "v0.1.1");
+        assert!(selected.prerelease);
+    }
+
+    #[test]
+    fn stable_channel_selects_next_stable_manifest_after_prerelease() {
+        let selected = selected_release_from_releases(
+            vec![
+                release("v0.1.2-beta.1", true, true),
+                release("v0.1.1", false, true),
+            ],
+            false,
+        )
+        .expect("stable manifest should be selected");
+        assert_eq!(selected.tag_name, "v0.1.1");
+        assert!(!selected.prerelease);
+    }
 }
