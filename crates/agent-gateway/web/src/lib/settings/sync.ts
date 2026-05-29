@@ -1,6 +1,7 @@
 import {
   normalizeChatRuntimeControls,
   normalizeProjectToolsFileTreeSettings,
+  normalizeProjectToolsGitReviewSettings,
   normalizeSettings,
   workspaceProjectPathKey,
   type AppSettings,
@@ -311,6 +312,21 @@ function mergeSyncedProjectToolsFileTreeSettings(
   };
 }
 
+function mergeSyncedProjectToolsGitReviewSettings(
+  current: AppSettings["customSettings"]["projectToolsGitReview"],
+  incoming: unknown,
+): AppSettings["customSettings"]["projectToolsGitReview"] {
+  const currentState = normalizeProjectToolsGitReviewSettings(current);
+  const incomingState = normalizeProjectToolsGitReviewSettings(incoming);
+  const openFromIncoming = incomingState.openVersion >= currentState.openVersion;
+  return {
+    openProjectPathKeys: openFromIncoming
+      ? incomingState.openProjectPathKeys
+      : currentState.openProjectPathKeys,
+    openVersion: Math.max(currentState.openVersion, incomingState.openVersion),
+  };
+}
+
 export function buildGatewaySettingsSyncPayload(
   settings: AppSettings,
   options: { includeProviderApiKeyUpdates?: boolean } = {},
@@ -388,6 +404,15 @@ export function applyGatewaySettingsSyncPayload(
             incomingCustomSettings.projectToolsFileTree,
           )
         : current.customSettings.projectToolsFileTree,
+      projectToolsGitReview: Object.prototype.hasOwnProperty.call(
+        incomingCustomSettings,
+        "projectToolsGitReview",
+      )
+        ? mergeSyncedProjectToolsGitReviewSettings(
+            current.customSettings.projectToolsGitReview,
+            incomingCustomSettings.projectToolsGitReview,
+          )
+        : current.customSettings.projectToolsGitReview,
       chatSidebar: current.customSettings.chatSidebar,
       projectToolsPanel: current.customSettings.projectToolsPanel,
     },

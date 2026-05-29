@@ -88,9 +88,16 @@ export type GitOperationResponse = {
   message: string;
 };
 
+export type GitInitOptions = {
+  branch?: string;
+  userName?: string;
+  userEmail?: string;
+};
+
 export type GitClient = {
   status(workdir: string): Promise<GitRepositoryState>;
   branches(workdir: string): Promise<GitBranchesResponse>;
+  init(workdir: string, options?: GitInitOptions): Promise<GitOperationResponse>;
   switchBranch(workdir: string, branch: string, kind?: string): Promise<GitOperationResponse>;
   createBranch(workdir: string, branch: string): Promise<GitOperationResponse>;
   diff(workdir: string, mode: "branch" | "working_tree", path?: string): Promise<GitDiffResponse>;

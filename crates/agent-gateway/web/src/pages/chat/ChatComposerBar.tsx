@@ -72,7 +72,7 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: {
   gitClient?: GitClient | null;
   gitWriteEnabled?: boolean;
   gitDisabledMessage?: string;
-  onGitChanged?: () => void;
+  onGitChanged?: (workdir: string) => void;
   onSend: () => void;
   onStop: () => void;
   onComposerBusyChange: (isBusy: boolean) => void;
@@ -391,7 +391,7 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: {
                 disabled={controlsDisabled}
                 canWrite={gitWriteEnabled}
                 disabledMessage={gitDisabledMessage}
-                onChanged={onGitChanged}
+                onChanged={() => onGitChanged?.(workdir)}
               />
             </div>
 

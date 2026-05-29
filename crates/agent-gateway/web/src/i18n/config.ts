@@ -14,6 +14,7 @@ export const translations: Record<Locale, Record<string, string>> = {
     /* ── App / Global ── */
     "app.loading": "正在加载设置...",
     "app.name": "LiveAgent",
+    "window.close": "关闭",
 
     /* ── Tooltip ── */
     "tooltip.settings": "设置",
@@ -222,6 +223,14 @@ export const translations: Record<Locale, Record<string, string>> = {
     "git.branchSelector.newBranchPlaceholder": "new-branch",
     "git.branchSelector.create": "创建",
     "git.branchSelector.createNewBranch": "创建新分支",
+    "git.branchSelector.initRepository": "初始化仓库",
+    "git.branchSelector.initRepositoryTitle": "初始化 Git 仓库",
+    "git.branchSelector.initRepositoryDescription": "在当前目录创建 .git，并写入可选的本地 Git 用户信息。",
+    "git.branchSelector.targetDirectory": "目标目录",
+    "git.branchSelector.initialBranch": "初始分支",
+    "git.branchSelector.initialBranchRequired": "请输入初始分支名。",
+    "git.branchSelector.userNameOptional": "用户名（可选）",
+    "git.branchSelector.userEmailOptional": "邮箱（可选）",
     "projectTools.reorderTab": "调整标签排序",
     "projectTools.reorderTabHint": "拖动排序，或聚焦后按左右方向键移动",
     "projectTools.shell": "Shell",
@@ -925,6 +934,7 @@ export const translations: Record<Locale, Record<string, string>> = {
     /* ── App / Global ── */
     "app.loading": "Loading settings...",
     "app.name": "LiveAgent",
+    "window.close": "Close",
 
     /* ── Tooltip ── */
     "tooltip.settings": "Settings",
@@ -1133,6 +1143,14 @@ export const translations: Record<Locale, Record<string, string>> = {
     "git.branchSelector.newBranchPlaceholder": "new-branch",
     "git.branchSelector.create": "Create",
     "git.branchSelector.createNewBranch": "Create New Branch",
+    "git.branchSelector.initRepository": "Initialize Repository",
+    "git.branchSelector.initRepositoryTitle": "Initialize Git Repository",
+    "git.branchSelector.initRepositoryDescription": "Create .git in the current directory and optionally save local Git user details.",
+    "git.branchSelector.targetDirectory": "Target Directory",
+    "git.branchSelector.initialBranch": "Initial Branch",
+    "git.branchSelector.initialBranchRequired": "Enter an initial branch name.",
+    "git.branchSelector.userNameOptional": "User name (optional)",
+    "git.branchSelector.userEmailOptional": "Email (optional)",
     "projectTools.reorderTab": "Reorder tab",
     "projectTools.reorderTabHint": "Drag to reorder, or focus and use Left/Right",
     "projectTools.shell": "Shell",

@@ -102,6 +102,21 @@ const CHANGES_MENU_HEIGHT = 170;
 const GIT_HISTORY_LIMIT = 120;
 const CHANGE_CONTEXT_MENU_ITEM_CLASS =
   "flex w-full items-center gap-2 px-3 py-2 text-left text-xs hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-45";
+const GIT_REVIEW_POLL_INTERVAL_MS = 1500;
+
+type GitRefreshOptions = {
+  force?: boolean;
+  notifyChanged?: boolean;
+  silent?: boolean;
+};
+
+function dispatchGitChanged(workdir: string) {
+  window.dispatchEvent(
+    new CustomEvent("liveagent:git-changed", {
+      detail: { workdir },
+    }),
+  );
+}
 
 function useIsDark() {
   const [isDark, setIsDark] = useState(() => document.documentElement.classList.contains("dark"));
@@ -755,6 +770,71 @@ function revealTargetForEntry(entry: GitStatusEntry) {
   return entry.path;
 }
 
+function gitRepositoryStateSignature(state: GitRepositoryState) {
+  const dirty = state.dirtyCounts;
+  const header = [
+    state.status,
+    state.error ?? "",
+    state.repoRoot,
+    state.workdir,
+    state.head,
+    state.upstream,
+    state.ahead,
+    state.behind,
+    dirty.staged,
+    dirty.unstaged,
+    dirty.untracked,
+    dirty.conflicted,
+  ].join("\x1f");
+  const entries = state.entries
+    .map((entry) =>
+      [
+        entry.path,
+        entry.oldPath ?? "",
+        entry.indexStatus,
+        entry.worktreeStatus,
+        entry.kind,
+        entry.staged ? "1" : "0",
+        entry.conflicted ? "1" : "0",
+        entry.untracked ? "1" : "0",
+      ].join("\x1e"),
+    )
+    .join("\x1f");
+  return `${header}\x1d${entries}`;
+}
+
+function gitHistorySignature(state: GitRepositoryState, commits: GitCommitSummary[]) {
+  const commitsSignature = commits
+    .map((commit) =>
+      [
+        commit.sha,
+        commit.parents.join(","),
+        commit.refs.join(","),
+        commit.authorDate,
+        commit.subject,
+        commit.fileCount,
+        commit.files
+          .map((file) => [file.path, file.oldPath ?? "", file.status, file.kind].join("\x1e"))
+          .join("\x1c"),
+      ].join("\x1e"),
+    )
+    .join("\x1f");
+  return `${gitRepositoryStateSignature(state)}\x1d${commitsSignature}`;
+}
+
+function gitDiffSignature(diff: GitDiffResponse) {
+  return [
+    diff.baseRef,
+    diff.headRef,
+    diff.mode,
+    diff.files.join("\x1e"),
+    diff.binaryFiles.join("\x1e"),
+    diff.truncated ? "1" : "0",
+    diff.stat,
+    diff.patch,
+  ].join("\x1f");
+}
+
 function assertGitOperationResult(value: unknown, fallbackMessage: string) {
   if (!value || typeof value !== "object") return;
   const result = value as { ok?: unknown; message?: unknown; stderr?: unknown };
@@ -806,9 +886,16 @@ export function GitReviewPanel(props: {
   const expandedCommitShaRef = useRef("");
   const reviewModeRef = useRef<GitReviewMode>("changes");
   const diffRequestIdRef = useRef(0);
+  const diffInFlightRequestIdRef = useRef(0);
   const commitDiffRequestIdRef = useRef(0);
   const panelRef = useRef<HTMLDivElement | null>(null);
   const historyListRef = useRef<HTMLDivElement | null>(null);
+  const statusSignatureRef = useRef("");
+  const historySignatureRef = useRef("");
+  const branchDiffSignatureRef = useRef("");
+  const worktreeDiffSignatureRef = useRef("");
+  const refreshInFlightRef = useRef(false);
+  const historyInFlightRef = useRef(false);
   const suppressNextGitChangedRef = useRef(false);
 
   useEffect(() => {
@@ -833,6 +920,9 @@ export function GitReviewPanel(props: {
 
   const clearDiffs = useCallback(() => {
     diffRequestIdRef.current += 1;
+    diffInFlightRequestIdRef.current = 0;
+    branchDiffSignatureRef.current = "";
+    worktreeDiffSignatureRef.current = "";
     setBranchDiff(null);
     setWorktreeDiff(null);
     setBranchError("");
@@ -840,17 +930,25 @@ export function GitReviewPanel(props: {
   }, []);
 
   const loadDiffForPath = useCallback(
-    async (path: string) => {
+    async (path: string, options: GitRefreshOptions = {}) => {
       const cleanPath = path.trim();
+      if (options.silent && diffInFlightRequestIdRef.current !== 0) {
+        return;
+      }
       const requestId = diffRequestIdRef.current + 1;
       diffRequestIdRef.current = requestId;
-      setBranchError("");
-      setError("");
+      diffInFlightRequestIdRef.current = requestId;
+      if (!options.silent) {
+        setBranchError("");
+        setError("");
+      }
       if (!gitClient || !cwd.trim() || !cleanPath) {
         clearDiffs();
         return;
       }
-      setDiffLoading(true);
+      if (!options.silent) {
+        setDiffLoading(true);
+      }
       try {
         const [branchResult, worktreeResult] = await Promise.allSettled([
           gitClient.diff(cwd, "branch", cleanPath),
@@ -858,14 +956,26 @@ export function GitReviewPanel(props: {
         ]);
         if (diffRequestIdRef.current !== requestId) return;
         if (branchResult.status === "fulfilled") {
-          setBranchDiff(branchResult.value);
+          const signature = gitDiffSignature(branchResult.value);
+          if (!options.silent || branchDiffSignatureRef.current !== signature) {
+            setBranchDiff(branchResult.value);
+          }
+          branchDiffSignatureRef.current = signature;
+          setBranchError("");
         } else {
+          branchDiffSignatureRef.current = "";
           setBranchDiff(null);
           setBranchError(branchResult.reason instanceof Error ? branchResult.reason.message : String(branchResult.reason));
         }
         if (worktreeResult.status === "fulfilled") {
-          setWorktreeDiff(worktreeResult.value);
+          const signature = gitDiffSignature(worktreeResult.value);
+          if (!options.silent || worktreeDiffSignatureRef.current !== signature) {
+            setWorktreeDiff(worktreeResult.value);
+          }
+          worktreeDiffSignatureRef.current = signature;
+          setError("");
         } else {
+          worktreeDiffSignatureRef.current = "";
           setWorktreeDiff(null);
           setError(worktreeResult.reason instanceof Error ? worktreeResult.reason.message : String(worktreeResult.reason));
         }
@@ -875,27 +985,56 @@ export function GitReviewPanel(props: {
         }
       } finally {
         if (diffRequestIdRef.current === requestId) {
-          setDiffLoading(false);
+          diffInFlightRequestIdRef.current = 0;
+          if (!options.silent) {
+            setDiffLoading(false);
+          }
         }
       }
     },
     [clearDiffs, cwd, gitClient],
   );
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (options: GitRefreshOptions = {}) => {
+    if (refreshInFlightRef.current) {
+      return;
+    }
+    refreshInFlightRef.current = true;
+    const silent = options.silent === true;
+    const force = options.force !== false;
     if (!gitClient || !cwd.trim()) {
+      statusSignatureRef.current = "";
       setState(emptyGitRepositoryState(cwd));
       setSelectedPath("");
       clearDiffs();
+      refreshInFlightRef.current = false;
       return;
     }
-    setLoading(true);
-    setError("");
-    setBranchError("");
+    if (!silent) {
+      setLoading(true);
+      setError("");
+      setBranchError("");
+    }
     try {
       const nextState = await gitClient.status(cwd);
+      const previousSignature = statusSignatureRef.current;
+      const nextSignature = gitRepositoryStateSignature(nextState);
+      const stateChanged = previousSignature !== nextSignature;
+      statusSignatureRef.current = nextSignature;
+      if (options.notifyChanged && previousSignature && stateChanged) {
+        suppressNextGitChangedRef.current = true;
+        dispatchGitChanged(cwd);
+      }
+      if (!force && !stateChanged) {
+        const currentPath = selectedPathRef.current;
+        if (currentPath && reviewModeRef.current === "changes") {
+          void loadDiffForPath(currentPath, { silent: true, force: false });
+        }
+        return;
+      }
       setState(nextState);
       if (nextState.status !== "ready") {
+        selectedPathRef.current = "";
         setSelectedPath("");
         clearDiffs();
         return;
@@ -907,14 +1046,19 @@ export function GitReviewPanel(props: {
       selectedPathRef.current = nextPath;
       setSelectedPath(nextPath);
       if (nextPath) {
-        void loadDiffForPath(nextPath);
+        void loadDiffForPath(nextPath, { silent: silent && nextPath === currentPath });
       } else {
         clearDiffs();
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (!silent || force) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      setLoading(false);
+      refreshInFlightRef.current = false;
+      if (!silent) {
+        setLoading(false);
+      }
     }
   }, [clearDiffs, cwd, gitClient, loadDiffForPath]);
 
@@ -949,8 +1093,15 @@ export function GitReviewPanel(props: {
     [cwd, gitClient],
   );
 
-  const loadHistory = useCallback(async () => {
+  const loadHistory = useCallback(async (options: GitRefreshOptions = {}) => {
+    if (historyInFlightRef.current) {
+      return;
+    }
+    historyInFlightRef.current = true;
+    const silent = options.silent === true;
+    const force = options.force !== false;
     if (!gitClient || !cwd.trim()) {
+      historySignatureRef.current = "";
       setHistoryCommits([]);
       selectedCommitShaRef.current = "";
       selectedCommitFilePathRef.current = "";
@@ -960,12 +1111,29 @@ export function GitReviewPanel(props: {
       setExpandedCommitSha("");
       setCommitDiff(null);
       setHistoryError("");
+      historyInFlightRef.current = false;
       return;
     }
-    setHistoryLoading(true);
-    setHistoryError("");
+    if (!silent) {
+      setHistoryLoading(true);
+      setHistoryError("");
+    }
     try {
       const response = await gitClient.log(cwd, GIT_HISTORY_LIMIT);
+      const nextSignature = gitHistorySignature(response.state, response.commits);
+      const historyChanged = historySignatureRef.current !== nextSignature;
+      const previousStatusSignature = statusSignatureRef.current;
+      const nextStatusSignature = gitRepositoryStateSignature(response.state);
+      const statusChanged = previousStatusSignature !== nextStatusSignature;
+      historySignatureRef.current = nextSignature;
+      statusSignatureRef.current = nextStatusSignature;
+      if (options.notifyChanged && previousStatusSignature && statusChanged) {
+        suppressNextGitChangedRef.current = true;
+        dispatchGitChanged(cwd);
+      }
+      if (!force && !historyChanged) {
+        return;
+      }
       setState(response.state);
       setHistoryCommits(response.commits);
       if (response.state.status !== "ready" || response.commits.length === 0) {
@@ -1002,17 +1170,22 @@ export function GitReviewPanel(props: {
         setCommitDiff(null);
       }
     } catch (err) {
-      setHistoryCommits([]);
-      selectedCommitShaRef.current = "";
-      selectedCommitFilePathRef.current = "";
-      expandedCommitShaRef.current = "";
-      setSelectedCommitSha("");
-      setSelectedCommitFilePath("");
-      setExpandedCommitSha("");
-      setCommitDiff(null);
-      setHistoryError(err instanceof Error ? err.message : String(err));
+      if (!silent || force) {
+        setHistoryCommits([]);
+        selectedCommitShaRef.current = "";
+        selectedCommitFilePathRef.current = "";
+        expandedCommitShaRef.current = "";
+        setSelectedCommitSha("");
+        setSelectedCommitFilePath("");
+        setExpandedCommitSha("");
+        setCommitDiff(null);
+        setHistoryError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      setHistoryLoading(false);
+      historyInFlightRef.current = false;
+      if (!silent) {
+        setHistoryLoading(false);
+      }
     }
   }, [cwd, gitClient, loadCommitDiff]);
 
@@ -1025,6 +1198,38 @@ export function GitReviewPanel(props: {
       void loadHistory();
     }
   }, [loadHistory, reviewMode]);
+
+  useEffect(() => {
+    if (!gitClient || !cwd.trim()) {
+      return;
+    }
+    let stopped = false;
+    const refreshVisiblePanel = () => {
+      if (stopped || document.hidden || !panelRef.current?.getClientRects().length) {
+        return;
+      }
+      if (reviewModeRef.current === "history") {
+        void loadHistory({ silent: true, force: false, notifyChanged: true });
+      } else {
+        void refresh({ silent: true, force: false, notifyChanged: true });
+      }
+    };
+    const interval = window.setInterval(refreshVisiblePanel, GIT_REVIEW_POLL_INTERVAL_MS);
+    const handleFocus = () => refreshVisiblePanel();
+    const handleVisibilityChange = () => {
+      if (!document.hidden) {
+        refreshVisiblePanel();
+      }
+    };
+    window.addEventListener("focus", handleFocus);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      stopped = true;
+      window.clearInterval(interval);
+      window.removeEventListener("focus", handleFocus);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [cwd, gitClient, loadHistory, refresh]);
 
   useEffect(() => {
     const handleGitChanged = () => {
@@ -1055,7 +1260,7 @@ export function GitReviewPanel(props: {
           await loadHistory();
         }
         suppressNextGitChangedRef.current = true;
-        window.dispatchEvent(new Event("liveagent:git-changed"));
+        dispatchGitChanged(cwd);
         return true;
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
@@ -1318,9 +1523,9 @@ export function GitReviewPanel(props: {
             aria-label={t("projectTools.gitReview.refresh")}
             onClick={() => {
               if (reviewMode === "history") {
-                void loadHistory();
+                void loadHistory({ notifyChanged: true });
               } else {
-                void refresh();
+                void refresh({ notifyChanged: true });
               }
             }}
           >
@@ -1571,7 +1776,7 @@ export function GitReviewPanel(props: {
                 disabled={historyLoading}
                 title={t("projectTools.gitReview.refresh")}
                 aria-label={t("projectTools.gitReview.refresh")}
-                onClick={() => void loadHistory()}
+                onClick={() => void loadHistory({ notifyChanged: true })}
               >
                 <RefreshCw className={cn("h-3.5 w-3.5", historyLoading && "animate-spin")} />
               </Button>
@@ -1786,7 +1991,7 @@ export function GitReviewPanel(props: {
             disabled={loading}
             onClick={() => {
               setChangesMenu(null);
-              void refresh();
+              void refresh({ notifyChanged: true });
             }}
           >
             <RefreshCw className="h-3.5 w-3.5" />

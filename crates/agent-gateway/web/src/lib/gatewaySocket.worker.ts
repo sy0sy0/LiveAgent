@@ -483,6 +483,7 @@ async function resolveRequest(client: GatewayWebSocketClient, method: string, pa
       return client.memoryManage(payload as MemoryManagePayload);
     case "git.status":
     case "git.branches":
+    case "git.init":
     case "git.switch_branch":
     case "git.create_branch":
     case "git.diff":

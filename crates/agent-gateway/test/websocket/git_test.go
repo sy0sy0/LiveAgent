@@ -57,6 +57,13 @@ func TestWebSocketGitRejectsWriteRequestsWhenDisabled(t *testing.T) {
 				"path": "src/main.rs",
 			},
 		},
+		{
+			id:      "git-init-disabled",
+			reqType: "git.init",
+			args: map[string]any{
+				"branch": "main",
+			},
+		},
 		{id: "git-stage-all-disabled", reqType: "git.stage_all"},
 		{id: "git-unstage-all-disabled", reqType: "git.unstage_all"},
 		{id: "git-discard-all-disabled", reqType: "git.discard_all"},

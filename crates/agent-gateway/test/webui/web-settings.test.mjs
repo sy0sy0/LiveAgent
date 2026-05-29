@@ -189,6 +189,15 @@ test("loadWebSettings forces current gateway URL/token over stale persisted remo
   stale.remote.gatewayUrl = "https://old.example";
   stale.remote.token = "old-token";
   stale.system.workdir = "/workspace";
+  stale.customSettings.projectToolsFileTree = {
+    openProjectPathKeys: ["/stale/project"],
+    openVersion: 1,
+    projects: {},
+  };
+  stale.customSettings.projectToolsGitReview = {
+    openProjectPathKeys: ["/stale/project"],
+    openVersion: 1,
+  };
   store.set("liveagent.gateway.webui.settings.v1", JSON.stringify(stale));
 
   const loaded = webSettings.loadWebSettings(" new-token ");
@@ -196,6 +205,8 @@ test("loadWebSettings forces current gateway URL/token over stale persisted remo
   assert.equal(loaded.remote.gatewayUrl, "https://new.example");
   assert.equal(loaded.remote.token, "new-token");
   assert.equal(loaded.remote.enabled, true);
+  assert.deepEqual(loaded.customSettings.projectToolsFileTree.openProjectPathKeys, []);
+  assert.deepEqual(loaded.customSettings.projectToolsGitReview.openProjectPathKeys, []);
 });
 
 test("gateway settings sync keeps remote connection local and syncs web terminal setting", () => {
@@ -325,6 +336,50 @@ test("gateway settings sync preserves active workspace project by path when ids 
   const synced = settingsSync.applyGatewaySettingsSyncPayload(current, incoming);
 
   assert.equal(synced.system.activeWorkspaceProjectId, "desktop-project-a");
+});
+
+test("gateway settings sync keeps newer git review tab open state", () => {
+  installWindow();
+  const current = settings.normalizeSettings({
+    customSettings: {
+      projectToolsGitReview: {
+        openProjectPathKeys: ["/web/project"],
+        openVersion: 2,
+      },
+    },
+  });
+
+  const staleSynced = settingsSync.applyGatewaySettingsSyncPayload(current, {
+    customSettings: {
+      projectToolsGitReview: {
+        openProjectPathKeys: [],
+        openVersion: 1,
+      },
+    },
+  });
+  assert.deepEqual(staleSynced.customSettings.projectToolsGitReview.openProjectPathKeys, [
+    "/web/project",
+  ]);
+  assert.equal(staleSynced.customSettings.projectToolsGitReview.openVersion, 2);
+
+  const newerSynced = settingsSync.applyGatewaySettingsSyncPayload(staleSynced, {
+    customSettings: {
+      projectToolsGitReview: {
+        openProjectPathKeys: ["/desktop/project"],
+        openVersion: 3,
+      },
+    },
+  });
+  assert.deepEqual(newerSynced.customSettings.projectToolsGitReview.openProjectPathKeys, [
+    "/desktop/project",
+  ]);
+  assert.equal(newerSynced.customSettings.projectToolsGitReview.openVersion, 3);
+
+  const payload = settingsSync.buildGatewaySettingsSyncPayload(newerSynced);
+  assert.deepEqual(payload.customSettings.projectToolsGitReview, {
+    openProjectPathKeys: ["/desktop/project"],
+    openVersion: 3,
+  });
 });
 
 test("gateway settings sync keeps newer project conversation activity", () => {

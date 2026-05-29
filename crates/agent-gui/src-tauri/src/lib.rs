@@ -147,6 +147,7 @@ macro_rules! app_invoke_handler {
             commands::terminal::terminal_read_tail,
             commands::git::git_status,
             commands::git::git_branches,
+            commands::git::git_init,
             commands::git::git_switch_branch,
             commands::git::git_create_branch,
             commands::git::git_diff,

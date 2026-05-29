@@ -54,6 +54,7 @@ import {
   getProjectToolsPanelTabOrder,
   isAgentDevMode,
   isProjectToolsFileTreeOpen,
+  isProjectToolsGitReviewOpen,
   normalizeChatRuntimeControlsForProvider,
   normalizeSettings,
   removeProjectToolsProjectState,
@@ -63,6 +64,7 @@ import {
   updateCustomSettings,
   updateProjectToolsFileTreeProjectState,
   updateProjectToolsFileTreeOpen,
+  updateProjectToolsGitReviewOpen,
   updateProjectToolsPanelTabOrder,
   type AppSettings,
   type ChatRuntimeControls,
@@ -6145,7 +6147,13 @@ export default function App() {
                 gitClient={gitClient}
                 gitWriteEnabled={settings.remote.enableWebGit}
                 gitDisabledMessage={gitDisabledMessage}
-                onGitChanged={() => window.dispatchEvent(new Event("liveagent:git-changed"))}
+                onGitChanged={(gitWorkdir) =>
+                  window.dispatchEvent(
+                    new CustomEvent("liveagent:git-changed", {
+                      detail: { workdir: gitWorkdir },
+                    }),
+                  )
+                }
                 onSend={() => {
                   if (
                     submitInFlightRef.current ||
@@ -6323,6 +6331,10 @@ export default function App() {
               settings.customSettings,
               terminalProjectPathKey,
             )}
+            gitReviewOpen={isProjectToolsGitReviewOpen(
+              settings.customSettings,
+              terminalProjectPathKey,
+            )}
             client={terminalClient}
             gitClient={gitClient}
             gitWriteEnabled={settings.remote.enableWebGit}
@@ -6360,6 +6372,11 @@ export default function App() {
             onFileTreeStateChange={(patch) =>
               setSettings((prev) =>
                 updateProjectToolsFileTreeProjectState(prev, terminalProjectPathKey, patch),
+              )
+            }
+            onGitReviewOpenChange={(open) =>
+              setSettings((prev) =>
+                updateProjectToolsGitReviewOpen(prev, terminalProjectPathKey, open),
               )
             }
             onSessionsChange={handleProjectTerminalSessionsChange}

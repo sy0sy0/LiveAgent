@@ -531,7 +531,7 @@ func (c *websocketConnection) dispatch(req websocketRequest) {
 		c.handleTerminalRequest(req)
 	case "terminal.detach":
 		c.handleTerminalDetach(req)
-	case "git.status", "git.branches", "git.switch_branch", "git.create_branch", "git.diff", "git.log", "git.commit_diff", "git.stage", "git.stage_all", "git.unstage", "git.unstage_all", "git.discard", "git.discard_all", "git.add_to_gitignore", "git.commit", "git.fetch", "git.pull", "git.push":
+	case "git.status", "git.branches", "git.init", "git.switch_branch", "git.create_branch", "git.diff", "git.log", "git.commit_diff", "git.stage", "git.stage_all", "git.unstage", "git.unstage_all", "git.discard", "git.discard_all", "git.add_to_gitignore", "git.commit", "git.fetch", "git.pull", "git.push":
 		c.handleGitRequest(req)
 	case "cron.manage":
 		c.handleCronManage(req)
@@ -2121,7 +2121,7 @@ func gitActionFromRequestType(requestType string) string {
 
 func gitActionIsWrite(action string) bool {
 	switch action {
-	case "switch_branch", "create_branch", "stage", "stage_all", "unstage", "unstage_all", "discard", "discard_all", "add_to_gitignore", "commit", "fetch", "pull", "push":
+	case "init", "switch_branch", "create_branch", "stage", "stage_all", "unstage", "unstage_all", "discard", "discard_all", "add_to_gitignore", "commit", "fetch", "pull", "push":
 		return true
 	default:
 		return false

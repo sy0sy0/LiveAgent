@@ -136,6 +136,8 @@ struct GitGatewayArgs {
     mode: Option<String>,
     commit: Option<String>,
     limit: Option<usize>,
+    user_name: Option<String>,
+    user_email: Option<String>,
 }
 
 struct GitOutput {
@@ -528,6 +530,42 @@ fn validate_branch_name(repo_root: &str, branch: &str) -> Result<String, String>
     Ok(branch.to_string())
 }
 
+fn validate_git_init_workdir(workdir: &str) -> Result<String, String> {
+    let workdir = workdir.trim();
+    if workdir.is_empty() {
+        return Err("初始化目录不能为空。".to_string());
+    }
+    let metadata = fs::metadata(workdir).map_err(|error| format!("初始化目录不可访问：{error}"))?;
+    if !metadata.is_dir() {
+        return Err("初始化目录必须是文件夹。".to_string());
+    }
+    Ok(workdir.to_string())
+}
+
+fn validate_git_config_value(label: &str, value: Option<String>) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.chars().any(|ch| matches!(ch, '\0' | '\n' | '\r')) {
+        return Err(format!("{label} 不能包含换行或空字符。"));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn append_output(target: &mut String, value: &str) {
+    if value.trim().is_empty() {
+        return;
+    }
+    if !target.is_empty() {
+        target.push('\n');
+    }
+    target.push_str(value);
+}
+
 fn build_untracked_file_patch(repo_root: &str, path: &str) -> Result<Option<String>, String> {
     let clean_path = validate_repo_relative_path(path)?;
     let repo_root_path =
@@ -598,6 +636,34 @@ fn append_untracked_file_patches(
     Ok(())
 }
 
+fn append_initial_worktree_file_patches(
+    repo_root: &str,
+    entries: &[GitStatusEntry],
+    path_filter: Option<&str>,
+    patch: &mut String,
+    binary_files: &mut Vec<String>,
+) -> Result<(), String> {
+    for entry in entries {
+        if path_filter.is_some_and(|path| path != entry.path) {
+            continue;
+        }
+        let clean_path = validate_repo_relative_path(&entry.path)?;
+        if !Path::new(repo_root).join(&clean_path).exists() {
+            continue;
+        }
+        match build_untracked_file_patch(repo_root, &clean_path)? {
+            Some(initial_patch) => {
+                if !patch.trim().is_empty() {
+                    patch.push('\n');
+                }
+                patch.push_str(&initial_patch);
+            }
+            None => binary_files.push(clean_path),
+        }
+    }
+    Ok(())
+}
+
 fn operation_response(
     workdir: &str,
     result: Result<GitOutput, String>,
@@ -652,6 +718,88 @@ pub(crate) fn git_create_branch_sync(
         git_success(&state.repo_root, &["switch", "-c", branch.as_str()]),
         "分支已创建并检出。",
     )
+}
+
+pub(crate) fn git_init_sync(
+    workdir: String,
+    branch: String,
+    user_name: Option<String>,
+    user_email: Option<String>,
+) -> Result<GitOperationResponse, String> {
+    let workdir = validate_git_init_workdir(&workdir)?;
+    let existing_state = git_status_sync(workdir.clone())?;
+    if existing_state.status == "ready" {
+        return Err("当前目录已位于 Git 仓库内。".to_string());
+    }
+
+    let branch = {
+        let branch = branch.trim();
+        if branch.is_empty() {
+            "main".to_string()
+        } else {
+            branch.to_string()
+        }
+    };
+    if branch.chars().any(char::is_whitespace) {
+        return Err("分支名不能包含空白字符。".to_string());
+    }
+    git_success(&workdir, &["check-ref-format", "--branch", branch.as_str()])?;
+
+    let user_name = validate_git_config_value("Git user.name", user_name)?;
+    let user_email = validate_git_config_value("Git user.email", user_email)?;
+    let init_output = match git_success(&workdir, &["init", "-b", branch.as_str()]) {
+        Ok(output) => output,
+        Err(error) => {
+            return operation_response(&workdir, Err(error), "Git 仓库已初始化。");
+        }
+    };
+
+    let mut stdout = init_output.stdout;
+    let mut stderr = init_output.stderr;
+    if let Some(user_name) = user_name {
+        match git_success(&workdir, &["config", "user.name", user_name.as_str()]) {
+            Ok(output) => {
+                append_output(&mut stdout, &output.stdout);
+                append_output(&mut stderr, &output.stderr);
+            }
+            Err(error) => {
+                let state = git_status_sync(workdir.clone())?;
+                return Ok(GitOperationResponse {
+                    ok: false,
+                    state,
+                    stdout,
+                    stderr: error.clone(),
+                    message: error,
+                });
+            }
+        }
+    }
+    if let Some(user_email) = user_email {
+        match git_success(&workdir, &["config", "user.email", user_email.as_str()]) {
+            Ok(output) => {
+                append_output(&mut stdout, &output.stdout);
+                append_output(&mut stderr, &output.stderr);
+            }
+            Err(error) => {
+                let state = git_status_sync(workdir.clone())?;
+                return Ok(GitOperationResponse {
+                    ok: false,
+                    state,
+                    stdout,
+                    stderr: error.clone(),
+                    message: error,
+                });
+            }
+        }
+    }
+
+    Ok(GitOperationResponse {
+        ok: true,
+        state: git_status_sync(workdir)?,
+        stdout,
+        stderr,
+        message: "Git 仓库已初始化。".to_string(),
+    })
 }
 
 fn ref_exists(repo_root: &str, reference: &str) -> bool {
@@ -972,6 +1120,33 @@ pub(crate) fn git_diff_sync(
         .as_deref()
         .map(validate_repo_relative_path)
         .transpose()?;
+    let files = state
+        .entries
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect();
+    if mode == "working_tree" && !ref_exists(&state.repo_root, "HEAD") {
+        let mut patch = String::new();
+        let mut binary_files = Vec::new();
+        append_initial_worktree_file_patches(
+            &state.repo_root,
+            &state.entries,
+            clean_path.as_deref(),
+            &mut patch,
+            &mut binary_files,
+        )?;
+        let (patch, truncated) = truncate_patch(patch);
+        return Ok(GitDiffResponse {
+            base_ref: "ROOT".to_string(),
+            head_ref: "WORKTREE".to_string(),
+            mode,
+            files,
+            patch,
+            stat: String::new(),
+            truncated,
+            binary_files,
+        });
+    }
     let mut base_ref = String::new();
     let mut head_ref = "HEAD".to_string();
     let mut args: Vec<String> = vec![
@@ -1008,11 +1183,6 @@ pub(crate) fn git_diff_sync(
         )?;
     }
     let (patch, truncated) = truncate_patch(patch);
-    let files = state
-        .entries
-        .iter()
-        .map(|entry| entry.path.clone())
-        .collect();
     if mode == "working_tree" {
         base_ref = "HEAD".to_string();
         head_ref = "WORKTREE".to_string();
@@ -1252,6 +1422,12 @@ pub(crate) fn git_gateway_action_sync(
     let value = match action.as_str() {
         "status" => serde_json::to_value(git_status_sync(workdir)?),
         "branches" => serde_json::to_value(git_branches_sync(workdir)?),
+        "init" => serde_json::to_value(git_init_sync(
+            workdir,
+            args.branch.unwrap_or_else(|| "main".to_string()),
+            args.user_name,
+            args.user_email,
+        )?),
         "switch_branch" => serde_json::to_value(git_switch_branch_sync(
             workdir,
             args.branch.unwrap_or_default(),
@@ -1330,6 +1506,25 @@ pub async fn git_create_branch(
     tauri::async_runtime::spawn_blocking(move || git_create_branch_sync(workdir, branch))
         .await
         .map_err(|error| format!("git_create_branch join 失败：{error}"))?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn git_init(
+    workdir: String,
+    branch: Option<String>,
+    user_name: Option<String>,
+    user_email: Option<String>,
+) -> Result<GitOperationResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        git_init_sync(
+            workdir,
+            branch.unwrap_or_else(|| "main".to_string()),
+            user_name,
+            user_email,
+        )
+    })
+    .await
+    .map_err(|error| format!("git_init join 失败：{error}"))?
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1496,6 +1691,13 @@ mod tests {
     fn gateway_args_accept_empty_json() {
         assert!(parse_gateway_args(String::new()).is_ok());
         assert!(parse_gateway_args(json!({"path":"src/main.rs"}).to_string()).is_ok());
+        let init_args = parse_gateway_args(
+            json!({"branch":"main","userName":"LiveAgent Test","userEmail":"test@example.com"})
+                .to_string(),
+        )
+        .expect("parse init args");
+        assert_eq!(init_args.user_name.as_deref(), Some("LiveAgent Test"));
+        assert_eq!(init_args.user_email.as_deref(), Some("test@example.com"));
     }
 
     #[test]
@@ -1541,6 +1743,70 @@ mod tests {
         run_temp_git(temp.path(), &["add", "README.md"]);
         run_temp_git(temp.path(), &["commit", "-m", "initial"]);
         Some(temp)
+    }
+
+    #[test]
+    fn git_init_creates_repo_with_branch_and_local_identity() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temp repo");
+        let workdir = temp.path().to_string_lossy().to_string();
+        let initialized = git_init_sync(
+            workdir.clone(),
+            "trunk".to_string(),
+            Some("LiveAgent Test".to_string()),
+            Some("test@example.com".to_string()),
+        )
+        .expect("init repo");
+        assert!(initialized.ok, "init failed: {}", initialized.message);
+        assert_eq!(initialized.state.status, "ready");
+        assert_eq!(initialized.state.head, "trunk");
+
+        let user_name =
+            git_success(&workdir, &["config", "--get", "user.name"]).expect("user.name");
+        let user_email =
+            git_success(&workdir, &["config", "--get", "user.email"]).expect("user.email");
+        assert_eq!(user_name.stdout, "LiveAgent Test");
+        assert_eq!(user_email.stdout, "test@example.com");
+
+        let duplicate = git_init_sync(workdir, "main".to_string(), None, None)
+            .expect_err("second init should fail");
+        assert!(duplicate.contains("Git 仓库内"), "{duplicate}");
+    }
+
+    #[test]
+    fn git_worktree_diff_handles_unborn_head_repo() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temp repo");
+        let workdir = temp.path().to_string_lossy().to_string();
+        let initialized =
+            git_init_sync(workdir.clone(), "main".to_string(), None, None).expect("init repo");
+        assert!(initialized.ok, "init failed: {}", initialized.message);
+        assert!(!ref_exists(&workdir, "HEAD"));
+
+        fs::write(temp.path().join("draft.txt"), "draft\n").expect("write draft");
+        let diff = git_diff_sync(
+            workdir.clone(),
+            Some("working_tree".to_string()),
+            Some("draft.txt".to_string()),
+        )
+        .expect("working tree diff in unborn repo");
+        assert_eq!(diff.base_ref, "ROOT");
+        assert_eq!(diff.head_ref, "WORKTREE");
+        assert!(
+            diff.files.contains(&"draft.txt".to_string()),
+            "diff files: {:?}",
+            diff.files
+        );
+        assert!(
+            diff.patch.contains("diff --git a/draft.txt b/draft.txt")
+                && diff.patch.contains("+draft"),
+            "working tree diff patch:\n{}",
+            diff.patch
+        );
     }
 
     #[test]

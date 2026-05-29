@@ -64,6 +64,7 @@ type ProjectToolsPanelProps = {
   tabOrder?: string[];
   fileTreeOpen: boolean;
   fileTreeState: ProjectToolsFileTreeProjectState;
+  gitReviewOpen: boolean;
   client: TerminalClient;
   gitClient?: GitClient | null;
   gitWriteEnabled?: boolean;
@@ -73,6 +74,7 @@ type ProjectToolsPanelProps = {
   onTabOrderChange?: (tabOrder: string[]) => void;
   onFileTreeOpenChange: (open: boolean) => void;
   onFileTreeStateChange: (patch: ProjectToolsFileTreeStatePatch) => void;
+  onGitReviewOpenChange: (open: boolean) => void;
   onSessionsChange?: (sessions: TerminalSession[]) => void;
   onInsertFileMention?: (path: string, kind: "file" | "dir") => void;
   onClose?: () => void;
@@ -560,6 +562,7 @@ export function ProjectToolsPanel(props: ProjectToolsPanelProps) {
     tabOrder = [],
     fileTreeOpen,
     fileTreeState,
+    gitReviewOpen,
     client,
     gitClient,
     gitWriteEnabled = true,
@@ -569,6 +572,7 @@ export function ProjectToolsPanel(props: ProjectToolsPanelProps) {
     onTabOrderChange,
     onFileTreeOpenChange,
     onFileTreeStateChange,
+    onGitReviewOpenChange,
     onSessionsChange,
     onInsertFileMention,
     onClose,
@@ -583,7 +587,6 @@ export function ProjectToolsPanel(props: ProjectToolsPanelProps) {
   const [error, setError] = useState<string | null>(null);
   const [shellOptions, setShellOptions] = useState<TerminalShellOption[]>([]);
   const [createMenuOpen, setCreateMenuOpen] = useState(false);
-  const [gitReviewOpen, setGitReviewOpen] = useState(activeTab === "gitReview");
   const [shouldRenderContent, setShouldRenderContent] = useState(isOpen);
   const [widthCollapsed, setWidthCollapsed] = useState(!isOpen);
   const [isResizing, setIsResizing] = useState(false);
@@ -842,9 +845,8 @@ export function ProjectToolsPanel(props: ProjectToolsPanelProps) {
     setClosingSessionId("");
     setDraftTabOrder(null);
     setDraggingTabId("");
-    setGitReviewOpen(activeTab === "gitReview");
     tabDragRef.current = null;
-  }, [activeTab, projectPathKey]);
+  }, [projectPathKey]);
 
   useEffect(() => {
     if (!draftTabOrder) return;
@@ -1173,16 +1175,16 @@ export function ProjectToolsPanel(props: ProjectToolsPanelProps) {
 
   const startGitReview = useCallback(() => {
     if (!projectReady) return;
-    setGitReviewOpen(true);
+    onGitReviewOpenChange(true);
     onActiveTabChange("gitReview");
-  }, [onActiveTabChange, projectReady]);
+  }, [onActiveTabChange, onGitReviewOpenChange, projectReady]);
 
   const closeGitReview = useCallback(() => {
-    setGitReviewOpen(false);
+    onGitReviewOpenChange(false);
     if (activeTab === "gitReview") {
       onActiveTabChange("terminal");
     }
-  }, [activeTab, onActiveTabChange]);
+  }, [activeTab, onActiveTabChange, onGitReviewOpenChange]);
 
   const renderCreateTerminalMenuItem = () => {
     if (shellOptions.length > 1) {

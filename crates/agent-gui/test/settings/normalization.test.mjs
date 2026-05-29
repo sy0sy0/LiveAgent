@@ -471,6 +471,10 @@ test("gateway settings sync payload redacts provider api keys", () => {
           },
         },
       },
+      projectToolsGitReview: {
+        openProjectPathKeys: ["/workspace/b", "/workspace/a", "/workspace/a"],
+        openVersion: 2,
+      },
     },
   });
 
@@ -498,6 +502,10 @@ test("gateway settings sync payload redacts provider api keys", () => {
         stateVersion: 0,
       },
     },
+  });
+  assert.deepEqual(payload.customSettings.projectToolsGitReview, {
+    openProjectPathKeys: ["/workspace/a", "/workspace/b"],
+    openVersion: 2,
   });
   assert.equal(Object.hasOwn(payload.customSettings, "projectToolsPanel"), false);
   assert.deepEqual(payload.chatRuntimeControls, appSettings.chatRuntimeControls);
@@ -721,6 +729,10 @@ test("removes project tools state when a workspace project is deleted", () => {
           },
         },
       },
+      projectToolsGitReview: {
+        openProjectPathKeys: ["/workspace/app", "/workspace/other"],
+        openVersion: 5,
+      },
     },
   });
 
@@ -736,6 +748,10 @@ test("removes project tools state when a workspace project is deleted", () => {
   assert.deepEqual(Object.keys(cleaned.customSettings.projectToolsFileTree.projects), [
     "/workspace/other",
   ]);
+  assert.deepEqual(cleaned.customSettings.projectToolsGitReview.openProjectPathKeys, [
+    "/workspace/other",
+  ]);
+  assert.equal(cleaned.customSettings.projectToolsGitReview.openVersion, 6);
   assert.equal(settings.removeProjectToolsProjectState(cleaned, "/workspace/app"), cleaned);
 
   const projectOnlyState = settings.normalizeSettings({
@@ -759,6 +775,21 @@ test("removes project tools state when a workspace project is deleted", () => {
   );
   assert.equal(projectOnlyCleaned.customSettings.projectToolsFileTree.openVersion, 8);
   assert.deepEqual(projectOnlyCleaned.customSettings.projectToolsFileTree.projects, {});
+
+  const gitReviewOnlyState = settings.normalizeSettings({
+    customSettings: {
+      projectToolsGitReview: {
+        openProjectPathKeys: ["/workspace/app"],
+        openVersion: 9,
+      },
+    },
+  });
+  const gitReviewOnlyCleaned = settings.removeProjectToolsProjectState(
+    gitReviewOnlyState,
+    "/workspace/app",
+  );
+  assert.equal(gitReviewOnlyCleaned.customSettings.projectToolsGitReview.openVersion, 10);
+  assert.deepEqual(gitReviewOnlyCleaned.customSettings.projectToolsGitReview.openProjectPathKeys, []);
 });
 
 test("gateway settings sync keeps project tools panel state local", () => {
@@ -773,6 +804,7 @@ test("gateway settings sync keeps project tools panel state local", () => {
       },
       projectToolsFileTree: {
         openProjectPathKeys: ["/desktop/project"],
+        openVersion: 1,
         projects: {
           "/desktop/project": {
             query: "desktop",
@@ -781,6 +813,10 @@ test("gateway settings sync keeps project tools panel state local", () => {
             revision: 1,
           },
         },
+      },
+      projectToolsGitReview: {
+        openProjectPathKeys: ["/desktop/project"],
+        openVersion: 1,
       },
     },
   });
@@ -795,6 +831,7 @@ test("gateway settings sync keeps project tools panel state local", () => {
       },
       projectToolsFileTree: {
         openProjectPathKeys: ["/web/project"],
+        openVersion: 2,
         projects: {
           "/web/project": {
             query: "web",
@@ -803,6 +840,10 @@ test("gateway settings sync keeps project tools panel state local", () => {
             revision: 2,
           },
         },
+      },
+      projectToolsGitReview: {
+        openProjectPathKeys: ["/web/project"],
+        openVersion: 2,
       },
     },
   });
@@ -836,9 +877,16 @@ test("gateway settings sync keeps project tools panel state local", () => {
     revision: 2,
     stateVersion: 0,
   });
+  assert.deepEqual(synced.customSettings.projectToolsGitReview.openProjectPathKeys, [
+    "/web/project",
+  ]);
+  assert.equal(synced.customSettings.projectToolsGitReview.openVersion, 2);
 
-  const { projectToolsFileTree: _projectToolsFileTree, ...legacyCustomSettings } =
-    payload.customSettings;
+  const {
+    projectToolsFileTree: _projectToolsFileTree,
+    projectToolsGitReview: _projectToolsGitReview,
+    ...legacyCustomSettings
+  } = payload.customSettings;
   const legacySynced = sync.applyGatewaySettingsSyncPayload(current, {
     ...payload,
     customSettings: legacyCustomSettings,
@@ -853,6 +901,10 @@ test("gateway settings sync keeps project tools panel state local", () => {
     revision: 1,
     stateVersion: 0,
   });
+  assert.deepEqual(legacySynced.customSettings.projectToolsGitReview.openProjectPathKeys, [
+    "/desktop/project",
+  ]);
+  assert.equal(legacySynced.customSettings.projectToolsGitReview.openVersion, 1);
 });
 
 test("gateway settings sync ignores stale project file tree UI snapshots", () => {
@@ -969,6 +1021,65 @@ test("gateway settings sync ignores stale project file tree UI snapshots", () =>
   });
   assert.deepEqual(deletedProjectSynced.customSettings.projectToolsFileTree.openProjectPathKeys, []);
   assert.deepEqual(deletedProjectSynced.customSettings.projectToolsFileTree.projects, {});
+});
+
+test("gateway settings sync ignores stale project git review open snapshots", () => {
+  const current = settings.normalizeSettings({
+    customSettings: {
+      projectToolsGitReview: {
+        openProjectPathKeys: ["/workspace/app"],
+        openVersion: 2,
+      },
+    },
+  });
+
+  const staleSynced = sync.applyGatewaySettingsSyncPayload(current, {
+    customSettings: {
+      projectToolsGitReview: {
+        openProjectPathKeys: [],
+        openVersion: 1,
+      },
+    },
+  });
+
+  assert.deepEqual(staleSynced.customSettings.projectToolsGitReview.openProjectPathKeys, [
+    "/workspace/app",
+  ]);
+  assert.equal(staleSynced.customSettings.projectToolsGitReview.openVersion, 2);
+
+  const newerSynced = sync.applyGatewaySettingsSyncPayload(staleSynced, {
+    customSettings: {
+      projectToolsGitReview: {
+        openProjectPathKeys: [],
+        openVersion: 3,
+      },
+    },
+  });
+
+  assert.deepEqual(newerSynced.customSettings.projectToolsGitReview.openProjectPathKeys, []);
+  assert.equal(newerSynced.customSettings.projectToolsGitReview.openVersion, 3);
+
+  const deletedProjectLocal = settings.removeProjectToolsProjectState(
+    settings.normalizeSettings({
+      customSettings: {
+        projectToolsGitReview: {
+          openProjectPathKeys: ["/workspace/deleted"],
+          openVersion: 4,
+        },
+      },
+    }),
+    "/workspace/deleted",
+  );
+  const deletedProjectSynced = sync.applyGatewaySettingsSyncPayload(deletedProjectLocal, {
+    customSettings: {
+      projectToolsGitReview: {
+        openProjectPathKeys: ["/workspace/deleted"],
+        openVersion: 4,
+      },
+    },
+  });
+  assert.deepEqual(deletedProjectSynced.customSettings.projectToolsGitReview.openProjectPathKeys, []);
+  assert.equal(deletedProjectSynced.customSettings.projectToolsGitReview.openVersion, 5);
 });
 
 test("gateway settings sync keeps newer project conversation activity", () => {

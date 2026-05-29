@@ -15,6 +15,17 @@ export const tauriGitClient: GitClient = {
   async branches(workdir) {
     return normalizeGitBranchesResponse(await invoke("git_branches", { workdir }), workdir);
   },
+  async init(workdir, options = {}) {
+    return normalizeGitOperationResponse(
+      await invoke("git_init", {
+        workdir,
+        branch: options.branch,
+        user_name: options.userName,
+        user_email: options.userEmail,
+      }),
+      workdir,
+    );
+  },
   async switchBranch(workdir, branch, kind) {
     return normalizeGitOperationResponse(
       await invoke("git_switch_branch", { workdir, branch, kind }),

@@ -7,6 +7,7 @@ import {
   normalizeSettings,
   normalizeChatRuntimeControls,
   normalizeProjectToolsFileTreeSettings,
+  normalizeProjectToolsGitReviewSettings,
   normalizeProjectToolsPanelTabOrders,
   type ChatRuntimeControls,
   normalizeSkillsSettings,
@@ -54,6 +55,7 @@ function toPersistedLocalCustomSettings(
   return {
     ...customSettings,
     projectToolsFileTree: normalizeProjectToolsFileTreeSettings({}),
+    projectToolsGitReview: normalizeProjectToolsGitReviewSettings({}),
   };
 }
 
@@ -107,6 +109,7 @@ function readLocalUiSettings(): {
         tabOrders: normalizeProjectToolsPanelTabOrders(projectToolsPanel.tabOrders),
       },
       projectToolsFileTree: normalizeProjectToolsFileTreeSettings({}),
+      projectToolsGitReview: normalizeProjectToolsGitReviewSettings({}),
     });
   }
 

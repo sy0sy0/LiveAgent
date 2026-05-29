@@ -16,6 +16,16 @@ export function createGatewayGitClient(api: GatewayWebSocketClientLike): GitClie
     async branches(workdir) {
       return normalizeGitBranchesResponse(await api.gitRequest("branches", workdir), workdir);
     },
+    async init(workdir, options = {}) {
+      return normalizeGitOperationResponse(
+        await api.gitRequest("init", workdir, {
+          branch: options.branch,
+          userName: options.userName,
+          userEmail: options.userEmail,
+        }),
+        workdir,
+      );
+    },
     async switchBranch(workdir, branch, kind) {
       return normalizeGitOperationResponse(
         await api.gitRequest("switch_branch", workdir, { branch, kind }),
