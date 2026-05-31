@@ -119,6 +119,7 @@ macro_rules! app_invoke_handler {
             commands::update::app_update_install,
             commands::update::app_restart,
             commands::app::app_confirmed_exit,
+            commands::app::app_macos_traffic_light_metrics,
             // Hooks
             commands::hook::hook_run_script,
             commands::hook::hook_run_http_requests,

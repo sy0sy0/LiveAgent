@@ -2630,6 +2630,7 @@ dependencies = [
  "globset",
  "ignore",
  "lopdf",
+ "objc2-app-kit 0.3.2",
  "portable-pty",
  "prost",
  "quick-xml 0.38.4",
