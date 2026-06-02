@@ -114,7 +114,10 @@ const EDITOR_CONTEXT_MENU_HEIGHT = 300;
 type WorkspaceCodeEditorOverlayProps = {
   openRequest: WorkspaceCodeEditorOpenRequest | null;
   closeRequestId?: number;
+  isOpen: boolean;
+  finalCloseRequested?: boolean;
   theme: "light" | "dark";
+  onHide: () => void;
   onClose: () => void;
 };
 
@@ -268,7 +271,15 @@ function getEditorContextMenuShortcuts() {
 }
 
 export function WorkspaceCodeEditorOverlay(props: WorkspaceCodeEditorOverlayProps) {
-  const { openRequest, closeRequestId, theme, onClose } = props;
+  const {
+    openRequest,
+    closeRequestId,
+    isOpen,
+    finalCloseRequested = false,
+    theme,
+    onHide,
+    onClose,
+  } = props;
   const { t } = useLocale();
   const contextMenuShortcuts = useMemo(() => getEditorContextMenuShortcuts(), []);
   const overlayRef = useRef<HTMLDivElement | null>(null);
@@ -321,8 +332,20 @@ export function WorkspaceCodeEditorOverlay(props: WorkspaceCodeEditorOverlayProp
     setIsVisible(true);
   }, []);
 
-  const finishClose = useCallback(() => {
+  const finishHide = useCallback(() => {
     if (closeAnimationTimeoutRef.current !== null) return;
+    setIsVisible(false);
+    closeAnimationTimeoutRef.current = window.setTimeout(() => {
+      closeAnimationTimeoutRef.current = null;
+      onHide();
+    }, EDITOR_OVERLAY_ANIMATION_MS);
+  }, [onHide]);
+
+  const finishClose = useCallback(() => {
+    if (closeAnimationTimeoutRef.current !== null) {
+      window.clearTimeout(closeAnimationTimeoutRef.current);
+      closeAnimationTimeoutRef.current = null;
+    }
     setIsVisible(false);
     closeAnimationTimeoutRef.current = window.setTimeout(() => {
       closeAnimationTimeoutRef.current = null;
@@ -500,13 +523,10 @@ export function WorkspaceCodeEditorOverlay(props: WorkspaceCodeEditorOverlayProp
           if (currentActive !== tabKey) return currentActive;
           return next[Math.min(index, next.length - 1)]?.key ?? "";
         });
-        if (next.length === 0) {
-          window.requestAnimationFrame(finishClose);
-        }
         return next;
       });
     },
-    [disposeModel, finishClose],
+    [disposeModel],
   );
 
   const requestCloseTab = useCallback(
@@ -543,16 +563,15 @@ export function WorkspaceCodeEditorOverlay(props: WorkspaceCodeEditorOverlayProp
     finishClose();
   }, [finishClose, hasDirtyTabs]);
 
-  useEffect(() => {
-    if (closeRequestId == null) return;
-    if (closeRequestIdRef.current == null) {
-      closeRequestIdRef.current = closeRequestId;
+  const hideOverlay = useCallback(() => {
+    if (finalCloseRequested) {
+      requestCloseOverlay();
       return;
     }
-    if (closeRequestIdRef.current === closeRequestId) return;
-    closeRequestIdRef.current = closeRequestId;
-    requestCloseOverlay();
-  }, [closeRequestId, requestCloseOverlay]);
+    setPendingDialog(null);
+    setContextMenu(null);
+    finishHide();
+  }, [finalCloseRequested, finishHide, requestCloseOverlay]);
 
   const discardDialogTarget = useCallback(() => {
     const dialog = pendingDialog;
@@ -634,8 +653,34 @@ export function WorkspaceCodeEditorOverlay(props: WorkspaceCodeEditorOverlayProp
     if (!openRequest || openRequestIdRef.current === openRequest.id) return;
     openRequestIdRef.current = openRequest.id;
     cancelPendingClose();
+    setIsVisible(true);
     void readTab(openRequest);
   }, [cancelPendingClose, openRequest, readTab]);
+
+  useEffect(() => {
+    cancelPendingClose();
+    setIsVisible(isOpen);
+  }, [cancelPendingClose, isOpen]);
+
+  useEffect(() => {
+    if (closeRequestId == null) return;
+    if (closeRequestIdRef.current == null) {
+      closeRequestIdRef.current = closeRequestId;
+      return;
+    }
+    if (closeRequestIdRef.current === closeRequestId) return;
+    closeRequestIdRef.current = closeRequestId;
+    requestCloseOverlay();
+  }, [closeRequestId, requestCloseOverlay]);
+
+  useEffect(() => {
+    if (finalCloseRequested) return;
+    cancelPendingClose();
+    if (isOpen) {
+      setIsVisible(true);
+    }
+    setPendingDialog((current) => (current?.kind === "closeOverlay" ? null : current));
+  }, [cancelPendingClose, finalCloseRequested, isOpen]);
 
   useEffect(() => {
     activeKeyRef.current = activeTab?.key ?? "";
@@ -723,6 +768,7 @@ export function WorkspaceCodeEditorOverlay(props: WorkspaceCodeEditorOverlayProp
       if (event.key === "Escape") {
         setContextMenu(null);
       }
+      if (!isOpen) return;
       if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "s") return;
       const currentKey = activeKeyRef.current;
       if (!currentKey) return;
@@ -731,7 +777,7 @@ export function WorkspaceCodeEditorOverlay(props: WorkspaceCodeEditorOverlayProp
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [saveTab]);
+  }, [isOpen, saveTab]);
 
   useEffect(() => {
     if (!contextMenu) return;
@@ -813,7 +859,7 @@ export function WorkspaceCodeEditorOverlay(props: WorkspaceCodeEditorOverlayProp
           >
             <RefreshCw className={cn("h-4 w-4", isOpening && "animate-spin")} />
           </IconButton>
-          <IconButton label={t("workspaceEditor.close")} onClick={requestCloseOverlay}>
+          <IconButton label={t("workspaceEditor.close")} onClick={hideOverlay}>
             <X className="h-4 w-4" />
           </IconButton>
         </div>

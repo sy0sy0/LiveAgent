@@ -690,7 +690,12 @@ export function ChatPage(props: ChatPageProps) {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [activeView, setActiveView] = useState<"chat" | "skills-hub" | "mcp-hub">("chat");
   const [projectToolsPanelOpen, setProjectToolsPanelOpen] = useState(false);
+  const projectToolsFileTreeOpenCount =
+    settings.customSettings.projectToolsFileTree.openProjectPathKeys.length;
+  const previousProjectToolsFileTreeOpenCountRef = useRef(projectToolsFileTreeOpenCount);
+  const [workspaceEditorMounted, setWorkspaceEditorMounted] = useState(false);
   const [workspaceEditorOpen, setWorkspaceEditorOpen] = useState(false);
+  const [workspaceEditorCleanupPending, setWorkspaceEditorCleanupPending] = useState(false);
   const [workspaceEditorOpenRequest, setWorkspaceEditorOpenRequest] =
     useState<WorkspaceCodeEditorOpenRequest | null>(null);
   const [workspaceEditorCloseRequestId, setWorkspaceEditorCloseRequestId] = useState(0);
@@ -1465,6 +1470,8 @@ export function ChatPage(props: ChatPageProps) {
     (path: string) => {
       if (!terminalProjectPath || !terminalProjectPathKey) return;
       workspaceEditorRequestIdRef.current += 1;
+      setWorkspaceEditorCleanupPending(false);
+      setWorkspaceEditorMounted(true);
       setWorkspaceEditorOpen(true);
       setWorkspaceEditorOpenRequest({
         id: workspaceEditorRequestIdRef.current,
@@ -1478,6 +1485,23 @@ export function ChatPage(props: ChatPageProps) {
   const requestWorkspaceEditorClose = useCallback(() => {
     setWorkspaceEditorCloseRequestId((current) => current + 1);
   }, []);
+  useEffect(() => {
+    const previousOpenCount = previousProjectToolsFileTreeOpenCountRef.current;
+    previousProjectToolsFileTreeOpenCountRef.current = projectToolsFileTreeOpenCount;
+    if (projectToolsFileTreeOpenCount > 0 && workspaceEditorCleanupPending) {
+      setWorkspaceEditorCleanupPending(false);
+    }
+    if (previousOpenCount > 0 && projectToolsFileTreeOpenCount === 0 && workspaceEditorMounted) {
+      setWorkspaceEditorCleanupPending(true);
+      setWorkspaceEditorOpen(true);
+      requestWorkspaceEditorClose();
+    }
+  }, [
+    projectToolsFileTreeOpenCount,
+    requestWorkspaceEditorClose,
+    workspaceEditorCleanupPending,
+    workspaceEditorMounted,
+  ]);
   useEffect(() => {
     if (!terminalProjectPathKey) {
       setProjectTerminalSessions([]);
@@ -4451,7 +4475,7 @@ export function ChatPage(props: ChatPageProps) {
             </>
           )}
         </div>
-        {workspaceEditorOpen ? (
+        {workspaceEditorMounted ? (
           <Suspense
             fallback={
               <div className="absolute inset-0 z-50 flex min-h-0 flex-col border-r border-border bg-background text-sm text-muted-foreground shadow-2xl">
@@ -4465,8 +4489,17 @@ export function ChatPage(props: ChatPageProps) {
             <WorkspaceCodeEditorOverlay
               openRequest={workspaceEditorOpenRequest}
               closeRequestId={workspaceEditorCloseRequestId}
+              isOpen={workspaceEditorOpen}
+              finalCloseRequested={workspaceEditorCleanupPending}
               theme={settings.theme}
-              onClose={() => setWorkspaceEditorOpen(false)}
+              onHide={() => setWorkspaceEditorOpen(false)}
+              onClose={() => {
+                setWorkspaceEditorOpen(false);
+                setWorkspaceEditorMounted(false);
+                setWorkspaceEditorCleanupPending(false);
+                setWorkspaceEditorOpenRequest(null);
+                setWorkspaceEditorCloseRequestId(0);
+              }}
             />
           </Suspense>
         ) : null}
@@ -4518,9 +4551,6 @@ export function ChatPage(props: ChatPageProps) {
         }
         onFileTreeOpenChange={(open) => {
           setSettings((prev) => updateProjectToolsFileTreeOpen(prev, terminalProjectPathKey, open));
-          if (!open) {
-            requestWorkspaceEditorClose();
-          }
         }}
         onFileTreeStateChange={(patch) =>
           setSettings((prev) =>

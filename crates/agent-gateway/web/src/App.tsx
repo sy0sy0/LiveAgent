@@ -817,7 +817,12 @@ export default function App() {
   const [isFileDropActive, setIsFileDropActive] = useState(false);
   const [activeView, setActiveView] = useState<"chat" | "skills-hub" | "mcp-hub">("chat");
   const [projectToolsPanelOpen, setProjectToolsPanelOpen] = useState(false);
+  const projectToolsFileTreeOpenCount =
+    settings.customSettings.projectToolsFileTree.openProjectPathKeys.length;
+  const previousProjectToolsFileTreeOpenCountRef = useRef(projectToolsFileTreeOpenCount);
+  const [workspaceEditorMounted, setWorkspaceEditorMounted] = useState(false);
   const [workspaceEditorOpen, setWorkspaceEditorOpen] = useState(false);
+  const [workspaceEditorCleanupPending, setWorkspaceEditorCleanupPending] = useState(false);
   const [workspaceEditorOpenRequest, setWorkspaceEditorOpenRequest] =
     useState<WorkspaceCodeEditorOpenRequest | null>(null);
   const [workspaceEditorCloseRequestId, setWorkspaceEditorCloseRequestId] = useState(0);
@@ -5294,6 +5299,8 @@ export default function App() {
     (path: string) => {
       if (!terminalProjectPath || !terminalProjectPathKey) return;
       workspaceEditorRequestIdRef.current += 1;
+      setWorkspaceEditorCleanupPending(false);
+      setWorkspaceEditorMounted(true);
       setWorkspaceEditorOpen(true);
       setWorkspaceEditorOpenRequest({
         id: workspaceEditorRequestIdRef.current,
@@ -5307,6 +5314,23 @@ export default function App() {
   const requestWorkspaceEditorClose = useCallback(() => {
     setWorkspaceEditorCloseRequestId((current) => current + 1);
   }, []);
+  useEffect(() => {
+    const previousOpenCount = previousProjectToolsFileTreeOpenCountRef.current;
+    previousProjectToolsFileTreeOpenCountRef.current = projectToolsFileTreeOpenCount;
+    if (projectToolsFileTreeOpenCount > 0 && workspaceEditorCleanupPending) {
+      setWorkspaceEditorCleanupPending(false);
+    }
+    if (previousOpenCount > 0 && projectToolsFileTreeOpenCount === 0 && workspaceEditorMounted) {
+      setWorkspaceEditorCleanupPending(true);
+      setWorkspaceEditorOpen(true);
+      requestWorkspaceEditorClose();
+    }
+  }, [
+    projectToolsFileTreeOpenCount,
+    requestWorkspaceEditorClose,
+    workspaceEditorCleanupPending,
+    workspaceEditorMounted,
+  ]);
   const projectTerminalSessions = useMemo(
     () =>
       terminalProjectPathKey
@@ -6292,7 +6316,7 @@ export default function App() {
               </div>
             )}
           </main>
-          {workspaceEditorOpen ? (
+          {workspaceEditorMounted ? (
             <Suspense
               fallback={
                 <div className="workspace-code-editor-overlay absolute inset-0 z-40 flex items-center justify-center border-r border-border bg-background text-sm text-muted-foreground shadow-2xl">
@@ -6303,8 +6327,17 @@ export default function App() {
               <WorkspaceCodeEditorOverlay
                 openRequest={workspaceEditorOpenRequest}
                 closeRequestId={workspaceEditorCloseRequestId}
+                isOpen={workspaceEditorOpen}
+                finalCloseRequested={workspaceEditorCleanupPending}
                 theme={settings.theme}
-                onClose={() => setWorkspaceEditorOpen(false)}
+                onHide={() => setWorkspaceEditorOpen(false)}
+                onClose={() => {
+                  setWorkspaceEditorOpen(false);
+                  setWorkspaceEditorMounted(false);
+                  setWorkspaceEditorCleanupPending(false);
+                  setWorkspaceEditorOpenRequest(null);
+                  setWorkspaceEditorCloseRequestId(0);
+                }}
               />
             </Suspense>
           ) : null}
@@ -6368,9 +6401,6 @@ export default function App() {
               setSettings((prev) =>
                 updateProjectToolsFileTreeOpen(prev, terminalProjectPathKey, open),
               );
-              if (!open) {
-                requestWorkspaceEditorClose();
-              }
             }}
             onFileTreeStateChange={(patch) =>
               setSettings((prev) =>
