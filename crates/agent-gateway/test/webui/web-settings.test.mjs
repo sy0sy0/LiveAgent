@@ -258,6 +258,7 @@ test("gateway settings sync keeps remote connection local and syncs web terminal
   const payload = settingsSync.buildGatewaySettingsSyncPayload(synced);
   assert.deepEqual(payload.remote, {
     enableWebTerminal: synced.remote.enableWebTerminal,
+    enableWebSshTerminal: synced.remote.enableWebSshTerminal,
     enableWebGit: synced.remote.enableWebGit,
     enableWebTunnels: synced.remote.enableWebTunnels,
   });
@@ -469,6 +470,132 @@ test("ssh settings sync preserves project host associations when older payload o
     },
   });
   assert.deepEqual(cleared.ssh.projectHostAssociations, {});
+});
+
+test("settings update payload omits unchanged empty ssh hosts for non-ssh updates", () => {
+  installWindow();
+  const desktop = settings.normalizeSettings({
+    ssh: {
+      hosts: [
+        {
+          id: "ssh-prod",
+          name: "Prod",
+          host: "prod.example.com",
+          username: "deploy",
+          authType: "password",
+        },
+      ],
+      projectHostAssociations: {
+        "/project-a": ["ssh-prod"],
+      },
+    },
+  });
+  const staleWeb = settings.normalizeSettings({
+    customSettings: {
+      projectToolsSshTunnel: {
+        openProjectPathKeys: [],
+        openVersion: 0,
+      },
+    },
+    ssh: {
+      hosts: [],
+      projectHostAssociations: {},
+    },
+  });
+  const nextWeb = settings.updateProjectToolsSshTunnelOpen(staleWeb, "/project-a", true);
+
+  const update = settingsSync.buildGatewaySettingsSyncUpdatePayload(staleWeb, nextWeb, {
+    includeProviderApiKeyUpdates: true,
+  });
+
+  assert.equal(Object.hasOwn(update, "ssh"), false);
+  assert.equal(Object.hasOwn(update, "customSettings"), true);
+
+  const merged = settingsSync.applyGatewaySettingsSyncPayload(desktop, update);
+  assert.deepEqual(
+    merged.ssh.hosts.map((host) => host.id),
+    ["ssh-prod"],
+  );
+  assert.deepEqual(merged.ssh.projectHostAssociations, {
+    "/project-a": ["ssh-prod"],
+  });
+  assert.equal(settings.isProjectToolsSshTunnelOpen(merged.customSettings, "/project-a"), true);
+});
+
+test("settings update payload includes ssh when hosts are explicitly deleted", () => {
+  installWindow();
+  const current = settings.normalizeSettings({
+    ssh: {
+      hosts: [
+        {
+          id: "ssh-prod",
+          name: "Prod",
+          host: "prod.example.com",
+          username: "deploy",
+          authType: "password",
+        },
+      ],
+      projectHostAssociations: {
+        "/project-a": ["ssh-prod"],
+      },
+    },
+  });
+  const deleted = settings.updateSsh(current, {
+    hosts: [],
+    projectHostAssociations: {},
+  });
+
+  const update = settingsSync.buildGatewaySettingsSyncUpdatePayload(current, deleted, {
+    includeProviderApiKeyUpdates: true,
+  });
+
+  assert.equal(Object.hasOwn(update, "ssh"), true);
+  assert.deepEqual(update.ssh.hosts, []);
+  assert.deepEqual(update.ssh.projectHostAssociations, {});
+});
+
+test("settings update payload includes ssh for secret-only ssh updates", () => {
+  installWindow();
+  const current = settings.normalizeSettings({
+    ssh: {
+      hosts: [
+        {
+          id: "ssh-prod",
+          name: "Prod",
+          host: "prod.example.com",
+          username: "deploy",
+          authType: "password",
+          password: "old-password",
+        },
+      ],
+    },
+  });
+  const next = settings.normalizeSettings({
+    ...current,
+    ssh: {
+      ...current.ssh,
+      hosts: [
+        {
+          ...current.ssh.hosts[0],
+          password: "new-password",
+        },
+      ],
+    },
+  });
+
+  const update = settingsSync.buildGatewaySettingsSyncUpdatePayload(current, next, {
+    includeProviderApiKeyUpdates: true,
+  });
+
+  assert.equal(Object.hasOwn(update, "ssh"), true);
+  assert.deepEqual(update.sshSecretUpdates, {
+    "ssh-prod": {
+      password: "new-password",
+    },
+  });
+
+  const merged = settingsSync.applyGatewaySettingsSyncPayload(current, update);
+  assert.equal(merged.ssh.hosts[0].password, "new-password");
 });
 
 test("workspace project selection stays out of synced system workdir", () => {

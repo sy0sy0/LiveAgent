@@ -1584,6 +1584,129 @@ test("gateway settings sync applies redacted ssh hosts without clearing local se
   assert.equal(updated.ssh.hosts[0].proxy.password, "new-proxy-password");
 });
 
+test("gateway settings update payload omits unchanged empty ssh hosts for non-ssh updates", () => {
+  const desktop = settings.normalizeSettings({
+    ssh: {
+      hosts: [
+        {
+          id: "prod",
+          name: "Production",
+          host: "prod.example.com",
+          username: "deploy",
+          authType: "password",
+        },
+      ],
+      projectHostAssociations: {
+        "/workspace/project": ["prod"],
+      },
+    },
+  });
+  const staleWeb = settings.normalizeSettings({
+    customSettings: {
+      projectToolsSshTunnel: {
+        openProjectPathKeys: [],
+        openVersion: 0,
+      },
+    },
+    ssh: {
+      hosts: [],
+      projectHostAssociations: {},
+    },
+  });
+  const nextWeb = settings.updateProjectToolsSshTunnelOpen(staleWeb, "/workspace/project", true);
+
+  const update = sync.buildGatewaySettingsSyncUpdatePayload(staleWeb, nextWeb, {
+    includeProviderApiKeyUpdates: true,
+  });
+
+  assert.equal(Object.hasOwn(update, "ssh"), false);
+  assert.equal(Object.hasOwn(update, "customSettings"), true);
+
+  const merged = sync.applyGatewaySettingsSyncPayload(desktop, update);
+  assert.deepEqual(
+    merged.ssh.hosts.map((host) => host.id),
+    ["prod"],
+  );
+  assert.deepEqual(merged.ssh.projectHostAssociations, {
+    "/workspace/project": ["prod"],
+  });
+  assert.equal(settings.isProjectToolsSshTunnelOpen(merged.customSettings, "/workspace/project"), true);
+});
+
+test("gateway settings update payload includes ssh when hosts are explicitly deleted", () => {
+  const current = settings.normalizeSettings({
+    ssh: {
+      hosts: [
+        {
+          id: "prod",
+          name: "Production",
+          host: "prod.example.com",
+          username: "deploy",
+          authType: "password",
+        },
+      ],
+      projectHostAssociations: {
+        "/workspace/project": ["prod"],
+      },
+    },
+  });
+  const deleted = settings.updateSsh(current, {
+    hosts: [],
+    projectHostAssociations: {},
+  });
+
+  const update = sync.buildGatewaySettingsSyncUpdatePayload(current, deleted, {
+    includeProviderApiKeyUpdates: true,
+  });
+
+  assert.equal(Object.hasOwn(update, "ssh"), true);
+  assert.deepEqual(update.ssh.hosts, []);
+  assert.deepEqual(update.ssh.projectHostAssociations, {});
+});
+
+test("gateway settings update payload includes ssh for secret-only ssh updates", () => {
+  const current = settings.normalizeSettings({
+    ssh: {
+      hosts: [
+        {
+          id: "prod",
+          name: "Production",
+          host: "prod.example.com",
+          username: "deploy",
+          authType: "password",
+          password: "old-password",
+        },
+      ],
+    },
+  });
+  const next = settings.normalizeSettings({
+    ...current,
+    ssh: {
+      ...current.ssh,
+      hosts: [
+        {
+          ...current.ssh.hosts[0],
+          password: "new-password",
+        },
+      ],
+    },
+  });
+
+  const update = sync.buildGatewaySettingsSyncUpdatePayload(current, next, {
+    includeProviderApiKeyUpdates: true,
+  });
+
+  assert.equal(Object.hasOwn(update, "ssh"), true);
+  assert.deepEqual(update.sshSecretUpdates, {
+    prod: {
+      password: "new-password",
+    },
+  });
+
+  const merged = sync.applyGatewaySettingsSyncPayload(current, update);
+  assert.equal(merged.ssh.hosts[0].password, "new-password");
+});
+
 test("web storage redaction clears api keys but keeps configured state", () => {
   const appSettings = settings.normalizeSettings({
     customProviders: [

@@ -40,6 +40,11 @@ type SshLatencyState = {
   failed: boolean;
 };
 
+type PendingSshCreate = {
+  hostId: string;
+  existingSessionIds: Set<string>;
+};
+
 type SshTunnelPanelProps = {
   cwd: string;
   projectPathKey: string;
@@ -186,6 +191,7 @@ export function SshTunnelPanel(props: SshTunnelPanelProps) {
   const [view, setView] = useState<SshTunnelView>("list");
   const [createHostId, setCreateHostId] = useState("");
   const [createTitle, setCreateTitle] = useState("");
+  const [createSftpEnabled, setCreateSftpEnabled] = useState(false);
   const [creating, setCreating] = useState(false);
   const [closingSessionId, setClosingSessionId] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -196,6 +202,7 @@ export function SshTunnelPanel(props: SshTunnelPanelProps) {
     {},
   );
   const latencyRequestsRef = useRef<Set<string>>(new Set());
+  const pendingCreateRef = useRef<PendingSshCreate | null>(null);
   const associatedSet = useMemo(() => new Set(associatedHostIds), [associatedHostIds]);
   const associatedHosts = useMemo(
     () => hosts.filter((host) => associatedSet.has(host.id)),
@@ -289,6 +296,39 @@ export function SshTunnelPanel(props: SshTunnelPanelProps) {
     return () => window.clearInterval(timer);
   }, [refreshSessionLatency, visibleSessions]);
 
+  const finishCreateFlow = useCallback(() => {
+    if (!pendingCreateRef.current) return;
+    pendingCreateRef.current = null;
+    setPrompt(null);
+    setPromptAnswer("");
+    setCreateTitle("");
+    setCreateSftpEnabled(false);
+    setCreating(false);
+    setError(null);
+    setView("list");
+  }, []);
+
+  const finishCreatedSnapshot = useCallback(
+    (snapshot: TerminalSnapshot) => {
+      onSessionSnapshot(snapshot);
+      finishCreateFlow();
+    },
+    [finishCreateFlow, onSessionSnapshot],
+  );
+
+  useEffect(() => {
+    const pending = pendingCreateRef.current;
+    if (!pending) return;
+    const createdSession = sshSessions.find(
+      (session) =>
+        session.ssh?.hostId === pending.hostId &&
+        !pending.existingSessionIds.has(session.id) &&
+        sessionBelongsToProject(session, projectPathKey),
+    );
+    if (!createdSession) return;
+    finishCreateFlow();
+  }, [finishCreateFlow, projectPathKey, sshSessions]);
+
   const toggleHost = (hostId: string) => {
     const current = associatedHostIds.filter((id) => hosts.some((host) => host.id === id));
     const next = associatedSet.has(hostId)
@@ -299,6 +339,10 @@ export function SshTunnelPanel(props: SshTunnelPanelProps) {
 
   const handleCreate = useCallback(() => {
     if (!selectedCreateHost || !canCreate) return;
+    pendingCreateRef.current = {
+      hostId: selectedCreateHost.id,
+      existingSessionIds: new Set(sshSessions.map((session) => session.id)),
+    };
     setCreating(true);
     setError(null);
     void client
@@ -316,21 +360,23 @@ export function SshTunnelPanel(props: SshTunnelPanelProps) {
           return;
         }
         if (result.snapshot) {
-          onSessionSnapshot(result.snapshot);
-          setCreateTitle("");
-          setView("list");
+          finishCreatedSnapshot(result.snapshot);
         }
       })
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+      .catch((err) => {
+        pendingCreateRef.current = null;
+        setError(err instanceof Error ? err.message : String(err));
+      })
       .finally(() => setCreating(false));
   }, [
     canCreate,
     client,
     createTitle,
     cwd,
-    onSessionSnapshot,
+    finishCreatedSnapshot,
     projectPathKey,
     selectedCreateHost,
+    sshSessions,
   ]);
 
   const handleSubmitPrompt = useCallback(() => {
@@ -354,16 +400,16 @@ export function SshTunnelPanel(props: SshTunnelPanelProps) {
         setPrompt(null);
         setPromptAnswer("");
         if (result.snapshot) {
-          onSessionSnapshot(result.snapshot);
-          setView("list");
+          finishCreatedSnapshot(result.snapshot);
         }
       })
       .catch((err) => setError(err instanceof Error ? err.message : String(err)))
       .finally(() => setAnsweringPrompt(false));
-  }, [answeringPrompt, client, onSessionSnapshot, prompt, promptAnswer]);
+  }, [answeringPrompt, client, finishCreatedSnapshot, prompt, promptAnswer]);
 
   const handleCancelPrompt = useCallback(() => {
     const promptId = prompt?.id;
+    pendingCreateRef.current = null;
     setPrompt(null);
     setPromptAnswer("");
     if (!promptId) return;
@@ -635,6 +681,18 @@ export function SshTunnelPanel(props: SshTunnelPanelProps) {
                   className="h-10 w-full rounded-lg border border-border/70 bg-background/80 px-3 text-sm text-foreground outline-none transition-colors placeholder:text-muted-foreground/70 focus-visible:border-emerald-500/50 focus-visible:ring-1 focus-visible:ring-emerald-500/20"
                   placeholder={selectedCreateHost?.name || t("projectTools.sshTunnelTabTitlePlaceholder")}
                 />
+              </label>
+
+              <label className="flex cursor-pointer items-center gap-3 rounded-lg border border-border/70 bg-background/80 px-3 py-2.5 text-sm text-foreground transition-colors hover:border-emerald-500/40">
+                <input
+                  type="checkbox"
+                  checked={createSftpEnabled}
+                  onChange={(event) => setCreateSftpEnabled(event.currentTarget.checked)}
+                  className="h-4 w-4 rounded border-border text-emerald-500 accent-emerald-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/20"
+                />
+                <span className="min-w-0 flex-1 text-xs font-medium">
+                  {t("projectTools.sshTunnelSftpEnabled")}
+                </span>
               </label>
 
               {selectedCreateHost ? (

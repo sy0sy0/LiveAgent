@@ -331,6 +331,88 @@ test("SharedWorker gateway client accepts terminal list sessions from worker pay
   resetGatewayWebSocketClient();
 });
 
+test("SharedWorker gateway client keeps SSH create snapshots from worker payload", async () => {
+  installBrowser();
+  FakeSharedWorker.instances = [];
+  globalThis.SharedWorker = FakeSharedWorker;
+  const loader = createWebModuleLoader();
+  const { getGatewayWebSocketClient, resetGatewayWebSocketClient } = loader.loadModule("src/lib/gatewaySocket.ts");
+  resetGatewayWebSocketClient();
+
+  const client = getGatewayWebSocketClient(" token ");
+  const port = FakeSharedWorker.instances[0].port;
+  const connect = port.messages.find((message) => message.type === "connect");
+  port.emit({
+    type: "ready",
+    connection_id: connect.connection_id,
+    payload: { status: { online: true }, error: null },
+  });
+
+  const createPromise = client.createSshTerminal({
+    cwd: "/workspace/project",
+    projectPathKey: "project-key",
+    hostId: "host-1",
+  });
+  await waitFor(
+    () => port.messages.some((message) => message.type === "request" && message.method === "terminal.create_ssh"),
+    "terminal.create_ssh worker request",
+  );
+  const request = port.messages.find((message) => message.type === "request" && message.method === "terminal.create_ssh");
+  assert.ok(request);
+  assert.deepEqual(request.payload, {
+    cwd: "/workspace/project",
+    project_path_key: "project-key",
+    ssh_host_id: "host-1",
+    title: undefined,
+    cols: undefined,
+    rows: undefined,
+  });
+  port.emit({
+    type: "response",
+    connection_id: connect.connection_id,
+    request_id: request.request_id,
+    payload: {
+      snapshot: {
+        session: {
+          id: "ssh-1",
+          projectPathKey: "project-key",
+          cwd: "/workspace/project",
+          shell: "ssh",
+          title: "Claw-SG",
+          kind: "ssh",
+          ssh: {
+            hostId: "host-1",
+            hostName: "Claw-SG",
+            username: "root",
+            host: "8.219.204.112",
+            port: 22,
+            authType: "privateKey",
+            status: "connected",
+            reconnectAttempt: 0,
+            reconnectMaxAttempts: 3,
+          },
+          pid: null,
+          cols: 80,
+          rows: 24,
+          createdAt: 10,
+          updatedAt: 10,
+          running: true,
+        },
+        output: "root@s878169:~# ",
+        truncated: false,
+        outputStartOffset: 0,
+        outputEndOffset: 18,
+      },
+    },
+  });
+
+  const result = await createPromise;
+  assert.equal(result.snapshot?.session.id, "ssh-1");
+  assert.equal(result.snapshot?.session.ssh?.hostId, "host-1");
+  assert.equal(result.snapshot?.output, "root@s878169:~# ");
+  resetGatewayWebSocketClient();
+});
+
 test("SharedWorker gateway client forwards chat runtime controls to the worker", async () => {
   installBrowser();
   FakeSharedWorker.instances = [];

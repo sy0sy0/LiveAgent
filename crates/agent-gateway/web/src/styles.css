@@ -1687,6 +1687,91 @@ html[data-liveagent-webui="gateway"] .external-link-modal-overlay[data-state="cl
   }
 }
 
+html[data-liveagent-webui="gateway"] .project-terminal-viewport {
+  --project-terminal-padding-x: 0.75rem;
+  --project-terminal-padding-y: 0.625rem;
+  --project-terminal-scrollbar-size: 8px;
+  --project-terminal-background: hsl(var(--background));
+  background: var(--project-terminal-background);
+}
+
+html[data-liveagent-webui="gateway"]
+  .workspace-ssh-terminal-overlay
+  .project-terminal-viewport {
+  --project-terminal-padding-x: 1rem;
+}
+
+html[data-liveagent-webui="gateway"] .project-terminal-viewport,
+html[data-liveagent-webui="gateway"] .project-terminal-viewport .xterm,
+html[data-liveagent-webui="gateway"] .project-terminal-viewport .xterm-screen,
+html[data-liveagent-webui="gateway"] .project-terminal-viewport .xterm-scrollable-element {
+  overscroll-behavior: contain;
+  touch-action: none;
+}
+
+html[data-liveagent-webui="gateway"] .project-terminal-viewport .xterm {
+  background: var(--project-terminal-background);
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  padding:
+    var(--project-terminal-padding-y)
+    var(--project-terminal-padding-x)
+    var(--project-terminal-padding-y)
+    var(--project-terminal-padding-x);
+}
+
+html[data-liveagent-webui="gateway"] .project-terminal-viewport .xterm-viewport,
+html[data-liveagent-webui="gateway"] .project-terminal-viewport .xterm-screen,
+html[data-liveagent-webui="gateway"] .project-terminal-viewport .xterm-scrollable-element {
+  background: var(--project-terminal-background) !important;
+}
+
+html[data-liveagent-webui="gateway"] .project-terminal-viewport .xterm-scrollable-element {
+  -webkit-overflow-scrolling: touch;
+}
+
+html[data-liveagent-webui="gateway"]
+  .project-terminal-viewport
+  .xterm-scrollable-element
+  > .scrollbar.vertical
+  > .slider {
+  border-radius: 999px;
+}
+
+html[data-liveagent-webui="gateway"] .project-terminal-viewport .xterm-viewport {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+  transition: scrollbar-color 0.2s ease;
+}
+
+html[data-liveagent-webui="gateway"] .project-terminal-viewport:hover .xterm-viewport {
+  scrollbar-color: hsl(var(--muted-foreground) / 0.32) transparent;
+}
+
+html[data-liveagent-webui="gateway"] .project-terminal-viewport .xterm-viewport::-webkit-scrollbar {
+  width: var(--project-terminal-scrollbar-size);
+  height: var(--project-terminal-scrollbar-size);
+}
+
+html[data-liveagent-webui="gateway"] .project-terminal-viewport .xterm-viewport::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+html[data-liveagent-webui="gateway"] .project-terminal-viewport .xterm-viewport::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: transparent;
+  transition: background 0.2s ease;
+}
+
+html[data-liveagent-webui="gateway"] .project-terminal-viewport:hover .xterm-viewport::-webkit-scrollbar-thumb {
+  background: hsl(var(--muted-foreground) / 0.28);
+}
+
+html[data-liveagent-webui="gateway"] .project-terminal-viewport .xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted-foreground) / 0.45);
+}
+
 /* ─── Responsive ─────────────────────────────────────────────────── */
 
 @media (max-width: 1080px) {
@@ -1847,18 +1932,6 @@ html[data-liveagent-webui="gateway"] .external-link-modal-overlay[data-state="cl
 
   html[data-liveagent-webui="gateway"] .project-tools-panel-inner {
     min-width: 0;
-  }
-
-  html[data-liveagent-webui="gateway"] .project-terminal-viewport,
-  html[data-liveagent-webui="gateway"] .project-terminal-viewport .xterm,
-  html[data-liveagent-webui="gateway"] .project-terminal-viewport .xterm-screen,
-  html[data-liveagent-webui="gateway"] .project-terminal-viewport .xterm-scrollable-element {
-    overscroll-behavior: contain;
-    touch-action: none;
-  }
-
-  html[data-liveagent-webui="gateway"] .project-terminal-viewport .xterm-scrollable-element {
-    -webkit-overflow-scrolling: touch;
   }
 
   html[data-liveagent-webui="gateway"] .project-tools-panel-handle {

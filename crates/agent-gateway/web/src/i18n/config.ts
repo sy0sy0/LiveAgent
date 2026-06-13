@@ -263,7 +263,7 @@ export const translations: Record<Locale, Record<string, string>> = {
     "projectTools.sshTunnelCreateNoAssociatedHosts": "当前项目还没有关联 SSH 主机",
     "projectTools.sshTunnelCreateNoAssociatedHostsHint": "先关联 Settings > SSH 中的主机，再从这里新建 SSH 连接。",
     "projectTools.sshTunnelHost": "SSH 主机",
-    "projectTools.sshTunnelSftpEnabled": "开启 SFTP",
+    "projectTools.sshTunnelSftpEnabled": "SFTP功能",
     "projectTools.sshTunnelNote": "备注",
     "projectTools.sshTunnelNotePlaceholder": "可选：记录用途或访问说明",
     "projectTools.sshTunnelCreate": "创建隧道",
@@ -1636,7 +1636,7 @@ export const translations: Record<Locale, Record<string, string>> = {
     "projectTools.sshTunnelCreateNoAssociatedHostsHint":
       "Associate hosts from Settings > SSH before creating an SSH connection here.",
     "projectTools.sshTunnelHost": "SSH host",
-    "projectTools.sshTunnelSftpEnabled": "Enable SFTP",
+    "projectTools.sshTunnelSftpEnabled": "SFTP feature",
     "projectTools.sshTunnelNote": "Note",
     "projectTools.sshTunnelNotePlaceholder": "Optional: purpose or access notes",
     "projectTools.sshTunnelCreate": "Create tunnel",

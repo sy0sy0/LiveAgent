@@ -299,6 +299,60 @@
     background: hsl(var(--muted-foreground) / 0.38);
   }
 
+  /* SSH/Bash terminal viewport - keep padding on .xterm so fit() measures rows correctly. */
+  .project-terminal-viewport {
+    --project-terminal-padding-x: 0.75rem;
+    --project-terminal-padding-y: 0.625rem;
+    --project-terminal-scrollbar-size: 8px;
+    --project-terminal-background: hsl(var(--background));
+    background: var(--project-terminal-background);
+  }
+  .project-terminal-viewport .xterm {
+    background: var(--project-terminal-background);
+    box-sizing: border-box;
+    width: 100%;
+    height: 100%;
+    padding:
+      var(--project-terminal-padding-y)
+      var(--project-terminal-padding-x)
+      var(--project-terminal-padding-y)
+      var(--project-terminal-padding-x);
+  }
+  .project-terminal-viewport .xterm-viewport,
+  .project-terminal-viewport .xterm-screen,
+  .project-terminal-viewport .xterm-scrollable-element {
+    background: var(--project-terminal-background) !important;
+  }
+  .project-terminal-viewport .xterm-scrollable-element > .scrollbar.vertical > .slider {
+    border-radius: 999px;
+  }
+  .project-terminal-viewport .xterm-viewport {
+    scrollbar-width: thin;
+    scrollbar-color: transparent transparent;
+    transition: scrollbar-color 0.2s ease;
+  }
+  .project-terminal-viewport:hover .xterm-viewport {
+    scrollbar-color: hsl(var(--muted-foreground) / 0.32) transparent;
+  }
+  .project-terminal-viewport .xterm-viewport::-webkit-scrollbar {
+    width: var(--project-terminal-scrollbar-size);
+    height: var(--project-terminal-scrollbar-size);
+  }
+  .project-terminal-viewport .xterm-viewport::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .project-terminal-viewport .xterm-viewport::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: transparent;
+    transition: background 0.2s ease;
+  }
+  .project-terminal-viewport:hover .xterm-viewport::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted-foreground) / 0.28);
+  }
+  .project-terminal-viewport .xterm-viewport::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.45);
+  }
+
   .git-review-transient-scrollbar {
     scrollbar-width: none;
     -ms-overflow-style: none;

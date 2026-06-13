@@ -1,4 +1,7 @@
-import type { GatewaySettingsSyncPayload } from "@/lib/settings/sync";
+import type {
+  GatewaySettingsSyncPayload,
+  GatewaySettingsSyncUpdatePayload,
+} from "@/lib/settings/sync";
 import type { HistoryMessageRef } from "@/lib/chat/conversationState";
 import type { PendingUploadedFile } from "@/lib/chat/uploadedFiles";
 
@@ -280,6 +283,8 @@ type RawTerminalResponse = {
   action?: string;
   sessions?: RawTerminalSession[];
   session?: RawTerminalSession;
+  snapshot?: TerminalSnapshot;
+  prompt?: TerminalSshPrompt;
   output?: string;
   truncated?: boolean;
   outputStartOffset?: number;
@@ -582,8 +587,8 @@ function normalizeTerminalSnapshot(input: RawTerminalResponse): TerminalSnapshot
 
 function normalizeTerminalSshCreateResult(input: RawTerminalResponse): TerminalSshCreateResult {
   return {
-    snapshot: input.session ? normalizeTerminalSnapshot(input) : undefined,
-    prompt: normalizeTerminalSshPrompt(input.sshPrompt ?? input.ssh_prompt),
+    snapshot: input.snapshot ?? (input.session ? normalizeTerminalSnapshot(input) : undefined),
+    prompt: input.prompt ?? normalizeTerminalSshPrompt(input.sshPrompt ?? input.ssh_prompt),
   };
 }
 
@@ -1408,7 +1413,7 @@ export class GatewayWebSocketClient {
     return this.requestWithRecovery<GatewaySettingsSyncPayload>("settings.get", {});
   }
 
-  async updateSettings(payload: GatewaySettingsSyncPayload): Promise<void> {
+  async updateSettings(payload: GatewaySettingsSyncUpdatePayload): Promise<void> {
     await this.request("settings.update", payload);
   }
 
@@ -2401,7 +2406,7 @@ export type GatewayWebSocketClientLike = {
   deleteHistory(conversationId: string): Promise<void>;
   listProviders(): Promise<GatewayProviderSummary[]>;
   getSettings(): Promise<GatewaySettingsSyncPayload>;
-  updateSettings(payload: GatewaySettingsSyncPayload): Promise<void>;
+  updateSettings(payload: GatewaySettingsSyncUpdatePayload): Promise<void>;
   resetSshKnownHost(params: { host: string; port: number }): Promise<SshKnownHostResetResult>;
   listSkillFiles(): Promise<SkillListResponse>;
   manageSkill<T = unknown>(payload: SkillManagePayload): Promise<T>;
@@ -3161,7 +3166,7 @@ class SharedWorkerGatewayWebSocketClient implements GatewayWebSocketClientLike {
     return this.request<GatewaySettingsSyncPayload>("settings.get", {});
   }
 
-  async updateSettings(payload: GatewaySettingsSyncPayload): Promise<void> {
+  async updateSettings(payload: GatewaySettingsSyncUpdatePayload): Promise<void> {
     await this.request("settings.update", payload);
   }
 

@@ -1,4 +1,7 @@
-import type { GatewaySettingsSyncPayload } from "@/lib/settings/sync";
+import type {
+  GatewaySettingsSyncPayload,
+  GatewaySettingsSyncUpdatePayload,
+} from "@/lib/settings/sync";
 import type { HistoryMessageRef } from "@/lib/chat/conversationState";
 import type { PendingUploadedFile } from "@/lib/chat/uploadedFiles";
 import type { TerminalEvent, TerminalSession, TerminalSnapshot } from "@/lib/terminal/types";
@@ -516,7 +519,7 @@ async function resolveRequest(client: GatewayWebSocketClient, method: string, pa
     case "settings.get":
       return client.getSettings();
     case "settings.update":
-      await client.updateSettings(payload as GatewaySettingsSyncPayload);
+      await client.updateSettings(payload as GatewaySettingsSyncUpdatePayload);
       return undefined;
     case "settings.ssh_known_host.reset": {
       const body = (payload && typeof payload === "object" ? payload : {}) as Record<

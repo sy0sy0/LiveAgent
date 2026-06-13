@@ -49,6 +49,25 @@ export type GatewaySettingsSyncPayload = {
   providerApiKeyUpdates?: GatewayProviderApiKeyUpdates;
   sshSecretUpdates?: GatewaySshSecretUpdates;
 };
+export type GatewaySettingsSyncUpdatePayload = Partial<GatewaySettingsSyncPayload>;
+
+const GATEWAY_SETTINGS_SYNC_FIELDS = [
+  "system",
+  "customProviders",
+  "mcp",
+  "agents",
+  "ssh",
+  "hooks",
+  "cron",
+  "remote",
+  "memory",
+  "customSettings",
+  "skills",
+  "chatRuntimeControls",
+  "selectedModel",
+  "theme",
+  "locale",
+] as const satisfies readonly (keyof GatewaySettingsSyncPayload)[];
 
 function asObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -557,6 +576,33 @@ export function buildGatewaySettingsSyncPayload(
     payload.sshSecretUpdates = sshSecretUpdates;
   }
   return payload;
+}
+
+export function buildGatewaySettingsSyncUpdatePayload(
+  prev: AppSettings,
+  next: AppSettings,
+  options: { includeProviderApiKeyUpdates?: boolean } = {},
+): GatewaySettingsSyncUpdatePayload {
+  const previousPayload = buildGatewaySettingsSyncPayload(prev);
+  const nextPayload = buildGatewaySettingsSyncPayload(next, options);
+  const update: GatewaySettingsSyncUpdatePayload = {};
+
+  for (const field of GATEWAY_SETTINGS_SYNC_FIELDS) {
+    if (JSON.stringify(previousPayload[field]) !== JSON.stringify(nextPayload[field])) {
+      (update as Record<string, unknown>)[field] = nextPayload[field];
+    }
+  }
+
+  if (nextPayload.providerApiKeyUpdates) {
+    update.customProviders ??= nextPayload.customProviders;
+    update.providerApiKeyUpdates = nextPayload.providerApiKeyUpdates;
+  }
+  if (nextPayload.sshSecretUpdates) {
+    update.ssh ??= nextPayload.ssh;
+    update.sshSecretUpdates = nextPayload.sshSecretUpdates;
+  }
+
+  return update;
 }
 
 export function applyGatewaySettingsSyncPayload(

@@ -2,7 +2,7 @@ import "@xterm/xterm/css/xterm.css";
 
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal as XTerm } from "@xterm/xterm";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type CSSProperties } from "react";
 import { cn } from "@/lib/shared/utils";
 import type {
   TerminalClient,
@@ -28,30 +28,58 @@ function terminalTheme(theme: "light" | "dark") {
       background: "#0b0f14",
       foreground: "#d6deeb",
       cursor: "#f8fafc",
-      selectionBackground: "#334155",
-      black: "#0f172a",
+      cursorAccent: "#0b0f14",
+      selectionBackground: "#2c3e57",
+      selectionInactiveBackground: "#22304a",
+      scrollbarSliderBackground: "rgba(148, 163, 184, 0.18)",
+      scrollbarSliderHoverBackground: "rgba(148, 163, 184, 0.3)",
+      scrollbarSliderActiveBackground: "rgba(148, 163, 184, 0.42)",
+      overviewRulerBorder: "transparent",
+      black: "#1b2733",
       red: "#ef4444",
       green: "#22c55e",
       yellow: "#eab308",
       blue: "#38bdf8",
       magenta: "#c084fc",
       cyan: "#2dd4bf",
-      white: "#e5e7eb",
+      white: "#cbd5e1",
+      brightBlack: "#64748b",
+      brightRed: "#f87171",
+      brightGreen: "#4ade80",
+      brightYellow: "#fde047",
+      brightBlue: "#7dd3fc",
+      brightMagenta: "#d8b4fe",
+      brightCyan: "#5eead4",
+      brightWhite: "#f8fafc",
     };
   }
   return {
-    background: "#ffffff",
-    foreground: "#172033",
+    background: "#fcfcfd",
+    foreground: "#1f2933",
     cursor: "#111827",
-    selectionBackground: "#dbeafe",
-    black: "#111827",
+    cursorAccent: "#fcfcfd",
+    selectionBackground: "#bfdbfe",
+    selectionInactiveBackground: "#dbeafe",
+    scrollbarSliderBackground: "rgba(100, 116, 139, 0.16)",
+    scrollbarSliderHoverBackground: "rgba(100, 116, 139, 0.26)",
+    scrollbarSliderActiveBackground: "rgba(100, 116, 139, 0.36)",
+    overviewRulerBorder: "transparent",
+    black: "#1f2933",
     red: "#dc2626",
     green: "#16a34a",
-    yellow: "#ca8a04",
+    yellow: "#b45309",
     blue: "#2563eb",
     magenta: "#9333ea",
     cyan: "#0891b2",
-    white: "#f8fafc",
+    white: "#e2e8f0",
+    brightBlack: "#64748b",
+    brightRed: "#ef4444",
+    brightGreen: "#22c55e",
+    brightYellow: "#d97706",
+    brightBlue: "#3b82f6",
+    brightMagenta: "#a855f7",
+    brightCyan: "#06b6d4",
+    brightWhite: "#f8fafc",
   };
 }
 
@@ -86,6 +114,9 @@ export function XTermViewport({
 
   const termRef = useRef<XTerm | null>(null);
   const fitAndResizeRef = useRef<(() => void) | null>(null);
+  const viewportStyle = {
+    "--project-terminal-background": terminalTheme(theme).background,
+  } as CSSProperties;
 
   useEffect(() => {
     if (!termRef.current) return;
@@ -114,15 +145,20 @@ export function XTermViewport({
     const bufferedEvents: TerminalEvent[] = [];
     const term = new XTerm({
       cursorBlink: true,
+      cursorStyle: "block",
+      cursorInactiveStyle: "outline",
       disableStdin: !sessionRef.current.running,
       fontFamily:
         '"SF Mono", SFMono-Regular, Menlo, Monaco, "Cascadia Code", Consolas, "Liberation Mono", monospace',
-      fontSize: 12,
+      fontSize: 13,
       fontWeight: "normal",
       fontWeightBold: "bold",
-      lineHeight: 1.1,
+      lineHeight: 1.3,
       letterSpacing: 0,
       scrollback: 5000,
+      overviewRuler: {
+        width: 8,
+      },
       theme: terminalTheme(themeRef.current),
     });
     termRef.current = term;
@@ -356,8 +392,9 @@ export function XTermViewport({
   return (
     <div
       ref={containerRef}
+      style={viewportStyle}
       className={cn(
-        "project-terminal-viewport h-full min-h-0 w-full overflow-hidden px-2 py-2",
+        "project-terminal-viewport h-full min-h-0 w-full overflow-hidden",
         className,
       )}
     />

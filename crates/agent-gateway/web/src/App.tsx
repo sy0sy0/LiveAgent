@@ -99,6 +99,7 @@ import {
 import {
   applyGatewaySettingsSyncPayload,
   buildGatewaySettingsSyncPayload,
+  buildGatewaySettingsSyncUpdatePayload,
   redactSettingsForWebStorage,
   type GatewaySettingsSyncPayload,
 } from "@/lib/settings/sync";
@@ -607,15 +608,6 @@ function hasSettingsSyncChanged(prev: AppSettings, next: AppSettings) {
   return (
     JSON.stringify(buildGatewaySettingsSyncPayload(prev)) !==
     JSON.stringify(buildGatewaySettingsSyncPayload(next))
-  );
-}
-
-function hasSensitiveSettingsUpdates(settings: AppSettings) {
-  return (
-    settings.customProviders.some((provider) => provider.apiKey.trim().length > 0) ||
-    settings.ssh.hosts.some(
-      (host) => host.password.trim().length > 0 || host.privateKey.trim().length > 0,
-    )
   );
 }
 
@@ -2129,10 +2121,16 @@ export default function App() {
   }, [token]);
 
   const queueSettingsSave = useCallback(
-    (next: AppSettings, fallback: string, syncGateway: boolean) => {
+    (prev: AppSettings, next: AppSettings, fallback: string, syncGateway: boolean) => {
       const saveSequence = ++settingsSaveSequenceRef.current;
       setSettingsSaveState({ status: "saving" });
       const redactedNext = redactSettingsForWebStorage(next);
+      const gatewayUpdate =
+        syncGateway && api
+          ? buildGatewaySettingsSyncUpdatePayload(prev, next, {
+              includeProviderApiKeyUpdates: true,
+            })
+          : null;
 
       settingsSaveChainRef.current = settingsSaveChainRef.current
         .catch(() => undefined)
@@ -2140,12 +2138,8 @@ export default function App() {
           persistWebSettings(redactedNext);
         })
         .then(async () => {
-          if (syncGateway && api) {
-            await api.updateSettings(
-              buildGatewaySettingsSyncPayload(next, {
-                includeProviderApiKeyUpdates: true,
-              }),
-            );
+          if (gatewayUpdate && Object.keys(gatewayUpdate).length > 0) {
+            await api?.updateSettings(gatewayUpdate);
           }
         })
         .then(() => {
@@ -2173,7 +2167,7 @@ export default function App() {
         if (!hasSettingsSyncChanged(prev, next)) {
           return prev;
         }
-        queueSettingsSave(next, "同步桌面端设置失败。", false);
+        queueSettingsSave(prev, next, "同步桌面端设置失败。", false);
         return next;
       });
     },
@@ -2186,9 +2180,10 @@ export default function App() {
         const rawNext = resolveAppWorkspaceProjects(normalizeSettings(updater(prev)));
         const next = redactSettingsForWebStorage(rawNext);
         queueSettingsSave(
+          prev,
           rawNext,
           "保存 WebUI 设置失败。",
-          hasSettingsSyncChanged(prev, next) || hasSensitiveSettingsUpdates(rawNext),
+          true,
         );
         return next;
       });
