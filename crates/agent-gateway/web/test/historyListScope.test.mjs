@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { createTsModuleLoader } from "../../../agent-gui/test/helpers/load-ts-module.mjs";
+import { createWebModuleLoader } from "../../test/helpers/load-web-module.mjs";
 
-const loader = createTsModuleLoader({
+const loader = createWebModuleLoader({
   rootDir: fileURLToPath(new URL("../", import.meta.url)),
 });
 const historyListScope = loader.loadModule("src/lib/chat/historyListScope.ts");

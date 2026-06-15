@@ -2,14 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { createTsModuleLoader } from "../../../agent-gui/test/helpers/load-ts-module.mjs";
+import { createWebModuleLoader } from "../../test/helpers/load-web-module.mjs";
 
 const rootDir = fileURLToPath(new URL("../", import.meta.url));
-const uiMessagesLoader = createTsModuleLoader({ rootDir });
+const uiMessagesLoader = createWebModuleLoader({ rootDir });
 const uiMessages = uiMessagesLoader.loadModule("src/lib/chat/uiMessages.ts");
 const hostedSearch = uiMessagesLoader.loadModule("src/lib/chat/hostedSearch.ts");
 const uploadedImagePreview = uiMessagesLoader.loadModule("src/lib/chat/uploadedImagePreview.ts");
-const loader = createTsModuleLoader({
+const loader = createWebModuleLoader({
   rootDir,
   mocks: {
     "@/lib/chat/chatPageHelpers": {
