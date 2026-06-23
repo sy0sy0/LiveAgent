@@ -991,6 +991,81 @@ func TestDesktopBroadcastChatEventCreatesAttachableRun(t *testing.T) {
 	}
 }
 
+func TestHistoryRunningCreatesAttachableConversationRun(t *testing.T) {
+	t.Parallel()
+
+	sm := newTestSessionManager()
+	sm.SetSession(session.NewAgentSession(sm.LatestAuthSnapshot()))
+
+	sm.DispatchFromAgent(&gatewayv1.AgentEnvelope{
+		RequestId: "history-sync-1",
+		Payload: &gatewayv1.AgentEnvelope_HistorySync{
+			HistorySync: &gatewayv1.HistorySyncEvent{
+				Kind:           "running",
+				ConversationId: "conversation-1",
+				Conversation: &gatewayv1.ConversationSummary{
+					Id:  "conversation-1",
+					Cwd: "/workspace",
+				},
+			},
+		},
+	})
+
+	summaries := sm.ActiveChatRunSummaries()
+	if len(summaries) != 1 ||
+		summaries[0].ConversationID != "conversation-1" ||
+		summaries[0].RequestID != "conversation-live-conversation-1" ||
+		summaries[0].Workdir != "/workspace" ||
+		summaries[0].FirstSeq != 1 {
+		t.Fatalf("active summaries = %#v", summaries)
+	}
+
+	ch, done, cleanup, snapshot, err := sm.SubscribeChatRun("", "conversation-1", 0)
+	if err != nil {
+		t.Fatalf("SubscribeChatRun: %v", err)
+	}
+	defer cleanup()
+	assertDoneOpen(t, done)
+	if snapshot.RequestID != "conversation-live-conversation-1" ||
+		snapshot.State != session.ChatRunStateRunning ||
+		snapshot.Workdir != "/workspace" ||
+		snapshot.Done {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+
+	select {
+	case event := <-ch:
+		t.Fatalf("unexpected replay before first token: %#v", event)
+	default:
+	}
+
+	sm.DispatchFromAgent(&gatewayv1.AgentEnvelope{
+		RequestId: "conversation-live-conversation-1",
+		Payload: &gatewayv1.AgentEnvelope_ChatEvent{
+			ChatEvent: &gatewayv1.ChatEvent{
+				Type:           gatewayv1.ChatEvent_TOKEN,
+				ConversationId: "conversation-1",
+				Data:           `{"text":"hello"}`,
+			},
+		},
+	})
+
+	select {
+	case event := <-ch:
+		if event.Seq != 1 {
+			t.Fatalf("event seq = %d, want 1", event.Seq)
+		}
+		if event.Event.GetType() != gatewayv1.ChatEvent_TOKEN {
+			t.Fatalf("event type = %v, want TOKEN", event.Event.GetType())
+		}
+		if event.Workdir != "/workspace" {
+			t.Fatalf("event workdir = %q, want /workspace", event.Workdir)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for token after history running")
+	}
+}
+
 func TestCompletedHistoryUpsertDoesNotPreemptTerminalChatEvent(t *testing.T) {
 	t.Parallel()
 

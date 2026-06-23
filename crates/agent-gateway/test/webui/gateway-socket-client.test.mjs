@@ -504,12 +504,16 @@ test("GatewayWebSocketClient streamChatEvents sends replay cursor", async () => 
   try {
     const client = getGatewayWebSocketClient(" token ");
     const events = [];
-    for await (const event of client.streamChatEvents(" conversation-1 ", { afterSeq: 41 })) {
+    for await (const event of client.streamChatEvents(" conversation-1 ", {
+      runId: " live-run ",
+      afterSeq: 41,
+    })) {
       events.push(event);
     }
 
     assert.equal(fetchCalls.length, 1);
     assert.equal(fetchCalls[0].url.pathname, "/api/chat/events");
+    assert.equal(fetchCalls[0].url.searchParams.get("run_id"), "live-run");
     assert.equal(fetchCalls[0].url.searchParams.get("conversation_id"), "conversation-1");
     assert.equal(fetchCalls[0].url.searchParams.get("after_seq"), "41");
     assert.equal(fetchCalls[0].init.method, "GET");

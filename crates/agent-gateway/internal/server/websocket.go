@@ -258,7 +258,7 @@ func (c *websocketConnection) startHistorySyncForwarder() {
 				if !ok {
 					return
 				}
-				if err := c.writeHistoryEvent(websocketHistorySyncPayload(event)); err != nil {
+				if err := c.writeHistoryEvent(websocketHistorySyncPayload(event, c.sm.ActiveChatRunSummaries()...)); err != nil {
 					c.close()
 					return
 				}

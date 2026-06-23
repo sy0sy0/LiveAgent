@@ -273,4 +273,9 @@ export type GatewayHistoryEvent =
       kind: "running" | "idle";
       conversation_id: string;
       conversation?: ConversationSummary;
+      run_id?: string;
+      first_seq?: number;
+      latest_seq?: number;
+      run_epoch?: number;
+      updated_at?: number;
     };

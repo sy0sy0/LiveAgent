@@ -2241,6 +2241,7 @@ export default function GatewayApp() {
         let terminalEventSeen = false;
         try {
           for await (const event of currentApi.streamChatEvents(conversationIdValue, {
+            runId: runtime?.runId,
             afterSeq: streamAfterSeq,
             signal: controller.signal,
           })) {
@@ -2368,8 +2369,12 @@ export default function GatewayApp() {
 
       if (event.kind === "running" || event.kind === "idle") {
         setRemoteConversationRunningState(targetConversationId, event.kind === "running", {
+          runId: event.run_id,
           workdir: event.conversation?.cwd,
-          updatedAt: event.conversation?.updated_at,
+          firstSeq: event.first_seq,
+          latestSeq: event.latest_seq,
+          runEpoch: event.run_epoch,
+          updatedAt: event.updated_at ?? event.conversation?.updated_at,
         });
         if (event.kind === "running") {
           if (!isConversationEventStreamSubscribed(targetConversationId)) {

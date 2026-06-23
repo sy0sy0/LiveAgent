@@ -78,6 +78,7 @@ type PendingRequest = {
 };
 
 type ChatEventStreamOptions = {
+  runId?: string;
   afterSeq?: number;
   signal?: AbortSignal;
 };
@@ -1502,8 +1503,10 @@ export class GatewayWebSocketClient {
     if (signal?.aborted) {
       return;
     }
+    const normalizedRunId = options?.runId?.trim() ?? "";
     for await (const event of streamGatewayChatEvents({
       token: this.token,
+      runId: normalizedRunId || undefined,
       conversationId: normalizedConversationId,
       afterSeq: options?.afterSeq,
       signal,
@@ -3444,8 +3447,10 @@ class SharedWorkerGatewayWebSocketClient implements GatewayWebSocketClientLike {
     if (signal?.aborted) {
       return;
     }
+    const normalizedRunId = options?.runId?.trim() ?? "";
     for await (const event of streamGatewayChatEvents({
       token: this.token,
+      runId: normalizedRunId || undefined,
       conversationId: normalizedConversationId,
       afterSeq: options?.afterSeq,
       signal,
