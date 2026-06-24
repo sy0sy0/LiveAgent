@@ -2058,7 +2058,11 @@ export function ChatPage(props: ChatPageProps) {
   }
 
   function stopSending() {
-    stopConversation(currentConversationIdRef.current);
+    const conversationId = currentConversationIdRef.current.trim();
+    if (!conversationId) return;
+    if (!stopConversation(conversationId)) {
+      requestQueuedChatTurnProcessing(conversationId);
+    }
   }
 
   function clearCurrentComposerDraftForQueuedTurn(conversationId: string) {
@@ -2072,7 +2076,7 @@ export function ChatPage(props: ChatPageProps) {
     clearCachedComposerDraft(targetConversationId);
   }
 
-  function enqueueCurrentComposerTurn(position: "end" | "front" | "edit") {
+  function enqueueCurrentComposerTurn(position: "end" | "edit") {
     const conversationId = currentConversationIdRef.current.trim();
     const draft = composerRef.current?.getDraft() ?? null;
     const uploadedFiles = pendingUploadedFiles.slice();
@@ -2112,9 +2116,7 @@ export function ChatPage(props: ChatPageProps) {
       if (editSlot) {
         return insertQueuedChatTurnAtSlot(current, queuedTurn, editSlot);
       }
-      return position === "front"
-        ? promoteQueuedChatTurn(appendQueuedChatTurn(current, queuedTurn), queuedTurn.id)
-        : appendQueuedChatTurn(current, queuedTurn);
+      return appendQueuedChatTurn(current, queuedTurn);
     });
     if (editSlot) {
       queuedChatTurnEditSlotRef.current = null;
@@ -2209,16 +2211,6 @@ export function ChatPage(props: ChatPageProps) {
     }
   }, [runningConversationIds, queuedChatTurns]);
 
-  function enqueueCurrentComposerTurnAndMaybeInterrupt() {
-    const conversationId = currentConversationIdRef.current.trim();
-    if (!enqueueCurrentComposerTurn("front")) return;
-    if (isConversationRunning(conversationId)) {
-      stopConversation(conversationId);
-      return;
-    }
-    requestQueuedChatTurnProcessing(conversationId);
-  }
-
   function runQueuedTurnNow(id: string) {
     const queuedTurn = queuedChatTurnsRef.current.find((item) => item.id === id.trim());
     if (!queuedTurn) return;
@@ -2230,8 +2222,8 @@ export function ChatPage(props: ChatPageProps) {
     requestQueuedChatTurnProcessing(queuedTurn.conversationId);
   }
 
-  function moveQueuedTurn(id: string, direction: "up" | "down") {
-    setQueuedChatTurnsState((current) => moveQueuedChatTurn(current, id, direction));
+  function moveQueuedTurnUp(id: string) {
+    setQueuedChatTurnsState((current) => moveQueuedChatTurn(current, id, "up"));
   }
 
   function editQueuedTurn(id: string) {
@@ -4572,10 +4564,6 @@ export function ChatPage(props: ChatPageProps) {
     stopSendingActionRef.current();
   }, []);
 
-  const handleInterruptAndSend = useCallback(() => {
-    enqueueCurrentComposerTurnAndMaybeInterrupt();
-  }, [enqueueCurrentComposerTurnAndMaybeInterrupt]);
-
   const handleComposerBusyChange = useCallback((isBusy: boolean) => {
     composerBusyRef.current = isBusy;
   }, []);
@@ -4949,7 +4937,6 @@ export function ChatPage(props: ChatPageProps) {
                 }
                 onSend={handleSend}
                 onStop={handleStopSending}
-                onInterruptAndSend={handleInterruptAndSend}
                 onComposerBusyChange={handleComposerBusyChange}
                 onChatRuntimeControlsChange={handleChatRuntimeControlsChange}
                 onPickReadableFiles={pickReadableFiles}
@@ -4958,7 +4945,7 @@ export function ChatPage(props: ChatPageProps) {
                 onRemovePendingUpload={removePendingUpload}
                 queuedTurns={queuedChatTurnsForCurrentConversation}
                 onRunQueuedTurnNow={runQueuedTurnNow}
-                onMoveQueuedTurn={moveQueuedTurn}
+                onMoveQueuedTurnUp={moveQueuedTurnUp}
                 onEditQueuedTurn={editQueuedTurn}
                 onRemoveQueuedTurn={removeQueuedTurn}
                 onHeightChange={setComposerOverlayHeight}
