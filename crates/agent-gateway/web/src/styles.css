@@ -104,6 +104,47 @@ html[data-liveagent-webui="gateway"] .project-file-tree-panel-scroll {
   scroll-padding-bottom: max(16px, env(safe-area-inset-bottom));
 }
 
+html[data-liveagent-webui="gateway"] .workdir-picker-tree {
+  --rct-color-tree-bg: transparent;
+  --rct-color-tree-focus-outline: transparent;
+  --rct-color-focustree-item-selected-bg: hsl(var(--accent));
+  --rct-color-focustree-item-selected-text: hsl(var(--accent-foreground));
+  --rct-color-focustree-item-hover-bg: hsl(var(--muted) / 0.72);
+  --rct-color-focustree-item-hover-text: hsl(var(--foreground));
+  --rct-color-focustree-item-active-bg: hsl(var(--muted));
+  --rct-color-focustree-item-active-text: hsl(var(--foreground));
+  --rct-color-focustree-item-focused-border: hsl(var(--ring) / 0.58);
+  --rct-color-focustree-item-draggingover-bg: hsl(var(--accent));
+  --rct-color-focustree-item-draggingover-color: hsl(var(--accent-foreground));
+  --rct-color-nonfocustree-item-selected-bg: hsl(var(--accent) / 0.78);
+  --rct-color-nonfocustree-item-selected-text: hsl(var(--accent-foreground));
+  --rct-color-nonfocustree-item-focused-border: hsl(var(--border));
+  --rct-color-search-highlight-bg: hsl(var(--primary) / 0.18);
+  --rct-color-arrow: hsl(var(--muted-foreground));
+  --rct-bar-color: hsl(var(--ring));
+  --rct-focus-outline: hsl(var(--ring));
+}
+
+html[data-liveagent-webui="gateway"] .workdir-picker-tree .rct-tree-root {
+  background: transparent;
+  color: hsl(var(--foreground));
+  font-family: inherit;
+}
+
+html[data-liveagent-webui="gateway"].dark .workdir-picker-tree {
+  --rct-color-focustree-item-selected-bg: hsl(var(--accent) / 0.92);
+  --rct-color-focustree-item-selected-text: hsl(var(--foreground));
+  --rct-color-focustree-item-hover-bg: hsl(var(--muted) / 0.68);
+  --rct-color-focustree-item-active-bg: hsl(var(--muted) / 0.86);
+  --rct-color-nonfocustree-item-selected-bg: hsl(var(--accent) / 0.72);
+  --rct-color-nonfocustree-item-selected-text: hsl(var(--foreground));
+  --rct-color-search-highlight-bg: hsl(var(--primary) / 0.24);
+}
+
+html[data-liveagent-webui="gateway"] .workdir-picker-tree .rct-tree-item-button {
+  min-width: 0;
+}
+
 html[data-liveagent-webui="gateway"] .project-tools-panel-tabs::-webkit-scrollbar {
   display: none;
   width: 0;

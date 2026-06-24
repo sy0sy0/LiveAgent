@@ -483,7 +483,7 @@ export function GitBranchSelector(props: {
             "composer-reasoning-trigger inline-flex h-8 min-w-0 max-w-[13rem] items-center gap-1 rounded-full border px-2 text-xs font-medium outline-hidden transition-colors",
             noRepo
               ? "border-transparent bg-foreground/[0.04] text-muted-foreground"
-              : "border-emerald-300/25 bg-emerald-50/65 text-foreground hover:bg-emerald-50 dark:border-emerald-300/15 dark:bg-emerald-400/[0.08]",
+              : "border-emerald-300/25 bg-emerald-50/65 text-foreground hover:bg-emerald-50 dark:border-emerald-300/15 dark:bg-emerald-400/[0.08] dark:hover:bg-emerald-400/[0.13]",
             "disabled:pointer-events-none disabled:opacity-45",
           )}
           title={visibleError || (!canWrite ? disabledMessage : "") || label}

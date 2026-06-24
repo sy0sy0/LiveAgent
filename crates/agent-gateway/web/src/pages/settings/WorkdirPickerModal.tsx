@@ -571,7 +571,7 @@ export function WorkdirPickerModal(props: WorkdirPickerModalProps) {
             ) : null}
           </div>
 
-          <div className="min-h-0 flex-1 overflow-auto rounded-xl border border-border/60 bg-muted/20 p-2">
+          <div className="workdir-picker-tree min-h-0 flex-1 overflow-auto rounded-xl border border-border/60 bg-muted/20 p-2">
             <ControlledTreeEnvironment
               items={items}
               getItemTitle={(item) => item.data.label}
