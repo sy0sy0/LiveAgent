@@ -34,7 +34,6 @@ func (m *Manager) IsOnline() bool {
 func (m *Manager) SetSession(s *AgentSession) {
 	m.registry.mu.Lock()
 	previous := m.registry.session
-	previousEpoch := m.registry.sessionEpoch
 	if m.registry.authValid {
 		s.AgentID = m.registry.lastAuth.AgentID
 		s.AgentVersion = m.registry.lastAuth.AgentVersion
@@ -53,7 +52,6 @@ func (m *Manager) SetSession(s *AgentSession) {
 	}
 	if previous != nil && previous != s {
 		previous.Close()
-		m.failOpenChatRunsForSessionEpoch(previousEpoch, agentDisconnectedChatRunMessage)
 	}
 }
 
@@ -63,7 +61,6 @@ func (m *Manager) ClearSession(session *AgentSession) {
 		m.registry.mu.Unlock()
 		return
 	}
-	clearedEpoch := m.registry.sessionEpoch
 	m.registry.session = nil
 	clearRuntimeStatusLocked(m.registry)
 	m.registry.mu.Unlock()
@@ -74,7 +71,6 @@ func (m *Manager) ClearSession(session *AgentSession) {
 
 	session.Close()
 	m.clearTerminalSessionSnapshot()
-	m.failOpenChatRunsForSessionEpoch(clearedEpoch, agentDisconnectedChatRunMessage)
 }
 
 func (m *Manager) ClearSessionIfHeartbeatStale(session *AgentSession, timeout time.Duration) bool {
@@ -92,14 +88,12 @@ func (m *Manager) ClearSessionIfHeartbeatStale(session *AgentSession, timeout ti
 		m.registry.mu.Unlock()
 		return false
 	}
-	clearedEpoch := m.registry.sessionEpoch
 	m.registry.session = nil
 	clearRuntimeStatusLocked(m.registry)
 	m.registry.mu.Unlock()
 
 	session.Close()
 	m.clearTerminalSessionSnapshot()
-	m.failOpenChatRunsForSessionEpoch(clearedEpoch, agentDisconnectedChatRunMessage)
 	return true
 }
 
@@ -116,7 +110,6 @@ func (m *Manager) ClearSessionForEpoch(sessionEpoch uint64) bool {
 
 	session.Close()
 	m.clearTerminalSessionSnapshot()
-	m.failOpenChatRunsForSessionEpoch(sessionEpoch, agentDisconnectedChatRunMessage)
 	return true
 }
 

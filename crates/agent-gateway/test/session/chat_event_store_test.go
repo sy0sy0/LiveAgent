@@ -3,6 +3,7 @@ package session_test
 import (
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -77,10 +78,6 @@ func (s *staleReplayChatEventStore) Replay(
 	int,
 ) (session.ChatRunSnapshot, []*session.ChatBroadcastEvent, bool, error) {
 	return s.snapshot, s.replay, true, nil
-}
-
-func (s *staleReplayChatEventStore) FailOpenRuns(string) error {
-	return nil
 }
 
 func (s *staleReplayChatEventStore) Close() error {
@@ -230,6 +227,59 @@ func TestSQLiteHistoryRunningDoesNotCreateAttachableConversationRun(t *testing.T
 	}
 	if summaries := sm.ActiveChatRunSummaries(); len(summaries) != 0 {
 		t.Fatalf("active summaries after completed history running = %#v, want empty", summaries)
+	}
+}
+
+func TestSQLiteRuntimeSnapshotReplaysAttachableConversationRun(t *testing.T) {
+	t.Parallel()
+
+	dbPath := filepath.Join(t.TempDir(), "gateway-chat.sqlite3")
+	sm, store := newPersistentTestSessionManager(t, dbPath)
+	sm.ApplyChatRuntimeSnapshot(&gatewayv1.ChatRuntimeSnapshot{
+		ConversationId:         "conversation-1",
+		RunId:                  "run-1",
+		ClientRequestId:        "client-1",
+		WorkerId:               "gui-live",
+		State:                  session.ChatRunStateRunning,
+		Cwd:                    "/workspace",
+		Revision:               7,
+		EntriesJson:            `[{"id":"u1","kind":"user","text":"hello","attachments":[]},{"id":"a1","kind":"assistant","text":"partial","round":1}]`,
+		ToolStatus:             "Thinking...",
+		ToolStatusIsCompaction: false,
+	})
+	if err := store.Close(); err != nil {
+		t.Fatalf("close first store: %v", err)
+	}
+
+	next, nextStore := newPersistentTestSessionManager(t, dbPath)
+	defer nextStore.Close()
+	summaries := next.ActiveChatRunSummaries()
+	if len(summaries) != 0 {
+		t.Fatalf("active summaries before replay = %#v, want lazy hydration only", summaries)
+	}
+
+	ch, done, cleanup, snapshot, err := next.SubscribeChatRun("", "conversation-1", 0)
+	if err != nil {
+		t.Fatalf("SubscribeChatRun: %v", err)
+	}
+	defer cleanup()
+	assertDoneOpen(t, done)
+	if snapshot.RequestID != "run-1" ||
+		snapshot.State != session.ChatRunStateRunning ||
+		snapshot.Done ||
+		snapshot.Workdir != "/workspace" {
+		t.Fatalf("snapshot after runtime replay = %#v, want running run-1", snapshot)
+	}
+
+	select {
+	case event := <-ch:
+		eventType, _ := event.Payload["type"].(string)
+		entriesJSON, _ := event.Payload["entries_json"].(string)
+		if eventType != "runtime_snapshot" || !strings.Contains(entriesJSON, "partial") {
+			t.Fatalf("replayed runtime snapshot = %#v, want partial runtime_snapshot", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for runtime snapshot replay")
 	}
 }
 
@@ -462,7 +512,7 @@ func TestSQLiteChatEventStoreContinuesConversationSeqAcrossRuns(t *testing.T) {
 	}
 }
 
-func TestSQLiteChatEventStoreFailsOpenRunsOnManagerStartup(t *testing.T) {
+func TestSQLiteChatEventStorePreservesOpenRunsOnManagerStartup(t *testing.T) {
 	t.Parallel()
 
 	dbPath := filepath.Join(t.TempDir(), "gateway-chat.sqlite3")
@@ -486,21 +536,22 @@ func TestSQLiteChatEventStoreFailsOpenRunsOnManagerStartup(t *testing.T) {
 		t.Fatalf("SubscribeChatRun: %v", err)
 	}
 	defer cleanup()
-	if snapshot.State != session.ChatRunStateFailed || !snapshot.Done || snapshot.LatestSeq != 2 {
-		t.Fatalf("snapshot after restart = %#v, want failed terminal run", snapshot)
+	if snapshot.State != session.ChatRunStateQueued || snapshot.Done || snapshot.LatestSeq != 1 {
+		t.Fatalf("snapshot after restart = %#v, want open queued run", snapshot)
 	}
 
-	gotTypes := make([]string, 0, 2)
-	for len(gotTypes) < 2 {
-		select {
-		case event := <-ch:
-			eventType, _ := event.Payload["type"].(string)
-			gotTypes = append(gotTypes, eventType)
-		case <-time.After(time.Second):
-			t.Fatalf("timed out waiting for failed replay, got %#v", gotTypes)
+	select {
+	case event := <-ch:
+		eventType, _ := event.Payload["type"].(string)
+		if eventType != "accepted" {
+			t.Fatalf("replayed event type = %q, want accepted", eventType)
 		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for accepted replay")
 	}
-	if gotTypes[0] != "accepted" || gotTypes[1] != "failed" {
-		t.Fatalf("replayed event types = %#v, want accepted then failed", gotTypes)
+	select {
+	case event := <-ch:
+		t.Fatalf("unexpected replay after preserved open run: %#v", event)
+	default:
 	}
 }

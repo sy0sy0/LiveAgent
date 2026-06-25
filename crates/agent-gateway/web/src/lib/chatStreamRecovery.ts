@@ -3,6 +3,9 @@ import type { ChatEntry } from "./chatUi";
 import { isLocalDraftConversationId } from "./localDraftConversation";
 
 const CHAT_STREAM_NOT_AVAILABLE_RE = /\bchat stream not available\b/i;
+const RECOVERABLE_TRANSPORT_STATUS_CODES = new Set([408, 425, 429, 502, 503, 504, 520, 521, 522, 523, 524]);
+const RECOVERABLE_TRANSPORT_MESSAGE_RE =
+  /\b(?:502\s+bad\s+gateway|503\s+service\s+unavailable|504\s+gateway\s+timeout|bad\s+gateway|gateway\s+timeout|service\s+unavailable|temporarily\s+unavailable|failed\s+to\s+fetch|networkerror|network\s+error|load\s+failed|connection\s+(?:reset|closed|lost)|socket\s+hang\s+up|err_(?:network|internet_disconnected|connection_(?:reset|closed|refused)))\b/i;
 
 export type ChatStreamUnavailableRecoveryAction =
   | "refresh-history-snapshot"
@@ -16,6 +19,20 @@ export function isChatStreamNotAvailableMessage(value: unknown) {
         ? value
         : String(value ?? "");
   return CHAT_STREAM_NOT_AVAILABLE_RE.test(message.trim());
+}
+
+export function isRecoverableChatStreamTransportStatus(status: number) {
+  return Number.isInteger(status) && RECOVERABLE_TRANSPORT_STATUS_CODES.has(status);
+}
+
+export function isRecoverableChatStreamTransportMessage(value: unknown) {
+  const message =
+    value instanceof Error
+      ? value.message
+      : typeof value === "string"
+        ? value
+        : String(value ?? "");
+  return RECOVERABLE_TRANSPORT_MESSAGE_RE.test(message.trim());
 }
 
 export function isChatStreamNotAvailableEvent(event: ChatEvent) {

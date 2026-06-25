@@ -73,6 +73,7 @@ import type {
   ChatQueueItemSummary,
   ChatQueueSnapshot,
   ChatEvent,
+  ChatRuntimeSnapshotEvent,
   ConversationSummary,
   GatewayHistoryEvent,
   HistoryDetail,
@@ -92,6 +93,7 @@ import { parseHistoryMessagesJsonAsync } from "@/lib/historyParser";
 import {
   isChatStreamNotAvailableEvent,
   isChatStreamNotAvailableMessage,
+  isRecoverableChatStreamTransportMessage,
   resolveChatStreamUnavailableRecoveryAction,
   shouldHydrateRestoredConversationSnapshot,
 } from "@/lib/chatStreamRecovery";
@@ -2024,14 +2026,6 @@ export default function GatewayApp() {
     [clearConversationLiveStream, recordProjectActivity],
   );
 
-  const isConversationEventStreamSubscribed = useCallback((targetConversationId: string) => {
-    const conversationIdValue = targetConversationId.trim();
-    return (
-      conversationIdValue !== "" &&
-      conversationEventStreamControllersRef.current.has(conversationIdValue)
-    );
-  }, []);
-
   const stopConversationEventStreamSubscription = useCallback((targetConversationId: string) => {
     const conversationIdValue = targetConversationId.trim();
     if (!conversationIdValue) {
@@ -2115,7 +2109,11 @@ export default function GatewayApp() {
   const clearConversationStreamingState = useCallback(
     (
       targetConversationId: string,
-      options?: { remoteRunId?: string; preserveRemoteRunOnMismatch?: boolean },
+      options?: {
+        remoteRunId?: string;
+        preserveRemoteRun?: boolean;
+        preserveRemoteRunOnMismatch?: boolean;
+      },
     ) => {
       const conversationIdValue = targetConversationId.trim();
       if (!conversationIdValue) {
@@ -2133,10 +2131,11 @@ export default function GatewayApp() {
         remoteRunningConversationRuntimeRef.current.get(conversationIdValue),
       );
       const shouldClearRemoteRunning =
-        !options?.preserveRemoteRunOnMismatch ||
-        !expectedRemoteRunKey ||
-        !currentRemoteRunKey ||
-        expectedRemoteRunKey === currentRemoteRunKey;
+        !options?.preserveRemoteRun &&
+        (!options?.preserveRemoteRunOnMismatch ||
+          !expectedRemoteRunKey ||
+          !currentRemoteRunKey ||
+          expectedRemoteRunKey === currentRemoteRunKey);
       if (shouldClearRemoteRunning) {
         setRemoteConversationRunningState(conversationIdValue, false);
       }
@@ -2233,6 +2232,59 @@ export default function GatewayApp() {
     [api, refreshVisibleConversationHistorySnapshot],
   );
 
+  const applyChatRuntimeSnapshotEvent = useCallback(
+    (
+      event: ChatRuntimeSnapshotEvent,
+      fallbackConversationId: string,
+      currentApi = api,
+    ) => {
+      const conversationIdValue =
+        event.conversation_id?.trim() || fallbackConversationId.trim();
+      if (!conversationIdValue) {
+        return false;
+      }
+
+      const liveStore = getConversationLiveStreamStore(conversationIdValue);
+      if (!liveStore) {
+        return false;
+      }
+
+      liveStore.applySnapshot(event, { flush: true });
+      const normalizedStatus = normalizeOptionalStatus(event.tool_status);
+      const isCompaction =
+        normalizedStatus !== null && event.tool_status_is_compaction === true;
+      setLiveConversationStreamStatus(conversationIdValue, normalizedStatus, isCompaction);
+      markLiveConversationStreamActive(conversationIdValue);
+
+      const state = event.state ?? "running";
+      const terminalState =
+        state === "completed" || state === "failed" || state === "cancelled";
+      setRemoteConversationRunningState(conversationIdValue, !terminalState, {
+        runId: event.run_id,
+        workdir: event.workdir,
+        updatedAt: normalizeGatewayTimestampMs(event.updated_at),
+      });
+
+      if (terminalState) {
+        markCompletedLiveStream(conversationIdValue);
+        commitTerminalConversationLiveStream(conversationIdValue);
+        refreshHistoryAfterCompletedLiveStream(conversationIdValue, currentApi);
+      }
+
+      return terminalState;
+    },
+    [
+      api,
+      commitTerminalConversationLiveStream,
+      getConversationLiveStreamStore,
+      markCompletedLiveStream,
+      markLiveConversationStreamActive,
+      refreshHistoryAfterCompletedLiveStream,
+      setLiveConversationStreamStatus,
+      setRemoteConversationRunningState,
+    ],
+  );
+
   const recoverUnavailableConversationStream = useCallback(
     (targetConversationId: string, currentApi = api) => {
       const conversationIdValue = targetConversationId.trim();
@@ -2301,7 +2353,6 @@ export default function GatewayApp() {
       conversationEventStreamControllersRef.current.set(conversationIdValue, controller);
       conversationEventStreamRunIdsRef.current.set(conversationIdValue, nextRunKey);
       clearCompletedLiveStreamMarker(conversationIdValue);
-      clearConversationLiveStream(conversationIdValue);
       const liveStore = getConversationLiveStreamStore(conversationIdValue);
       if (!liveStore) {
         conversationEventStreamControllersRef.current.delete(conversationIdValue);
@@ -2315,6 +2366,7 @@ export default function GatewayApp() {
 
       void (async () => {
         let terminalEventSeen = false;
+        let recoverableTransportErrorSeen = false;
         try {
           for await (const event of currentApi.streamChatEvents(conversationIdValue, {
             runId: runtime?.runId,
@@ -2331,6 +2383,19 @@ export default function GatewayApp() {
               applyLiveConversationTitle(eventConversationId, liveTitle, {
                 isFinal: true,
               });
+            }
+
+            if (event.type === "runtime_snapshot") {
+              const terminalSnapshot = applyChatRuntimeSnapshotEvent(
+                event,
+                conversationIdValue,
+                currentApi,
+              );
+              if (terminalSnapshot) {
+                terminalEventSeen = true;
+                return;
+              }
+              continue;
             }
 
             if (event.type === "tool_status") {
@@ -2369,6 +2434,11 @@ export default function GatewayApp() {
               recoverUnavailableConversationStream(conversationIdValue, currentApi);
               return;
             }
+            if (isRecoverableChatStreamTransportMessage(message)) {
+              recoverableTransportErrorSeen = true;
+              liveStore.flush();
+              return;
+            }
             liveStore.appendEvent(
               {
                 type: "error",
@@ -2392,7 +2462,18 @@ export default function GatewayApp() {
           if (!terminalEventSeen && controller.signal.aborted) {
             liveStore.flush();
           }
-          if (!terminalEventSeen && !controller.signal.aborted) {
+          if (recoverableTransportErrorSeen && !controller.signal.aborted) {
+            liveStore.flush();
+            clearConversationStreamingState(conversationIdValue, { preserveRemoteRun: true });
+            window.setTimeout(() => {
+              if (
+                remoteRunningConversationIdsRef.current.has(conversationIdValue) &&
+                !conversationEventStreamControllersRef.current.has(conversationIdValue)
+              ) {
+                subscribeVisibleConversationEventStream(conversationIdValue, currentApi);
+              }
+            }, 500);
+          } else if (!terminalEventSeen && !controller.signal.aborted) {
             liveStore.flush();
             clearConversationStreamingState(conversationIdValue);
             setLiveConversationStreamStatus(conversationIdValue, null);
@@ -2404,11 +2485,11 @@ export default function GatewayApp() {
       api,
       applyLiveConversationTitle,
       clearCompletedLiveStreamMarker,
-      clearConversationLiveStream,
       clearConversationStreamingState,
       commitTerminalConversationLiveStream,
       getConversationAbortController,
       getConversationLiveStreamStore,
+      applyChatRuntimeSnapshotEvent,
       handleTunnelManagerChatEvent,
       markCompletedLiveStream,
       markLiveConversationStreamActive,
@@ -2476,9 +2557,6 @@ export default function GatewayApp() {
           updatedAt: event.updated_at ?? event.conversation?.updated_at,
         });
         if (event.kind === "running") {
-          if (!isConversationEventStreamSubscribed(targetConversationId)) {
-            clearConversationLiveStream(targetConversationId);
-          }
           subscribeVisibleConversationEventStream(targetConversationId, api);
           return;
         }
@@ -2646,7 +2724,6 @@ export default function GatewayApp() {
     hasRecentlyCompletedLiveStream,
     hasRetainedConversationLiveStream,
     isAgentMode,
-    isConversationEventStreamSubscribed,
     maybeAdoptActiveDraftConversation,
     recordProjectActivity,
     refreshVisibleConversationHistorySnapshot,
@@ -2660,28 +2737,18 @@ export default function GatewayApp() {
   ]);
 
   useEffect(() => {
-    if (status?.online) {
+    if (!status?.online) {
+      stopAllConversationEventStreamSubscriptions();
       return;
     }
-    setRemoteRunningConversationIds((current) => {
-      if (current.size === 0) {
-        remoteRunningConversationIdsRef.current = current;
-        return current;
-      }
-      const next = new Set<string>();
-      remoteRunningConversationIdsRef.current = next;
-      return next;
-    });
-    setRemoteRunningConversationRuntime((current) => {
-      if (current.size === 0) {
-        remoteRunningConversationRuntimeRef.current = current;
-        return current;
-      }
-      const next = new Map<string, RunningConversationRuntime>();
-      remoteRunningConversationRuntimeRef.current = next;
-      return next;
-    });
-  }, [status?.online]);
+    const visibleConversationId = resolveVisibleConversationId(
+      selectedHistoryIdRef.current,
+      conversationIdRef.current,
+    );
+    if (visibleConversationId && remoteRunningConversationIdsRef.current.has(visibleConversationId)) {
+      subscribeVisibleConversationEventStream(visibleConversationId, api);
+    }
+  }, [api, status?.online, stopAllConversationEventStreamSubscriptions, subscribeVisibleConversationEventStream]);
 
   async function selectHistory(
     conversationIdValue: string,
@@ -2749,7 +2816,8 @@ export default function GatewayApp() {
       if (options?.syncChat) {
         const shouldPreserveLiveRuntime =
           blockedHistoryHydrationConversationIdsRef.current.has(detail.conversation_id) ||
-          getConversationAbortController(detail.conversation_id) !== null;
+          getConversationAbortController(detail.conversation_id) !== null ||
+          remoteRunningConversationIdsRef.current.has(detail.conversation_id);
         if (shouldPreserveLiveRuntime) {
           return;
         }
@@ -3042,8 +3110,9 @@ export default function GatewayApp() {
       if (shouldHydrateSelection) {
         await selectHistory(preferredConversationId, currentApi, {
           syncChat: shouldSyncChat,
-          resetLiveStream:
-            shouldSyncChat && remoteRunningConversationIdsRef.current.has(preferredConversationId),
+          resetLiveStream: false,
+          clearLiveStream:
+            shouldSyncChat && !remoteRunningConversationIdsRef.current.has(preferredConversationId),
           scrollToBottom: shouldSyncChat,
         });
       }
@@ -3638,6 +3707,7 @@ export default function GatewayApp() {
     }
 
     let terminalEventSeen = false;
+    let recoverableTransportErrorSeen = false;
     let runActive = false;
     let runtimeStarted = false;
     let activeGatewayRunId = "";
@@ -3810,6 +3880,20 @@ export default function GatewayApp() {
             });
           }
         }
+        if (event.type === "runtime_snapshot") {
+          markRuntimeStarted();
+          const terminalSnapshot = applyChatRuntimeSnapshotEvent(event, activeConversationId, api);
+          if (terminalSnapshot) {
+            terminalEventSeen = true;
+            clearRuntimeStartingStatusTimer();
+            clearConversationStreamingState(
+              activeConversationId,
+              preserveRemoteRunCleanupOptions(),
+            );
+          }
+          continue;
+        }
+
         if (isChatControlEvent(event)) {
           if (event.type === "queued_in_gui" || event.state === "desktop_queued") {
             terminalEventSeen = true;
@@ -3922,6 +4006,15 @@ export default function GatewayApp() {
         if (isChatStreamNotAvailableMessage(message)) {
           terminalEventSeen = true;
           recoverUnavailableActiveConversationStream(activeConversationId, api);
+        } else if (
+          isRecoverableChatStreamTransportMessage(message) &&
+          (runActive ||
+            runtimeStarted ||
+            activeGatewayRunId !== "" ||
+            remoteRunningConversationIdsRef.current.has(activeConversationId))
+        ) {
+          recoverableTransportErrorSeen = true;
+          getConversationLiveStreamStore(activeConversationId)?.flush();
         } else {
           updateConversationRuntimeEntry(activeConversationId, (current) => ({
             ...current,
@@ -3932,7 +4025,10 @@ export default function GatewayApp() {
     } finally {
       clearRuntimeStartingStatusTimer();
       chatStartInFlightRef.current = false;
-      clearConversationStreamingState(activeConversationId, preserveRemoteRunCleanupOptions());
+      clearConversationStreamingState(activeConversationId, {
+        ...preserveRemoteRunCleanupOptions(),
+        preserveRemoteRun: recoverableTransportErrorSeen,
+      });
       if (remoteRunningConversationIdsRef.current.has(activeConversationId)) {
         subscribeVisibleConversationEventStream(activeConversationId, api);
       }
@@ -4659,7 +4755,7 @@ export default function GatewayApp() {
     const isRemoteRunning = remoteRunningConversationIdsRef.current.has(targetConversationId);
     void selectHistory(targetConversationId, api, {
       syncChat: true,
-      resetLiveStream: isRemoteRunning,
+      resetLiveStream: false,
       clearLiveStream: !isRemoteRunning,
       scrollToBottom: true,
     });

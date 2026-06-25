@@ -1,4 +1,4 @@
-import type { Context, UserMessage } from "@earendil-works/pi-ai";
+import type { Context, Message, UserMessage } from "@earendil-works/pi-ai";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -59,6 +59,7 @@ import {
   type RenderTimelineItem,
   truncateConversationFromMessage,
 } from "../lib/chat/conversation/conversationState";
+import type { LiveTranscriptStore } from "../lib/chat/conversation/liveTranscriptStore";
 import {
   createConversationHookLifecycle,
   createGatewayBridgeEventController,
@@ -214,6 +215,10 @@ import {
   normalizeGatewayWorkdir,
 } from "./chat/gateway/gatewayBridgeTypes";
 import {
+  buildGatewayRuntimeSnapshotEntries,
+  type GatewayRuntimeSnapshotState,
+} from "./chat/gateway/chatRuntimeSnapshot";
+import {
   appendQueuedChatTurn,
   buildQueuedChatTurnPreview,
   createQueuedChatTurn,
@@ -309,9 +314,23 @@ type SyncedRunningConversationRuntime = {
   updatedAt: number;
 };
 
+type ActiveGatewayRuntimeRun = {
+  conversationId: string;
+  runId: string;
+  clientRequestId?: string;
+  workerId?: string;
+  cwd?: string;
+  revision: number;
+  state: GatewayRuntimeSnapshotState;
+  userMessage: Message;
+  transcriptStore: LiveTranscriptStore;
+  toolStatusIsCompaction: boolean;
+};
+
 const HISTORY_SWITCH_OVERLAY_MIN_MS = 260;
 const PROJECT_HISTORY_DELETE_PAGE_SIZE = 200;
 const SHARED_HISTORY_LIST_PAGE_SIZE = 200;
+const GATEWAY_RUNTIME_SNAPSHOT_DEBOUNCE_MS = 300;
 
 function appendManagedSkillSelections(current: readonly string[], names: readonly string[]) {
   const out = mergeAlwaysEnabledSkillNames(current);
@@ -1829,6 +1848,7 @@ export function ChatPage(props: ChatPageProps) {
     | null
   >(null);
   const chatQueueRevisionRef = useRef(0);
+  const chatQueueKnownConversationIdsRef = useRef(new Set<string>());
   const remoteQueuedChatTurnEditSlotsRef = useRef<
     Map<
       string,
@@ -1839,7 +1859,9 @@ export function ChatPage(props: ChatPageProps) {
       }
     >
   >(new Map());
-  const gatewayConversationActivityChainsRef = useRef(new Map<string, Promise<void>>());
+  const activeGatewayRuntimeRunsRef = useRef(new Map<string, ActiveGatewayRuntimeRun>());
+  const gatewayRuntimeSnapshotChainsRef = useRef(new Map<string, Promise<void>>());
+  const gatewayRuntimeSnapshotTimersRef = useRef(new Map<string, number>());
   const previousRunningConversationIdsRef = useRef<ReadonlySet<string>>(new Set());
 
   function buildChatQueueSnapshot(
@@ -1879,11 +1901,39 @@ export function ChatPage(props: ChatPageProps) {
     };
   }
 
+  function rememberChatQueueConversationId(conversationId: string) {
+    const key = conversationId.trim();
+    if (key) {
+      chatQueueKnownConversationIdsRef.current.add(key);
+    }
+    return key;
+  }
+
+  function collectChatQueueSnapshotConversationIds(
+    queue: readonly QueuedChatTurn[] = queuedChatTurnsRef.current,
+    extraConversationIds: readonly string[] = [],
+  ) {
+    const conversationIds = new Set(chatQueueKnownConversationIdsRef.current);
+    for (const item of queue) {
+      const key = rememberChatQueueConversationId(item.conversationId);
+      if (key) conversationIds.add(key);
+    }
+    for (const conversationId of extraConversationIds) {
+      const key = rememberChatQueueConversationId(conversationId);
+      if (key) conversationIds.add(key);
+    }
+    return conversationIds;
+  }
+
   function publishChatQueueSnapshot(
     conversationId: string,
     queue: readonly QueuedChatTurn[] = queuedChatTurnsRef.current,
   ) {
-    const snapshot = buildChatQueueSnapshot(conversationId, queue);
+    const targetConversationId = rememberChatQueueConversationId(conversationId);
+    if (!targetConversationId) {
+      return;
+    }
+    const snapshot = buildChatQueueSnapshot(targetConversationId, queue);
     void invoke("gateway_publish_chat_queue_event", {
       input: {
         conversationId: snapshot.conversationId,
@@ -1893,6 +1943,15 @@ export function ChatPage(props: ChatPageProps) {
     } as any).catch((error) => {
       console.warn("gateway_publish_chat_queue_event failed", error);
     });
+  }
+
+  function publishChatQueueSnapshots(
+    conversationIds: Iterable<string>,
+    queue: readonly QueuedChatTurn[] = queuedChatTurnsRef.current,
+  ) {
+    for (const conversationId of conversationIds) {
+      publishChatQueueSnapshot(conversationId, queue);
+    }
   }
 
   const setQueuedChatTurnsState = useCallback(
@@ -1907,9 +1966,7 @@ export function ChatPage(props: ChatPageProps) {
       for (const item of next) conversationIds.add(item.conversationId);
       const currentId = currentConversationIdRef.current.trim();
       if (currentId) conversationIds.add(currentId);
-      for (const conversationId of conversationIds) {
-        if (conversationId.trim()) publishChatQueueSnapshot(conversationId, next);
-      }
+      publishChatQueueSnapshots(conversationIds, next);
       return next;
     },
     [],
@@ -3059,50 +3116,154 @@ export function ChatPage(props: ChatPageProps) {
     return persisted;
   }
 
-  async function publishGatewayConversationActivity(
-    conversationId: string,
-    running: boolean,
-    workdir?: string,
-  ) {
+  function clearGatewayRuntimeSnapshotTimer(conversationId: string) {
     const targetConversationId = conversationId.trim();
     if (!targetConversationId) {
       return;
     }
+    const timerId = gatewayRuntimeSnapshotTimersRef.current.get(targetConversationId);
+    if (timerId === undefined) {
+      return;
+    }
+    window.clearTimeout(timerId);
+    gatewayRuntimeSnapshotTimersRef.current.delete(targetConversationId);
+  }
+
+  async function publishGatewayRuntimeSnapshot(
+    run: ActiveGatewayRuntimeRun,
+    state: GatewayRuntimeSnapshotState = run.state,
+  ) {
+    const liveTranscript = run.transcriptStore.getSnapshot();
+    const entries = buildGatewayRuntimeSnapshotEntries({
+      userMessage: run.userMessage,
+      liveTranscript,
+    });
+    run.state = state;
+    run.revision += 1;
+    const toolStatus = liveTranscript.toolStatus?.trim() || "";
 
     try {
-      await invoke("gateway_publish_conversation_activity", {
-        conversation_id: targetConversationId,
-        running,
-        workdir: workdir?.trim() || null,
+      await invoke("gateway_publish_chat_runtime_snapshot", {
+        input: {
+          conversationId: run.conversationId,
+          runId: run.runId,
+          clientRequestId: run.clientRequestId ?? "",
+          workerId: run.workerId ?? "",
+          state,
+          cwd: run.cwd ?? "",
+          updatedAt: Date.now(),
+          revision: run.revision,
+          entriesJson: JSON.stringify(entries),
+          toolStatus,
+          toolStatusIsCompaction: Boolean(toolStatus) && run.toolStatusIsCompaction,
+        },
       } as any);
     } catch (error) {
-      console.warn("gateway_publish_conversation_activity failed", error);
+      console.warn("gateway_publish_chat_runtime_snapshot failed", error);
     }
   }
 
-  function queueGatewayConversationActivity(
+  function queueGatewayRuntimeSnapshotForRun(
+    run: ActiveGatewayRuntimeRun,
+    options?: { state?: GatewayRuntimeSnapshotState; force?: boolean },
+  ) {
+    const state = options?.state ?? run.state;
+    run.state = state;
+    if (options?.force) {
+      clearGatewayRuntimeSnapshotTimer(run.conversationId);
+    } else if (gatewayRuntimeSnapshotTimersRef.current.has(run.conversationId)) {
+      return gatewayRuntimeSnapshotChainsRef.current.get(run.conversationId) ?? Promise.resolve();
+    }
+
+    const publish = () => {
+      gatewayRuntimeSnapshotTimersRef.current.delete(run.conversationId);
+      const previous =
+        gatewayRuntimeSnapshotChainsRef.current.get(run.conversationId) ?? Promise.resolve();
+      const next = previous
+        .catch(() => undefined)
+        .then(() => publishGatewayRuntimeSnapshot(run, state));
+      gatewayRuntimeSnapshotChainsRef.current.set(run.conversationId, next);
+      void next.finally(() => {
+        if (gatewayRuntimeSnapshotChainsRef.current.get(run.conversationId) === next) {
+          gatewayRuntimeSnapshotChainsRef.current.delete(run.conversationId);
+        }
+      });
+      return next;
+    };
+
+    if (options?.force) {
+      return publish();
+    }
+
+    const timerId = window.setTimeout(publish, GATEWAY_RUNTIME_SNAPSHOT_DEBOUNCE_MS);
+    gatewayRuntimeSnapshotTimersRef.current.set(run.conversationId, timerId);
+    return gatewayRuntimeSnapshotChainsRef.current.get(run.conversationId) ?? Promise.resolve();
+  }
+
+  function queueGatewayRuntimeSnapshot(
     conversationId: string,
-    running: boolean,
-    workdir?: string,
+    options?: { state?: GatewayRuntimeSnapshotState; force?: boolean },
+  ) {
+    const targetConversationId = conversationId.trim();
+    if (!targetConversationId) {
+      return Promise.resolve();
+    }
+    const run = activeGatewayRuntimeRunsRef.current.get(targetConversationId);
+    if (!run) {
+      return Promise.resolve();
+    }
+    return queueGatewayRuntimeSnapshotForRun(run, options);
+  }
+
+  function registerActiveGatewayRuntimeRun(run: ActiveGatewayRuntimeRun) {
+    activeGatewayRuntimeRunsRef.current.set(run.conversationId, run);
+    return run;
+  }
+
+  function finishActiveGatewayRuntimeRun(
+    conversationId: string,
+    state: GatewayRuntimeSnapshotState,
   ) {
     const targetConversationId = conversationId.trim();
     if (!targetConversationId) {
       return;
     }
-
-    const previous =
-      gatewayConversationActivityChainsRef.current.get(targetConversationId) ??
-      Promise.resolve();
-    const next = previous
-      .catch(() => undefined)
-      .then(() => publishGatewayConversationActivity(targetConversationId, running, workdir));
-    gatewayConversationActivityChainsRef.current.set(targetConversationId, next);
-    void next.finally(() => {
-      if (gatewayConversationActivityChainsRef.current.get(targetConversationId) === next) {
-        gatewayConversationActivityChainsRef.current.delete(targetConversationId);
+    const run = activeGatewayRuntimeRunsRef.current.get(targetConversationId);
+    if (!run) {
+      return;
+    }
+    void queueGatewayRuntimeSnapshotForRun(run, { state, force: true }).finally(() => {
+      if (activeGatewayRuntimeRunsRef.current.get(targetConversationId) === run) {
+        activeGatewayRuntimeRunsRef.current.delete(targetConversationId);
       }
+      clearGatewayRuntimeSnapshotTimer(targetConversationId);
     });
   }
+
+  useEffect(
+    () => () => {
+      for (const timerId of gatewayRuntimeSnapshotTimersRef.current.values()) {
+        window.clearTimeout(timerId);
+      }
+      gatewayRuntimeSnapshotTimersRef.current.clear();
+      activeGatewayRuntimeRunsRef.current.clear();
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!canShareHistory) {
+      return;
+    }
+    publishChatQueueSnapshots(
+      collectChatQueueSnapshotConversationIds(queuedChatTurnsRef.current, [
+        currentConversationIdRef.current,
+      ]),
+    );
+    for (const run of activeGatewayRuntimeRunsRef.current.values()) {
+      void queueGatewayRuntimeSnapshotForRun(run, { state: run.state, force: true });
+    }
+  }, [canShareHistory, remoteRuntimeStatus.connectedSince, remoteRuntimeStatus.sessionId]);
 
   function applyGatewayBridgeRebase(conversationId: string, baseMessageRef: HistoryMessageRef) {
     const targetConversationId = conversationId.trim();
@@ -3524,7 +3685,11 @@ export function ChatPage(props: ChatPageProps) {
       requestId: gatewayBridgeRequestId,
       workerId: gatewayBridgeWorkerId,
       enabled: Boolean(gatewayBridgeRequest) || hasRemoteGatewayTarget,
-      sendEvent: queueGatewayBridgeEventForRequest,
+      sendEvent: (requestId, event, options) => {
+        const result = queueGatewayBridgeEventForRequest(requestId, event, options);
+        void queueGatewayRuntimeSnapshot(conversationId);
+        return result;
+      },
       resolveErrorConversationId: () =>
         gatewayBridgeRequest?.conversationId ?? currentConversationIdRef.current,
     });
@@ -3535,6 +3700,11 @@ export function ChatPage(props: ChatPageProps) {
     ) => {
       gatewayBridgeEvents.queueToolStatus(status, isCompaction);
       updateToolStatus(status, transcriptStore, visible);
+      const run = activeGatewayRuntimeRunsRef.current.get(conversationId);
+      if (run) {
+        run.toolStatusIsCompaction = Boolean(status?.trim()) && isCompaction;
+      }
+      void queueGatewayRuntimeSnapshot(conversationId);
     };
     const setConversationErrorState = (message: string | null) => {
       updateConversationRuntimeEntry(conversationId, (prev) => ({
@@ -3798,7 +3968,21 @@ export function ChatPage(props: ChatPageProps) {
         return;
       }
       gatewayRunStarted = true;
-      queueGatewayConversationActivity(conversationId, true, conversationCwd);
+      if (gatewayBridgeRequest || hasRemoteGatewayTarget) {
+        const run = registerActiveGatewayRuntimeRun({
+          conversationId,
+          runId: gatewayBridgeRequestId,
+          clientRequestId: gatewayBridgeRequest?.clientRequestId,
+          workerId: gatewayBridgeWorkerId,
+          cwd: conversationCwd,
+          revision: 0,
+          state: "running",
+          userMessage: pendingUserMessage,
+          transcriptStore,
+          toolStatusIsCompaction: false,
+        });
+        void queueGatewayRuntimeSnapshotForRun(run, { state: "running", force: true });
+      }
     }
     function markConversationRunStarted() {
       if (conversationRunStarted) {
@@ -3813,14 +3997,14 @@ export function ChatPage(props: ChatPageProps) {
         stickToBottom();
       }
     }
-    function markConversationRunStopped() {
+    function markConversationRunStopped(state: GatewayRuntimeSnapshotState = "completed") {
       if (!conversationRunStarted) {
         return;
       }
       setConversationAbortController(conversationId, null);
       setConversationSendingState(conversationId, false);
       if (gatewayRunStarted) {
-        queueGatewayConversationActivity(conversationId, false, conversationCwd);
+        finishActiveGatewayRuntimeRun(conversationId, state);
       }
     }
     let localGatewayRunStarted = false;
@@ -3851,16 +4035,14 @@ export function ChatPage(props: ChatPageProps) {
         setConversationErrorState(message);
         gatewayBridgeEvents.emitError(message, conversationId);
         gatewayBridgeEvents.close();
-        markConversationRunStopped();
+        markConversationRunStopped("failed");
         return false;
       }
     }
 
     // Persist the user turn immediately so WebUI/GUI sidebars can surface the
-    // latest conversation before the assistant round finishes. For gateway
-    // requests, the desktop-owned run must be marked started first; otherwise
-    // the history running broadcast can make WebUI subscribe to the synthetic
-    // conversation-live run instead of the real queued request.
+    // latest conversation before the assistant round finishes. The live runtime
+    // itself is mirrored through ChatRuntimeSnapshot, not history_sync.
     const initialPersist = persistConversationWithHistorySync({
       conversationId,
       sessionId,
@@ -3880,7 +4062,7 @@ export function ChatPage(props: ChatPageProps) {
         setConversationErrorState(message);
         gatewayBridgeEvents.emitError(message, conversationId);
         gatewayBridgeEvents.close();
-        markConversationRunStopped();
+        markConversationRunStopped("failed");
         return true;
       }
       try {
@@ -3890,7 +4072,7 @@ export function ChatPage(props: ChatPageProps) {
         setConversationErrorState(message);
         gatewayBridgeEvents.emitError(message, conversationId);
         gatewayBridgeEvents.close();
-        markConversationRunStopped();
+        markConversationRunStopped("failed");
         return true;
       }
     } else {
@@ -4075,7 +4257,7 @@ export function ChatPage(props: ChatPageProps) {
         setConversationErrorState(message);
         gatewayBridgeEvents.emitError(message, conversationId);
         gatewayBridgeEvents.close();
-        markConversationRunStopped();
+        markConversationRunStopped("failed");
         return true;
       }
 
@@ -4492,6 +4674,7 @@ export function ChatPage(props: ChatPageProps) {
       }));
     }
 
+    let gatewayRuntimeFinalState: GatewayRuntimeSnapshotState = "completed";
     try {
       if (effectiveIsAgentMode) {
         await chatRuntimeHost.runTurn({
@@ -4630,6 +4813,7 @@ export function ChatPage(props: ChatPageProps) {
       }
     } catch (err) {
       const aborted = requestController.signal.aborted || isAbortLikeError(err);
+      gatewayRuntimeFinalState = aborted ? "cancelled" : "failed";
       const remoteErrorMessage = aborted
         ? "Cancelled"
         : (err instanceof Error ? err.message : String(err)) || "Request failed";
@@ -4656,7 +4840,7 @@ export function ChatPage(props: ChatPageProps) {
       clearCompactionRollback();
       hookLifecycle.endAgent();
       clearAbortSnapshot(transcriptStore);
-      markConversationRunStopped();
+      markConversationRunStopped(gatewayRuntimeFinalState);
       pruneIdleConversationCaches([conversationId]);
       requestQueuedChatTurnProcessing(conversationId);
     }

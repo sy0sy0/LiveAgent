@@ -384,10 +384,6 @@ func (s *blockingAppendChatEventStore) Replay(string, string, int64, int) (sessi
 	return session.ChatRunSnapshot{}, nil, false, nil
 }
 
-func (s *blockingAppendChatEventStore) FailOpenRuns(string) error {
-	return nil
-}
-
 func (s *blockingAppendChatEventStore) Close() error {
 	return nil
 }
@@ -496,7 +492,7 @@ func TestStartAcceptedChatCommandUsesInMemoryConversationSeqDuringPersistLag(t *
 	}
 }
 
-func TestClearSessionIfHeartbeatStaleFailsOpenChatRuns(t *testing.T) {
+func TestClearSessionIfHeartbeatStalePreservesOpenChatRuns(t *testing.T) {
 	t.Parallel()
 
 	sm := newTestSessionManager()
@@ -509,7 +505,7 @@ func TestClearSessionIfHeartbeatStaleFailsOpenChatRuns(t *testing.T) {
 	); err != nil {
 		t.Fatalf("StartPendingChatCommandRun: %v", err)
 	}
-	ch, _, cleanup, _, err := sm.SubscribeChatRun("request-1", "conversation-1", 0)
+	ch, done, cleanup, _, err := sm.SubscribeChatRun("request-1", "conversation-1", 0)
 	if err != nil {
 		t.Fatalf("SubscribeChatRun: %v", err)
 	}
@@ -519,16 +515,16 @@ func TestClearSessionIfHeartbeatStaleFailsOpenChatRuns(t *testing.T) {
 	if !sm.ClearSessionIfHeartbeatStale(sess, time.Nanosecond) {
 		t.Fatalf("current stale session was not cleared")
 	}
+	assertDoneOpen(t, done)
 	select {
 	case event := <-ch:
-		if event.Event.GetType() != gatewayv1.ChatEvent_ERROR {
-			t.Fatalf("event type = %v, want ERROR", event.Event.GetType())
-		}
-		if !strings.Contains(event.Event.GetData(), "Desktop agent disconnected") {
-			t.Fatalf("event data = %q", event.Event.GetData())
-		}
-	case <-time.After(time.Second):
-		t.Fatalf("timed out waiting for heartbeat timeout chat error")
+		t.Fatalf("unexpected chat event after heartbeat timeout: %#v", event)
+	default:
+	}
+	got := activeChatRunConversationIDs(sm)
+	want := []string{"conversation-1"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("active chat runs after heartbeat timeout = %#v, want %#v", got, want)
 	}
 }
 
@@ -1002,6 +998,211 @@ func TestDesktopBroadcastChatEventCreatesAttachableRun(t *testing.T) {
 	}
 }
 
+func TestChatRuntimeSnapshotCreatesAttachableConversationRun(t *testing.T) {
+	t.Parallel()
+
+	sm := newTestSessionManager()
+	sm.SetSession(session.NewAgentSession(sm.LatestAuthSnapshot()))
+
+	sm.DispatchFromAgent(&gatewayv1.AgentEnvelope{
+		RequestId: "runtime-snapshot-1",
+		Payload: &gatewayv1.AgentEnvelope_ChatRuntimeSnapshot{
+			ChatRuntimeSnapshot: &gatewayv1.ChatRuntimeSnapshot{
+				ConversationId:         "conversation-1",
+				RunId:                  "run-1",
+				ClientRequestId:        "client-1",
+				WorkerId:               "gui-live",
+				State:                  session.ChatRunStateRunning,
+				Cwd:                    "/workspace",
+				Revision:               1,
+				EntriesJson:            `[{"id":"u1","kind":"user","text":"hello","attachments":[]},{"id":"a1","kind":"assistant","text":"partial","round":1}]`,
+				ToolStatus:             "Thinking...",
+				ToolStatusIsCompaction: false,
+			},
+		},
+	})
+
+	summaries := sm.ActiveChatRunSummaries()
+	if len(summaries) != 1 ||
+		summaries[0].ConversationID != "conversation-1" ||
+		summaries[0].RequestID != "run-1" ||
+		summaries[0].Workdir != "/workspace" {
+		t.Fatalf("active summaries = %#v, want snapshot-backed run-1", summaries)
+	}
+
+	ch, done, cleanup, snapshot, err := sm.SubscribeChatRun("", "conversation-1", 0)
+	if err != nil {
+		t.Fatalf("SubscribeChatRun: %v", err)
+	}
+	defer cleanup()
+	assertDoneOpen(t, done)
+	if snapshot.RequestID != "run-1" || snapshot.State != session.ChatRunStateRunning || snapshot.Done {
+		t.Fatalf("snapshot = %#v, want running run-1", snapshot)
+	}
+
+	select {
+	case event := <-ch:
+		if event.RequestID != "run-1" || event.Seq != 1 {
+			t.Fatalf("runtime snapshot event = %#v, want run-1 seq 1", event)
+		}
+		eventType, _ := event.Payload["type"].(string)
+		if eventType != "runtime_snapshot" {
+			t.Fatalf("payload type = %q, want runtime_snapshot", eventType)
+		}
+		entriesJSON, _ := event.Payload["entries_json"].(string)
+		if !strings.Contains(entriesJSON, "partial") {
+			t.Fatalf("entries_json = %q, want partial assistant text", entriesJSON)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for runtime snapshot replay")
+	}
+}
+
+func TestChatRuntimeSnapshotTerminalClosesSubscribers(t *testing.T) {
+	t.Parallel()
+
+	sm := newTestSessionManager()
+	sm.SetSession(session.NewAgentSession(sm.LatestAuthSnapshot()))
+	sm.ApplyChatRuntimeSnapshot(&gatewayv1.ChatRuntimeSnapshot{
+		ConversationId: "conversation-1",
+		RunId:          "run-1",
+		State:          session.ChatRunStateRunning,
+		Revision:       1,
+		EntriesJson:    `[{"id":"u1","kind":"user","text":"hello","attachments":[]}]`,
+	})
+
+	ch, done, cleanup, _, err := sm.SubscribeChatRun("run-1", "conversation-1", 1)
+	if err != nil {
+		t.Fatalf("SubscribeChatRun: %v", err)
+	}
+	defer cleanup()
+	assertDoneOpen(t, done)
+
+	sm.ApplyChatRuntimeSnapshot(&gatewayv1.ChatRuntimeSnapshot{
+		ConversationId: "conversation-1",
+		RunId:          "run-1",
+		State:          session.ChatRunStateCompleted,
+		Revision:       2,
+		EntriesJson:    `[{"id":"u1","kind":"user","text":"hello","attachments":[]},{"id":"a1","kind":"assistant","text":"done","round":1}]`,
+	})
+
+	select {
+	case event := <-ch:
+		eventType, _ := event.Payload["type"].(string)
+		state, _ := event.Payload["state"].(string)
+		if eventType != "runtime_snapshot" || state != session.ChatRunStateCompleted {
+			t.Fatalf("terminal snapshot event = %#v, want completed runtime_snapshot", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for terminal runtime snapshot")
+	}
+	assertDoneClosed(t, done)
+	if summaries := sm.ActiveChatRunSummaries(); len(summaries) != 0 {
+		t.Fatalf("active summaries after terminal snapshot = %#v, want empty", summaries)
+	}
+}
+
+func TestChatRuntimeSnapshotIgnoresStaleRunningAfterTerminal(t *testing.T) {
+	t.Parallel()
+
+	sm := newTestSessionManager()
+	sm.SetSession(session.NewAgentSession(sm.LatestAuthSnapshot()))
+	sm.ApplyChatRuntimeSnapshot(&gatewayv1.ChatRuntimeSnapshot{
+		ConversationId: "conversation-1",
+		RunId:          "run-1",
+		State:          session.ChatRunStateRunning,
+		Revision:       1,
+		EntriesJson:    `[{"id":"u1","kind":"user","text":"hello","attachments":[]}]`,
+	})
+	sm.ApplyChatRuntimeSnapshot(&gatewayv1.ChatRuntimeSnapshot{
+		ConversationId: "conversation-1",
+		RunId:          "run-1",
+		State:          session.ChatRunStateCompleted,
+		Revision:       2,
+		EntriesJson:    `[{"id":"u1","kind":"user","text":"hello","attachments":[]},{"id":"a1","kind":"assistant","text":"done","round":1}]`,
+	})
+	sm.ApplyChatRuntimeSnapshot(&gatewayv1.ChatRuntimeSnapshot{
+		ConversationId: "conversation-1",
+		RunId:          "run-1",
+		State:          session.ChatRunStateRunning,
+		Revision:       1,
+		EntriesJson:    `[{"id":"u1","kind":"user","text":"hello","attachments":[]},{"id":"a1","kind":"assistant","text":"stale","round":1}]`,
+	})
+
+	if summaries := sm.ActiveChatRunSummaries(); len(summaries) != 0 {
+		t.Fatalf("active summaries after stale running snapshot = %#v, want empty", summaries)
+	}
+	snapshot, ok := sm.ChatRunSnapshot("run-1", "conversation-1")
+	if !ok || snapshot.State != session.ChatRunStateCompleted || !snapshot.Done || snapshot.LatestSeq != 2 {
+		t.Fatalf("snapshot after stale running = %#v ok=%v, want completed seq 2", snapshot, ok)
+	}
+}
+
+func TestChatRuntimeSnapshotTerminalCanFollowDoneEvent(t *testing.T) {
+	t.Parallel()
+
+	sm := newTestSessionManager()
+	sm.SetSession(session.NewAgentSession(sm.LatestAuthSnapshot()))
+	sm.ApplyChatRuntimeSnapshot(&gatewayv1.ChatRuntimeSnapshot{
+		ConversationId: "conversation-1",
+		RunId:          "run-1",
+		State:          session.ChatRunStateRunning,
+		Revision:       1,
+		EntriesJson:    `[{"id":"u1","kind":"user","text":"hello","attachments":[]}]`,
+	})
+	sm.DispatchFromAgent(&gatewayv1.AgentEnvelope{
+		RequestId: "run-1",
+		Payload: &gatewayv1.AgentEnvelope_ChatEvent{
+			ChatEvent: &gatewayv1.ChatEvent{
+				Type:           gatewayv1.ChatEvent_DONE,
+				ConversationId: "conversation-1",
+				Data:           `{}`,
+			},
+		},
+	})
+	sm.ApplyChatRuntimeSnapshot(&gatewayv1.ChatRuntimeSnapshot{
+		ConversationId: "conversation-1",
+		RunId:          "run-1",
+		State:          session.ChatRunStateCompleted,
+		Revision:       2,
+		EntriesJson:    `[{"id":"u1","kind":"user","text":"hello","attachments":[]},{"id":"a1","kind":"assistant","text":"final","round":1}]`,
+	})
+
+	ch, _, cleanup, snapshot, err := sm.SubscribeChatRun("run-1", "conversation-1", 0)
+	if err != nil {
+		t.Fatalf("SubscribeChatRun: %v", err)
+	}
+	defer cleanup()
+	if snapshot.State != session.ChatRunStateCompleted || !snapshot.Done || snapshot.LatestSeq != 3 {
+		t.Fatalf("snapshot = %#v, want completed seq 3", snapshot)
+	}
+
+	gotRuntimeSnapshots := 0
+	gotFinalSnapshot := false
+	for gotRuntimeSnapshots < 2 {
+		select {
+		case event := <-ch:
+			if event.Payload == nil {
+				continue
+			}
+			eventType, _ := event.Payload["type"].(string)
+			if eventType != "runtime_snapshot" {
+				continue
+			}
+			gotRuntimeSnapshots += 1
+			entriesJSON, _ := event.Payload["entries_json"].(string)
+			if strings.Contains(entriesJSON, "final") {
+				gotFinalSnapshot = true
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for final runtime snapshot")
+		}
+	}
+	if !gotFinalSnapshot {
+		t.Fatalf("final runtime snapshot was not replayed")
+	}
+}
+
 func TestHistoryRunningDoesNotCreateAttachableConversationRun(t *testing.T) {
 	t.Parallel()
 
@@ -1352,7 +1553,7 @@ func TestActiveChatRunSummariesReturnOpenRuns(t *testing.T) {
 	}
 }
 
-func TestClearSessionFailsOpenChatRuns(t *testing.T) {
+func TestClearSessionPreservesOpenChatRuns(t *testing.T) {
 	t.Parallel()
 
 	sm := newTestSessionManager()
@@ -1382,21 +1583,14 @@ func TestClearSessionFailsOpenChatRuns(t *testing.T) {
 
 	select {
 	case event := <-ch:
-		if event.Event.GetType() != gatewayv1.ChatEvent_ERROR {
-			t.Fatalf("event type = %v, want ERROR", event.Event.GetType())
-		}
-		if event.Event.GetConversationId() != "conversation-1" {
-			t.Fatalf("conversation id = %q, want conversation-1", event.Event.GetConversationId())
-		}
-		if !strings.Contains(event.Event.GetData(), "Desktop agent disconnected") {
-			t.Fatalf("event data = %q, want disconnect message", event.Event.GetData())
-		}
-	case <-time.After(time.Second):
-		t.Fatalf("timed out waiting for disconnect chat error")
+		t.Fatalf("unexpected chat event after session clear: %#v", event)
+	default:
 	}
 
-	if got := activeChatRunConversationIDs(sm); len(got) != 0 {
-		t.Fatalf("active chat runs after disconnect = %#v, want empty", got)
+	got := activeChatRunConversationIDs(sm)
+	want := []string{"conversation-1"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("active chat runs after disconnect = %#v, want %#v", got, want)
 	}
 
 	restarted, created, err := sm.StartPendingChatCommandRun(
@@ -1407,8 +1601,20 @@ func TestClearSessionFailsOpenChatRuns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartPendingChatCommandRun retry: %v", err)
 	}
-	if !created || restarted.RequestID != "request-2" {
-		t.Fatalf("retry run = %#v created=%v, want new request-2", restarted, created)
+	if created || restarted.RequestID != "request-1" {
+		t.Fatalf("retry run = %#v created=%v, want preserved request-1", restarted, created)
+	}
+
+	sm.SetSession(session.NewAgentSession(sm.LatestAuthSnapshot()))
+	sm.ApplyChatRuntimeSnapshot(&gatewayv1.ChatRuntimeSnapshot{
+		ConversationId: "conversation-1",
+		RunId:          "request-1",
+		State:          session.ChatRunStateRunning,
+		EntriesJson:    `[{"id":"u1","kind":"user","text":"hello","attachments":[]}]`,
+		Revision:       1,
+	})
+	if snapshot, ok := sm.ChatRunSnapshot("request-1", "conversation-1"); !ok || snapshot.State != session.ChatRunStateRunning || snapshot.Done {
+		t.Fatalf("snapshot after reconnect = %#v ok=%v, want running request-1", snapshot, ok)
 	}
 }
 
@@ -1430,4 +1636,93 @@ func TestStaleClearSessionDoesNotFailReplacementChatRun(t *testing.T) {
 		t.Fatalf("active chat runs after stale clear = %#v, want %#v", got, want)
 	}
 	assertDoneOpen(t, second.Done())
+}
+
+func TestChatQueueEventsReplayLatestSnapshotToNewSubscribers(t *testing.T) {
+	t.Parallel()
+
+	sm := newTestSessionManager()
+	sm.SetSession(session.NewAgentSession(sm.LatestAuthSnapshot()))
+	sm.DispatchFromAgent(&gatewayv1.AgentEnvelope{
+		RequestId: "queue-event-1",
+		Payload: &gatewayv1.AgentEnvelope_ChatQueueEvent{
+			ChatQueueEvent: &gatewayv1.ChatQueueEvent{
+				ConversationId: " conversation-1 ",
+				SnapshotJson:   `{"conversationId":"conversation-1","revision":2,"items":[{"id":"queue-1"}]}`,
+				Revision:       2,
+			},
+		},
+	})
+	sm.DispatchFromAgent(&gatewayv1.AgentEnvelope{
+		RequestId: "queue-event-stale",
+		Payload: &gatewayv1.AgentEnvelope_ChatQueueEvent{
+			ChatQueueEvent: &gatewayv1.ChatQueueEvent{
+				ConversationId: "conversation-1",
+				SnapshotJson:   `{"conversationId":"conversation-1","revision":1,"items":[]}`,
+				Revision:       1,
+			},
+		},
+	})
+	sm.DispatchFromAgent(&gatewayv1.AgentEnvelope{
+		RequestId: "queue-event-zero",
+		Payload: &gatewayv1.AgentEnvelope_ChatQueueEvent{
+			ChatQueueEvent: &gatewayv1.ChatQueueEvent{
+				ConversationId: "conversation-1",
+				SnapshotJson:   `{"conversationId":"conversation-1","revision":0,"items":[]}`,
+				Revision:       0,
+			},
+		},
+	})
+
+	cached, ok := sm.ChatQueueSnapshot("conversation-1")
+	if !ok || cached.GetRevision() != 2 || !strings.Contains(cached.GetSnapshotJson(), "queue-1") {
+		t.Fatalf("cached queue snapshot = %#v ok=%v, want revision 2 with queue-1", cached, ok)
+	}
+
+	events, cleanup := sm.SubscribeChatQueueEvents()
+	defer cleanup()
+	select {
+	case event := <-events:
+		if event.GetConversationId() != "conversation-1" ||
+			event.GetRevision() != 2 ||
+			!strings.Contains(event.GetSnapshotJson(), "queue-1") {
+			t.Fatalf("replayed queue snapshot = %#v, want latest revision 2", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for replayed queue snapshot")
+	}
+}
+
+func TestChatQueueSnapshotAllowsNewSessionToResetRevision(t *testing.T) {
+	t.Parallel()
+
+	sm := newTestSessionManager()
+	sm.SetSession(session.NewAgentSession(sm.LatestAuthSnapshot()))
+	sm.DispatchFromAgent(&gatewayv1.AgentEnvelope{
+		RequestId: "queue-event-1",
+		Payload: &gatewayv1.AgentEnvelope_ChatQueueEvent{
+			ChatQueueEvent: &gatewayv1.ChatQueueEvent{
+				ConversationId: "conversation-1",
+				SnapshotJson:   `{"conversationId":"conversation-1","revision":5,"items":[{"id":"queue-1"}]}`,
+				Revision:       5,
+			},
+		},
+	})
+
+	sm.SetSession(session.NewAgentSession(sm.LatestAuthSnapshot()))
+	sm.DispatchFromAgent(&gatewayv1.AgentEnvelope{
+		RequestId: "queue-event-reset",
+		Payload: &gatewayv1.AgentEnvelope_ChatQueueEvent{
+			ChatQueueEvent: &gatewayv1.ChatQueueEvent{
+				ConversationId: "conversation-1",
+				SnapshotJson:   `{"conversationId":"conversation-1","revision":0,"items":[]}`,
+				Revision:       0,
+			},
+		},
+	})
+
+	cached, ok := sm.ChatQueueSnapshot("conversation-1")
+	if !ok || cached.GetRevision() != 0 || strings.Contains(cached.GetSnapshotJson(), "queue-1") {
+		t.Fatalf("cached queue snapshot after new session = %#v ok=%v, want empty revision 0", cached, ok)
+	}
 }

@@ -21,8 +21,6 @@ const (
 	chatRunStartRetention    = 5 * time.Minute
 	chatRunStaleRetention    = 12 * time.Hour
 
-	agentDisconnectedChatRunMessage = "Desktop agent disconnected. Please retry."
-
 	chatRuntimeReadyTTL      = 15 * time.Second
 	agentSessionHeartbeatTTL = 90 * time.Second
 	defaultRuntimeReadyState = "ready"
@@ -109,23 +107,24 @@ const (
 )
 
 type chatRun struct {
-	requestID        string
-	conversationID   string
-	clientRequestID  string
-	workdir          string
-	sessionEpoch     uint64
-	runEpoch         int64
-	events           []*ChatBroadcastEvent
-	nextSeq          int64
-	state            string
-	errorCode        string
-	accepted         bool
-	started          bool
-	firstDeltaLogged bool
-	done             bool
-	updatedAt        time.Time
-	expiresAt        time.Time
-	subscribers      map[int]*chatRunSubscriber
+	requestID               string
+	conversationID          string
+	clientRequestID         string
+	workdir                 string
+	sessionEpoch            uint64
+	runEpoch                int64
+	events                  []*ChatBroadcastEvent
+	nextSeq                 int64
+	state                   string
+	errorCode               string
+	accepted                bool
+	started                 bool
+	firstDeltaLogged        bool
+	done                    bool
+	runtimeSnapshotRevision int64
+	updatedAt               time.Time
+	expiresAt               time.Time
+	subscribers             map[int]*chatRunSubscriber
 }
 
 type chatRunSubscriber struct {
@@ -162,10 +161,5 @@ func NewManager() *Manager {
 func NewManagerWithChatEventStore(store ChatEventStore) (*Manager, error) {
 	manager := NewManager()
 	manager.chatStore.eventStore = store
-	if store != nil {
-		if err := store.FailOpenRuns("Gateway restarted before the remote chat run finished. Please retry."); err != nil {
-			return nil, err
-		}
-	}
 	return manager, nil
 }

@@ -97,6 +97,22 @@ export type ChatControlEvent = {
   workdir?: string;
 };
 
+export type ChatRuntimeSnapshotEvent = {
+  type: "runtime_snapshot";
+  conversation_id?: string;
+  run_id?: string;
+  client_request_id?: string;
+  worker_id?: string;
+  state?: ChatRunControlState;
+  updated_at?: number;
+  revision?: number;
+  entries_json?: string;
+  tool_status?: string | null;
+  tool_status_is_compaction?: boolean;
+  seq?: number;
+  workdir?: string;
+};
+
 export type ChatEvent = (
   | {
       type: "token";
@@ -164,6 +180,7 @@ export type ChatEvent = (
       conversation_id?: string;
     }
   | { type: "error"; message: string; round?: number; conversation_id?: string }
+  | ChatRuntimeSnapshotEvent
   | ChatControlEvent
 ) & { seq?: number; workdir?: string };
 

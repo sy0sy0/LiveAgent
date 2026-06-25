@@ -1,5 +1,5 @@
 import { pushChatEvent, type ChatEntry } from "./chatUi";
-import type { ChatEvent } from "./gatewayTypes";
+import type { ChatEvent, ChatRuntimeSnapshotEvent } from "./gatewayTypes";
 
 export type LiveConversationStreamSnapshot = {
   revision: number;
@@ -11,6 +11,7 @@ export type LiveConversationStreamSnapshot = {
 export type LiveConversationStreamStore = {
   getSnapshot: () => LiveConversationStreamSnapshot;
   subscribe: (listener: () => void) => () => void;
+  applySnapshot: (event: ChatRuntimeSnapshotEvent, options?: { flush?: boolean }) => void;
   appendEvent: (event: ChatEvent, options?: { flush?: boolean }) => void;
   setToolStatus: (
     toolStatus: string | null | undefined,
@@ -85,6 +86,51 @@ function readChatEventSeq(event: ChatEvent) {
     : null;
 }
 
+function readRuntimeSnapshotRevision(event: ChatRuntimeSnapshotEvent) {
+  return typeof event.revision === "number" && Number.isFinite(event.revision) && event.revision > 0
+    ? Math.floor(event.revision)
+    : 0;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function isSnapshotChatEntry(value: unknown): value is ChatEntry {
+  if (!isRecord(value) || typeof value.id !== "string" || typeof value.kind !== "string") {
+    return false;
+  }
+  switch (value.kind) {
+    case "user":
+      return typeof value.text === "string" && Array.isArray(value.attachments);
+    case "assistant":
+    case "thinking":
+    case "error":
+      return typeof value.text === "string";
+    case "tool_call":
+      return isRecord(value.toolCall);
+    case "tool_result":
+      return isRecord(value.toolResult);
+    case "hosted_search":
+      return isRecord(value.hostedSearch);
+    default:
+      return false;
+  }
+}
+
+function parseRuntimeSnapshotEntries(entriesJson: string | undefined) {
+  const raw = typeof entriesJson === "string" ? entriesJson.trim() : "";
+  if (!raw) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter(isSnapshotChatEntry) : [];
+  } catch {
+    return [];
+  }
+}
+
 function isTerminalChatEvent(event: ChatEvent) {
   if (event.type === "done" || event.type === "error") {
     return true;
@@ -146,6 +192,8 @@ export function createLiveConversationStreamStore(): LiveConversationStreamStore
   let timeoutId: number | null = null;
   let rafFallbackTimeoutId: number | null = null;
   let lastCommitAt = 0;
+  let latestRuntimeSnapshotRevision = 0;
+  let latestRuntimeSnapshotSeq = 0;
   const seenEventSeqs = new Set<number>();
   const listeners = new Set<() => void>();
 
@@ -259,6 +307,9 @@ export function createLiveConversationStreamStore(): LiveConversationStreamStore
     appendEvent: (event, options) => {
       const eventSeq = readChatEventSeq(event);
       if (eventSeq !== null) {
+        if (latestRuntimeSnapshotSeq > 0 && eventSeq <= latestRuntimeSnapshotSeq) {
+          return;
+        }
         if (seenEventSeqs.has(eventSeq)) {
           return;
         }
@@ -313,6 +364,55 @@ export function createLiveConversationStreamStore(): LiveConversationStreamStore
         options,
       );
     },
+    applySnapshot: (event, options) => {
+      const eventSeq = readChatEventSeq(event);
+      const snapshotRevision = readRuntimeSnapshotRevision(event);
+      if (
+        snapshotRevision > 0 &&
+        latestRuntimeSnapshotRevision > 0 &&
+        snapshotRevision < latestRuntimeSnapshotRevision
+      ) {
+        return;
+      }
+      if (
+        snapshotRevision > 0 &&
+        latestRuntimeSnapshotRevision > 0 &&
+        snapshotRevision === latestRuntimeSnapshotRevision &&
+        eventSeq !== null &&
+        latestRuntimeSnapshotSeq > 0 &&
+        eventSeq <= latestRuntimeSnapshotSeq
+      ) {
+        return;
+      }
+
+      const entries = parseRuntimeSnapshotEntries(event.entries_json);
+      const toolStatus = normalizeOptionalStatus(event.tool_status);
+      const toolStatusIsCompaction = Boolean(toolStatus) && event.tool_status_is_compaction === true;
+
+      latestRuntimeSnapshotRevision = Math.max(latestRuntimeSnapshotRevision, snapshotRevision);
+      if (eventSeq !== null) {
+        latestRuntimeSnapshotSeq = Math.max(latestRuntimeSnapshotSeq, eventSeq);
+        seenEventSeqs.add(eventSeq);
+      }
+      updateDraft(
+        (previous) => {
+          if (
+            previous.entries === entries &&
+            previous.toolStatus === toolStatus &&
+            previous.toolStatusIsCompaction === toolStatusIsCompaction
+          ) {
+            return previous;
+          }
+          return {
+            ...previous,
+            entries,
+            toolStatus,
+            toolStatusIsCompaction,
+          };
+        },
+        options,
+      );
+    },
     setToolStatus: (toolStatus, isCompaction = false, options) => {
       updateDraft(
         (previous) => {
@@ -347,6 +447,8 @@ export function createLiveConversationStreamStore(): LiveConversationStreamStore
         revision: draft.revision + 1,
       };
       seenEventSeqs.clear();
+      latestRuntimeSnapshotRevision = 0;
+      latestRuntimeSnapshotSeq = 0;
       cancelScheduledCommit();
       commit();
     },

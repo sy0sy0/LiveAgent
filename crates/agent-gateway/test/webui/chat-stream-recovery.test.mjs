@@ -7,6 +7,8 @@ test("chat stream recovery detects released attach streams", () => {
   const {
     isChatStreamNotAvailableEvent,
     isChatStreamNotAvailableMessage,
+    isRecoverableChatStreamTransportMessage,
+    isRecoverableChatStreamTransportStatus,
     resolveChatStreamUnavailableRecoveryAction,
     shouldHydrateRestoredConversationSnapshot,
   } = loader.loadModule("src/lib/chatStreamRecovery.ts");
@@ -17,6 +19,15 @@ test("chat stream recovery detects released attach streams", () => {
     true,
   );
   assert.equal(isChatStreamNotAvailableMessage("chat request failed"), false);
+  assert.equal(isRecoverableChatStreamTransportStatus(502), true);
+  assert.equal(isRecoverableChatStreamTransportStatus(404), false);
+  assert.equal(
+    isRecoverableChatStreamTransportMessage(
+      "<html><head><title>502 Bad Gateway</title></head><body>nginx</body></html>",
+    ),
+    true,
+  );
+  assert.equal(isRecoverableChatStreamTransportMessage("model rejected the request"), false);
 
   assert.equal(
     isChatStreamNotAvailableEvent({

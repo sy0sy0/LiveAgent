@@ -27,7 +27,15 @@ func (c *websocketConnection) handleChatQueueRequest(req websocketRequest) {
 		_ = c.writeError(req.ID, "invalid "+req.Type+" payload")
 		return
 	}
+	action := chatQueueActionFromRequestType(req.Type)
+	conversationID := strings.TrimSpace(body.ConversationID)
 	if !c.sm.IsOnline() {
+		if action == "get" {
+			if event, ok := c.sm.ChatQueueSnapshot(conversationID); ok {
+				_ = c.writeResponse(req.ID, websocketChatQueueSnapshotResponsePayload(event))
+				return
+			}
+		}
 		_ = c.writeError(req.ID, "agent offline")
 		return
 	}
@@ -37,8 +45,8 @@ func (c *websocketConnection) handleChatQueueRequest(req websocketRequest) {
 		Timestamp: time.Now().Unix(),
 		Payload: &gatewayv1.GatewayEnvelope_ChatQueue{
 			ChatQueue: &gatewayv1.ChatQueueRequest{
-				Action:            chatQueueActionFromRequestType(req.Type),
-				ConversationId:    strings.TrimSpace(body.ConversationID),
+				Action:            action,
+				ConversationId:    conversationID,
 				ItemId:            strings.TrimSpace(body.ItemID),
 				Direction:         strings.TrimSpace(body.Direction),
 				Revision:          body.Revision,
@@ -49,6 +57,12 @@ func (c *websocketConnection) handleChatQueueRequest(req websocketRequest) {
 		},
 	})
 	if err != nil {
+		if action == "get" {
+			if event, ok := c.sm.ChatQueueSnapshot(conversationID); ok {
+				_ = c.writeResponse(req.ID, websocketChatQueueSnapshotResponsePayload(event))
+				return
+			}
+		}
 		_ = c.writeError(req.ID, websocketErrorMessage(err))
 		return
 	}
@@ -71,4 +85,15 @@ func (c *websocketConnection) handleChatQueueRequest(req websocketRequest) {
 		"error_code":    resp.GetErrorCode(),
 		"revision":      resp.GetRevision(),
 	})
+}
+
+func websocketChatQueueSnapshotResponsePayload(event *gatewayv1.ChatQueueEvent) map[string]any {
+	return map[string]any{
+		"accepted":      true,
+		"message":       "",
+		"snapshot_json": event.GetSnapshotJson(),
+		"item_json":     "",
+		"error_code":    "",
+		"revision":      event.GetRevision(),
+	}
 }

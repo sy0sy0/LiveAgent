@@ -108,6 +108,21 @@ func TestHistoryRunningPayloadIncludesReplayCursor(t *testing.T) {
 	}
 }
 
+func TestWebsocketChatQueueSnapshotResponsePayload(t *testing.T) {
+	payload := websocketChatQueueSnapshotResponsePayload(&gatewayv1.ChatQueueEvent{
+		ConversationId: "conversation-1",
+		SnapshotJson:   `{"conversationId":"conversation-1","revision":3,"items":[{"id":"queue-1"}]}`,
+		Revision:       3,
+	})
+
+	if payload["accepted"] != true ||
+		payload["snapshot_json"] != `{"conversationId":"conversation-1","revision":3,"items":[{"id":"queue-1"}]}` ||
+		payload["revision"] != uint64(3) ||
+		payload["error_code"] != "" {
+		t.Fatalf("chat queue snapshot response payload = %#v", payload)
+	}
+}
+
 func TestWebsocketTerminalPayloadsPreserveOutputOffsets(t *testing.T) {
 	response := websocketTerminalResponsePayload(&gatewayv1.TerminalResponse{
 		Action:            "attach",

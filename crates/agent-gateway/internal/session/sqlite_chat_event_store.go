@@ -19,7 +19,6 @@ type ChatEventStore interface {
 	StartRun(input ChatRunStoreStart) (ChatRunSnapshot, bool, error)
 	AppendEvents(inputs []ChatRunEventAppend) error
 	Replay(requestID string, conversationID string, afterSeq int64, limit int) (ChatRunSnapshot, []*ChatBroadcastEvent, bool, error)
-	FailOpenRuns(message string) error
 	Close() error
 }
 
@@ -468,95 +467,6 @@ func (s *sqliteChatEventStore) Replay(
 		return ChatRunSnapshot{}, nil, false, err
 	}
 	return snapshot, events, true, nil
-}
-
-func (s *sqliteChatEventStore) FailOpenRuns(message string) error {
-	if s == nil || s.db == nil {
-		return nil
-	}
-	message = strings.TrimSpace(message)
-	if message == "" {
-		message = "Gateway restarted before the remote chat run finished. Please retry."
-	}
-	now := time.Now()
-	nowMs := now.UnixMilli()
-
-	ctx := context.Background()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer rollbackUnlessCommitted(tx)
-
-	rows, err := tx.QueryContext(ctx, `
-		SELECT run_id, conversation_id, client_request_id, workdir, run_epoch, latest_seq
-		FROM chat_runs
-		WHERE done = 0
-	`)
-	if err != nil {
-		return err
-	}
-	type openRun struct {
-		runID           string
-		conversationID  string
-		clientRequestID string
-		workdir         string
-		runEpoch        int64
-		latestSeq       int64
-	}
-	openRuns := make([]openRun, 0)
-	for rows.Next() {
-		var run openRun
-		if err := rows.Scan(&run.runID, &run.conversationID, &run.clientRequestID, &run.workdir, &run.runEpoch, &run.latestSeq); err != nil {
-			_ = rows.Close()
-			return err
-		}
-		openRuns = append(openRuns, run)
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-
-	for _, run := range openRuns {
-		seq := run.latestSeq + 1
-		payload := map[string]any{
-			"type":              "failed",
-			"request_id":        run.runID,
-			"client_request_id": run.clientRequestID,
-			"conversation_id":   run.conversationID,
-			"run_epoch":         run.runEpoch,
-			"state":             ChatRunStateFailed,
-			"error_code":        "gateway_restarted",
-			"message":           message,
-			"seq":               seq,
-		}
-		if run.workdir != "" {
-			payload["workdir"] = run.workdir
-		}
-		payloadJSON, err := json.Marshal(payload)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO chat_events (
-				event_id, conversation_id, run_id, client_request_id, type, seq, payload_json, created_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(run_id, seq) DO NOTHING
-		`, fmt.Sprintf("%s/%d", run.runID, seq), run.conversationID, run.runID, run.clientRequestID, "failed", seq, string(payloadJSON), nowMs); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE chat_runs
-			SET state = ?, error_code = ?, done = 1, latest_seq = max(latest_seq, ?), updated_at = ?
-			WHERE run_id = ?
-		`, ChatRunStateFailed, "gateway_restarted", seq, nowMs, run.runID); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
 }
 
 func (s *sqliteChatEventStore) lookupRunByClientRequestTx(

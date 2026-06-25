@@ -53,6 +53,7 @@ type syncHub struct {
 	chatQueueMu          sync.Mutex
 	nextChatQueueSubID   int
 	chatQueueSubscribers map[int]chan *gatewayv1.ChatQueueEvent
+	chatQueueSnapshots   map[string]chatQueueSnapshotRecord
 }
 
 func newSyncHub() *syncHub {
@@ -64,6 +65,7 @@ func newSyncHub() *syncHub {
 		terminalStreamSubscribers: make(map[int]chan *gatewayv1.TerminalStreamFrame),
 		sftpSubscribers:           make(map[int]chan *gatewayv1.SftpEvent),
 		chatQueueSubscribers:      make(map[int]chan *gatewayv1.ChatQueueEvent),
+		chatQueueSnapshots:        make(map[string]chatQueueSnapshotRecord),
 	}
 }
 

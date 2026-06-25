@@ -16,11 +16,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{
-        client::IntoClientRequest,
-        http::header::SEC_WEBSOCKET_PROTOCOL,
-        Message,
-    },
+    tungstenite::{client::IntoClientRequest, http::header::SEC_WEBSOCKET_PROTOCOL, Message},
 };
 use tonic::metadata::MetadataValue;
 use tonic::transport::{ClientTlsConfig, Endpoint};
@@ -259,6 +255,30 @@ pub struct GatewayChatQueueEventInput {
     pub snapshot_json: String,
     #[serde(default)]
     pub revision: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayChatRuntimeSnapshot {
+    pub conversation_id: String,
+    pub run_id: String,
+    #[serde(default)]
+    pub client_request_id: Option<String>,
+    #[serde(default)]
+    pub worker_id: Option<String>,
+    pub state: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub updated_at: i64,
+    #[serde(default)]
+    pub revision: i64,
+    #[serde(default)]
+    pub entries_json: String,
+    #[serde(default)]
+    pub tool_status: Option<String>,
+    #[serde(default)]
+    pub tool_status_is_compaction: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -604,6 +624,14 @@ impl GatewayController {
         if let Err(error) = self.send_agent_envelope(envelope).await {
             eprintln!("send gateway history sync event failed: {error}");
         }
+    }
+
+    pub async fn publish_chat_runtime_snapshot(
+        &self,
+        snapshot: GatewayChatRuntimeSnapshot,
+    ) -> Result<(), String> {
+        let envelope = build_chat_runtime_snapshot_envelope(snapshot)?;
+        self.send_agent_envelope(envelope).await
     }
 
     pub async fn publish_settings_sync(&self, payload: Value) -> Result<(), String> {
@@ -4793,8 +4821,16 @@ fn should_drop_tunnel_ws_header(name: &str) -> bool {
 
 fn tunnel_target_origin(url: &Url) -> String {
     match url.port() {
-        Some(port) => format!("{}://{}:{port}", url.scheme(), url.host_str().unwrap_or("localhost")),
-        None => format!("{}://{}", url.scheme(), url.host_str().unwrap_or("localhost")),
+        Some(port) => format!(
+            "{}://{}:{port}",
+            url.scheme(),
+            url.host_str().unwrap_or("localhost")
+        ),
+        None => format!(
+            "{}://{}",
+            url.scheme(),
+            url.host_str().unwrap_or("localhost")
+        ),
     }
 }
 
@@ -4878,40 +4914,6 @@ pub fn build_history_sync_delete(conversation_id: impl Into<String>) -> GatewayH
         kind: "delete".to_string(),
         conversation_id,
         conversation: None,
-    }
-}
-
-pub fn build_history_sync_activity(
-    conversation_id: impl Into<String>,
-    running: bool,
-    cwd: impl Into<Option<String>>,
-) -> GatewayHistorySyncEvent {
-    let conversation_id = conversation_id.into();
-    let cwd = cwd
-        .into()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    GatewayHistorySyncEvent {
-        kind: if running {
-            "running".to_string()
-        } else {
-            "idle".to_string()
-        },
-        conversation: cwd.map(|cwd| GatewayHistorySyncConversation {
-            id: conversation_id.clone(),
-            title: String::new(),
-            provider_id: None,
-            model: None,
-            session_id: None,
-            cwd: Some(cwd),
-            created_at: 0,
-            updated_at: chrono::Utc::now().timestamp_millis(),
-            message_count: 0,
-            is_pinned: false,
-            pinned_at: None,
-            is_shared: false,
-        }),
-        conversation_id,
     }
 }
 
@@ -5469,14 +5471,15 @@ fn serialize_settings_sync_payload(payload: &Value) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_chat_event_envelope, build_endpoint, build_grpc_url,
-        build_local_settings_update_event_payload, build_tunnel_upstream_url,
+        build_chat_event_envelope, build_chat_runtime_snapshot_envelope, build_endpoint,
+        build_grpc_url, build_local_settings_update_event_payload, build_tunnel_upstream_url,
         format_gateway_terminal_stream_rpc_error, history_share_resolve_error_code,
         merge_settings_sync_snapshot, normalize_tunnel_ttl, proto,
         queue_terminal_stream_handshake_frame, required_terminal_project_path_key,
         set_disconnected_status, tunnel_expires_at, validate_tunnel_target_url,
-        GatewayChatRequestEvent, GatewayController, GatewayStatusSnapshot, RemoteChatInboxRecord,
-        GATEWAY_CHAT_LEASE_MS, GATEWAY_CHAT_RUNNING_LEASE_MS,
+        GatewayChatRequestEvent, GatewayChatRuntimeSnapshot, GatewayController,
+        GatewayStatusSnapshot, RemoteChatInboxRecord, GATEWAY_CHAT_LEASE_MS,
+        GATEWAY_CHAT_RUNNING_LEASE_MS,
     };
     use crate::commands::settings::RemoteSettingsPayload;
     use serde_json::{json, Value};
@@ -5568,6 +5571,63 @@ mod tests {
         assert_eq!(event.execution_mode, "tools");
         assert_eq!(event.workdir, "/workspace");
         assert_eq!(event.selected_system_tools, vec!["http_get_test"]);
+    }
+
+    #[test]
+    fn chat_runtime_snapshot_envelope_preserves_live_projection() {
+        let envelope = build_chat_runtime_snapshot_envelope(GatewayChatRuntimeSnapshot {
+            conversation_id: " conversation-1 ".to_string(),
+            run_id: " run-1 ".to_string(),
+            client_request_id: Some("client-1".to_string()),
+            worker_id: Some("worker-1".to_string()),
+            state: " running ".to_string(),
+            cwd: Some("/workspace".to_string()),
+            updated_at: 1_772_000_000_000,
+            revision: 7,
+            entries_json: r#"[{"id":"u1","kind":"user","text":"hello","attachments":[]}]"#
+                .to_string(),
+            tool_status: Some("Thinking...".to_string()),
+            tool_status_is_compaction: true,
+        })
+        .expect("runtime snapshot envelope should be valid");
+
+        assert_eq!(envelope.request_id, "chat-runtime-snapshot-run-1-7");
+        match envelope.payload {
+            Some(proto::agent_envelope::Payload::ChatRuntimeSnapshot(snapshot)) => {
+                assert_eq!(snapshot.conversation_id, "conversation-1");
+                assert_eq!(snapshot.run_id, "run-1");
+                assert_eq!(snapshot.client_request_id, "client-1");
+                assert_eq!(snapshot.worker_id, "worker-1");
+                assert_eq!(snapshot.state, "running");
+                assert_eq!(snapshot.cwd, "/workspace");
+                assert_eq!(snapshot.updated_at, 1_772_000_000_000);
+                assert_eq!(snapshot.revision, 7);
+                assert!(snapshot.entries_json.contains("hello"));
+                assert_eq!(snapshot.tool_status, "Thinking...");
+                assert!(snapshot.tool_status_is_compaction);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chat_runtime_snapshot_envelope_rejects_missing_identity() {
+        let err = build_chat_runtime_snapshot_envelope(GatewayChatRuntimeSnapshot {
+            conversation_id: "conversation-1".to_string(),
+            run_id: " ".to_string(),
+            client_request_id: None,
+            worker_id: None,
+            state: "running".to_string(),
+            cwd: None,
+            updated_at: 0,
+            revision: 1,
+            entries_json: String::new(),
+            tool_status: None,
+            tool_status_is_compaction: false,
+        })
+        .expect_err("empty run id should be rejected");
+
+        assert!(err.contains("run_id"));
     }
 
     #[test]
@@ -5756,11 +5816,8 @@ mod tests {
     #[test]
     fn build_tunnel_upstream_url_keeps_probe_paths_outside_target_base() {
         let target = validate_tunnel_target_url("http://localhost:3000/app").unwrap();
-        let upstream = build_tunnel_upstream_url(
-            &target.url,
-            "/.liveagent-tunnel-probe/ws?check=1",
-        )
-        .unwrap();
+        let upstream =
+            build_tunnel_upstream_url(&target.url, "/.liveagent-tunnel-probe/ws?check=1").unwrap();
         assert_eq!(
             upstream.as_str(),
             "http://localhost:3000/.liveagent-tunnel-probe/ws?check=1"
@@ -6374,6 +6431,51 @@ fn build_history_sync_envelope(
                 kind: event.kind,
                 conversation,
                 conversation_id: event.conversation_id,
+            },
+        )),
+    })
+}
+
+fn build_chat_runtime_snapshot_envelope(
+    snapshot: GatewayChatRuntimeSnapshot,
+) -> Result<proto::AgentEnvelope, String> {
+    let conversation_id = snapshot.conversation_id.trim().to_string();
+    if conversation_id.is_empty() {
+        return Err("chat runtime snapshot conversation_id is required".to_string());
+    }
+
+    let run_id = snapshot.run_id.trim().to_string();
+    if run_id.is_empty() {
+        return Err("chat runtime snapshot run_id is required".to_string());
+    }
+
+    let state = snapshot.state.trim().to_string();
+    if state.is_empty() {
+        return Err("chat runtime snapshot state is required".to_string());
+    }
+
+    let updated_at = if snapshot.updated_at > 0 {
+        snapshot.updated_at
+    } else {
+        chrono::Utc::now().timestamp_millis()
+    };
+
+    Ok(proto::AgentEnvelope {
+        request_id: format!("chat-runtime-snapshot-{}-{}", run_id, snapshot.revision),
+        timestamp: now_unix_seconds(),
+        payload: Some(proto::agent_envelope::Payload::ChatRuntimeSnapshot(
+            proto::ChatRuntimeSnapshot {
+                conversation_id,
+                run_id,
+                client_request_id: snapshot.client_request_id.unwrap_or_default(),
+                worker_id: snapshot.worker_id.unwrap_or_default(),
+                state,
+                cwd: snapshot.cwd.unwrap_or_default(),
+                updated_at,
+                revision: snapshot.revision,
+                entries_json: snapshot.entries_json,
+                tool_status: snapshot.tool_status.unwrap_or_default(),
+                tool_status_is_compaction: snapshot.tool_status_is_compaction,
             },
         )),
     })

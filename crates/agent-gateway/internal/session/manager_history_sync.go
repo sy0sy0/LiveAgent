@@ -34,7 +34,6 @@ func (m *Manager) broadcastHistorySync(event *gatewayv1.HistorySyncEvent) {
 		return
 	}
 
-	m.applyHistorySyncToChatRun(event)
 	m.releaseCompletedChatRunAfterHistoryUpsert(event)
 
 	m.syncHub.historyMu.Lock()
@@ -134,46 +133,6 @@ func historySyncConversationID(event *gatewayv1.HistorySyncEvent) string {
 		conversationID = strings.TrimSpace(event.GetConversation().GetId())
 	}
 	return conversationID
-}
-
-func historySyncWorkdir(event *gatewayv1.HistorySyncEvent) string {
-	if event == nil || event.GetConversation() == nil {
-		return ""
-	}
-	return strings.TrimSpace(event.GetConversation().GetCwd())
-}
-
-func (m *Manager) applyHistorySyncToChatRun(event *gatewayv1.HistorySyncEvent) {
-	kind := strings.TrimSpace(event.GetKind())
-	conversationID := historySyncConversationID(event)
-	if conversationID == "" {
-		return
-	}
-
-	workdir := historySyncWorkdir(event)
-	now := time.Now()
-
-	m.chatStore.chatMu.Lock()
-	m.pruneExpiredChatRunsLocked(now)
-
-	switch kind {
-	case "running", "upsert":
-		if workdir == "" {
-			if kind != "running" {
-				m.chatStore.chatMu.Unlock()
-				return
-			}
-		}
-		if requestID := strings.TrimSpace(m.chatStore.chatRunByConversation[conversationID]); requestID != "" {
-			if run := m.chatStore.chatRuns[requestID]; run != nil && !run.done {
-				if workdir != "" {
-					run.workdir = workdir
-				}
-				run.updatedAt = now
-			}
-		}
-	}
-	m.chatStore.chatMu.Unlock()
 }
 
 func (m *Manager) releaseCompletedChatRunAfterHistoryUpsert(event *gatewayv1.HistorySyncEvent) {

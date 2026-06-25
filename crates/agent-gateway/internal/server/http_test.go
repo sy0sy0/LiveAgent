@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1136,6 +1137,72 @@ func TestChatEventsReplayConversationAcrossRuns(t *testing.T) {
 		if got[index] != want[index] {
 			t.Fatalf("conversation SSE replay = %#v, want %#v", got, want)
 		}
+	}
+}
+
+func TestChatEventsRuntimeSnapshotTerminatesSSE(t *testing.T) {
+	sm := session.NewManager()
+	sm.ApplyChatRuntimeSnapshot(&gatewayv1.ChatRuntimeSnapshot{
+		ConversationId: "conversation-1",
+		RunId:          "run-1",
+		State:          session.ChatRunStateRunning,
+		Revision:       1,
+		EntriesJson:    `[{"id":"u1","kind":"user","text":"hello","attachments":[]},{"id":"a1","kind":"assistant","text":"partial","round":1}]`,
+	})
+	sm.ApplyChatRuntimeSnapshot(&gatewayv1.ChatRuntimeSnapshot{
+		ConversationId: "conversation-1",
+		RunId:          "run-1",
+		State:          session.ChatRunStateCompleted,
+		Revision:       2,
+		EntriesJson:    `[{"id":"u1","kind":"user","text":"hello","attachments":[]},{"id":"a1","kind":"assistant","text":"done","round":1}]`,
+	})
+
+	ts := httptest.NewServer(NewHTTPServer(&config.Config{Token: "dev-token"}, sm))
+	defer ts.Close()
+
+	req, err := http.NewRequest(
+		http.MethodGet,
+		ts.URL+"/api/chat/events?conversation_id=conversation-1&after_seq=0",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer dev-token")
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("get chat events: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("events status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	first := readChatSSEEvent(t, reader)
+	if first["type"] != "runtime.snapshot" || first["run_id"] != "run-1" {
+		t.Fatalf("first runtime snapshot event = %#v", first)
+	}
+	firstPayload, _ := first["payload"].(map[string]any)
+	if firstPayload["type"] != "runtime_snapshot" || firstPayload["state"] != "running" {
+		t.Fatalf("first runtime snapshot payload = %#v", firstPayload)
+	}
+
+	second := readChatSSEEvent(t, reader)
+	if second["type"] != "runtime.snapshot" || second["run_id"] != "run-1" {
+		t.Fatalf("terminal runtime snapshot event = %#v", second)
+	}
+	secondPayload, _ := second["payload"].(map[string]any)
+	if secondPayload["type"] != "runtime_snapshot" || secondPayload["state"] != "completed" {
+		t.Fatalf("terminal runtime snapshot payload = %#v", secondPayload)
+	}
+
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read rest of runtime snapshot stream: %v", err)
+	}
+	if strings.TrimSpace(string(rest)) != "" {
+		t.Fatalf("unexpected data after terminal runtime snapshot: %q", string(rest))
 	}
 }
 

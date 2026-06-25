@@ -641,6 +641,62 @@ test("GatewayWebSocketClient streamChatEvents resumes from the last delivered ev
   }
 });
 
+test("GatewayWebSocketClient streamChatEvents retries transient gateway HTTP errors", async () => {
+  installBrowser({
+    setTimeout: (fn, _delay, ...args) => setTimeout(fn, 0, ...args),
+  });
+  const realFetch = globalThis.fetch;
+  const fetchCalls = [];
+  const encoder = new TextEncoder();
+  globalThis.fetch = async (rawUrl, init = {}) => {
+    const url = new URL(String(rawUrl));
+    fetchCalls.push({ url, init });
+    if (url.pathname !== "/api/chat/events") {
+      return new Response(JSON.stringify({ error: `unexpected ${url.pathname}` }), { status: 404 });
+    }
+    if (fetchCalls.length === 1) {
+      return new Response(
+        "<html><head><title>502 Bad Gateway</title></head><body>nginx</body></html>",
+        { status: 502, headers: { "Content-Type": "text/html" } },
+      );
+    }
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            'id: 42\nevent: chat.event\ndata: {"seq":42,"payload":{"type":"done","conversation_id":"conversation-1"}}\n\n',
+          ),
+        );
+        controller.close();
+      },
+    });
+    return new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    });
+  };
+
+  const loader = createWebModuleLoader();
+  const { getGatewayWebSocketClient, resetGatewayWebSocketClient } = loader.loadModule("src/lib/gatewaySocket.ts");
+  resetGatewayWebSocketClient();
+
+  try {
+    const client = getGatewayWebSocketClient(" token ");
+    const events = [];
+    for await (const event of client.streamChatEvents(" conversation-1 ", { afterSeq: 41 })) {
+      events.push(event);
+    }
+
+    assert.equal(fetchCalls.length, 2);
+    assert.equal(fetchCalls[0].url.searchParams.get("after_seq"), "41");
+    assert.equal(fetchCalls[1].url.searchParams.get("after_seq"), "41");
+    assert.deepEqual(events, [{ type: "done", conversation_id: "conversation-1", seq: 42 }]);
+  } finally {
+    globalThis.fetch = realFetch;
+    resetGatewayWebSocketClient();
+  }
+});
+
 test("GatewayWebSocketClient streamChatEvents ignores stale terminal events from older runs", async () => {
   installBrowser();
   const realFetch = globalThis.fetch;

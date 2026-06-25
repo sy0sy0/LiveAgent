@@ -33,6 +33,10 @@ import type {
   SftpTransferResponse,
 } from "@/lib/sftp/types";
 import { BrowserGatewayTerminalStreamClient } from "@/lib/terminal/gatewayTerminalStreamClient";
+import {
+  isRecoverableChatStreamTransportMessage,
+  isRecoverableChatStreamTransportStatus,
+} from "@/lib/chatStreamRecovery";
 
 import type {
   AgentStatus,
@@ -828,6 +832,15 @@ function waitForChatReconnect(delayMs: number, signal?: AbortSignal) {
   });
 }
 
+function nextChatReconnectDelay(reconnectAttempt: number) {
+  const baseDelay = Math.min(
+    RECONNECT_MAX_DELAY_MS,
+    RECONNECT_INITIAL_DELAY_MS * 2 ** Math.min(reconnectAttempt, 5),
+  );
+  const jitter = Math.floor(Math.random() * Math.min(500, Math.max(1, baseDelay)));
+  return baseDelay + jitter;
+}
+
 async function* streamGatewayChatEvents(params: {
   token: string;
   runId?: string;
@@ -848,7 +861,7 @@ async function* streamGatewayChatEvents(params: {
   let lastSeq = normalizeAfterSeq(params.afterSeq);
   let reconnectAttempt = 0;
   let terminalSeen = false;
-    while (!terminalSeen && !params.signal?.aborted) {
+  while (!terminalSeen && !params.signal?.aborted) {
     const eventsUrl = buildGatewayApiUrl("/api/chat/events");
     if (runId) {
       eventsUrl.searchParams.set("run_id", runId);
@@ -859,34 +872,44 @@ async function* streamGatewayChatEvents(params: {
     eventsUrl.searchParams.set("after_seq", String(lastSeq));
 
     let response: Response;
-      try {
-        const headers: Record<string, string> = {
-          Accept: "text/event-stream",
-          Authorization: `Bearer ${token}`,
-        };
-        if (lastSeq > 0) {
-          headers["Last-Event-ID"] = String(lastSeq);
-        }
-        response = await fetch(eventsUrl.toString(), {
-          method: "GET",
-          headers,
-          signal: params.signal,
-        });
+    try {
+      const headers: Record<string, string> = {
+        Accept: "text/event-stream",
+        Authorization: `Bearer ${token}`,
+      };
+      if (lastSeq > 0) {
+        headers["Last-Event-ID"] = String(lastSeq);
+      }
+      response = await fetch(eventsUrl.toString(), {
+        method: "GET",
+        headers,
+        signal: params.signal,
+      });
     } catch {
       if (params.signal?.aborted) {
         return;
       }
-      const baseDelay = Math.min(
-        RECONNECT_MAX_DELAY_MS,
-        RECONNECT_INITIAL_DELAY_MS * 2 ** Math.min(reconnectAttempt, 5),
-      );
+      const delay = nextChatReconnectDelay(reconnectAttempt);
       reconnectAttempt += 1;
-      const jitter = Math.floor(Math.random() * Math.min(500, Math.max(1, baseDelay)));
-      await waitForChatReconnect(baseDelay + jitter, params.signal);
+      await waitForChatReconnect(delay, params.signal);
       continue;
     }
 
-    if (!response.ok || !response.body) {
+    if (!response.ok) {
+      const message = await readGatewayHTTPError(response, "Gateway chat event stream failed");
+      if (
+        isRecoverableChatStreamTransportStatus(response.status) ||
+        isRecoverableChatStreamTransportMessage(message)
+      ) {
+        const delay = nextChatReconnectDelay(reconnectAttempt);
+        reconnectAttempt += 1;
+        await waitForChatReconnect(delay, params.signal);
+        continue;
+      }
+      throw new Error(message);
+    }
+
+    if (!response.body) {
       throw new Error(await readGatewayHTTPError(response, "Gateway chat event stream failed"));
     }
 
@@ -925,13 +948,9 @@ async function* streamGatewayChatEvents(params: {
     }
 
     if (!terminalSeen && !params.signal?.aborted) {
-      const baseDelay = Math.min(
-        RECONNECT_MAX_DELAY_MS,
-        RECONNECT_INITIAL_DELAY_MS * 2 ** Math.min(reconnectAttempt, 5),
-      );
+      const delay = nextChatReconnectDelay(reconnectAttempt);
       reconnectAttempt += 1;
-      const jitter = Math.floor(Math.random() * Math.min(500, Math.max(1, baseDelay)));
-      await waitForChatReconnect(baseDelay + jitter, params.signal);
+      await waitForChatReconnect(delay, params.signal);
     }
   }
 }
@@ -1043,6 +1062,11 @@ function isTerminalChatControlEvent(event: ChatEvent | null | undefined) {
 }
 
 function isTerminalChatEvent(event: ChatEvent | null | undefined) {
+  if (event?.type === "runtime_snapshot") {
+    return (
+      event.state === "completed" || event.state === "failed" || event.state === "cancelled"
+    );
+  }
   return event?.type === "done" || event?.type === "error" || isTerminalChatControlEvent(event);
 }
 

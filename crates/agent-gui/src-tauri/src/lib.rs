@@ -233,7 +233,7 @@ macro_rules! app_invoke_handler {
             commands::gateway::gateway_chat_release_lease,
             commands::gateway::gateway_chat_queue_respond,
             commands::gateway::gateway_publish_chat_queue_event,
-            commands::gateway::gateway_publish_conversation_activity,
+            commands::gateway::gateway_publish_chat_runtime_snapshot,
             commands::gateway::gateway_publish_settings_sync,
             commands::gateway::gateway_tunnel_list,
             commands::gateway::gateway_tunnel_create,

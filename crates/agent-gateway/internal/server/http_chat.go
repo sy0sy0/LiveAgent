@@ -316,6 +316,14 @@ func isTerminalChatPayload(payload map[string]any) bool {
 	switch strings.TrimSpace(eventType) {
 	case "done", "completed", "error", "failed", "cancelled":
 		return true
+	case "runtime_snapshot":
+		state, _ := payload["state"].(string)
+		switch strings.TrimSpace(state) {
+		case "completed", "failed", "cancelled":
+			return true
+		default:
+			return false
+		}
 	default:
 		return false
 	}
@@ -326,6 +334,8 @@ func cloudChatEventType(payload map[string]any) string {
 	switch strings.TrimSpace(eventType) {
 	case "accepted":
 		return "run.accepted"
+	case "runtime_snapshot":
+		return "runtime.snapshot"
 	case "user_message":
 		return "user.message.appended"
 	case "rebased":

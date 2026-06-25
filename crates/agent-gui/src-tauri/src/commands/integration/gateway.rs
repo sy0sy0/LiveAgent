@@ -4,9 +4,9 @@ use serde_json::Value;
 
 use crate::commands::settings::{load_remote_settings, open_db, parse_remote_settings_payload};
 use crate::services::gateway::{
-    build_history_sync_activity, GatewayChatClaimedRequest, GatewayChatQueueEventInput,
-    GatewayChatQueueResponseInput, GatewayController, GatewayStatusSnapshot,
-    GatewayTunnelCreateInput, GatewayTunnelSummary, GatewayTunnelUpdateInput,
+    GatewayChatClaimedRequest, GatewayChatQueueEventInput, GatewayChatQueueResponseInput,
+    GatewayChatRuntimeSnapshot, GatewayController, GatewayStatusSnapshot, GatewayTunnelCreateInput,
+    GatewayTunnelSummary, GatewayTunnelUpdateInput,
 };
 
 #[tauri::command]
@@ -193,20 +193,13 @@ pub async fn gateway_publish_chat_queue_event(
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub async fn gateway_publish_conversation_activity(
-    conversation_id: String,
-    running: bool,
-    workdir: Option<String>,
+pub async fn gateway_publish_chat_runtime_snapshot(
+    input: GatewayChatRuntimeSnapshot,
     gateway_controller: tauri::State<'_, Arc<GatewayController>>,
 ) -> Result<(), String> {
     gateway_controller
-        .publish_history_sync(build_history_sync_activity(
-            conversation_id,
-            running,
-            workdir,
-        ))
-        .await;
-    Ok(())
+        .publish_chat_runtime_snapshot(input)
+        .await
 }
 
 #[tauri::command]
