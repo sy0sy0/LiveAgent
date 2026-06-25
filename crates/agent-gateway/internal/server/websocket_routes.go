@@ -61,6 +61,7 @@ var websocketRequestHandlers = map[string]websocketRequestHandler{
 	"tunnel.create":                  (*websocketConnection).handleTunnelCreate,
 	"tunnel.update":                  (*websocketConnection).handleTunnelUpdate,
 	"tunnel.close":                   (*websocketConnection).handleTunnelClose,
+	"tunnel.probe":                   (*websocketConnection).handleTunnelProbe,
 	"git.status":                     (*websocketConnection).handleGitRequest,
 	"git.branches":                   (*websocketConnection).handleGitRequest,
 	"git.init":                       (*websocketConnection).handleGitRequest,

@@ -1115,6 +1115,12 @@ async function resolveRequest(client: GatewayWebSocketClient, method: string, pa
           String(body.id ?? body.tunnelId ?? body.tunnel_id ?? body.slug ?? ""),
         ),
       };
+    case "tunnel.probe":
+      return {
+        tunnel: await client.probeTunnel(
+          String(body.id ?? body.tunnelId ?? body.tunnel_id ?? body.slug ?? ""),
+        ),
+      };
     case "provider.models":
       return client.getProviderModels(
         String(body.type ?? ""),

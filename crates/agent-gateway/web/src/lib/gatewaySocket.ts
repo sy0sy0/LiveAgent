@@ -223,6 +223,16 @@ export type TunnelSummary = {
   activeConnections: number;
   status: "active" | "expired" | "offline";
   projectPathKey: string;
+  diagnostics: TunnelDiagnostic[];
+};
+
+export type TunnelDiagnostic = {
+  protocol: "http" | "websocket" | "sse";
+  status: "ok" | "failed" | "unknown";
+  statusCode: number;
+  errorCode: string;
+  message: string;
+  checkedAt: number;
 };
 
 type RawTunnelSummary = {
@@ -242,6 +252,19 @@ type RawTunnelSummary = {
   status?: string;
   projectPathKey?: string;
   project_path_key?: string;
+  diagnostics?: RawTunnelDiagnostic[];
+};
+
+type RawTunnelDiagnostic = {
+  protocol?: string;
+  status?: string;
+  statusCode?: number;
+  status_code?: number;
+  errorCode?: string;
+  error_code?: string;
+  message?: string;
+  checkedAt?: number;
+  checked_at?: number;
 };
 
 type RawTunnelResponse = {
@@ -1332,6 +1355,27 @@ function normalizeTunnelStatus(input: unknown): TunnelSummary["status"] {
   return input === "expired" || input === "offline" ? input : "active";
 }
 
+function normalizeTunnelDiagnosticProtocol(input: unknown): TunnelDiagnostic["protocol"] {
+  if (input === "websocket" || input === "sse") return input;
+  return "http";
+}
+
+function normalizeTunnelDiagnosticStatus(input: unknown): TunnelDiagnostic["status"] {
+  if (input === "ok" || input === "failed") return input;
+  return "unknown";
+}
+
+function normalizeTunnelDiagnostic(input: RawTunnelDiagnostic): TunnelDiagnostic {
+  return {
+    protocol: normalizeTunnelDiagnosticProtocol(input.protocol),
+    status: normalizeTunnelDiagnosticStatus(input.status),
+    statusCode: Number(input.statusCode ?? input.status_code ?? 0),
+    errorCode: (input.errorCode ?? input.error_code ?? "").trim(),
+    message: (input.message ?? "").trim(),
+    checkedAt: Number(input.checkedAt ?? input.checked_at ?? 0),
+  };
+}
+
 function fallbackTunnelPublicUrl(slug: string) {
   const origin = getRuntimeOrigin().replace(/\/$/, "");
   return origin && slug ? `${origin}/t/${slug}/` : "";
@@ -1350,6 +1394,7 @@ function normalizeTunnelSummary(input: RawTunnelSummary): TunnelSummary {
     activeConnections: Number(input.activeConnections ?? input.active_connections ?? 0),
     status: normalizeTunnelStatus(input.status),
     projectPathKey: (input.projectPathKey ?? input.project_path_key ?? "").trim(),
+    diagnostics: (input.diagnostics ?? []).map(normalizeTunnelDiagnostic),
   };
 }
 
@@ -2063,6 +2108,14 @@ export class GatewayWebSocketClient {
   async closeTunnel(id: string): Promise<TunnelSummary> {
     return normalizeTunnelResponse(
       await this.request<RawTunnelResponse>("tunnel.close", {
+        id,
+      }),
+    );
+  }
+
+  async probeTunnel(id: string): Promise<TunnelSummary> {
+    return normalizeTunnelResponse(
+      await this.request<RawTunnelResponse>("tunnel.probe", {
         id,
       }),
     );
@@ -3028,6 +3081,7 @@ export type GatewayWebSocketClientLike = {
   listTunnels(): Promise<TunnelSummary[]>;
   createTunnel(input: TunnelCreateInput): Promise<TunnelSummary>;
   updateTunnel(input: TunnelUpdateInput): Promise<TunnelSummary>;
+  probeTunnel(id: string): Promise<TunnelSummary>;
   closeTunnel(id: string): Promise<TunnelSummary>;
   listHistory(page: number, pageSize: number, filter?: HistoryListFilter): Promise<HistoryList>;
   listHistoryWorkdirs(): Promise<HistoryWorkdirsResponse>;
@@ -4147,6 +4201,14 @@ class SharedWorkerGatewayWebSocketClient implements GatewayWebSocketClientLike {
   async closeTunnel(id: string): Promise<TunnelSummary> {
     return normalizeTunnelResponse(
       await this.request<RawTunnelResponse>("tunnel.close", {
+        id,
+      }),
+    );
+  }
+
+  async probeTunnel(id: string): Promise<TunnelSummary> {
+    return normalizeTunnelResponse(
+      await this.request<RawTunnelResponse>("tunnel.probe", {
         id,
       }),
     );

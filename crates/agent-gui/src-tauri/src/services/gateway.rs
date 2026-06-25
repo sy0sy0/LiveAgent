@@ -14,7 +14,14 @@ use serde_json::{json, Value};
 use tauri::Emitter;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{
+        client::IntoClientRequest,
+        http::header::SEC_WEBSOCKET_PROTOCOL,
+        Message,
+    },
+};
 use tonic::metadata::MetadataValue;
 use tonic::transport::{ClientTlsConfig, Endpoint};
 use uuid::Uuid;
@@ -115,6 +122,18 @@ pub struct GatewayTunnelSummary {
     pub active_connections: u32,
     pub status: String,
     pub project_path_key: String,
+    pub diagnostics: Vec<GatewayTunnelDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayTunnelDiagnostic {
+    pub protocol: String,
+    pub status: String,
+    pub status_code: u32,
+    pub error_code: String,
+    pub message: String,
+    pub checked_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -651,7 +670,10 @@ impl GatewayController {
             .map(gateway_tunnel_summary_from_proto)
             .ok_or_else(|| "gateway tunnel create returned no tunnel".to_string())?;
         self.store_local_tunnel(summary.clone(), target)?;
-        Ok(summary)
+        Ok(self
+            .tunnel_probe(summary.id.clone())
+            .await
+            .unwrap_or(summary))
     }
 
     pub async fn tunnel_update(
@@ -690,6 +712,41 @@ impl GatewayController {
             .map(gateway_tunnel_summary_from_proto)
             .ok_or_else(|| "gateway tunnel update returned no tunnel".to_string())?;
         self.store_local_tunnel(summary.clone(), target)?;
+        Ok(self
+            .tunnel_probe(summary.id.clone())
+            .await
+            .unwrap_or(summary))
+    }
+
+    pub async fn tunnel_probe(&self, tunnel_id: String) -> Result<GatewayTunnelSummary, String> {
+        let tunnel_id = tunnel_id.trim().to_string();
+        if tunnel_id.is_empty() {
+            return Err("tunnel id is required".to_string());
+        }
+        if !self.status().online {
+            return self
+                .local_tunnel_summaries("offline")?
+                .into_iter()
+                .find(|summary| summary.id == tunnel_id || summary.slug == tunnel_id)
+                .ok_or_else(|| "tunnel not found".to_string());
+        }
+        let public_base_url = self.config_tx.borrow().gateway_url.clone();
+        let response = self
+            .send_tunnel_control_request(proto::TunnelControlRequest {
+                action: "probe".to_string(),
+                tunnel_id,
+                public_base_url,
+                ..Default::default()
+            })
+            .await?;
+        if !response.error_message.trim().is_empty() {
+            return Err(response.error_message);
+        }
+        let summary = response
+            .tunnel
+            .map(gateway_tunnel_summary_from_proto)
+            .ok_or_else(|| "gateway tunnel probe returned no tunnel".to_string())?;
+        self.merge_tunnel_summaries(&[summary.clone()])?;
         Ok(summary)
     }
 
@@ -3690,7 +3747,7 @@ impl GatewayController {
                 self.remove_tunnel_http_stream(&frame.stream_id);
                 Ok(())
             }
-            proto::TunnelFrameKind::WsOpen => {
+            proto::TunnelFrameKind::WsDial => {
                 let stream_id = frame.stream_id.trim().to_string();
                 let tunnel_id = frame.tunnel_id.clone();
                 let slug = frame.slug.clone();
@@ -3808,6 +3865,7 @@ impl GatewayController {
         let stream_id = frame.stream_id.trim().to_string();
         let tunnel_id = record.summary.id.clone();
         let slug = record.summary.slug.clone();
+        let headers = frame.headers.clone();
         let (gateway_tx, gateway_rx) = mpsc::channel::<proto::TunnelFrame>(128);
         self.tunnel_ws_streams
             .lock()
@@ -3822,6 +3880,7 @@ impl GatewayController {
                 tunnel_id,
                 slug,
                 upstream_url,
+                headers,
                 gateway_rx,
             )
             .await;
@@ -3848,6 +3907,7 @@ impl GatewayController {
             active_connections: 0,
             status: "active".to_string(),
             project_path_key: normalize_project_path_key(&request.project_path_key),
+            diagnostics: Vec::new(),
         };
         self.store_local_tunnel(summary.clone(), target)?;
         Ok(summary)
@@ -4094,6 +4154,11 @@ fn gateway_tunnel_summary_from_proto(summary: proto::TunnelSummary) -> GatewayTu
         active_connections: summary.active_connections,
         status: summary.status,
         project_path_key: normalize_project_path_key(&summary.project_path_key),
+        diagnostics: summary
+            .diagnostics
+            .into_iter()
+            .map(gateway_tunnel_diagnostic_from_proto)
+            .collect(),
     }
 }
 
@@ -4109,6 +4174,37 @@ fn proto_tunnel_summary_from_gateway(summary: GatewayTunnelSummary) -> proto::Tu
         active_connections: summary.active_connections,
         status: summary.status,
         project_path_key: normalize_project_path_key(&summary.project_path_key),
+        diagnostics: summary
+            .diagnostics
+            .into_iter()
+            .map(proto_tunnel_diagnostic_from_gateway)
+            .collect(),
+    }
+}
+
+fn gateway_tunnel_diagnostic_from_proto(
+    diagnostic: proto::TunnelDiagnostic,
+) -> GatewayTunnelDiagnostic {
+    GatewayTunnelDiagnostic {
+        protocol: diagnostic.protocol,
+        status: diagnostic.status,
+        status_code: diagnostic.status_code,
+        error_code: diagnostic.error_code,
+        message: diagnostic.message,
+        checked_at: diagnostic.checked_at,
+    }
+}
+
+fn proto_tunnel_diagnostic_from_gateway(
+    diagnostic: GatewayTunnelDiagnostic,
+) -> proto::TunnelDiagnostic {
+    proto::TunnelDiagnostic {
+        protocol: diagnostic.protocol,
+        status: diagnostic.status,
+        status_code: diagnostic.status_code,
+        error_code: diagnostic.error_code,
+        message: diagnostic.message,
+        checked_at: diagnostic.checked_at,
     }
 }
 
@@ -4165,7 +4261,11 @@ fn join_tunnel_paths(base_path: &str, rest_path: &str) -> String {
 fn build_tunnel_upstream_url(base: &Url, public_path: &str) -> Result<Url, String> {
     let (path, query) = split_tunnel_path_and_query(public_path);
     let mut url = base.clone();
-    let joined_path = join_tunnel_paths(url.path(), path);
+    let joined_path = if tunnel_probe_kind_from_path(path).is_some() {
+        normalize_tunnel_path(path)
+    } else {
+        join_tunnel_paths(url.path(), path)
+    };
     url.set_path(&joined_path);
     url.set_query(query.filter(|value| !value.is_empty()));
     url.set_fragment(None);
@@ -4244,6 +4344,17 @@ async fn run_tunnel_http_request(
     body_rx: mpsc::Receiver<Result<Vec<u8>, io::Error>>,
 ) {
     let result = async {
+        if let Some(probe) = tunnel_probe_kind_from_path(upstream_url.path()) {
+            return send_tunnel_http_probe_response(
+                &controller,
+                &stream_id,
+                &tunnel_id,
+                &slug,
+                probe,
+            )
+            .await;
+        }
+
         let method = reqwest::Method::from_bytes(method.trim().as_bytes())
             .map_err(|e| format!("invalid tunnel request method: {e}"))?;
         let body = reqwest::Body::wrap_stream(ReceiverStream::new(body_rx));
@@ -4333,24 +4444,78 @@ async fn run_tunnel_websocket(
     tunnel_id: String,
     slug: String,
     upstream_url: Url,
+    headers: Vec<proto::TunnelHeader>,
     mut gateway_rx: mpsc::Receiver<proto::TunnelFrame>,
 ) {
-    let result = async {
-        let (ws_stream, _) = connect_async(upstream_url.as_str())
-            .await
-            .map_err(|e| format!("local tunnel websocket failed: {e}"))?;
-        send_tunnel_frame(
-            &controller,
-            proto::TunnelFrame {
-                stream_id: stream_id.clone(),
-                tunnel_id: tunnel_id.clone(),
-                slug: slug.clone(),
-                kind: proto::TunnelFrameKind::WsOpen as i32,
-                ..Default::default()
-            },
-        )
-        .await?;
+    if tunnel_probe_kind_from_path(upstream_url.path()).as_deref() == Some("ws") {
+        run_tunnel_websocket_probe(controller, stream_id, tunnel_id, slug, gateway_rx).await;
+        return;
+    }
 
+    let mut request = match upstream_url.as_str().into_client_request() {
+        Ok(request) => request,
+        Err(error) => {
+            let _ = send_tunnel_frame(
+                &controller,
+                proto::TunnelFrame {
+                    stream_id,
+                    tunnel_id,
+                    slug,
+                    kind: proto::TunnelFrameKind::WsDialError as i32,
+                    error: format!("invalid local tunnel websocket request: {error}"),
+                    ..Default::default()
+                },
+            )
+            .await;
+            return;
+        }
+    };
+    apply_tunnel_ws_request_headers(&mut request, &headers, &upstream_url);
+    let (ws_stream, response) = match connect_async(request).await {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = send_tunnel_frame(
+                &controller,
+                proto::TunnelFrame {
+                    stream_id,
+                    tunnel_id,
+                    slug,
+                    kind: proto::TunnelFrameKind::WsDialError as i32,
+                    error: format!("local tunnel websocket failed: {error}"),
+                    ..Default::default()
+                },
+            )
+            .await;
+            return;
+        }
+    };
+    let selected_protocol = response
+        .headers()
+        .get(SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if let Err(error) = send_tunnel_frame(
+        &controller,
+        proto::TunnelFrame {
+            stream_id: stream_id.clone(),
+            tunnel_id: tunnel_id.clone(),
+            slug: slug.clone(),
+            kind: proto::TunnelFrameKind::WsDialOk as i32,
+            ws_protocol: selected_protocol,
+            ..Default::default()
+        },
+    )
+    .await
+    {
+        controller.remove_tunnel_ws_stream(&stream_id);
+        let _ = error;
+        return;
+    }
+
+    let result = async {
         let (mut local_write, mut local_read) = ws_stream.split();
         loop {
             tokio::select! {
@@ -4449,6 +4614,188 @@ async fn run_tunnel_websocket(
         },
     )
     .await;
+}
+
+async fn send_tunnel_http_probe_response(
+    controller: &GatewayController,
+    stream_id: &str,
+    tunnel_id: &str,
+    slug: &str,
+    probe: String,
+) -> Result<(), String> {
+    let (status_code, content_type, body) = match probe.as_str() {
+        "sse" => (
+            200,
+            "text/event-stream; charset=utf-8",
+            b"event: liveagent-probe\ndata: ok\n\n".to_vec(),
+        ),
+        _ => (204, "text/plain; charset=utf-8", Vec::new()),
+    };
+    send_tunnel_frame(
+        controller,
+        proto::TunnelFrame {
+            stream_id: stream_id.to_string(),
+            tunnel_id: tunnel_id.to_string(),
+            slug: slug.to_string(),
+            kind: proto::TunnelFrameKind::HttpResponseStart as i32,
+            status_code,
+            headers: vec![proto::TunnelHeader {
+                name: "content-type".to_string(),
+                value: content_type.to_string(),
+            }],
+            ..Default::default()
+        },
+    )
+    .await?;
+    if !body.is_empty() {
+        send_tunnel_frame(
+            controller,
+            proto::TunnelFrame {
+                stream_id: stream_id.to_string(),
+                tunnel_id: tunnel_id.to_string(),
+                slug: slug.to_string(),
+                kind: proto::TunnelFrameKind::HttpResponseBody as i32,
+                body,
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
+    send_tunnel_frame(
+        controller,
+        proto::TunnelFrame {
+            stream_id: stream_id.to_string(),
+            tunnel_id: tunnel_id.to_string(),
+            slug: slug.to_string(),
+            kind: proto::TunnelFrameKind::HttpResponseEnd as i32,
+            end_stream: true,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+async fn run_tunnel_websocket_probe(
+    controller: Arc<GatewayController>,
+    stream_id: String,
+    tunnel_id: String,
+    slug: String,
+    mut gateway_rx: mpsc::Receiver<proto::TunnelFrame>,
+) {
+    let _ = send_tunnel_frame(
+        &controller,
+        proto::TunnelFrame {
+            stream_id: stream_id.clone(),
+            tunnel_id: tunnel_id.clone(),
+            slug: slug.clone(),
+            kind: proto::TunnelFrameKind::WsDialOk as i32,
+            ..Default::default()
+        },
+    )
+    .await;
+    while let Some(frame) = gateway_rx.recv().await {
+        match frame.kind() {
+            proto::TunnelFrameKind::WsFrame => {
+                let body = if frame.body == b"ping" {
+                    b"pong".to_vec()
+                } else {
+                    frame.body
+                };
+                let _ = send_tunnel_frame(
+                    &controller,
+                    proto::TunnelFrame {
+                        stream_id: stream_id.clone(),
+                        tunnel_id: tunnel_id.clone(),
+                        slug: slug.clone(),
+                        kind: proto::TunnelFrameKind::WsFrame as i32,
+                        ws_message_type: frame.ws_message_type,
+                        body,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            }
+            proto::TunnelFrameKind::WsClose | proto::TunnelFrameKind::Cancel => break,
+            _ => {}
+        }
+    }
+    controller.remove_tunnel_ws_stream(&stream_id);
+    let _ = send_tunnel_frame(
+        &controller,
+        proto::TunnelFrame {
+            stream_id,
+            tunnel_id,
+            slug,
+            kind: proto::TunnelFrameKind::WsClose as i32,
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+fn tunnel_probe_kind_from_path(path: &str) -> Option<String> {
+    let normalized = normalize_tunnel_path(path);
+    normalized
+        .strip_prefix("/.liveagent-tunnel-probe/")
+        .map(str::trim)
+        .filter(|value| matches!(*value, "http" | "sse" | "ws"))
+        .map(ToString::to_string)
+}
+
+fn apply_tunnel_ws_request_headers(
+    request: &mut tokio_tungstenite::tungstenite::http::Request<()>,
+    headers: &[proto::TunnelHeader],
+    upstream_url: &Url,
+) {
+    let target_origin = tunnel_target_origin(upstream_url);
+    for header in headers {
+        let name = header.name.trim();
+        if name.is_empty() || should_drop_tunnel_ws_header(name) {
+            continue;
+        }
+        let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let value = if header_name.as_str().eq_ignore_ascii_case("origin") {
+            target_origin.as_str()
+        } else {
+            header.value.as_str()
+        };
+        let Ok(header_value) = HeaderValue::from_str(value) else {
+            continue;
+        };
+        request.headers_mut().append(header_name, header_value);
+    }
+    if !headers
+        .iter()
+        .any(|header| header.name.eq_ignore_ascii_case("origin"))
+    {
+        if let Ok(header_value) = HeaderValue::from_str(&target_origin) {
+            request
+                .headers_mut()
+                .insert(HeaderName::from_static("origin"), header_value);
+        }
+    }
+}
+
+fn should_drop_tunnel_ws_header(name: &str) -> bool {
+    if should_drop_tunnel_header(name, true) {
+        return true;
+    }
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "sec-websocket-key"
+            | "sec-websocket-version"
+            | "sec-websocket-extensions"
+            | "sec-websocket-accept"
+    )
+}
+
+fn tunnel_target_origin(url: &Url) -> String {
+    match url.port() {
+        Some(port) => format!("{}://{}:{port}", url.scheme(), url.host_str().unwrap_or("localhost")),
+        None => format!("{}://{}", url.scheme(), url.host_str().unwrap_or("localhost")),
+    }
 }
 
 async fn send_tunnel_frame(
@@ -5404,6 +5751,20 @@ mod tests {
         let root_target = validate_tunnel_target_url("http://127.0.0.1:5173").unwrap();
         let root_upstream = build_tunnel_upstream_url(&root_target.url, "/").unwrap();
         assert_eq!(root_upstream.as_str(), "http://127.0.0.1:5173/");
+    }
+
+    #[test]
+    fn build_tunnel_upstream_url_keeps_probe_paths_outside_target_base() {
+        let target = validate_tunnel_target_url("http://localhost:3000/app").unwrap();
+        let upstream = build_tunnel_upstream_url(
+            &target.url,
+            "/.liveagent-tunnel-probe/ws?check=1",
+        )
+        .unwrap();
+        assert_eq!(
+            upstream.as_str(),
+            "http://localhost:3000/.liveagent-tunnel-probe/ws?check=1"
+        );
     }
 
     #[test]

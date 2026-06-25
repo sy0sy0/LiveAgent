@@ -230,7 +230,7 @@ type BuildBuiltinBaseToolRegistryParams = {
   sshManagerRemoteAllowed?: boolean;
   onSshSessionsChanged?: (change: SshManagerSessionChange) => void | Promise<void>;
   onTunnelsChanged?: (change: {
-    action: "create" | "close";
+    action: "create" | "probe" | "close";
     tunnel: {
       id: string;
       slug: string;
@@ -241,6 +241,14 @@ type BuildBuiltinBaseToolRegistryParams = {
       expiresAt: number;
       status: "active" | "expired" | "offline";
       projectPathKey?: string;
+      diagnostics?: Array<{
+        protocol: "http" | "websocket" | "sse";
+        status: "ok" | "failed" | "unknown";
+        statusCode: number;
+        errorCode: string;
+        message: string;
+        checkedAt: number;
+      }>;
     };
   }) => void | Promise<void>;
 };

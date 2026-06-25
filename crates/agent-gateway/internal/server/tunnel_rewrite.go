@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"io"
 	"mime"
 	"net/http"
@@ -23,7 +24,6 @@ const (
 	tunnelResponseRewriteNone tunnelResponseRewriteKind = iota
 	tunnelResponseRewriteHTML
 	tunnelResponseRewriteCSS
-	tunnelResponseRewriteJavaScript // kept for legacy tests/helpers; JS bodies are not rewritten.
 )
 
 func tunnelResponseRewriteKindFor(
@@ -58,13 +58,6 @@ func tunnelResponseRewriteKindFor(
 		return tunnelResponseRewriteHTML
 	case mediaType == "text/css":
 		return tunnelResponseRewriteCSS
-	case mediaType == "text/javascript",
-		mediaType == "application/javascript",
-		mediaType == "application/x-javascript",
-		mediaType == "text/ecmascript",
-		mediaType == "application/ecmascript",
-		strings.HasSuffix(mediaType, "+javascript"):
-		return tunnelResponseRewriteNone
 	default:
 		return tunnelResponseRewriteNone
 	}
@@ -89,8 +82,6 @@ func rewriteTunnelResponseBody(
 		rewritten = rewriteTunnelHTMLBody(rewritten, tunnel)
 	case tunnelResponseRewriteCSS:
 		rewritten = rewriteTunnelCSSBody(rewritten, tunnel)
-	case tunnelResponseRewriteJavaScript:
-		rewritten = rewriteTunnelJavaScriptBody(rewritten, tunnel)
 	}
 	if rewritten == original {
 		return body, false
@@ -102,6 +93,8 @@ func rewriteTunnelHTMLBody(input string, tunnel *gatewayv1.TunnelSummary) string
 	tokenizer := html.NewTokenizer(strings.NewReader(input))
 	var builder strings.Builder
 	changed := false
+	injected := false
+	shim := tunnelRuntimeBootstrapScript(tunnel)
 
 	for {
 		tokenType := tokenizer.Next()
@@ -119,6 +112,12 @@ func rewriteTunnelHTMLBody(input string, tunnel *gatewayv1.TunnelSummary) string
 		}
 
 		token := tokenizer.Token()
+		tagName := strings.ToLower(strings.TrimSpace(token.Data))
+		if !injected && shim != "" && tagName == "script" {
+			builder.WriteString(shim)
+			injected = true
+			changed = true
+		}
 		tokenChanged := false
 		for index := range token.Attr {
 			attr := &token.Attr[index]
@@ -144,8 +143,16 @@ func rewriteTunnelHTMLBody(input string, tunnel *gatewayv1.TunnelSummary) string
 		} else {
 			builder.WriteString(raw)
 		}
+		if !injected && shim != "" && tagName == "head" {
+			builder.WriteString(shim)
+			injected = true
+			changed = true
+		}
 	}
 
+	if !injected && shim != "" {
+		return shim + builder.String()
+	}
 	if !changed {
 		return input
 	}
@@ -183,10 +190,6 @@ func rewriteTunnelCSSBody(input string, tunnel *gatewayv1.TunnelSummary) string 
 	return builder.String()
 }
 
-func rewriteTunnelJavaScriptBody(input string, tunnel *gatewayv1.TunnelSummary) string {
-	return input
-}
-
 func isTunnelHTMLURLAttribute(key string) bool {
 	switch key {
 	case "href", "src", "action", "poster", "data", "formaction", "xlink:href":
@@ -194,6 +197,33 @@ func isTunnelHTMLURLAttribute(key string) bool {
 	default:
 		return false
 	}
+}
+
+func tunnelRuntimeBootstrapScript(tunnel *gatewayv1.TunnelSummary) string {
+	prefix := tunnelPublicPathPrefix(tunnel)
+	if prefix == "" {
+		return ""
+	}
+	config, err := json.Marshal(map[string]string{
+		"basePath": prefix,
+	})
+	if err != nil {
+		return ""
+	}
+	return `<script data-liveagent-tunnel-shim>(function(config){` +
+		`if(window.__LIVEAGENT_TUNNEL__&&window.__LIVEAGENT_TUNNEL__.installed)return;` +
+		`var base=String(config.basePath||"").replace(/\/+$/,"");` +
+		`window.__LIVEAGENT_TUNNEL__={basePath:base,installed:true};` +
+		`function rw(input){if(input==null||!base)return input;var raw=input instanceof URL?input.href:String(input);var u;try{u=new URL(raw,location.href)}catch(_){return input}` +
+		`if(u.host!==location.host||!/^(http:|https:|ws:|wss:)$/i.test(u.protocol))return input;` +
+		`if(u.pathname===base||u.pathname.indexOf(base+"/")===0)return u.href;` +
+		`u.pathname=base+(u.pathname==="/"?"/":u.pathname);return u.href}` +
+		`function rwWs(input){var out=rw(input);try{var u=new URL(String(out),location.href);if(u.protocol==="http:")u.protocol="ws:";if(u.protocol==="https:")u.protocol="wss:";return u.href}catch(_){return out}}` +
+		`if(window.WebSocket){var NativeWebSocket=window.WebSocket;window.WebSocket=function(url,protocols){return new NativeWebSocket(rwWs(url),protocols)};window.WebSocket.prototype=NativeWebSocket.prototype;["CONNECTING","OPEN","CLOSING","CLOSED"].forEach(function(k){window.WebSocket[k]=NativeWebSocket[k]})}` +
+		`if(window.EventSource){var NativeEventSource=window.EventSource;window.EventSource=function(url,options){return new NativeEventSource(rw(url),options)};window.EventSource.prototype=NativeEventSource.prototype}` +
+		`if(window.fetch){var nativeFetch=window.fetch.bind(window);window.fetch=function(input,init){if(input instanceof Request)return nativeFetch(new Request(rw(input.url),input),init);return nativeFetch(rw(input),init)}}` +
+		`if(window.XMLHttpRequest){var open=window.XMLHttpRequest.prototype.open;window.XMLHttpRequest.prototype.open=function(method,url){arguments[1]=rw(url);return open.apply(this,arguments)}}` +
+		`})(` + string(config) + `);</script>`
 }
 
 func rewriteTunnelCSSURLToken(token string, tunnel *gatewayv1.TunnelSummary) (string, bool) {

@@ -76,7 +76,7 @@ test("TunnelManager is injected only when Remote Web Tunnels are enabled and gat
   assert.equal(cronRegistry.hasTool("TunnelManager"), false);
 });
 
-test("TunnelManager list/create/close call gateway tunnel commands", async () => {
+test("TunnelManager list/create/probe/close call gateway tunnel commands", async () => {
   const invocations = [];
   const loader = createTsModuleLoader({
     mocks: {
@@ -99,6 +99,29 @@ test("TunnelManager list/create/close call gateway tunnel commands", async () =>
             return createTunnel({
               id: args.tunnel_id,
               status: "expired",
+            });
+          }
+          if (command === "gateway_tunnel_probe") {
+            return createTunnel({
+              id: args.tunnel_id,
+              diagnostics: [
+                {
+                  protocol: "websocket",
+                  status: "ok",
+                  statusCode: 101,
+                  errorCode: "",
+                  message: "WebSocket probe succeeded",
+                  checkedAt: 1_700_000_100,
+                },
+                {
+                  protocol: "sse",
+                  status: "unknown",
+                  statusCode: 0,
+                  errorCode: "",
+                  message: "",
+                  checkedAt: 1_700_000_100,
+                },
+              ],
             });
           }
           throw new Error(`unexpected invoke ${command}`);
@@ -138,6 +161,15 @@ test("TunnelManager list/create/close call gateway tunnel commands", async () =>
   assert.doesNotMatch(createResult.content[0].text, /activeConnections|connections/i);
   assert.match(createResult.content[0].text, /unlimited/);
 
+  const probeResult = await bundle.executeToolCall(
+    createToolCall({ action: "probe", id: "tun-1" }),
+  );
+  assert.equal(probeResult.isError, false);
+  assert.equal(probeResult.details.tunnel.activeConnections, undefined);
+  assert.match(probeResult.content[0].text, /diagnostics:/);
+  assert.match(probeResult.content[0].text, /websocket: ok status=101/);
+  assert.match(probeResult.content[0].text, /sse: unknown/);
+
   const closeBySlugResult = await bundle.executeToolCall(
     createToolCall({ action: "close", slug: "abc123" }),
   );
@@ -159,6 +191,7 @@ test("TunnelManager list/create/close call gateway tunnel commands", async () =>
           },
         },
       ],
+      ["gateway_tunnel_probe", { tunnel_id: "tun-1" }],
       ["gateway_tunnel_list", undefined],
       ["gateway_tunnel_close", { tunnel_id: "tun-1" }],
     ],
@@ -167,6 +200,7 @@ test("TunnelManager list/create/close call gateway tunnel commands", async () =>
     changes.map((change) => [change.action, change.tunnel.id, change.tunnel.activeConnections]),
     [
       ["create", "tun-created", undefined],
+      ["probe", "tun-1", undefined],
       ["close", "tun-1", undefined],
     ],
   );
@@ -204,6 +238,10 @@ test("TunnelManager rejects invalid arguments before invoking gateway commands",
   const missingCloseTarget = await bundle.executeToolCall(createToolCall({ action: "close" }));
   assert.equal(missingCloseTarget.isError, true);
   assert.match(missingCloseTarget.content[0].text, /id or TunnelManager.slug/);
+
+  const missingProbeTarget = await bundle.executeToolCall(createToolCall({ action: "probe" }));
+  assert.equal(missingProbeTarget.isError, true);
+  assert.match(missingProbeTarget.content[0].text, /id or TunnelManager.slug/);
 
   assert.deepEqual(invocations, []);
 });

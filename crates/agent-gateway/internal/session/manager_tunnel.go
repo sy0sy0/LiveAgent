@@ -37,6 +37,7 @@ type tunnelRecord struct {
 	targetURL         string
 	publicURL         string
 	projectPathKey    string
+	diagnostics       []*gatewayv1.TunnelDiagnostic
 	createdAt         time.Time
 	expiresAt         time.Time
 	activeConnections int
@@ -155,6 +156,29 @@ func (m *Manager) ListTunnels() []*gatewayv1.TunnelSummary {
 	}
 	sortTunnelSummaries(summaries)
 	return summaries
+}
+
+func (m *Manager) SetTunnelDiagnostics(identifier string, diagnostics []*gatewayv1.TunnelDiagnostic) (*gatewayv1.TunnelSummary, error) {
+	identifier = strings.TrimSpace(identifier)
+	if identifier == "" {
+		return nil, ErrTunnelNotFound
+	}
+	now := time.Now()
+	online := m.IsOnline()
+	m.tunnels.mu.Lock()
+	defer m.tunnels.mu.Unlock()
+
+	record := m.tunnels.tunnelsByID[identifier]
+	if record == nil {
+		if id := m.tunnels.tunnelIDBySlug[identifier]; id != "" {
+			record = m.tunnels.tunnelsByID[id]
+		}
+	}
+	if record == nil || record.closed {
+		return nil, ErrTunnelNotFound
+	}
+	record.diagnostics = cloneTunnelDiagnostics(diagnostics)
+	return tunnelSummaryLocked(record, now, online), nil
 }
 
 func (m *Manager) PrepareTunnelCreate(
@@ -635,6 +659,20 @@ func (m *Manager) handleAgentTunnelControlInner(
 			Tunnel:  tunnel,
 			Tunnels: m.ListTunnels(),
 		}
+	case "probe":
+		identifier := request.GetTunnelId()
+		if strings.TrimSpace(identifier) == "" {
+			identifier = request.GetSlug()
+		}
+		tunnel, err := m.ProbeTunnel(context.Background(), identifier, request.GetPublicBaseUrl())
+		if err != nil {
+			return tunnelControlErrorFor(action, err)
+		}
+		return &gatewayv1.TunnelControlResponse{
+			Action:  action,
+			Tunnel:  tunnel,
+			Tunnels: m.ListTunnels(),
+		}
 	case "close":
 		identifier := request.GetTunnelId()
 		if strings.TrimSpace(identifier) == "" {
@@ -781,6 +819,7 @@ func tunnelSummaryLocked(record *tunnelRecord, now time.Time, online bool) *gate
 		ActiveConnections: activeConnections,
 		Status:            status,
 		ProjectPathKey:    record.projectPathKey,
+		Diagnostics:       cloneTunnelDiagnostics(record.diagnostics),
 	}
 }
 
@@ -799,7 +838,29 @@ func cloneTunnelSummary(summary *gatewayv1.TunnelSummary) *gatewayv1.TunnelSumma
 		ActiveConnections: summary.GetActiveConnections(),
 		Status:            summary.GetStatus(),
 		ProjectPathKey:    strings.TrimSpace(summary.GetProjectPathKey()),
+		Diagnostics:       cloneTunnelDiagnostics(summary.GetDiagnostics()),
 	}
+}
+
+func cloneTunnelDiagnostics(input []*gatewayv1.TunnelDiagnostic) []*gatewayv1.TunnelDiagnostic {
+	if len(input) == 0 {
+		return nil
+	}
+	out := make([]*gatewayv1.TunnelDiagnostic, 0, len(input))
+	for _, item := range input {
+		if item == nil {
+			continue
+		}
+		out = append(out, &gatewayv1.TunnelDiagnostic{
+			Protocol:   strings.TrimSpace(item.GetProtocol()),
+			Status:     strings.TrimSpace(item.GetStatus()),
+			StatusCode: item.GetStatusCode(),
+			ErrorCode:  strings.TrimSpace(item.GetErrorCode()),
+			Message:    strings.TrimSpace(item.GetMessage()),
+			CheckedAt:  item.GetCheckedAt(),
+		})
+	}
+	return out
 }
 
 func sortTunnelSummaries(summaries []*gatewayv1.TunnelSummary) {

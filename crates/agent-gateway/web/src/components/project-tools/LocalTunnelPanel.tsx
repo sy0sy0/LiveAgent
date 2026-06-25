@@ -20,6 +20,7 @@ import {
   Link2,
   Loader2,
   Plus,
+  RefreshCw,
   Trash2,
   X,
 } from "../icons";
@@ -29,6 +30,7 @@ import { Label } from "../ui/label";
 
 export type { TunnelCreateInput };
 export type TunnelSummary = Omit<GatewayTunnelSummary, "activeConnections">;
+type TunnelDiagnostic = NonNullable<TunnelSummary["diagnostics"]>[number];
 
 export type TunnelTtlSeconds = 0 | 900 | 3600 | 14400;
 
@@ -36,6 +38,7 @@ export type LocalTunnelClient = {
   listTunnels(): Promise<TunnelSummary[]>;
   createTunnel(input: TunnelCreateInput): Promise<TunnelSummary>;
   updateTunnel(input: TunnelUpdateInput): Promise<TunnelSummary>;
+  probeTunnel(id: string): Promise<TunnelSummary>;
   closeTunnel(id: string): Promise<TunnelSummary>;
 };
 
@@ -73,6 +76,12 @@ const TTL_OPTIONS: Array<{ value: TunnelTtlSeconds; labelKey: string }> = [
   { value: 3600, labelKey: "projectTools.tunnelTtl1h" },
   { value: 14400, labelKey: "projectTools.tunnelTtl4h" },
   { value: 0, labelKey: "projectTools.tunnelTtlInfinite" },
+];
+
+const TUNNEL_DIAGNOSTIC_PROTOCOLS: TunnelDiagnostic["protocol"][] = [
+  "http",
+  "websocket",
+  "sse",
 ];
 
 const TUNNEL_INPUT_CLASS =
@@ -218,6 +227,15 @@ function ttlFromTunnel(tunnel: TunnelSummary, nowSeconds: number): TunnelTtlSeco
   return 14400;
 }
 
+function diagnosticFor(tunnel: TunnelSummary, protocol: TunnelDiagnostic["protocol"]) {
+  return tunnel.diagnostics?.find((item) => item.protocol === protocol);
+}
+
+function diagnosticLabel(protocol: TunnelDiagnostic["protocol"]) {
+  if (protocol === "websocket") return "WS";
+  return protocol.toUpperCase();
+}
+
 export function LocalTunnelPanel({
   client,
   enabled = true,
@@ -246,6 +264,7 @@ export function LocalTunnelPanel({
   const [creating, setCreating] = useState(false);
   const [savingId, setSavingId] = useState("");
   const [closingId, setClosingId] = useState("");
+  const [probingId, setProbingId] = useState("");
   const [copiedId, setCopiedId] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
@@ -426,6 +445,22 @@ export function LocalTunnelPanel({
         .finally(() => setClosingId((current) => (current === id ? "" : current)));
     },
     [client, closingId, enabled],
+  );
+
+  const probeTunnel = useCallback(
+    (id: string) => {
+      if (!enabled || probingId) return;
+      setProbingId(id);
+      setError(null);
+      void client
+        .probeTunnel(id)
+        .then((updated) =>
+          setTunnels((current) => current.map((item) => (item.id === updated.id ? updated : item))),
+        )
+        .catch((err) => setError(asErrorMessage(err)))
+        .finally(() => setProbingId((current) => (current === id ? "" : current)));
+    },
+    [client, enabled, probingId],
   );
 
   const copyLink = useCallback((tunnel: TunnelSummary) => {
@@ -878,6 +913,55 @@ export function LocalTunnelPanel({
                           <span className="shrink-0">{t("projectTools.tunnelTarget")}</span>
                           <span className="min-w-0 truncate font-mono">{tunnel.targetUrl}</span>
                         </div>
+                        <div className="mx-3 mt-2 grid grid-cols-3 gap-1">
+                          {TUNNEL_DIAGNOSTIC_PROTOCOLS.map((protocol) => {
+                            const diagnostic = diagnosticFor(tunnel, protocol);
+                            const status = diagnostic?.status ?? "unknown";
+                            const title = diagnostic
+                              ? [
+                                  diagnosticLabel(protocol),
+                                  t(
+                                    status === "ok"
+                                      ? "projectTools.tunnelDiagnosticOk"
+                                      : status === "failed"
+                                        ? "projectTools.tunnelDiagnosticFailed"
+                                        : "projectTools.tunnelDiagnosticUnknown",
+                                  ),
+                                  diagnostic.statusCode ? String(diagnostic.statusCode) : "",
+                                  diagnostic.errorCode,
+                                  diagnostic.message,
+                                ]
+                                  .filter(Boolean)
+                                  .join(" · ")
+                              : t("projectTools.tunnelDiagnosticUnknown");
+                            return (
+                              <div
+                                key={protocol}
+                                title={title}
+                                className={cn(
+                                  "flex h-6 min-w-0 items-center justify-center gap-1 rounded-md border px-1 text-[10px] font-medium",
+                                  status === "ok"
+                                    ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                                    : status === "failed"
+                                      ? "border-destructive/20 bg-destructive/10 text-destructive"
+                                      : "border-border/60 bg-muted/50 text-muted-foreground",
+                                )}
+                              >
+                                <span
+                                  className={cn(
+                                    "h-1.5 w-1.5 rounded-full",
+                                    status === "ok"
+                                      ? "bg-emerald-500"
+                                      : status === "failed"
+                                        ? "bg-destructive"
+                                        : "bg-muted-foreground/45",
+                                  )}
+                                />
+                                <span className="truncate">{diagnosticLabel(protocol)}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
                         <div className="mt-2 flex items-center justify-between gap-2 border-t border-border/40 py-1 pl-3 pr-1.5">
                           <div className="flex min-w-0 items-center gap-2 text-[11px] text-muted-foreground">
                             <span
@@ -907,6 +991,22 @@ export function LocalTunnelPanel({
                             ) : null}
                           </div>
                           <div className="flex shrink-0 items-center gap-0.5">
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              className="h-7 w-7 rounded-lg text-muted-foreground hover:text-foreground"
+                              disabled={!enabled || expired || probingId === tunnel.id}
+                              onClick={() => probeTunnel(tunnel.id)}
+                              title={!enabled ? disabledMessage : t("projectTools.tunnelProbe")}
+                              aria-label={t("projectTools.tunnelProbe")}
+                            >
+                              {probingId === tunnel.id ? (
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              ) : (
+                                <RefreshCw className="h-3.5 w-3.5" />
+                              )}
+                            </Button>
                             <Button
                               type="button"
                               variant="ghost"

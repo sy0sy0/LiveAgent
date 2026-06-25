@@ -109,6 +109,7 @@ func TestRewriteTunnelHTMLBodyPrefixesRootRelativeAttributes(t *testing.T) {
 	output := string(body)
 
 	assertContains(t, output, `href="/t/test-slug/styles.css"`)
+	assertContains(t, output, `data-liveagent-tunnel-shim`)
 	assertContains(t, output, `src="/t/test-slug/app.js"`)
 	assertContains(t, output, `action="/t/test-slug/api/messages"`)
 	assertContains(t, output, `href="/t/test-slug/api/health?check=1#ready"`)
@@ -144,16 +145,6 @@ func TestRewriteTunnelBodyStripsTargetBasePath(t *testing.T) {
 	assertContains(t, output, `href="/t/base-slug/api/health"`)
 	assertNotContains(t, output, `/t/base-slug/app/`)
 
-	jsBody, changed := rewriteTunnelResponseBody(
-		[]byte(`fetch("/app/api/health?check=1#ready")`),
-		tunnel,
-		tunnelResponseRewriteJavaScript,
-	)
-	if changed {
-		t.Fatal("rewriteTunnelResponseBody() reported an unsafe JavaScript change")
-	}
-	assertContains(t, string(jsBody), `fetch("/app/api/health?check=1#ready")`)
-
 	cssBody, changed := rewriteTunnelResponseBody(
 		[]byte(`body { background: url(/app/images/bg.png); }`),
 		tunnel,
@@ -165,7 +156,7 @@ func TestRewriteTunnelBodyStripsTargetBasePath(t *testing.T) {
 	assertContains(t, string(cssBody), `url(/t/base-slug/images/bg.png)`)
 }
 
-func TestRewriteTunnelJavaScriptBodyDoesNotRewriteStrings(t *testing.T) {
+func TestRewriteTunnelJavaScriptBodyIsNotRewritten(t *testing.T) {
 	t.Parallel()
 
 	tunnel := tunnelRewriteTestSummary()
@@ -178,7 +169,7 @@ func TestRewriteTunnelJavaScriptBodyDoesNotRewriteStrings(t *testing.T) {
 		`const already = "/t/test-slug/api/health"`,
 	}, "\n")
 
-	body, changed := rewriteTunnelResponseBody([]byte(input), tunnel, tunnelResponseRewriteJavaScript)
+	body, changed := rewriteTunnelResponseBody([]byte(input), tunnel, tunnelResponseRewriteNone)
 	if changed {
 		t.Fatal("rewriteTunnelResponseBody() reported an unsafe JavaScript change")
 	}
@@ -210,7 +201,32 @@ func TestRewriteTunnelHTMLBodyUsesHTMLParsingBoundaries(t *testing.T) {
 
 	assertContains(t, output, `style="background: url(&#39;/t/test-slug/images/bg.png&#39;)"`)
 	assertContains(t, output, `<script>const markup = '<a href="/api/not-real">';</script>`)
+	assertContains(t, output, `data-liveagent-tunnel-shim`)
 	assertNotContains(t, output, `/t/test-slug/api/not-real`)
+}
+
+func TestRewriteTunnelHTMLBodyInjectsRuntimeShimBeforeFirstScript(t *testing.T) {
+	t.Parallel()
+
+	body, changed := rewriteTunnelResponseBody(
+		[]byte(`<html><script>new WebSocket(location.origin)</script></html>`),
+		tunnelRewriteTestSummary(),
+		tunnelResponseRewriteHTML,
+	)
+	if !changed {
+		t.Fatal("rewriteTunnelResponseBody() did not inject runtime shim")
+	}
+	output := string(body)
+	shimIndex := strings.Index(output, `data-liveagent-tunnel-shim`)
+	appIndex := strings.Index(output, `new WebSocket`)
+	if shimIndex < 0 || appIndex < 0 || shimIndex > appIndex {
+		t.Fatalf("runtime shim was not injected before app script:\n%s", output)
+	}
+	assertContains(t, output, `"basePath":"/t/test-slug"`)
+	assertContains(t, output, `window.WebSocket=function`)
+	assertContains(t, output, `window.fetch=function`)
+	assertContains(t, output, `window.EventSource=function`)
+	assertContains(t, output, `XMLHttpRequest.prototype.open`)
 }
 
 func TestRewriteTunnelCSSBodyPrefixesRootRelativeURLs(t *testing.T) {

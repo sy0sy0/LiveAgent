@@ -2443,10 +2443,11 @@ test("Gateway SharedWorker forwards tunnel requests", async () => {
           publicUrl: "https://gateway.example/t/slug-1/",
           createdAt: 10,
           expiresAt: 3700,
-          activeConnections: 0,
-          status: "active",
-        },
-      ];
+	          activeConnections: 0,
+	          status: "active",
+	          diagnostics: [],
+	        },
+	      ];
     }
 
     createTunnel(input) {
@@ -2459,9 +2460,19 @@ test("Gateway SharedWorker forwards tunnel requests", async () => {
         publicUrl: "https://gateway.example/t/slug-2/",
         createdAt: 20,
         expiresAt: 920,
-        activeConnections: 0,
-        status: "active",
-      };
+	        activeConnections: 0,
+	        status: "active",
+	        diagnostics: [
+	          {
+	            protocol: "websocket",
+	            status: "ok",
+	            statusCode: 101,
+	            errorCode: "",
+	            message: "WebSocket probe succeeded",
+	            checkedAt: 20,
+	          },
+	        ],
+	      };
     }
 
     updateTunnel(input) {
@@ -2474,11 +2485,38 @@ test("Gateway SharedWorker forwards tunnel requests", async () => {
         publicUrl: "https://gateway.example/t/slug-2/",
         createdAt: 20,
         expiresAt: input.ttlSeconds === 0 ? 0 : 920,
-        activeConnections: 0,
-        status: "active",
-        projectPathKey: input.projectPathKey ?? "",
-      };
-    }
+	        activeConnections: 0,
+	        status: "active",
+	        projectPathKey: input.projectPathKey ?? "",
+	        diagnostics: [],
+	      };
+	    }
+
+	    probeTunnel(id) {
+	      this.calls.push(["probeTunnel", id]);
+	      return {
+	        id,
+	        slug: "slug-2",
+	        name: "Dashboard",
+	        targetUrl: "http://localhost:4000/dashboard",
+	        publicUrl: "https://gateway.example/t/slug-2/",
+	        createdAt: 20,
+	        expiresAt: 0,
+	        activeConnections: 0,
+	        status: "active",
+	        projectPathKey: "project:/tmp/liveagent",
+	        diagnostics: [
+	          {
+	            protocol: "websocket",
+	            status: "failed",
+	            statusCode: 200,
+	            errorCode: "path_or_upgrade_missed",
+	            message: "WebSocket probe returned a 200 HTML response",
+	            checkedAt: 30,
+	          },
+	        ],
+	      };
+	    }
 
     closeTunnel(id) {
       this.calls.push(["closeTunnel", id]);
@@ -2490,10 +2528,11 @@ test("Gateway SharedWorker forwards tunnel requests", async () => {
         publicUrl: "https://gateway.example/t/slug-2/",
         createdAt: 20,
         expiresAt: 920,
-        activeConnections: 0,
-        status: "expired",
-      };
-    }
+	        activeConnections: 0,
+	        status: "expired",
+	        diagnostics: [],
+	      };
+	    }
 
     dispose() {}
   }
@@ -2580,10 +2619,24 @@ test("Gateway SharedWorker forwards tunnel requests", async () => {
       projectPathKey: "project:/tmp/liveagent",
     },
   ]);
-  assert.equal(port.messages.at(-1).payload.tunnel.expiresAt, 0);
-  assert.equal(port.messages.at(-1).payload.tunnel.projectPathKey, "project:/tmp/liveagent");
+	  assert.equal(port.messages.at(-1).payload.tunnel.expiresAt, 0);
+	  assert.equal(port.messages.at(-1).payload.tunnel.projectPathKey, "project:/tmp/liveagent");
 
-  port.emit({
+	  port.emit({
+	    type: "request",
+	    connection_id: "connection-1",
+	    request_id: "tunnel-probe",
+	    method: "tunnel.probe",
+	    payload: { id: "tun-2" },
+	  });
+	  await waitFor(
+	    () => port.messages.some((message) => message.request_id === "tunnel-probe"),
+	    "shared worker tunnel probe response",
+	  );
+	  assert.deepEqual(clientInstances[0].calls.at(-1), ["probeTunnel", "tun-2"]);
+	  assert.equal(port.messages.at(-1).payload.tunnel.diagnostics[0].errorCode, "path_or_upgrade_missed");
+
+	  port.emit({
     type: "request",
     connection_id: "connection-1",
     request_id: "tunnel-close",

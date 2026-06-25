@@ -718,6 +718,8 @@ export function ChatPage(props: ChatPageProps) {
         invoke<TunnelSummary>("gateway_tunnel_create", { input }),
       updateTunnel: (input: TunnelUpdateInput) =>
         invoke<TunnelSummary>("gateway_tunnel_update", { input }),
+      probeTunnel: (id: string) =>
+        invoke<TunnelSummary>("gateway_tunnel_probe", { tunnel_id: id }),
       closeTunnel: (id: string) => invoke<TunnelSummary>("gateway_tunnel_close", { tunnel_id: id }),
     }),
     [],

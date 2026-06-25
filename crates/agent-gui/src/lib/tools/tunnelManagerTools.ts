@@ -19,11 +19,21 @@ type TunnelSummary = {
   activeConnections: number;
   status: "active" | "expired" | "offline";
   projectPathKey?: string;
+  diagnostics?: TunnelDiagnostic[];
+};
+
+type TunnelDiagnostic = {
+  protocol: "http" | "websocket" | "sse";
+  status: "ok" | "failed" | "unknown";
+  statusCode: number;
+  errorCode: string;
+  message: string;
+  checkedAt: number;
 };
 
 type TunnelManagerTunnelSummary = Omit<TunnelSummary, "activeConnections">;
 
-export type TunnelChangeAction = "create" | "close";
+export type TunnelChangeAction = "create" | "probe" | "close";
 
 export type TunnelManagerChange = {
   action: TunnelChangeAction;
@@ -37,7 +47,7 @@ type TunnelCreateInput = {
   projectPathKey?: string;
 };
 
-type TunnelManagerAction = "list" | "create" | "close";
+type TunnelManagerAction = "list" | "create" | "probe" | "close";
 
 type TunnelManagerDetails = {
   kind: "tunnel_manager";
@@ -49,11 +59,14 @@ type TunnelManagerDetails = {
 const TUNNEL_MANAGER_TOOL: Tool = {
   name: "TunnelManager",
   description:
-    "Manage temporary Remote HTTP tunnels through the Gateway. Use list to inspect active tunnels, create to expose a localhost or IPv4/IPv6 http service, and close to revoke a tunnel.",
+    "Manage temporary Remote HTTP/WebSocket/SSE tunnels through the Gateway. Use list to inspect active tunnels and diagnostics, create to expose a localhost or IPv4/IPv6 http service, probe to recheck HTTP/WebSocket/SSE diagnostics, and close to revoke a tunnel.",
   parameters: Type.Object({
-    action: Type.Union([Type.Literal("list"), Type.Literal("create"), Type.Literal("close")], {
-      description: "Tunnel action to perform.",
-    }),
+    action: Type.Union(
+      [Type.Literal("list"), Type.Literal("create"), Type.Literal("probe"), Type.Literal("close")],
+      {
+        description: "Tunnel action to perform.",
+      },
+    ),
     targetUrl: Type.Optional(
       Type.String({
         description:
@@ -72,12 +85,12 @@ const TUNNEL_MANAGER_TOOL: Tool = {
     ),
     id: Type.Optional(
       Type.String({
-        description: "Tunnel id for action=close. Preferred over slug when available.",
+        description: "Tunnel id for action=probe or action=close. Preferred over slug when available.",
       }),
     ),
     slug: Type.Optional(
       Type.String({
-        description: "Tunnel slug for action=close when id is not known.",
+        description: "Tunnel slug for action=probe or action=close when id is not known.",
       }),
     ),
   }),
@@ -94,10 +107,10 @@ function asArgs(value: unknown): Record<string, unknown> {
 }
 
 function normalizeAction(value: unknown): TunnelManagerAction {
-  if (value === "list" || value === "create" || value === "close") {
+  if (value === "list" || value === "create" || value === "probe" || value === "close") {
     return value;
   }
-  throw new Error('TunnelManager.action must be "list", "create", or "close".');
+  throw new Error('TunnelManager.action must be "list", "create", "probe", or "close".');
 }
 
 function normalizeTtlSeconds(value: unknown): TunnelTtlSeconds {
@@ -131,7 +144,7 @@ function stripConnectionCount(tunnel: TunnelSummary): TunnelManagerTunnelSummary
 
 function formatTunnelLine(tunnel: TunnelManagerTunnelSummary) {
   const name = tunnel.name.trim() || tunnel.targetUrl;
-  return [
+  const lines = [
     `- ${name}`,
     `  id: ${tunnel.id}`,
     `  slug: ${tunnel.slug}`,
@@ -139,7 +152,22 @@ function formatTunnelLine(tunnel: TunnelManagerTunnelSummary) {
     `  public: ${tunnel.publicUrl}`,
     `  status: ${tunnel.status}`,
     `  ttl: ${formatRemaining(tunnel.expiresAt)}`,
-  ].join("\n");
+  ];
+  if (tunnel.diagnostics?.length) {
+    lines.push("  diagnostics:");
+    for (const diagnostic of tunnel.diagnostics) {
+      const status =
+        diagnostic.status === "ok"
+          ? "ok"
+          : diagnostic.status === "failed"
+            ? `failed:${diagnostic.errorCode || "unknown"}`
+            : "unknown";
+      const statusCode = diagnostic.statusCode ? ` status=${diagnostic.statusCode}` : "";
+      const message = diagnostic.message ? ` ${diagnostic.message}` : "";
+      lines.push(`    ${diagnostic.protocol}: ${status}${statusCode}${message}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 function okResult(params: {
@@ -198,6 +226,27 @@ async function closeTunnel(id: string) {
   return invoke<TunnelSummary>("gateway_tunnel_close", { tunnel_id: id });
 }
 
+async function probeTunnel(id: string) {
+  return invoke<TunnelSummary>("gateway_tunnel_probe", { tunnel_id: id });
+}
+
+async function resolveTunnelId(args: Record<string, unknown>, action: "probe" | "close") {
+  const id = normalizeOptionalText(args.id);
+  const slug = normalizeOptionalText(args.slug);
+  if (!id && !slug) {
+    throw new Error(`TunnelManager.id or TunnelManager.slug is required for action=${action}.`);
+  }
+  if (id) {
+    return id;
+  }
+  const tunnels = await listTunnels();
+  const tunnelId = tunnels.find((tunnel) => tunnel.slug === slug)?.id ?? "";
+  if (!tunnelId) {
+    throw new Error(`No tunnel found for slug "${slug}".`);
+  }
+  return tunnelId;
+}
+
 async function executeTunnelManager(
   toolCall: ToolCall,
   params: {
@@ -226,8 +275,8 @@ async function executeTunnelManager(
       const tunnels = (await listTunnels()).map(stripConnectionCount);
       const text =
         tunnels.length === 0
-          ? "No Remote HTTP tunnels are currently registered."
-          : ["Remote HTTP tunnels:", ...tunnels.map(formatTunnelLine)].join("\n");
+          ? "No Remote tunnels are currently registered."
+          : ["Remote tunnels:", ...tunnels.map(formatTunnelLine)].join("\n");
       return okResult({ toolCall, action, text, tunnels });
     }
 
@@ -247,38 +296,39 @@ async function executeTunnelManager(
       return okResult({
         toolCall,
         action,
-        text: ["Created Remote HTTP tunnel:", formatTunnelLine(visibleTunnel)].join("\n"),
+        text: ["Created Remote tunnel:", formatTunnelLine(visibleTunnel)].join("\n"),
         tunnel: visibleTunnel,
       });
     }
 
-    const id = normalizeOptionalText(args.id);
-    const slug = normalizeOptionalText(args.slug);
-    if (!id && !slug) {
-      throw new Error("TunnelManager.id or TunnelManager.slug is required for action=close.");
+    if (action === "probe") {
+      const tunnel = await probeTunnel(await resolveTunnelId(args, "probe"));
+      const visibleTunnel = stripConnectionCount(tunnel);
+      await params.onTunnelsChanged?.({ action: "probe", tunnel: visibleTunnel });
+      return okResult({
+        toolCall,
+        action,
+        text: ["Rechecked Remote tunnel diagnostics:", formatTunnelLine(visibleTunnel)].join("\n"),
+        tunnel: visibleTunnel,
+      });
     }
 
-    let tunnelId = id;
-    if (!tunnelId) {
-      const tunnels = await listTunnels();
-      tunnelId = tunnels.find((tunnel) => tunnel.slug === slug)?.id ?? "";
-      if (!tunnelId) {
-        throw new Error(`No tunnel found for slug "${slug}".`);
-      }
-    }
-    const tunnel = await closeTunnel(tunnelId);
+    const tunnel = await closeTunnel(await resolveTunnelId(args, "close"));
     const visibleTunnel = stripConnectionCount(tunnel);
     await params.onTunnelsChanged?.({ action: "close", tunnel: visibleTunnel });
     return okResult({
       toolCall,
       action,
-      text: ["Closed Remote HTTP tunnel:", formatTunnelLine(visibleTunnel)].join("\n"),
+      text: ["Closed Remote tunnel:", formatTunnelLine(visibleTunnel)].join("\n"),
       tunnel: visibleTunnel,
     });
   } catch (err) {
     const args = asArgs(toolCall.arguments);
     const action =
-      args.action === "create" || args.action === "close" || args.action === "list"
+      args.action === "create" ||
+      args.action === "probe" ||
+      args.action === "close" ||
+      args.action === "list"
         ? args.action
         : undefined;
     return errorResult(toolCall, asErrorMessage(err), action);

@@ -65,6 +65,7 @@ func TestWebsocketRequestHandlersCoverKnownProtocolTypes(t *testing.T) {
 		"tunnel.create",
 		"tunnel.update",
 		"tunnel.close",
+		"tunnel.probe",
 		"git.status",
 		"git.branches",
 		"git.init",

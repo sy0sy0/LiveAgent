@@ -241,6 +241,14 @@ pub async fn gateway_tunnel_update(
 }
 
 #[tauri::command(rename_all = "snake_case")]
+pub async fn gateway_tunnel_probe(
+    tunnel_id: String,
+    gateway_controller: tauri::State<'_, Arc<GatewayController>>,
+) -> Result<GatewayTunnelSummary, String> {
+    gateway_controller.tunnel_probe(tunnel_id).await
+}
+
+#[tauri::command(rename_all = "snake_case")]
 pub async fn gateway_tunnel_close(
     tunnel_id: String,
     gateway_controller: tauri::State<'_, Arc<GatewayController>>,

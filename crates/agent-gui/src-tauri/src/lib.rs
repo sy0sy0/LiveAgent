@@ -238,6 +238,7 @@ macro_rules! app_invoke_handler {
             commands::gateway::gateway_tunnel_list,
             commands::gateway::gateway_tunnel_create,
             commands::gateway::gateway_tunnel_update,
+            commands::gateway::gateway_tunnel_probe,
             commands::gateway::gateway_tunnel_close,
             services::proxy::proxy_get_server_info,
         ]

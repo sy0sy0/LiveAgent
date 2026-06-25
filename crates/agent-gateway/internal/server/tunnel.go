@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -83,7 +82,7 @@ func serveTunnelHTTP(
 		Kind:     gatewayv1.TunnelFrameKind_TUNNEL_FRAME_KIND_HTTP_REQUEST_START,
 		Method:   r.Method,
 		Path:     restPath,
-		Headers:  filteredTunnelRequestHeaders(r.Header),
+		Headers:  tunnelRequestHeaders(r, lease.Tunnel()),
 	}
 	if err := sm.SendTunnelFrameToAgent(start); err != nil {
 		writeTunnelAcquireError(w, err)
@@ -235,29 +234,65 @@ func serveTunnelWebSocket(
 		writeTunnelAcquireError(w, err)
 		return
 	}
+
+	if err := sm.SendTunnelFrameToAgent(&gatewayv1.TunnelFrame{
+		StreamId: streamID,
+		TunnelId: lease.TunnelID(),
+		Slug:     slug,
+		Kind:     gatewayv1.TunnelFrameKind_TUNNEL_FRAME_KIND_WS_DIAL,
+		Method:   r.Method,
+		Path:     restPath,
+		Headers:  tunnelWebSocketRequestHeaders(r, lease.Tunnel()),
+	}); err != nil {
+		lease.Release()
+		writeTunnelAcquireError(w, err)
+		return
+	}
+
+	wsProtocol, dialErr := awaitTunnelWebSocketDial(lease)
+	if dialErr != nil {
+		_ = sm.SendTunnelFrameToAgent(&gatewayv1.TunnelFrame{
+			StreamId: streamID,
+			TunnelId: lease.TunnelID(),
+			Slug:     slug,
+			Kind:     gatewayv1.TunnelFrameKind_TUNNEL_FRAME_KIND_CANCEL,
+			Error:    dialErr.Error(),
+		})
+		lease.Release()
+		writeTunnelError(w, http.StatusBadGateway, dialErr.Error())
+		return
+	}
+
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(_ *http.Request) bool {
 			return true
 		},
 	}
+	if wsProtocol != "" {
+		upgrader.Subprotocols = []string{wsProtocol}
+	}
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		_ = sm.SendTunnelFrameToAgent(&gatewayv1.TunnelFrame{
+			StreamId: streamID,
+			TunnelId: lease.TunnelID(),
+			Slug:     slug,
+			Kind:     gatewayv1.TunnelFrameKind_TUNNEL_FRAME_KIND_WS_CLOSE,
+		})
 		lease.Release()
 		return
 	}
 	ws.SetReadLimit(16 * 1024 * 1024)
 	defer lease.Release()
-	handleTunnelWebSocket(ws, r, sm, lease, slug, streamID, restPath)
+	handleTunnelWebSocket(ws, sm, lease, slug, streamID)
 }
 
 func handleTunnelWebSocket(
 	ws *websocket.Conn,
-	r *http.Request,
 	sm *session.Manager,
 	lease *session.TunnelStreamLease,
 	slug string,
 	streamID string,
-	restPath string,
 ) {
 	closed := false
 	defer func() {
@@ -272,23 +307,6 @@ func handleTunnelWebSocket(
 		_ = ws.Close()
 	}()
 
-	if err := sm.SendTunnelFrameToAgent(&gatewayv1.TunnelFrame{
-		StreamId: streamID,
-		TunnelId: lease.TunnelID(),
-		Slug:     slug,
-		Kind:     gatewayv1.TunnelFrameKind_TUNNEL_FRAME_KIND_WS_OPEN,
-		Method:   r.Method,
-		Path:     restPath,
-		Headers:  filteredTunnelRequestHeaders(r.Header),
-	}); err != nil {
-		return
-	}
-
-	if !awaitTunnelWebSocketOpen(ws, lease) {
-		closed = true
-		return
-	}
-
 	browserFrames := make(chan *gatewayv1.TunnelFrame, 64)
 	readerDone := make(chan struct{})
 	go func() {
@@ -299,7 +317,7 @@ func handleTunnelWebSocket(
 				return
 			}
 			wireMessageType := "binary"
-			if messageType == websocket.TextMessage || utf8.Valid(body) {
+			if messageType == websocket.TextMessage {
 				wireMessageType = "text"
 			}
 			frame := &gatewayv1.TunnelFrame{
@@ -361,29 +379,36 @@ func handleTunnelWebSocket(
 	}
 }
 
-func awaitTunnelWebSocketOpen(ws *websocket.Conn, lease *session.TunnelStreamLease) bool {
+func awaitTunnelWebSocketDial(lease *session.TunnelStreamLease) (string, error) {
 	timer := time.NewTimer(30 * time.Second)
 	defer timer.Stop()
 	for {
 		select {
 		case <-timer.C:
-			return false
+			return "", errors.New("local tunnel websocket dial timed out")
 		case <-lease.Done():
-			return false
+			return "", errors.New("tunnel stream closed before websocket dial completed")
 		case frame := <-lease.Frames():
 			if frame == nil {
 				continue
 			}
 			switch frame.GetKind() {
-			case gatewayv1.TunnelFrameKind_TUNNEL_FRAME_KIND_WS_OPEN:
-				return true
+			case gatewayv1.TunnelFrameKind_TUNNEL_FRAME_KIND_WS_DIAL_OK:
+				return strings.TrimSpace(frame.GetWsProtocol()), nil
+			case gatewayv1.TunnelFrameKind_TUNNEL_FRAME_KIND_WS_DIAL_ERROR:
+				message := strings.TrimSpace(frame.GetError())
+				if message == "" {
+					message = "local tunnel websocket dial failed"
+				}
+				return "", errors.New(message)
 			case gatewayv1.TunnelFrameKind_TUNNEL_FRAME_KIND_ERROR,
 				gatewayv1.TunnelFrameKind_TUNNEL_FRAME_KIND_CANCEL,
 				gatewayv1.TunnelFrameKind_TUNNEL_FRAME_KIND_WS_CLOSE:
-				if frame.GetError() != "" {
-					_ = ws.WriteMessage(websocket.TextMessage, []byte(frame.GetError()))
+				message := strings.TrimSpace(frame.GetError())
+				if message == "" {
+					message = "local tunnel websocket dial failed"
 				}
-				return false
+				return "", errors.New(message)
 			}
 		}
 	}
@@ -499,8 +524,26 @@ func isWebSocketUpgrade(r *http.Request) bool {
 		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
 }
 
-func filteredTunnelRequestHeaders(headers http.Header) []*gatewayv1.TunnelHeader {
-	return filteredTunnelHeaders(headers, true)
+func tunnelRequestHeaders(r *http.Request, tunnel *gatewayv1.TunnelSummary) []*gatewayv1.TunnelHeader {
+	headers := filteredTunnelHeaders(r.Header, true)
+	return appendTunnelForwardedHeaders(headers, r, tunnel)
+}
+
+func tunnelWebSocketRequestHeaders(r *http.Request, tunnel *gatewayv1.TunnelSummary) []*gatewayv1.TunnelHeader {
+	headers := make([]*gatewayv1.TunnelHeader, 0, len(r.Header))
+	for name, values := range r.Header {
+		canonical := http.CanonicalHeaderKey(strings.TrimSpace(name))
+		if canonical == "" || shouldDropTunnelWebSocketRequestHeader(canonical) {
+			continue
+		}
+		for _, value := range values {
+			headers = append(headers, &gatewayv1.TunnelHeader{
+				Name:  canonical,
+				Value: value,
+			})
+		}
+	}
+	return appendTunnelForwardedHeaders(headers, r, tunnel)
 }
 
 func filteredTunnelResponseHeaders(headers []*gatewayv1.TunnelHeader) http.Header {
@@ -549,6 +592,47 @@ func shouldDropTunnelHeader(name string, request bool) bool {
 	default:
 		return false
 	}
+}
+
+func shouldDropTunnelWebSocketRequestHeader(name string) bool {
+	if shouldDropTunnelHeader(name, true) {
+		return true
+	}
+	switch strings.ToLower(name) {
+	case "sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions", "sec-websocket-accept":
+		return true
+	default:
+		return false
+	}
+}
+
+func appendTunnelForwardedHeaders(
+	headers []*gatewayv1.TunnelHeader,
+	r *http.Request,
+	tunnel *gatewayv1.TunnelSummary,
+) []*gatewayv1.TunnelHeader {
+	if r == nil {
+		return headers
+	}
+	proto := "http"
+	if r.TLS != nil {
+		proto = "https"
+	}
+	prefix := ""
+	if tunnel != nil && strings.TrimSpace(tunnel.GetSlug()) != "" {
+		prefix = "/t/" + strings.TrimSpace(tunnel.GetSlug())
+	}
+	headers = append(headers,
+		&gatewayv1.TunnelHeader{Name: "X-Forwarded-Host", Value: r.Host},
+		&gatewayv1.TunnelHeader{Name: "X-Forwarded-Proto", Value: proto},
+	)
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+		headers = append(headers, &gatewayv1.TunnelHeader{Name: "X-Forwarded-Origin", Value: origin})
+	}
+	if prefix != "" {
+		headers = append(headers, &gatewayv1.TunnelHeader{Name: "X-Forwarded-Prefix", Value: prefix})
+	}
+	return headers
 }
 
 func writeTunnelResponseHeaders(

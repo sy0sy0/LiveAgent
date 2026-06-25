@@ -208,6 +208,16 @@ message TunnelSummary {
   uint32 active_connections = 8;
   string status = 9;
   string project_path_key = 10;
+  repeated TunnelDiagnostic diagnostics = 11;
+}
+
+message TunnelDiagnostic {
+  string protocol = 1;
+  string status = 2;
+  uint32 status_code = 3;
+  string error_code = 4;
+  string message = 5;
+  int64 checked_at = 6;
 }
 
 message TunnelHeader {
@@ -223,11 +233,13 @@ enum TunnelFrameKind {
   TUNNEL_FRAME_KIND_HTTP_RESPONSE_START = 4;
   TUNNEL_FRAME_KIND_HTTP_RESPONSE_BODY = 5;
   TUNNEL_FRAME_KIND_HTTP_RESPONSE_END = 6;
-  TUNNEL_FRAME_KIND_WS_OPEN = 7;
-  TUNNEL_FRAME_KIND_WS_FRAME = 8;
-  TUNNEL_FRAME_KIND_WS_CLOSE = 9;
-  TUNNEL_FRAME_KIND_ERROR = 10;
-  TUNNEL_FRAME_KIND_CANCEL = 11;
+  TUNNEL_FRAME_KIND_WS_DIAL = 7;
+  TUNNEL_FRAME_KIND_WS_DIAL_OK = 8;
+  TUNNEL_FRAME_KIND_WS_DIAL_ERROR = 9;
+  TUNNEL_FRAME_KIND_WS_FRAME = 10;
+  TUNNEL_FRAME_KIND_WS_CLOSE = 11;
+  TUNNEL_FRAME_KIND_ERROR = 12;
+  TUNNEL_FRAME_KIND_CANCEL = 13;
 }
 
 message TunnelFrame {
@@ -243,6 +255,7 @@ message TunnelFrame {
   bool end_stream = 10;
   string error = 11;
   string ws_message_type = 12;
+  string ws_protocol = 13;
 }
 
 message MemoryManageRequest {

@@ -1,11 +1,13 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"time"
 
 	gatewayv1 "github.com/liveagent/agent-gateway/internal/proto/v1"
+	"github.com/liveagent/agent-gateway/internal/session"
 )
 
 const websocketDefaultTunnelTTLSeconds = 3600
@@ -49,6 +51,13 @@ type websocketTunnelUpdatePayload struct {
 }
 
 type websocketTunnelClosePayload struct {
+	ID       string `json:"id"`
+	TunnelID string `json:"tunnelId"`
+	TunnelId string `json:"tunnel_id"`
+	Slug     string `json:"slug"`
+}
+
+type websocketTunnelProbePayload struct {
 	ID       string `json:"id"`
 	TunnelID string `json:"tunnelId"`
 	TunnelId string `json:"tunnel_id"`
@@ -126,6 +135,7 @@ func (c *websocketConnection) handleTunnelCreate(req websocketRequest) {
 		_ = c.writeError(req.ID, websocketErrorMessage(err))
 		return
 	}
+	tunnel = c.probeTunnel(tunnel)
 	_ = c.writeResponse(req.ID, map[string]any{
 		"tunnel":  websocketTunnelSummaryPayload(tunnel, c.publicBaseURL()),
 		"tunnels": websocketTunnelSummariesPayload(c.sm.ListTunnels(), c.publicBaseURL()),
@@ -208,6 +218,45 @@ func (c *websocketConnection) handleTunnelUpdate(req websocketRequest) {
 		_ = c.writeError(req.ID, websocketErrorMessage(err))
 		return
 	}
+	tunnel = c.probeTunnel(tunnel)
+	_ = c.writeResponse(req.ID, map[string]any{
+		"tunnel":  websocketTunnelSummaryPayload(tunnel, c.publicBaseURL()),
+		"tunnels": websocketTunnelSummariesPayload(c.sm.ListTunnels(), c.publicBaseURL()),
+	})
+}
+
+func (c *websocketConnection) handleTunnelProbe(req websocketRequest) {
+	var body websocketTunnelProbePayload
+	if err := decodeWebSocketPayload(req.Payload, &body); err != nil {
+		_ = c.writeError(req.ID, "invalid tunnel.probe payload")
+		return
+	}
+	identifier := strings.TrimSpace(body.ID)
+	if identifier == "" {
+		identifier = strings.TrimSpace(body.TunnelID)
+	}
+	if identifier == "" {
+		identifier = strings.TrimSpace(body.TunnelId)
+	}
+	if identifier == "" {
+		identifier = strings.TrimSpace(body.Slug)
+	}
+	if identifier == "" {
+		_ = c.writeError(req.ID, "tunnel id is required")
+		return
+	}
+	var tunnel *gatewayv1.TunnelSummary
+	for _, item := range c.sm.ListTunnels() {
+		if item.GetId() == identifier || item.GetSlug() == identifier {
+			tunnel = item
+			break
+		}
+	}
+	if tunnel == nil {
+		_ = c.writeError(req.ID, "tunnel not found")
+		return
+	}
+	tunnel = c.probeTunnel(tunnel)
 	_ = c.writeResponse(req.ID, map[string]any{
 		"tunnel":  websocketTunnelSummaryPayload(tunnel, c.publicBaseURL()),
 		"tunnels": websocketTunnelSummariesPayload(c.sm.ListTunnels(), c.publicBaseURL()),
@@ -268,6 +317,16 @@ func (c *websocketConnection) publicBaseURL() string {
 	return publicBaseURLFromHTTPRequest(c.req)
 }
 
+func (c *websocketConnection) probeTunnel(tunnel *gatewayv1.TunnelSummary) *gatewayv1.TunnelSummary {
+	ctx, cancel := context.WithTimeout(c.req.Context(), 3*session.TunnelProbeTimeout)
+	defer cancel()
+	updated, err := c.sm.ProbeTunnel(ctx, tunnel.GetId(), c.publicBaseURL())
+	if err != nil {
+		return tunnel
+	}
+	return updated
+}
+
 func websocketTunnelSummariesPayload(
 	summaries []*gatewayv1.TunnelSummary,
 	publicBaseURL string,
@@ -309,7 +368,31 @@ func websocketTunnelSummaryPayload(
 		"status":             strings.TrimSpace(summary.GetStatus()),
 		"projectPathKey":     strings.TrimSpace(summary.GetProjectPathKey()),
 		"project_path_key":   strings.TrimSpace(summary.GetProjectPathKey()),
+		"diagnostics":        websocketTunnelDiagnosticsPayload(summary.GetDiagnostics()),
 	}
+}
+
+func websocketTunnelDiagnosticsPayload(
+	diagnostics []*gatewayv1.TunnelDiagnostic,
+) []map[string]any {
+	payload := make([]map[string]any, 0, len(diagnostics))
+	for _, diagnostic := range diagnostics {
+		if diagnostic == nil {
+			continue
+		}
+		payload = append(payload, map[string]any{
+			"protocol":    strings.TrimSpace(diagnostic.GetProtocol()),
+			"status":      strings.TrimSpace(diagnostic.GetStatus()),
+			"statusCode":  diagnostic.GetStatusCode(),
+			"status_code": diagnostic.GetStatusCode(),
+			"errorCode":   strings.TrimSpace(diagnostic.GetErrorCode()),
+			"error_code":  strings.TrimSpace(diagnostic.GetErrorCode()),
+			"message":     strings.TrimSpace(diagnostic.GetMessage()),
+			"checkedAt":   diagnostic.GetCheckedAt(),
+			"checked_at":  diagnostic.GetCheckedAt(),
+		})
+	}
+	return payload
 }
 
 func buildPublicTunnelURL(publicBaseURL string, slug string) string {
