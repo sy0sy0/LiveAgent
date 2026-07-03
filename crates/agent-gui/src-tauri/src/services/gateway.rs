@@ -1520,13 +1520,32 @@ impl GatewayController {
                                     return self.send_error_response(request_id, 400, error).await;
                                 }
                             };
-                        let public_snapshot = match redact_gateway_settings_sync_payload(snapshot) {
+                        let public_update = match redact_gateway_settings_sync_payload(snapshot) {
                             Ok(payload) => payload,
                             Err(error) => {
                                 return self.send_error_response(request_id, 400, error).await;
                             }
                         };
-                        if let Err(error) = self.store_settings_snapshot(public_snapshot) {
+                        // The update is a partial payload (only changed fields, e.g.
+                        // {"theme":"dark"}). Overlay it onto the current full snapshot;
+                        // storing it as-is would drop every other cached field and let
+                        // rebuilt snapshots revert UI-only settings like theme.
+                        let current_snapshot = match self.current_settings_snapshot().await {
+                            Ok(snapshot) => snapshot,
+                            Err(error) => {
+                                return self.send_error_response(request_id, 500, error).await;
+                            }
+                        };
+                        let merged_snapshot = match merge_settings_update_into_snapshot(
+                            current_snapshot,
+                            public_update,
+                        ) {
+                            Ok(payload) => payload,
+                            Err(error) => {
+                                return self.send_error_response(request_id, 400, error).await;
+                            }
+                        };
+                        if let Err(error) = self.store_settings_snapshot(merged_snapshot) {
                             return self.send_error_response(request_id, 500, error).await;
                         }
                         match self
@@ -3808,6 +3827,28 @@ fn merge_settings_sync_snapshot(snapshot: Value, cached: Option<&Value>) -> Resu
     Ok(Value::Object(merged))
 }
 
+fn merge_settings_update_into_snapshot(snapshot: Value, update: Value) -> Result<Value, String> {
+    let mut merged = match snapshot {
+        Value::Object(map) => map,
+        _ => return Err("gateway settings sync payload must be an object".to_string()),
+    };
+    let update = match update {
+        Value::Object(map) => map,
+        _ => return Err("gateway settings update payload must be an object".to_string()),
+    };
+
+    for (field, value) in update {
+        // Remote settings are desktop-owned (loaded from the local DB on every
+        // snapshot rebuild); never let a remote client overwrite them.
+        if field == "remote" {
+            continue;
+        }
+        merged.insert(field, value);
+    }
+
+    Ok(Value::Object(merged))
+}
+
 pub fn build_history_sync_upsert(summary: &ChatHistorySummary) -> GatewayHistorySyncEvent {
     GatewayHistorySyncEvent {
         kind: "upsert".to_string(),
@@ -4396,10 +4437,11 @@ mod tests {
         build_gateway_runtime_status_envelope, build_grpc_url,
         build_local_settings_update_event_payload, chat_event_is_terminal,
         format_gateway_terminal_stream_rpc_error, history_share_resolve_error_code,
-        merge_settings_sync_snapshot, proto, queue_terminal_stream_handshake_frame,
-        required_terminal_project_path_key, set_disconnected_status, GatewayChatRequestEvent,
-        GatewayChatRuntimeSnapshot, GatewayController, GatewayStatusSnapshot,
-        RemoteChatInboxRecord, GATEWAY_CHAT_LEASE_MS, GATEWAY_CHAT_RUNNING_LEASE_MS,
+        merge_settings_sync_snapshot, merge_settings_update_into_snapshot, proto,
+        queue_terminal_stream_handshake_frame, required_terminal_project_path_key,
+        set_disconnected_status, GatewayChatRequestEvent, GatewayChatRuntimeSnapshot,
+        GatewayController, GatewayStatusSnapshot, RemoteChatInboxRecord, GATEWAY_CHAT_LEASE_MS,
+        GATEWAY_CHAT_RUNNING_LEASE_MS,
     };
     use crate::commands::settings::RemoteSettingsPayload;
     use serde_json::{json, Value};
@@ -4764,6 +4806,57 @@ mod tests {
                 "model": "gpt-5.4"
             })
         );
+    }
+
+    #[test]
+    fn merge_settings_sync_snapshot_without_cache_leaves_ui_only_fields_absent() {
+        let db_snapshot = json!({
+            "system": { "executionMode": "agent-dev" },
+            "cron": [{ "id": "cron-a" }],
+        });
+
+        let merged =
+            merge_settings_sync_snapshot(db_snapshot, None).expect("merge settings sync snapshot");
+
+        let merged_map = merged.as_object().expect("merged snapshot object");
+        assert!(!merged_map.contains_key("theme"));
+        assert!(!merged_map.contains_key("locale"));
+        assert!(!merged_map.contains_key("selectedModel"));
+        assert_eq!(merged["system"], json!({ "executionMode": "agent-dev" }));
+    }
+
+    #[test]
+    fn merge_settings_update_into_snapshot_keeps_unrelated_fields() {
+        let full_snapshot = json!({
+            "system": { "executionMode": "agent-dev" },
+            "theme": "dark",
+            "locale": "en-US",
+            "selectedModel": {
+                "customProviderId": "provider-a",
+                "model": "gpt-5.4"
+            },
+            "remote": { "enableWebTerminal": true },
+        });
+        let partial_update = json!({
+            "theme": "system",
+            "remote": { "enableWebTerminal": false },
+        });
+
+        let merged = merge_settings_update_into_snapshot(full_snapshot, partial_update)
+            .expect("merge settings update into snapshot");
+
+        assert_eq!(merged["theme"], json!("system"));
+        assert_eq!(merged["locale"], json!("en-US"));
+        assert_eq!(
+            merged["selectedModel"],
+            json!({
+                "customProviderId": "provider-a",
+                "model": "gpt-5.4"
+            })
+        );
+        assert_eq!(merged["system"], json!({ "executionMode": "agent-dev" }));
+        // Remote settings are desktop-owned and must not be overwritten by clients.
+        assert_eq!(merged["remote"], json!({ "enableWebTerminal": true }));
     }
 
     #[test]

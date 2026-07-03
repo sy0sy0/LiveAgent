@@ -46,25 +46,12 @@ pub(crate) fn load_gateway_settings_sync_snapshot(conn: &Connection) -> Result<V
             "enableWebTunnels": remote.enable_web_tunnels,
         }),
     );
-    snapshot.insert("customSettings".to_string(), Value::Object(Map::new()));
-    snapshot.insert("skills".to_string(), Value::Object(Map::new()));
-    snapshot.insert(
-        "chatRuntimeControls".to_string(),
-        json!({
-            "thinkingEnabled": true,
-            "nativeWebSearchEnabled": true,
-            "reasoning": "high",
-            "reasoningByProvider": {
-                "claude_code": "high",
-                "codex_openai_responses": "high",
-                "codex_openai_completions": "high",
-                "gemini": "high",
-            },
-        }),
-    );
-    snapshot.insert("selectedModel".to_string(), Value::Null);
-    snapshot.insert("theme".to_string(), Value::String("light".to_string()));
-    snapshot.insert("locale".to_string(), Value::String("zh-CN".to_string()));
+    // UI-only fields (theme, locale, selectedModel, skills, chatRuntimeControls,
+    // customSettings) live in the webview's localStorage, not in this DB. They are
+    // deliberately omitted here: merge_settings_sync_snapshot overlays the cached
+    // values published by the webview, and receivers treat a missing field as
+    // "keep current". Fabricating defaults here (e.g. theme "light") would clobber
+    // the user's real theme on every publish that happens before the webview syncs.
     Ok(Value::Object(snapshot))
 }
 
@@ -177,4 +164,3 @@ fn redact_ssh_proxy_secret(proxy: Value) -> Result<Value, String> {
     );
     Ok(Value::Object(payload))
 }
-
