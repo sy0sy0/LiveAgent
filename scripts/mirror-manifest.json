@@ -29,6 +29,16 @@
     "components/project-tools/file-tree/Row.tsx",
     "components/project-tools/file-tree/ContextMenu.tsx",
     "lib/workspace-activity/types.ts",
-    "lib/workspace-activity/useWorkspaceInvalidation.ts"
+    "lib/workspace-activity/useWorkspaceInvalidation.ts",
+    "lib/memory/schema.ts",
+    "lib/memory/config.ts",
+    "lib/memory/api.ts",
+    "lib/memory/organizer/runRecord.ts",
+    "lib/memory/organizer/quota.ts",
+    "pages/settings/memory/panelModel.ts",
+    "pages/settings/memory/useMemoryPanelData.ts",
+    "pages/settings/memory/MemoryPanel.tsx",
+    "pages/settings/memory/OrganizerHistoryModal.tsx",
+    "pages/settings/memory/MemorySettingsDrawer.tsx"
   ]
 }

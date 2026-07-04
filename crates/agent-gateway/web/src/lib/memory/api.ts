@@ -1,14 +1,27 @@
-import { invoke } from "@tauri-apps/api/core";
+// Thin, fully-typed invoke bindings over the Rust MemoryStore commands.
+// On the gateway web build the same file works unchanged: the Tauri `invoke`
+// shim intercepts every `memory_*` command and forwards it over the websocket
+// to the connected desktop agent.
 
-export type MemoryScope = "global" | "project" | "auto";
-export type MemoryType = "user" | "feedback" | "project" | "reference";
-export type MemorySearchType = MemoryType | "daily";
+import { invoke } from "@tauri-apps/api/core";
+import type {
+  ApplyDecision,
+  MemoryConfidence,
+  MemoryEvidenceFields,
+  MemoryScope,
+  MemoryScopeFilter,
+  MemorySearchType,
+  MemoryType,
+  MemoryUpdateMode,
+  OrganizerMode,
+  OrganizerScope,
+} from "./schema";
+
 export type MemoryHistoryTimeMode = "message" | "updated" | "conversation";
-export type MemoryConfidence = "high" | "medium" | "low" | "unknown";
 
 export type MemoryMeta = {
   slug: string;
-  scope: "global" | "project";
+  scope: MemoryScope;
   workdirHash: string;
   workdirPath?: string | null;
   memoryType: MemorySearchType;
@@ -24,24 +37,26 @@ export type MemoryMeta = {
   fileSize: number;
 };
 
+export type MemoryScopeQuota = {
+  scope: MemoryScope;
+  workdirHash: string;
+  used: number;
+  limit: number;
+};
+
 export type MemoryListResponse = {
   entries: MemoryMeta[];
   truncated: boolean;
   quota: {
     used: number;
     limit: number;
-    scopeQuotas?: Array<{
-      scope: "global" | "project";
-      workdirHash: string;
-      used: number;
-      limit: number;
-    }>;
+    scopeQuotas?: MemoryScopeQuota[];
   };
 };
 
 export type MemoryReadResponse = {
   slug: string;
-  scope: "global" | "project";
+  scope: MemoryScope;
   memoryType: MemorySearchType;
   description: string;
   headline: string;
@@ -64,7 +79,7 @@ export type MemoryReadResponse = {
 
 export type MemorySearchMatch = {
   slug: string;
-  scope: "global" | "project";
+  scope: MemoryScope;
   memoryType: MemorySearchType;
   description: string;
   headline: string;
@@ -100,12 +115,15 @@ export type MemorySearchResponse = {
 
 export type MemoryMutationResponse = {
   slug: string;
-  scope: "global" | "project";
+  scope: MemoryScope;
   created: boolean;
   updated: boolean;
   deleted: boolean;
   indexUpdated: boolean;
   warning?: string | null;
+  /** Confidence actually stored after the Rust-side contract ran. */
+  appliedConfidence?: MemoryConfidence | null;
+  autoDowngraded?: boolean | null;
 };
 
 export type MemoryDeleteProjectResponse = {
@@ -116,7 +134,7 @@ export type MemoryDeleteProjectResponse = {
 
 export type MemoryOverviewEntry = {
   slug: string;
-  scope: "global" | "project";
+  scope: MemoryScope;
   memoryType: MemorySearchType;
   description: string;
   headline: string;
@@ -155,6 +173,21 @@ export type MemoryRecentRejectionsResponse = {
   entries: MemoryRejectionEntry[];
 };
 
+export type MemoryQuotaScopeSummary = {
+  scope: MemoryScope;
+  workdirHash: string;
+  used: number;
+  limit: number;
+  headroom: number;
+  archivedCount: number;
+  unreviewedCount: number;
+  oldestUnreviewedAgeDays?: number | null;
+};
+
+export type MemoryQuotaSummaryResponse = {
+  scopes: MemoryQuotaScopeSummary[];
+};
+
 export type MemoryBatchResponse = {
   created: string[];
   updated: string[];
@@ -167,7 +200,7 @@ export type MemoryBatchWarning = {
   code: string;
   message: string;
   slug?: string | null;
-  op?: "upsert" | "delete" | null;
+  op?: string | null;
   groupId?: string | null;
   decisionIndex?: number | null;
   details?: unknown;
@@ -206,7 +239,16 @@ export type MemoryOrganizeRun = {
   parseFailures: number;
   error?: string | null;
   finalSummary?: string | null;
-  trimmedProtocol: unknown;
+  phase?: string | null;
+  finalCount: number;
+  compressionRatio?: number | null;
+  compressionTarget?: number | null;
+  dryRun: boolean;
+  tokenUsageTotal: number;
+  quotaHeadroomAtStart?: number | null;
+  overrideReviewed: boolean;
+  /** Typed run report; parse only via organizer/runRecord.ts. */
+  report: unknown;
 };
 
 export type MemoryOrganizeRunCreateResponse = {
@@ -265,7 +307,7 @@ export function formatMemoryError(error: unknown) {
 }
 
 export async function memoryList(args: {
-  scope?: MemoryScope;
+  scope?: MemoryScopeFilter;
   workdir?: string;
   includeAllProjects?: boolean;
   memoryType?: MemorySearchType;
@@ -278,7 +320,7 @@ export async function memoryList(args: {
 
 export async function memoryRead(args: {
   slug: string;
-  scope?: MemoryScope;
+  scope?: MemoryScopeFilter;
   workdir?: string;
   workdirHash?: string;
   offset?: number;
@@ -289,7 +331,7 @@ export async function memoryRead(args: {
 
 export async function memorySearch(args: {
   query: string;
-  scope?: MemoryScope;
+  scope?: MemoryScopeFilter;
   workdir?: string;
   memoryType?: MemorySearchType;
   limit?: number;
@@ -304,7 +346,7 @@ export async function memorySearch(args: {
 
 export async function memoryWrite(args: {
   slug: string;
-  scope: "global" | "project";
+  scope: MemoryScope;
   workdir?: string;
   memoryType: MemoryType;
   description: string;
@@ -312,29 +354,31 @@ export async function memoryWrite(args: {
   actor?: string;
   conversationId?: string;
   model?: string;
+  evidence?: MemoryEvidenceFields;
 }) {
   return invoke<MemoryMutationResponse>("memory_write", { args });
 }
 
 export async function memoryUpdate(args: {
   slug: string;
-  scope?: MemoryScope;
+  scope?: MemoryScopeFilter;
   workdir?: string;
   workdirHash?: string;
   memoryType?: MemoryType;
   description?: string;
   body?: string;
-  mode?: "replace" | "append" | "merge";
+  mode?: MemoryUpdateMode;
   actor?: string;
   conversationId?: string;
   model?: string;
+  evidence?: MemoryEvidenceFields;
 }) {
   return invoke<MemoryMutationResponse>("memory_update", { args });
 }
 
 export async function memoryDelete(args: {
   slug: string;
-  scope: "global" | "project";
+  scope: MemoryScope;
   workdir?: string;
   workdirHash?: string;
   actor?: string;
@@ -355,7 +399,7 @@ export async function memoryDeleteProject(args: {
 
 export async function memoryAccept(args: {
   slug: string;
-  scope: "global" | "project";
+  scope: MemoryScope;
   workdir?: string;
   workdirHash?: string;
 }) {
@@ -365,29 +409,13 @@ export async function memoryAccept(args: {
 export async function memoryApplyBatch(args: {
   workdir?: string;
   conversationId?: string;
-  trigger?: "end" | "compaction" | "memory-organize";
+  trigger?: "memory-extraction" | "memory-organize" | "end" | "compaction";
   model?: string;
   localDate?: string;
   dailyAppend?: {
     bullet: string;
   };
-  decisions?: Array<{
-    op: "upsert" | "delete";
-    slug: string;
-    scope?: "global" | "project";
-    workdirHash?: string;
-    memoryType?: MemoryType;
-    description?: string;
-    body?: string;
-    reason?: string;
-    confidence?: number;
-    riskLevel?: "low" | "medium" | "high";
-    requiresUserAck?: boolean;
-    sourceSlugs?: string[];
-    evidencePreserved?: string[];
-    blockedReasons?: string[];
-    groupId?: string;
-  }>;
+  decisions?: ApplyDecision[];
 }) {
   return invoke<MemoryBatchResponse>("memory_apply_batch", { args });
 }
@@ -396,8 +424,8 @@ export async function memoryOrganizeRunCreate(args: {
   trigger: MemoryOrganizeTrigger;
   dueAt?: number;
   model?: unknown;
-  scope?: string;
-  mode?: string;
+  scope?: OrganizerScope;
+  mode?: OrganizerMode;
 }) {
   return invoke<MemoryOrganizeRunCreateResponse>("memory_organize_run_create", { args });
 }
@@ -418,7 +446,15 @@ export async function memoryOrganizeRunUpdate(args: {
   parseFailures?: number;
   error?: string;
   finalSummary?: string;
-  trimmedProtocol?: unknown;
+  phase?: string;
+  finalCount?: number;
+  compressionRatio?: number;
+  compressionTarget?: number;
+  dryRun?: boolean;
+  tokenUsageTotal?: number;
+  quotaHeadroomAtStart?: number;
+  overrideReviewed?: boolean;
+  report?: unknown;
 }) {
   return invoke<MemoryOrganizeRun | null>("memory_organize_run_update", { args });
 }
@@ -445,8 +481,8 @@ export async function memoryOrganizeDueClaim(args: {
   dueAt?: number;
   now?: number;
   model?: unknown;
-  scope?: string;
-  mode?: string;
+  scope?: OrganizerScope;
+  mode?: OrganizerMode;
 }) {
   return invoke<MemoryOrganizeDueClaimResponse>("memory_organize_due_claim", { args });
 }
@@ -467,6 +503,12 @@ export async function memoryRecentRejections(args?: {
   workdir?: string;
 }) {
   return invoke<MemoryRecentRejectionsResponse>("memory_recent_rejections", {
+    args: args ?? {},
+  });
+}
+
+export async function memoryQuotaSummary(args?: { workdir?: string }) {
+  return invoke<MemoryQuotaSummaryResponse>("memory_quota_summary", {
     args: args ?? {},
   });
 }

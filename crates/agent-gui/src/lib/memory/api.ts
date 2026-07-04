@@ -528,7 +528,3 @@ export async function memoryTodayDaily(rolloverHour?: number) {
 export async function memoryWipeAll() {
   return invoke<MemoryPathsInfo>("memory_wipe_all");
 }
-
-// TEMPORARY compat re-exports while the legacy memory modules are being
-// replaced phase-by-phase. New code must import these from ./schema.
-export type { MemoryConfidence, MemorySearchType, MemoryType } from "./schema";

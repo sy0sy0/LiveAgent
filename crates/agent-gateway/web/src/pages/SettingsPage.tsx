@@ -15,7 +15,7 @@ import { useLocale } from "../i18n";
 import { AgentsSection } from "./settings/AgentsSection";
 import { CronSection } from "./settings/CronSection";
 import { HooksSection } from "./settings/HooksSection";
-import { MemoryPanel } from "./settings/MemoryPanel";
+import { MemoryPanel } from "./settings/memory/MemoryPanel";
 import { ProvidersSection } from "./settings/ProvidersSection";
 import { RemoteSection } from "./settings/RemoteSection";
 import { SshSection } from "./settings/SshSection";

@@ -733,6 +733,13 @@ export const translations: Record<Locale, Record<string, string>> = {
     "settings.memoryQuotaNearLimitMessage": "记忆用量已超过 95%，新增记忆很快会被拒绝。",
     "settings.memoryQuotaFullMessage":
       "当前 scope 已达到 500 条普通记忆上限；新增记忆会被拒绝，请先删除或合并旧条目。",
+    "settings.memoryQuotaNotice": "记忆配额提醒：{scope} 已用 {used}/{limit}，建议运行记忆整理。",
+    "settings.memoryQuotaDegraded":
+      "记忆配额吃紧：{scope} 已用 {used}/{limit}，请运行记忆整理进行压缩。",
+    "settings.memoryQuotaCritical":
+      "记忆配额告急：{scope} 已用 {used}/{limit}，新记忆可能很快无法写入。",
+    "settings.memoryQuotaExhausted":
+      "记忆配额已满：{scope} 已用 {used}/{limit}，请立即整理或删除记忆。",
     "settings.memoryRefresh": "刷新",
     "settings.memoryOpenSettings": "记忆设置",
     "settings.memorySettingsTitle": "记忆设置",
@@ -2283,6 +2290,14 @@ export const translations: Record<Locale, Record<string, string>> = {
       "Memory usage is above 95%. New memories will soon be rejected.",
     "settings.memoryQuotaFullMessage":
       "This scope has reached the 500 ordinary-memory limit. New memories will be rejected until old entries are deleted or merged.",
+    "settings.memoryQuotaNotice":
+      "Memory quota notice: {scope} at {used}/{limit}. Consider running the organizer.",
+    "settings.memoryQuotaDegraded":
+      "Memory quota tight: {scope} at {used}/{limit}. Run the organizer to consolidate.",
+    "settings.memoryQuotaCritical":
+      "Memory quota critical: {scope} at {used}/{limit}. New memories may soon fail to write.",
+    "settings.memoryQuotaExhausted":
+      "Memory quota exhausted: {scope} at {used}/{limit}. Organize or delete memories now.",
     "settings.memoryRefresh": "Refresh",
     "settings.memoryOpenSettings": "Memory settings",
     "settings.memorySettingsTitle": "Memory settings",
