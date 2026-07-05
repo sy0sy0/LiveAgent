@@ -892,34 +892,6 @@
     }
   }
 
-  /* Glow pulse animation */
-  .hero-glow-pulse {
-    animation:
-      heroGlowPulse 5s ease-in-out infinite,
-      heroFadeIn 1.2s ease-out both;
-  }
-
-  @keyframes heroGlowPulse {
-    0%,
-    100% {
-      opacity: 0.7;
-      transform: scale(1);
-    }
-    50% {
-      opacity: 1;
-      transform: scale(1.12);
-    }
-  }
-
-  @keyframes heroFadeIn {
-    from {
-      opacity: 0;
-    }
-    to {
-      opacity: 0.7;
-    }
-  }
-
   /* Mention composer placeholder */
   .mention-composer.is-empty::before {
     content: attr(data-placeholder);

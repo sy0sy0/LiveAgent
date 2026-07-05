@@ -157,10 +157,6 @@ export const ChatTranscript = memo(function ChatTranscript(props: ChatTranscript
         <div className="mx-auto w-full max-w-[768px] px-5 py-4">
           {showNoModelsState ? (
             <div className="flex min-h-[calc(100vh-220px)] flex-col items-center justify-center">
-              <div className="pointer-events-none absolute inset-0 flex items-center justify-center overflow-hidden">
-                <div className="hero-glow-pulse h-[360px] w-[360px] rounded-full bg-[radial-gradient(closest-side,hsl(var(--foreground)/0.08),transparent_70%)] blur-3xl" />
-              </div>
-
               <div className="relative flex flex-col items-center">
                 <div className="hero-entrance hero-icon-float mb-5 flex h-24 w-24 items-center justify-center">
                   <img
@@ -192,10 +188,6 @@ export const ChatTranscript = memo(function ChatTranscript(props: ChatTranscript
             </div>
           ) : showStartChatState ? (
             <div className="flex min-h-[calc(100vh-220px)] flex-col items-center justify-center">
-              <div className="pointer-events-none absolute inset-0 flex items-center justify-center overflow-hidden">
-                <div className="hero-glow-pulse h-[360px] w-[360px] rounded-full bg-[radial-gradient(closest-side,hsl(var(--foreground)/0.08),transparent_70%)] blur-3xl" />
-              </div>
-
               <div className="relative flex flex-col items-center">
                 <div className="hero-entrance hero-icon-float mb-5 flex h-24 w-24 items-center justify-center">
                   <img
