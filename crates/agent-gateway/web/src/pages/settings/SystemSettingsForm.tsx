@@ -11,7 +11,7 @@ import {
 
 import { SUPPORTED_LOCALES, useLocale } from "../../i18n";
 import { type ExecutionMode, THEME_OPTIONS, type Theme, updateSystem } from "../../lib/settings";
-import { SYSTEM_TOOL_OPTIONS } from "../../lib/tools/systemToolOptions";
+import { SystemToolsSection } from "./SystemToolsSection";
 import type { SettingsSectionProps } from "./types";
 
 export function SystemSettingsForm(props: SettingsSectionProps) {
@@ -19,7 +19,6 @@ export function SystemSettingsForm(props: SettingsSectionProps) {
   const { t } = useLocale();
 
   const executionMode = settings.system.executionMode;
-  const selectedSystemTools = settings.system.selectedSystemTools;
   const isClassicAgentMode = executionMode === "tools";
   const isAgentDevMode = executionMode === "agent-dev";
   const appearanceIcon =
@@ -257,58 +256,7 @@ export function SystemSettingsForm(props: SettingsSectionProps) {
         </section>
       </div>
 
-      <div className="space-y-3">
-        <div className="flex items-center gap-2 text-sm font-medium text-foreground">
-          <Wrench className="h-4 w-4 text-muted-foreground" />
-          {t("settings.systemTools")}
-        </div>
-        <p className="text-xs leading-relaxed text-muted-foreground">
-          {t("settings.systemToolsDesc")}
-        </p>
-
-        <div className="space-y-2">
-          {SYSTEM_TOOL_OPTIONS.map((tool) => {
-            const checked = selectedSystemTools.includes(tool.id);
-            return (
-              <label
-                key={tool.id}
-                className={`flex cursor-pointer items-start gap-3 rounded-xl border-2 p-3.5 transition-all ${
-                  checked
-                    ? "border-primary/40 bg-primary/5"
-                    : "border-transparent bg-muted/40 hover:border-border hover:bg-muted/60"
-                }`}
-              >
-                <div className="mt-0.5">
-                  <input
-                    type="checkbox"
-                    className="h-4 w-4 cursor-pointer rounded accent-primary"
-                    checked={checked}
-                    onChange={(e) => {
-                      const next = e.currentTarget.checked
-                        ? [...selectedSystemTools, tool.id]
-                        : selectedSystemTools.filter((id) => id !== tool.id);
-                      setSettings((prev) => updateSystem(prev, { selectedSystemTools: next }));
-                    }}
-                  />
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div className="text-sm font-medium">{tool.label}</div>
-                  <div className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
-                    {tool.description}
-                  </div>
-                </div>
-              </label>
-            );
-          })}
-        </div>
-
-        {SYSTEM_TOOL_OPTIONS.length === 0 ? (
-          <div className="rounded-xl border border-dashed bg-muted/20 px-4 py-6 text-center">
-            <Wrench className="mx-auto mb-2 h-6 w-6 text-muted-foreground/40" />
-            <p className="text-xs text-muted-foreground">{t("settings.noSystemTools")}</p>
-          </div>
-        ) : null}
-      </div>
+      <SystemToolsSection settings={settings} setSettings={setSettings} />
     </div>
   );
 }

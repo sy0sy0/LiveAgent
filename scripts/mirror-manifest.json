@@ -60,6 +60,9 @@
     "pages/settings/CronTaskModal.tsx",
     "pages/settings/CronTaskViewModal.tsx",
     "lib/managed-process/store.ts",
-    "lib/managed-process/types.ts"
+    "lib/managed-process/types.ts",
+    "lib/tools/systemToolOptions.ts",
+    "lib/tools/builtinToolCatalog.ts",
+    "pages/settings/SystemToolsSection.tsx"
   ]
 }

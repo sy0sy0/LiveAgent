@@ -891,6 +891,24 @@
     }
   }
 
+  /* Settings system-tools tab views: soft enter when switching between the
+   * built-in and custom tabs (the view wrapper is keyed by tab). */
+  .settings-tools-view-enter {
+    animation: settingsToolsViewIn 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+    will-change: transform, opacity;
+  }
+
+  @keyframes settingsToolsViewIn {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
   /* Sidebar recent-conversation list: soft enter when the workspace scope
    * switches (the list content wrapper is keyed by scope). */
   .chat-history-scope-enter {
@@ -988,6 +1006,7 @@
   @media (prefers-reduced-motion: reduce) {
     .settings-section-enter,
     .settings-section-title-enter,
+    .settings-tools-view-enter,
     .chat-history-scope-enter {
       animation: none;
     }

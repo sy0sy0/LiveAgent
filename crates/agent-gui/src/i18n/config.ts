@@ -1027,6 +1027,112 @@ export const translations: Record<Locale, Record<string, string>> = {
     "settings.systemToolsDesc":
       "这里展示可选的系统内置工具与自定义系统工具；选中的工具会在 Agent 模式下注册，供模型在对话中调用。",
     "settings.noSystemTools": "暂无可用的系统工具",
+    "settings.systemToolsTabBuiltin": "系统工具",
+    "settings.systemToolsTabCustom": "自定义工具",
+    "settings.systemToolsBuiltinDesc":
+      "LiveAgent 在 Agent 模式下自动注册的内置工具，此处仅供查阅；点击眼睛图标查看详情。",
+    "settings.systemToolsCustomDesc":
+      "可按需启用的自定义系统工具；启用后会在 Agent 模式下注册，供模型在对话中调用。",
+    "settings.systemToolsViewDetail": "查看详情",
+    "settings.noCustomSystemTools": "暂无可用的自定义工具",
+    "settings.builtinToolCategory.fs": "文件系统",
+    "settings.builtinToolCategory.process": "终端与进程",
+    "settings.builtinToolCategory.intelligence": "智能与记忆",
+    "settings.builtinToolCategory.automation": "自动化",
+    "settings.builtinToolCategory.connectivity": "连接与集成",
+    "settings.builtinTool.read.name": "读取文件",
+    "settings.builtinTool.read.desc": "读取项目内文件的文本内容",
+    "settings.builtinTool.read.detail":
+      "按行读取项目目录内的文件内容，支持指定起始行与行数，适合查看代码与配置文件。只读操作，不会修改任何文件。",
+    "settings.builtinTool.image.name": "查看图片",
+    "settings.builtinTool.image.desc": "读取并识别项目内的图片文件",
+    "settings.builtinTool.image.detail":
+      "将项目内的图片文件加载为可视内容供模型理解，常用于查看截图、设计稿或图表。只读操作。",
+    "settings.builtinTool.write.name": "写入文件",
+    "settings.builtinTool.write.desc": "创建新文件或覆盖已有文件",
+    "settings.builtinTool.write.detail":
+      "在项目目录内创建新文件，或整体覆盖已有文件内容。属于写入操作，会实际改动磁盘上的文件，请留意模型的写入意图。",
+    "settings.builtinTool.edit.name": "编辑文件",
+    "settings.builtinTool.edit.desc": "对文件做精确的查找替换修改",
+    "settings.builtinTool.edit.detail":
+      "在已有文件中做精确的字符串查找替换，适合小范围代码修改。写入操作；改动前会校验原文完全匹配，降低误改风险。",
+    "settings.builtinTool.delete.name": "删除文件",
+    "settings.builtinTool.delete.desc": "删除项目内的文件或目录",
+    "settings.builtinTool.delete.detail":
+      "删除项目目录内的文件或目录。属于不可逆的写入操作，模型调用时请确认删除目标是否符合预期。",
+    "settings.builtinTool.list.name": "浏览目录",
+    "settings.builtinTool.list.desc": "列出目录下的文件与子目录",
+    "settings.builtinTool.list.detail":
+      "列出指定目录下的文件与子目录结构，帮助模型了解项目布局。只读操作。",
+    "settings.builtinTool.glob.name": "匹配文件",
+    "settings.builtinTool.glob.desc": "按通配符模式批量查找文件",
+    "settings.builtinTool.glob.detail":
+      "使用通配符模式（如 src/**/*.ts）在项目内批量查找文件路径，是模型定位文件的常用手段。只读操作。",
+    "settings.builtinTool.grep.name": "搜索内容",
+    "settings.builtinTool.grep.desc": "按正则在文件内容中全文检索",
+    "settings.builtinTool.grep.detail":
+      "在项目文件内容中做正则全文检索，支持按文件类型过滤，用于快速定位代码与文本。只读操作。",
+    "settings.builtinTool.bash.name": "执行命令",
+    "settings.builtinTool.bash.desc": "在项目目录中执行 Shell 命令",
+    "settings.builtinTool.bash.detail":
+      "在项目目录中执行 Shell 命令并返回输出，可用于构建、测试、Git 操作等。能力较强，命令会真实影响系统，请关注模型执行的内容。",
+    "settings.builtinTool.managed_process.name": "后台任务",
+    "settings.builtinTool.managed_process.desc": "启动并管理长时间运行的后台进程",
+    "settings.builtinTool.managed_process.detail":
+      "启动、探活与停止长时间运行的后台进程（如开发服务器），进程记录可跨应用重启保留。仅在对话场景注册。",
+    "settings.builtinTool.read_terminal.name": "读取终端",
+    "settings.builtinTool.read_terminal.desc": "读取右侧终端面板的屏幕内容",
+    "settings.builtinTool.read_terminal.detail":
+      "读取右侧终端面板当前显示的内容，便于模型了解命令行状态。只读操作；仅在对话场景且终端可用时注册。",
+    "settings.builtinTool.skills_manager.name": "技能管理",
+    "settings.builtinTool.skills_manager.desc": "查阅与管理已安装的技能",
+    "settings.builtinTool.skills_manager.detail":
+      "让模型查阅、安装与管理技能（Skills），按需加载领域知识与工作流。需要在设置中启用技能功能后注册。",
+    "settings.builtinTool.memory_manager.name": "记忆管理",
+    "settings.builtinTool.memory_manager.desc": "读写长期记忆，跨会话保留信息",
+    "settings.builtinTool.memory_manager.detail":
+      "维护跨会话的长期记忆：保存偏好、项目约定与关键结论，并在后续对话中检索使用。记忆内容可在设置的记忆面板中查看与整理。",
+    "settings.builtinTool.agent.name": "子代理",
+    "settings.builtinTool.agent.desc": "派生子代理并行处理复杂任务",
+    "settings.builtinTool.agent.detail":
+      "派生独立的子代理来并行探索、研究或执行子任务，适合拆解复杂工作。需要子代理运行时；仅在对话场景注册。",
+    "settings.builtinTool.send_message.name": "代理通信",
+    "settings.builtinTool.send_message.desc": "与子代理之间收发消息",
+    "settings.builtinTool.send_message.detail":
+      "在主对话与子代理之间传递消息，用于协调多代理协作。需要子代理运行时；仅在对话场景注册。",
+    "settings.builtinTool.cron_task_manager.name": "定时任务",
+    "settings.builtinTool.cron_task_manager.desc": "创建与管理定时自动任务",
+    "settings.builtinTool.cron_task_manager.detail":
+      "让模型创建、查询与管理定时任务，实现按计划自动执行提示词。任务配置可在设置的定时任务分区中查看。",
+    "settings.builtinTool.mcp_manager.name": "MCP 管理",
+    "settings.builtinTool.mcp_manager.desc": "管理 MCP 服务器的接入与开关",
+    "settings.builtinTool.mcp_manager.detail":
+      "让模型添加、启停与管理 MCP 服务器，接入外部工具生态。MCP 服务器带来的具体工具由各服务器自身提供。",
+    "settings.builtinTool.tunnel_manager.name": "隧道管理",
+    "settings.builtinTool.tunnel_manager.desc": "管理本地服务的公网隧道",
+    "settings.builtinTool.tunnel_manager.detail":
+      "创建与管理本地服务的公网访问隧道，便于分享开发中的页面。需要启用远程 Web 隧道功能；仅在对话场景注册。",
+    "settings.builtinTool.ssh_manager.name": "SSH 管理",
+    "settings.builtinTool.ssh_manager.desc": "连接与操作已关联的 SSH 主机",
+    "settings.builtinTool.ssh_manager.detail":
+      "在已关联的 SSH 主机上执行远程操作，如远程命令与文件管理。需要先在设置中关联 SSH 主机；仅在对话场景注册。",
+    "settings.customTool.http_get_test.name": "本地 HTTP 测试",
+    "settings.customTool.http_get_test.desc": "调用本地网络测试端点并返回响应",
+    "settings.customTool.http_get_test.detail":
+      "调用应用内置的网络测试端点并返回响应内容，用于诊断本机网络连通性。只读、无参数，不会产生副作用。",
+    "settings.toolDetailIdentifier": "工具标识",
+    "settings.toolDetailCategory": "类别",
+    "settings.toolDetailScopes": "运行场景",
+    "settings.toolDetailAccess": "访问权限",
+    "settings.toolDetailReadOnly": "只读",
+    "settings.toolDetailReadWrite": "读写",
+    "settings.toolScopeChat": "对话",
+    "settings.toolScopeCron": "定时任务",
+    "settings.toolDetailClose": "关闭",
+    "settings.toolDetailEnableInChat": "在 Agent 模式中启用",
+    "settings.toolBadgeBuiltin": "内置",
+    "settings.toolBadgeCustom": "自定义",
+    "settings.toolConditionalNote": "按条件注册",
 
     /* ── Settings Providers ── */
     "settings.addProvider": "新增供应商",
@@ -2645,6 +2751,114 @@ export const translations: Record<Locale, Record<string, string>> = {
     "settings.systemToolsDesc":
       "Optional built-in and custom system tools are shown here. Selected tools are registered in Agent mode and can be called by the model during conversation.",
     "settings.noSystemTools": "No system tools available",
+    "settings.systemToolsTabBuiltin": "Built-in",
+    "settings.systemToolsTabCustom": "Custom",
+    "settings.systemToolsBuiltinDesc":
+      "Built-in tools that LiveAgent registers automatically in Agent mode. Read-only list; click the eye icon for details.",
+    "settings.systemToolsCustomDesc":
+      "Optional custom system tools. Enabled tools are registered in Agent mode for the model to call during conversations.",
+    "settings.systemToolsViewDetail": "View details",
+    "settings.noCustomSystemTools": "No custom tools available",
+    "settings.builtinToolCategory.fs": "File System",
+    "settings.builtinToolCategory.process": "Terminal & Processes",
+    "settings.builtinToolCategory.intelligence": "Intelligence & Memory",
+    "settings.builtinToolCategory.automation": "Automation",
+    "settings.builtinToolCategory.connectivity": "Connectivity & Integrations",
+    "settings.builtinTool.read.name": "Read File",
+    "settings.builtinTool.read.desc": "Read text content from files in the project",
+    "settings.builtinTool.read.detail":
+      "Reads file content line by line within the project directory, with optional offset and line count — ideal for inspecting code and configuration files. Read-only; never modifies anything.",
+    "settings.builtinTool.image.name": "View Image",
+    "settings.builtinTool.image.desc": "Load and inspect image files in the project",
+    "settings.builtinTool.image.detail":
+      "Loads image files from the project as visual content the model can understand — handy for screenshots, design mockups, and charts. Read-only.",
+    "settings.builtinTool.write.name": "Write File",
+    "settings.builtinTool.write.desc": "Create new files or overwrite existing ones",
+    "settings.builtinTool.write.detail":
+      "Creates new files or fully overwrites existing ones inside the project directory. A write operation that changes files on disk — review the model's intent when it writes.",
+    "settings.builtinTool.edit.name": "Edit File",
+    "settings.builtinTool.edit.desc": "Make precise find-and-replace edits to files",
+    "settings.builtinTool.edit.detail":
+      "Performs exact string find-and-replace edits within existing files, suited to targeted code changes. A write operation; the original text is matched exactly before replacing to reduce accidental edits.",
+    "settings.builtinTool.delete.name": "Delete File",
+    "settings.builtinTool.delete.desc": "Delete files or directories in the project",
+    "settings.builtinTool.delete.detail":
+      "Deletes files or directories inside the project. An irreversible write operation — double-check the target whenever the model invokes it.",
+    "settings.builtinTool.list.name": "List Directory",
+    "settings.builtinTool.list.desc": "List files and subdirectories of a folder",
+    "settings.builtinTool.list.detail":
+      "Lists the files and subdirectories of a given folder so the model can understand the project layout. Read-only.",
+    "settings.builtinTool.glob.name": "Match Files",
+    "settings.builtinTool.glob.desc": "Find files in bulk with glob patterns",
+    "settings.builtinTool.glob.detail":
+      "Finds file paths in bulk using glob patterns such as src/**/*.ts — the model's go-to for locating files. Read-only.",
+    "settings.builtinTool.grep.name": "Search Content",
+    "settings.builtinTool.grep.desc": "Search file contents with regular expressions",
+    "settings.builtinTool.grep.detail":
+      "Runs regex searches across project file contents with optional file-type filters, used to quickly locate code and text. Read-only.",
+    "settings.builtinTool.bash.name": "Run Command",
+    "settings.builtinTool.bash.desc": "Execute shell commands in the project directory",
+    "settings.builtinTool.bash.detail":
+      "Executes shell commands in the project directory and returns their output — builds, tests, Git operations and more. Powerful: commands really run on your system, so keep an eye on what the model executes.",
+    "settings.builtinTool.managed_process.name": "Background Tasks",
+    "settings.builtinTool.managed_process.desc":
+      "Start and manage long-running background processes",
+    "settings.builtinTool.managed_process.detail":
+      "Starts, health-checks and stops long-running background processes such as dev servers; the process journal survives app restarts. Registered in chat sessions only.",
+    "settings.builtinTool.read_terminal.name": "Read Terminal",
+    "settings.builtinTool.read_terminal.desc": "Read the on-screen content of the terminal panel",
+    "settings.builtinTool.read_terminal.detail":
+      "Reads what is currently shown in the terminal panel so the model can follow command-line state. Read-only; registered in chat sessions when a terminal is available.",
+    "settings.builtinTool.skills_manager.name": "Skills Manager",
+    "settings.builtinTool.skills_manager.desc": "Browse and manage installed skills",
+    "settings.builtinTool.skills_manager.detail":
+      "Lets the model browse, install and manage skills, loading domain knowledge and workflows on demand. Registered once the Skills feature is enabled in settings.",
+    "settings.builtinTool.memory_manager.name": "Memory Manager",
+    "settings.builtinTool.memory_manager.desc": "Read and write long-term memory across sessions",
+    "settings.builtinTool.memory_manager.detail":
+      "Maintains long-term memory across sessions: saving preferences, project conventions and key conclusions for later recall. Contents can be reviewed and organized in the Memory settings panel.",
+    "settings.builtinTool.agent.name": "Subagent",
+    "settings.builtinTool.agent.desc": "Spawn subagents to work on complex tasks in parallel",
+    "settings.builtinTool.agent.detail":
+      "Spawns independent subagents to explore, research or execute subtasks in parallel — great for decomposing complex work. Requires the subagent runtime; chat sessions only.",
+    "settings.builtinTool.send_message.name": "Agent Messaging",
+    "settings.builtinTool.send_message.desc": "Exchange messages with subagents",
+    "settings.builtinTool.send_message.detail":
+      "Relays messages between the main conversation and subagents to coordinate multi-agent work. Requires the subagent runtime; chat sessions only.",
+    "settings.builtinTool.cron_task_manager.name": "Scheduled Tasks",
+    "settings.builtinTool.cron_task_manager.desc": "Create and manage scheduled automations",
+    "settings.builtinTool.cron_task_manager.detail":
+      "Lets the model create, inspect and manage cron tasks that run prompts on a schedule. Task configuration is visible in the Cron section of settings.",
+    "settings.builtinTool.mcp_manager.name": "MCP Manager",
+    "settings.builtinTool.mcp_manager.desc": "Manage MCP server connections and toggles",
+    "settings.builtinTool.mcp_manager.detail":
+      "Lets the model add, toggle and manage MCP servers to tap into external tool ecosystems. The concrete tools each server contributes come from the server itself.",
+    "settings.builtinTool.tunnel_manager.name": "Tunnel Manager",
+    "settings.builtinTool.tunnel_manager.desc": "Manage public tunnels for local services",
+    "settings.builtinTool.tunnel_manager.detail":
+      "Creates and manages public tunnels that expose local services, useful for sharing work-in-progress pages. Requires the remote web tunnel feature; chat sessions only.",
+    "settings.builtinTool.ssh_manager.name": "SSH Manager",
+    "settings.builtinTool.ssh_manager.desc": "Connect to and operate associated SSH hosts",
+    "settings.builtinTool.ssh_manager.detail":
+      "Performs remote operations — commands and file management — on associated SSH hosts. Requires an SSH host associated in settings; chat sessions only.",
+    "settings.customTool.http_get_test.name": "Local HTTP Test",
+    "settings.customTool.http_get_test.desc":
+      "Call the local network test endpoint and return its response",
+    "settings.customTool.http_get_test.detail":
+      "Calls the app's built-in network test endpoint and returns the response body, used to diagnose local network connectivity. Read-only, parameter-free, with no side effects.",
+    "settings.toolDetailIdentifier": "Tool identifier",
+    "settings.toolDetailCategory": "Category",
+    "settings.toolDetailScopes": "Runtime scopes",
+    "settings.toolDetailAccess": "Access",
+    "settings.toolDetailReadOnly": "Read-only",
+    "settings.toolDetailReadWrite": "Read & write",
+    "settings.toolScopeChat": "Chat",
+    "settings.toolScopeCron": "Scheduled tasks",
+    "settings.toolDetailClose": "Close",
+    "settings.toolDetailEnableInChat": "Enable in Agent mode",
+    "settings.toolBadgeBuiltin": "Built-in",
+    "settings.toolBadgeCustom": "Custom",
+    "settings.toolConditionalNote": "Conditional",
 
     /* ── Settings Providers ── */
     "settings.addProvider": "Add Provider",
