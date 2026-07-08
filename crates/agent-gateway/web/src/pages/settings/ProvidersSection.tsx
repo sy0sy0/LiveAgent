@@ -411,7 +411,7 @@ function ProviderModal({ providerType, initialData, onSave, onClose }: ModalProp
                 onValueChange={(value) => setRequestFormat(value as CodexRequestFormat)}
               >
                 <SelectTrigger className="w-full">
-                  <SelectValue />
+                  <SelectValue>{CODEX_REQUEST_FORMAT_LABELS[requestFormat]}</SelectValue>
                 </SelectTrigger>
                 <SelectContent>
                   {Object.entries(CODEX_REQUEST_FORMAT_LABELS).map(([value, label]) => (
