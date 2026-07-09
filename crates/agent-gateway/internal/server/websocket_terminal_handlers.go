@@ -4,6 +4,8 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
 	gatewayv1 "github.com/liveagent/agent-gateway/internal/proto/v1"
 )
 
@@ -156,9 +158,9 @@ func (c *websocketConnection) mergeTerminalListWithCachedSnapshot(
 	if !changed {
 		return resp
 	}
-	clone := *resp
+	clone := proto.CloneOf(resp)
 	clone.Sessions = merged
-	return &clone
+	return clone
 }
 
 func (c *websocketConnection) filterTerminalResponseForPermissions(action string, resp *gatewayv1.TerminalResponse) *gatewayv1.TerminalResponse {
@@ -177,9 +179,9 @@ func (c *websocketConnection) filterTerminalResponseForPermissions(action string
 	if !changed {
 		return resp
 	}
-	clone := *resp
+	clone := proto.CloneOf(resp)
 	clone.Sessions = filtered
-	return &clone
+	return clone
 }
 
 func (c *websocketConnection) rememberTerminalInterest(action string, body websocketTerminalRequestPayload, resp *gatewayv1.TerminalResponse) {
