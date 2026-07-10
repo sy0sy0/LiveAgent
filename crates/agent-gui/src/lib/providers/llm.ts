@@ -3,7 +3,11 @@ export { attachAnthropicAutomaticCaching } from "./runtime/anthropicCache";
 export { attachCodexResponsesStorage } from "./runtime/codexStorage";
 export { normalizeErrorMessage } from "./runtime/errors";
 export { assistantMessageToText, createStreamingTextReconciler } from "./runtime/messageUtils";
-export { createModelFromConfig } from "./runtime/modelFactory";
+export {
+  createModelFromConfig,
+  getAvailableThinkingLevelsForModel,
+  isThinkingAlwaysOnForModel,
+} from "./runtime/modelFactory";
 export { parseModelValue, toModelValue } from "./runtime/modelValue";
 export { attachProviderNativeWebSearch } from "./runtime/nativeSearchPayload";
 export {

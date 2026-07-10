@@ -15,11 +15,22 @@ const piAiModels = await import(
     import.meta.url,
   ).href
 );
+const piAiProvidersAll = await import(
+  new URL(
+    "../../web/node_modules/@earendil-works/pi-ai/dist/providers/all.js",
+    import.meta.url,
+  ).href
+);
 
 function createDefaultMocks() {
   return {
     "@earendil-works/pi-ai": {
-      getModels: piAiModels.getModels,
+      getSupportedThinkingLevels: piAiModels.getSupportedThinkingLevels,
+      clampThinkingLevel: piAiModels.clampThinkingLevel,
+    },
+    "@earendil-works/pi-ai/providers/all": {
+      getBuiltinModels: piAiProvidersAll.getBuiltinModels,
+      getBuiltinModel: piAiProvidersAll.getBuiltinModel,
     },
     "@sinclair/typebox": {
       Type: {

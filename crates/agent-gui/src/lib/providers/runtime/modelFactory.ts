@@ -1,4 +1,5 @@
-import type { Model, OpenAICompletionsCompat } from "@earendil-works/pi-ai";
+import type { Model, ModelThinkingLevel, OpenAICompletionsCompat } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
 import {
   type CodexRequestFormat,
@@ -382,4 +383,44 @@ export function createModelFromConfig(
     upstreamBaseUrl,
     modelId,
   });
+}
+
+export function getAvailableThinkingLevelsForModel(
+  providerId: ProviderId,
+  modelId: string,
+  baseUrl: string,
+  requestFormat?: CodexRequestFormat,
+  modelConfig?: ProviderModelConfig,
+  upstreamBaseUrl?: string,
+): ModelThinkingLevel[] {
+  if (!modelId.trim()) return [];
+  const model = createModelFromConfig(
+    providerId,
+    modelId,
+    baseUrl,
+    requestFormat,
+    modelConfig,
+    upstreamBaseUrl,
+  );
+  return getSupportedThinkingLevels(model).filter((level) => level !== "off");
+}
+
+export function isThinkingAlwaysOnForModel(
+  providerId: ProviderId,
+  modelId: string,
+  baseUrl: string,
+  requestFormat?: CodexRequestFormat,
+  modelConfig?: ProviderModelConfig,
+  upstreamBaseUrl?: string,
+): boolean {
+  if (!modelId.trim()) return false;
+  const model = createModelFromConfig(
+    providerId,
+    modelId,
+    baseUrl,
+    requestFormat,
+    modelConfig,
+    upstreamBaseUrl,
+  );
+  return !getSupportedThinkingLevels(model).includes("off");
 }

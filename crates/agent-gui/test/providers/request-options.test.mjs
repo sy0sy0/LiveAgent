@@ -144,6 +144,7 @@ test("provider request helpers normalize auth, metadata, errors, and model value
   });
   assert.equal(providers.toSimpleStreamReasoning("off"), undefined);
   assert.equal(providers.toSimpleStreamReasoning("high"), "high");
+  assert.equal(providers.toSimpleStreamReasoning("max"), "max");
   assert.deepEqual(providers.buildProviderRequestMetadata("claude_code", " session-1 "), {
     user_id: "session-1",
   });

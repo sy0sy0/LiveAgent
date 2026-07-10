@@ -37,6 +37,12 @@ const piAiProvidersAll = await import(
     import.meta.url,
   ).href
 );
+const piAiModels = await import(
+  new URL(
+    "../../node_modules/@earendil-works/pi-ai/dist/models.js",
+    import.meta.url,
+  ).href
+);
 
 function createDefaultMocks() {
   const typeboxMock = {
@@ -98,6 +104,8 @@ function createDefaultMocks() {
       parseJsonWithRepair: piAiJsonParse.parseJsonWithRepair,
       parseStreamingJson: piAiJsonParse.parseStreamingJson,
       repairJson: piAiJsonParse.repairJson,
+      getSupportedThinkingLevels: piAiModels.getSupportedThinkingLevels,
+      clampThinkingLevel: piAiModels.clampThinkingLevel,
       EventStream: class EventStream {
         constructor() {
           throw new Error("EventStream mock was not expected to be constructed");

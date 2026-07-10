@@ -59,6 +59,7 @@ const REASONING_I18N_KEYS: Record<ReasoningLevel, string> = {
   medium: "settings.reasoning.medium",
   high: "settings.reasoning.high",
   xhigh: "settings.reasoning.xhigh",
+  max: "settings.reasoning.max",
 };
 
 function isFocusVisibleTarget(target: EventTarget | null): boolean {
@@ -216,6 +217,7 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: {
   isAgentMode: boolean;
   chatRuntimeControls: ChatRuntimeControls;
   reasoningOptions: ReasoningLevel[];
+  thinkingAlwaysOn: boolean;
   gitClient?: GitClient | null;
   gitWriteEnabled?: boolean;
   gitDisabledMessage?: string;
@@ -246,6 +248,7 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: {
     isAgentMode,
     chatRuntimeControls,
     reasoningOptions,
+    thinkingAlwaysOn,
     gitClient,
     gitWriteEnabled = true,
     gitDisabledMessage,
@@ -443,17 +446,27 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: {
   }, [updateQueueScrollbar]);
 
   useEffect(() => {
-    if (reasoningOptions.length > 0 && reasoningOptions.includes(chatRuntimeControls.reasoning)) {
+    const reasoningNeedsReset =
+      !(reasoningOptions.length > 0 && reasoningOptions.includes(chatRuntimeControls.reasoning)) &&
+      !(
+        reasoningOptions.length === 0 &&
+        chatRuntimeControls.reasoning === DEFAULT_CHAT_RUNTIME_CONTROLS.reasoning
+      );
+    const thinkingNeedsEnable = thinkingAlwaysOn && !chatRuntimeControls.thinkingEnabled;
+    if (!reasoningNeedsReset && !thinkingNeedsEnable) {
       return;
     }
-    if (
-      reasoningOptions.length === 0 &&
-      chatRuntimeControls.reasoning === DEFAULT_CHAT_RUNTIME_CONTROLS.reasoning
-    ) {
-      return;
-    }
-    onChatRuntimeControlsChange({ reasoning: DEFAULT_CHAT_RUNTIME_CONTROLS.reasoning });
-  }, [chatRuntimeControls.reasoning, onChatRuntimeControlsChange, reasoningOptions]);
+    onChatRuntimeControlsChange({
+      ...(reasoningNeedsReset ? { reasoning: DEFAULT_CHAT_RUNTIME_CONTROLS.reasoning } : {}),
+      ...(thinkingNeedsEnable ? { thinkingEnabled: true } : {}),
+    });
+  }, [
+    chatRuntimeControls.reasoning,
+    chatRuntimeControls.thinkingEnabled,
+    onChatRuntimeControlsChange,
+    reasoningOptions,
+    thinkingAlwaysOn,
+  ]);
 
   useEffect(() => {
     const composerLayer = composerLayerRef.current;
@@ -744,7 +757,7 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: {
               <RuntimeControlTooltip label={thinkingTooltip}>
                 <button
                   type="button"
-                  disabled={controlsDisabled || !thinkingSupported}
+                  disabled={controlsDisabled || !thinkingSupported || thinkingAlwaysOn}
                   onClick={() =>
                     onChatRuntimeControlsChange({
                       thinkingEnabled: !chatRuntimeControls.thinkingEnabled,

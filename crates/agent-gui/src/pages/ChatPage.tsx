@@ -97,7 +97,7 @@ import {
   preparePreferredMonacoNlsLocale,
   setPreferredMonacoNlsLocale,
 } from "../lib/monacoNls";
-import { createModelFromConfig, toModelValue } from "../lib/providers/llm";
+import { createModelFromConfig, isThinkingAlwaysOnForModel, toModelValue } from "../lib/providers/llm";
 import {
   type AppSettings,
   applyMcpOpsToAppSettings,
@@ -532,15 +532,16 @@ function buildProviderRuntimeConfig(
   model: string,
   controlsInput?: ChatRuntimeControls,
 ) {
-  const controls = normalizeChatRuntimeControlsForProvider(controlsInput, {
+  const modelConfig = findProviderModelConfig(provider, model);
+  const reasoningParams = {
     providerId: provider.type,
     requestFormat: provider.requestFormat,
-  });
-  const reasoningSupported =
-    getChatRuntimeReasoningLevelsForProvider({
-      providerId: provider.type,
-      requestFormat: provider.requestFormat,
-    }).length > 0;
+    modelId: model,
+    baseUrl: provider.baseUrl,
+    modelConfig,
+  };
+  const controls = normalizeChatRuntimeControlsForProvider(controlsInput, reasoningParams);
+  const reasoningSupported = getChatRuntimeReasoningLevelsForProvider(reasoningParams).length > 0;
   return {
     baseUrl: provider.baseUrl,
     apiKey: provider.apiKey,
@@ -552,7 +553,7 @@ function buildProviderRuntimeConfig(
       : undefined,
     promptCachingEnabled: true,
     nativeWebSearchEnabled: controls.nativeWebSearchEnabled,
-    modelConfig: findProviderModelConfig(provider, model),
+    modelConfig,
   };
 }
 
@@ -4811,33 +4812,67 @@ export function ChatPage(props: ChatPageProps) {
   const currentChatProvider = settings.selectedModel
     ? settings.customProviders.find((item) => item.id === settings.selectedModel?.customProviderId)
     : undefined;
-  const chatRuntimeReasoningOptions = useMemo(
+  const currentChatModelId = settings.selectedModel?.model;
+  const currentChatModelConfig = useMemo(
     () =>
-      getChatRuntimeReasoningLevelsForProvider({
-        providerId: currentChatProvider?.type,
-        requestFormat: currentChatProvider?.requestFormat,
-      }),
-    [currentChatProvider?.requestFormat, currentChatProvider?.type],
+      currentChatProvider && currentChatModelId
+        ? findProviderModelConfig(currentChatProvider, currentChatModelId)
+        : undefined,
+    [currentChatProvider, currentChatModelId],
+  );
+  const chatRuntimeReasoningParams = useMemo(
+    () => ({
+      providerId: currentChatProvider?.type,
+      requestFormat: currentChatProvider?.requestFormat,
+      modelId: currentChatModelId,
+      baseUrl: currentChatProvider?.baseUrl,
+      modelConfig: currentChatModelConfig,
+    }),
+    [
+      currentChatModelConfig,
+      currentChatModelId,
+      currentChatProvider?.baseUrl,
+      currentChatProvider?.requestFormat,
+      currentChatProvider?.type,
+    ],
+  );
+  const chatRuntimeReasoningOptions = useMemo(
+    () => getChatRuntimeReasoningLevelsForProvider(chatRuntimeReasoningParams),
+    [chatRuntimeReasoningParams],
+  );
+  const chatRuntimeThinkingAlwaysOn = useMemo(
+    () =>
+      isThinkingAlwaysOnForModel(
+        currentChatProvider?.type ?? "claude_code",
+        currentChatModelId ?? "",
+        currentChatProvider?.baseUrl ?? "",
+        currentChatProvider?.requestFormat,
+        currentChatModelConfig,
+      ),
+    [
+      currentChatModelConfig,
+      currentChatModelId,
+      currentChatProvider?.baseUrl,
+      currentChatProvider?.requestFormat,
+      currentChatProvider?.type,
+    ],
   );
   const chatRuntimeControlsForCurrentProvider = useMemo(
-    () =>
-      normalizeChatRuntimeControlsForProvider(settings.chatRuntimeControls, {
-        providerId: currentChatProvider?.type,
-        requestFormat: currentChatProvider?.requestFormat,
-      }),
-    [currentChatProvider?.requestFormat, currentChatProvider?.type, settings.chatRuntimeControls],
+    () => normalizeChatRuntimeControlsForProvider(settings.chatRuntimeControls, chatRuntimeReasoningParams),
+    [chatRuntimeReasoningParams, settings.chatRuntimeControls],
   );
   const handleChatRuntimeControlsChange = useCallback(
     (patch: Partial<ChatRuntimeControls>) => {
       setSettings((prev) => ({
         ...prev,
-        chatRuntimeControls: updateChatRuntimeControlsForProvider(prev.chatRuntimeControls, patch, {
-          providerId: currentChatProvider?.type,
-          requestFormat: currentChatProvider?.requestFormat,
-        }),
+        chatRuntimeControls: updateChatRuntimeControlsForProvider(
+          prev.chatRuntimeControls,
+          patch,
+          chatRuntimeReasoningParams,
+        ),
       }));
     },
-    [currentChatProvider?.requestFormat, currentChatProvider?.type, setSettings],
+    [chatRuntimeReasoningParams, setSettings],
   );
   const currentConversationWorkspaceRoot = (() => {
     const currentItem = historyItems.find((item) => item.id === currentConversationId);
@@ -5134,6 +5169,7 @@ export function ChatPage(props: ChatPageProps) {
                 isAgentMode={isAgentMode}
                 chatRuntimeControls={chatRuntimeControlsForCurrentProvider}
                 reasoningOptions={chatRuntimeReasoningOptions}
+                thinkingAlwaysOn={chatRuntimeThinkingAlwaysOn}
                 gitClient={tauriGitClient}
                 workspaceActivityClient={tauriWorkspaceActivityClient}
                 onSend={handleSend}

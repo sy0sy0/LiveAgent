@@ -122,7 +122,7 @@ func NormalizeChatRuntimeControls(input *ChatRuntimeControlsBody) *ChatRuntimeCo
 
 func normalizeChatRuntimeReasoning(value string) string {
 	switch normalizeTrimmedText(value) {
-	case "minimal", "low", "medium", "high", "xhigh":
+	case "minimal", "low", "medium", "high", "xhigh", "max":
 		return normalizeTrimmedText(value)
 	default:
 		return "high"

@@ -122,7 +122,7 @@ test("web settings normalization canonicalizes project keyed maps with Windows p
   });
 });
 
-test("web chat runtime controls default and follow provider reasoning support", () => {
+test("web chat runtime controls default and follow model-aware reasoning support", () => {
   installWindow("https://gateway.example");
 
   const defaults = webSettings.getWebDefaultSettings(" token ");
@@ -138,22 +138,26 @@ test("web chat runtime controls default and follow provider reasoning support", 
     },
   });
 
-  assert.deepEqual(settings.getChatRuntimeReasoningLevelsForProvider({}), [
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-  ]);
-  assert.deepEqual(settings.getChatRuntimeReasoningLevelsForProvider({ providerId: "claude_code" }), [
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-  ]);
+  assert.deepEqual(settings.getChatRuntimeReasoningLevelsForProvider({}), []);
+  assert.deepEqual(
+    settings.getChatRuntimeReasoningLevelsForProvider({
+      providerId: "claude_code",
+      modelId: "claude-opus-4-8",
+    }),
+    ["minimal", "low", "medium", "high", "xhigh", "max"],
+  );
+  assert.deepEqual(
+    settings.getChatRuntimeReasoningLevelsForProvider({
+      providerId: "claude_code",
+      modelId: "claude-sonnet-4-6",
+    }),
+    ["minimal", "low", "medium", "high", "max"],
+  );
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
       providerId: "codex",
       requestFormat: "openai-responses",
+      modelId: "gpt-5.2",
     }),
     ["minimal", "low", "medium", "high", "xhigh"],
   );
@@ -161,15 +165,21 @@ test("web chat runtime controls default and follow provider reasoning support", 
     settings.getChatRuntimeReasoningLevelsForProvider({
       providerId: "codex",
       requestFormat: "openai-completions",
+      modelId: "gpt-5",
     }),
-    ["minimal", "low", "medium", "high", "xhigh"],
+    ["minimal", "low", "medium", "high"],
   );
-  assert.deepEqual(settings.getChatRuntimeReasoningLevelsForProvider({ providerId: "gemini" }), [
-    "minimal",
-    "low",
-    "medium",
-    "high",
-  ]);
+  assert.deepEqual(
+    settings.getChatRuntimeReasoningLevelsForProvider({
+      providerId: "gemini",
+      modelId: "gemini-2.5-pro",
+    }),
+    ["minimal", "low", "medium", "high"],
+  );
+
+  assert.equal(settings.isThinkingAlwaysOnForModel("claude_code", "claude-fable-5"), true);
+  assert.equal(settings.isThinkingAlwaysOnForModel("claude_code", "claude-opus-4-8"), false);
+  assert.equal(settings.isThinkingAlwaysOnForModel("claude_code", undefined), false);
 
   assert.deepEqual(
     settings.normalizeChatRuntimeControlsForProvider(
@@ -181,7 +191,7 @@ test("web chat runtime controls default and follow provider reasoning support", 
           gemini: "xhigh",
         },
       },
-      { providerId: "gemini" },
+      { providerId: "gemini", modelId: "gemini-2.5-pro" },
     ),
     {
       thinkingEnabled: false,
@@ -205,7 +215,7 @@ test("web chat runtime controls default and follow provider reasoning support", 
           codex_openai_completions: "xhigh",
         },
       },
-      { providerId: "codex", requestFormat: "openai-completions" },
+      { providerId: "codex", requestFormat: "openai-completions", modelId: "gpt-5.2" },
     ),
     {
       thinkingEnabled: true,
@@ -215,7 +225,7 @@ test("web chat runtime controls default and follow provider reasoning support", 
         claude_code: "xhigh",
         codex_openai_responses: "xhigh",
         codex_openai_completions: "xhigh",
-        gemini: "high",
+        gemini: "xhigh",
       },
     },
   );
@@ -224,7 +234,7 @@ test("web chat runtime controls default and follow provider reasoning support", 
     settings.updateChatRuntimeControlsForProvider(
       defaults.chatRuntimeControls,
       { reasoning: "xhigh" },
-      { providerId: "codex", requestFormat: "openai-responses" },
+      { providerId: "codex", requestFormat: "openai-responses", modelId: "gpt-5.2" },
     ),
     {
       thinkingEnabled: true,
@@ -248,7 +258,7 @@ test("web chat runtime controls default and follow provider reasoning support", 
           gemini: "low",
         },
       },
-      { providerId: "claude_code" },
+      { providerId: "claude_code", modelId: "claude-opus-4-8" },
     ).reasoning,
     "xhigh",
   );
@@ -262,9 +272,16 @@ test("web chat runtime controls default and follow provider reasoning support", 
           gemini: "low",
         },
       },
-      { providerId: "gemini" },
+      { providerId: "gemini", modelId: "gemini-2.5-pro" },
     ).reasoning,
     "low",
+  );
+  assert.equal(
+    settings.normalizeChatRuntimeControlsForProvider(defaults.chatRuntimeControls, {
+      providerId: "claude_code",
+      modelId: "not-a-real-model",
+    }).reasoning,
+    "high",
   );
 });
 
@@ -333,9 +350,9 @@ test("gateway settings sync keeps remote connection local and syncs web terminal
   assert.equal(synced.chatRuntimeControls.thinkingEnabled, false);
   assert.equal(synced.chatRuntimeControls.nativeWebSearchEnabled, false);
   assert.equal(synced.chatRuntimeControls.reasoning, "minimal");
-  assert.equal(synced.chatRuntimeControls.reasoningByProvider.claude_code, "high");
+  assert.equal(synced.chatRuntimeControls.reasoningByProvider.claude_code, "minimal");
   assert.equal(synced.chatRuntimeControls.reasoningByProvider.codex_openai_responses, "minimal");
-  assert.equal(synced.chatRuntimeControls.reasoningByProvider.gemini, "high");
+  assert.equal(synced.chatRuntimeControls.reasoningByProvider.gemini, "xhigh");
   assert.equal(synced.selectedModel, undefined);
   assert.equal(synced.remote.gatewayUrl, "https://gateway.example");
   assert.equal(synced.remote.token, "token");

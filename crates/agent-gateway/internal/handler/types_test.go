@@ -77,6 +77,16 @@ func TestNormalizeChatRuntimeControlsDefaultsAndTrims(t *testing.T) {
 		t.Fatalf("reasoning = %q, want xhigh", got.Reasoning)
 	}
 
+	max := NormalizeChatRuntimeControls(&ChatRuntimeControlsBody{
+		Reasoning: " max ",
+	})
+	if max == nil {
+		t.Fatalf("NormalizeChatRuntimeControls(max) = nil")
+	}
+	if max.Reasoning != "max" {
+		t.Fatalf("reasoning = %q, want max", max.Reasoning)
+	}
+
 	invalid := NormalizeChatRuntimeControls(&ChatRuntimeControlsBody{
 		NativeWebSearchEnabled: boolPtr(false),
 		Reasoning:              "remote-xhigh",

@@ -19,7 +19,7 @@ import {
   isDeepSeekTarget,
   mapDeepSeekReasoningEffort,
 } from "../deepSeekProviderAdapter";
-import { isRecord, resolveMaxTokens } from "./common";
+import { resolveMaxTokens } from "./common";
 import { normalizeStructuredToolCallHistoryForDeepSeek } from "./textModeToolRecovery";
 import {
   type AnthropicEffort,
@@ -40,58 +40,6 @@ function resolveDeepSeekAnthropicThinkingRuntime(
     mode: effort ? "adaptive" : "disabled",
     maxTokens: resolveMaxTokens(options.maxTokens, model.maxTokens),
     ...(effort ? { effort } : {}),
-  };
-}
-
-function applyAnthropicThinkingPayloadOverride(
-  payload: unknown,
-  thinking: AnthropicThinkingRuntime,
-): unknown {
-  if (!isRecord(payload)) return payload;
-
-  if (thinking.mode === "disabled" && thinking.omitDisabledThinking) {
-    const { thinking: _thinking, ...rest } = payload;
-    return rest;
-  }
-
-  if (thinking.mode !== "adaptive") return payload;
-
-  const outputConfig: Record<string, unknown> = isRecord(payload.output_config)
-    ? { ...payload.output_config }
-    : {};
-  if (thinking.effort) {
-    outputConfig.effort = thinking.effort;
-  }
-
-  return {
-    ...payload,
-    thinking: {
-      type: "adaptive",
-      ...(thinking.display ? { display: thinking.display } : {}),
-    },
-    ...(Object.keys(outputConfig).length > 0 ? { output_config: outputConfig } : {}),
-  };
-}
-
-function attachAnthropicThinkingPayloadOverride(
-  options: StreamOptionsEx,
-  thinking: AnthropicThinkingRuntime,
-): StreamOptionsEx {
-  if (thinking.mode !== "adaptive" && !thinking.omitDisabledThinking) return options;
-
-  const previousOnPayload = options.onPayload;
-  return {
-    ...options,
-    onPayload: async (payload, model) => {
-      let nextPayload = applyAnthropicThinkingPayloadOverride(payload, thinking);
-      if (previousOnPayload) {
-        const overridden = await previousOnPayload(nextPayload, model);
-        if (overridden !== undefined) {
-          nextPayload = overridden;
-        }
-      }
-      return nextPayload;
-    },
   };
 }
 
@@ -154,7 +102,7 @@ export function streamSimpleByApi(model: Model<any>, context: Context, options: 
             baseUrl: model.baseUrl,
             model,
           })
-        : attachAnthropicThinkingPayloadOverride(options, anthropicThinking);
+        : options;
       const anthropicContext = isDeepSeekAnthropic
         ? normalizeStructuredToolCallHistoryForDeepSeek(context)
         : context;
@@ -170,7 +118,7 @@ export function streamSimpleByApi(model: Model<any>, context: Context, options: 
         maxRetryDelayMs: anthropicOptions.maxRetryDelayMs,
         metadata: anthropicOptions.metadata,
         thinkingEnabled: anthropicThinking.thinkingEnabled,
-        ...(anthropicThinking.effort ? { effort: anthropicThinking.effort as any } : {}),
+        ...(anthropicThinking.effort ? { effort: anthropicThinking.effort } : {}),
         ...(anthropicThinking.thinkingBudgetTokens !== undefined
           ? { thinkingBudgetTokens: anthropicThinking.thinkingBudgetTokens }
           : {}),
@@ -196,7 +144,7 @@ export function streamSimpleByApi(model: Model<any>, context: Context, options: 
         : context;
       const openAIOptions: OpenAICompletionsOptions = {
         ...buildOpenAIBaseOptions(model, openAICompletionsOptions),
-        reasoningEffort: clampOpenAIReasoningEffort(model.id, openAICompletionsOptions.reasoning),
+        reasoningEffort: clampOpenAIReasoningEffort(model, openAICompletionsOptions.reasoning),
         toolChoice: mapToolChoiceToOpenAI(openAICompletionsOptions.toolChoice),
       };
       return streamOpenAICompletions(model as any, openAICompletionsContext, openAIOptions);
@@ -204,7 +152,7 @@ export function streamSimpleByApi(model: Model<any>, context: Context, options: 
     case "openai-responses": {
       const openAIOptions: OpenAIResponsesOptions = {
         ...buildOpenAIBaseOptions(model, options),
-        reasoningEffort: clampOpenAIReasoningEffort(model.id, options.reasoning),
+        reasoningEffort: clampOpenAIReasoningEffort(model, options.reasoning),
       };
       return streamOpenAIResponses(model as any, context, openAIOptions);
     }

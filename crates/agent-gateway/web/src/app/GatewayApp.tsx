@@ -73,6 +73,7 @@ import {
   getSshProjectHostIds,
   isAgentDevMode,
   isRightDockSingletonTabOpen,
+  isThinkingAlwaysOnForModel,
   normalizeChatRuntimeControlsForProvider,
   openRightDockSingletonTab,
   type RightDockFileTreeStatePatch,
@@ -1805,6 +1806,7 @@ export default function GatewayApp() {
       {
         providerId: currentChatProvider?.type,
         requestFormat: currentChatProvider?.requestFormat,
+        modelId: settings.selectedModel?.model,
       },
     );
     const commandInput: GatewayChatCommandInput = {
@@ -3107,16 +3109,32 @@ export default function GatewayApp() {
       getChatRuntimeReasoningLevelsForProvider({
         providerId: currentChatProvider?.type,
         requestFormat: currentChatProvider?.requestFormat,
+        modelId: settings.selectedModel?.model,
       }),
-    [currentChatProvider?.requestFormat, currentChatProvider?.type],
+    [
+      currentChatProvider?.requestFormat,
+      currentChatProvider?.type,
+      settings.selectedModel?.model,
+    ],
+  );
+  const chatRuntimeThinkingAlwaysOn = useMemo(
+    () =>
+      isThinkingAlwaysOnForModel(currentChatProvider?.type ?? "claude_code", settings.selectedModel?.model),
+    [currentChatProvider?.type, settings.selectedModel?.model],
   );
   const chatRuntimeControlsForCurrentProvider = useMemo(
     () =>
       normalizeChatRuntimeControlsForProvider(settings.chatRuntimeControls, {
         providerId: currentChatProvider?.type,
         requestFormat: currentChatProvider?.requestFormat,
+        modelId: settings.selectedModel?.model,
       }),
-    [currentChatProvider?.requestFormat, currentChatProvider?.type, settings.chatRuntimeControls],
+    [
+      currentChatProvider?.requestFormat,
+      currentChatProvider?.type,
+      settings.chatRuntimeControls,
+      settings.selectedModel?.model,
+    ],
   );
   const handleChatRuntimeControlsChange = useCallback(
     (patch: Partial<ChatRuntimeControls>) => {
@@ -3125,10 +3143,16 @@ export default function GatewayApp() {
         chatRuntimeControls: updateChatRuntimeControlsForProvider(prev.chatRuntimeControls, patch, {
           providerId: currentChatProvider?.type,
           requestFormat: currentChatProvider?.requestFormat,
+          modelId: settings.selectedModel?.model,
         }),
       }));
     },
-    [currentChatProvider?.requestFormat, currentChatProvider?.type, setSettings],
+    [
+      currentChatProvider?.requestFormat,
+      currentChatProvider?.type,
+      setSettings,
+      settings.selectedModel?.model,
+    ],
   );
   const isAgentDevExecutionMode = isAgentDevMode(settings.system.executionMode);
 
@@ -3919,6 +3943,7 @@ export default function GatewayApp() {
                     isAgentMode={isAgentMode}
                     chatRuntimeControls={chatRuntimeControlsForCurrentProvider}
                     reasoningOptions={chatRuntimeReasoningOptions}
+                    thinkingAlwaysOn={chatRuntimeThinkingAlwaysOn}
                     gitClient={gitClient}
                     gitWriteEnabled={settings.remote.enableWebGit}
                     gitDisabledMessage={gitDisabledMessage}

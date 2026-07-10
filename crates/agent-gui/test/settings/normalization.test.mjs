@@ -242,7 +242,7 @@ test("custom settings conversation title model only keeps enabled provider model
   assert.equal(cleared.customSettings.conversationTitleModel, undefined);
 });
 
-test("chat runtime controls default and follow provider reasoning support", () => {
+test("chat runtime controls default and follow provider model reasoning support", () => {
   const defaults = settings.getDefaultSettings();
   assert.deepEqual(defaults.chatRuntimeControls, {
     thinkingEnabled: true,
@@ -256,38 +256,75 @@ test("chat runtime controls default and follow provider reasoning support", () =
     },
   });
 
-  assert.deepEqual(settings.getChatRuntimeReasoningLevelsForProvider({}), [
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-  ]);
-  assert.deepEqual(settings.getChatRuntimeReasoningLevelsForProvider({ providerId: "claude_code" }), [
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-  ]);
+  // 没有 modelId 就无法解析目录，拿不到任何档位。
+  assert.deepEqual(settings.getChatRuntimeReasoningLevelsForProvider({}), []);
+
+  // claude-opus-4-5：pi-ai 目录没有 thinkingLevelMap，标准四档，无 xhigh/max。
+  assert.deepEqual(
+    settings.getChatRuntimeReasoningLevelsForProvider({
+      providerId: "claude_code",
+      modelId: "claude-opus-4-5",
+      baseUrl: "https://api.anthropic.com",
+    }),
+    ["minimal", "low", "medium", "high"],
+  );
+  // claude-sonnet-5：目录显式声明 xhigh/max。
+  assert.deepEqual(
+    settings.getChatRuntimeReasoningLevelsForProvider({
+      providerId: "claude_code",
+      modelId: "claude-sonnet-5",
+      baseUrl: "https://api.anthropic.com",
+    }),
+    ["minimal", "low", "medium", "high", "xhigh", "max"],
+  );
+  // gpt-5.1（openai-responses）：目录只覆盖 off，标准四档。
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
       providerId: "codex",
       requestFormat: "openai-responses",
+      modelId: "gpt-5.1",
+      baseUrl: "https://api.openai.com/v1",
+    }),
+    ["minimal", "low", "medium", "high"],
+  );
+  // gpt-5.2：目录额外声明 xhigh，仍无 max。
+  assert.deepEqual(
+    settings.getChatRuntimeReasoningLevelsForProvider({
+      providerId: "codex",
+      requestFormat: "openai-responses",
+      modelId: "gpt-5.2",
+      baseUrl: "https://api.openai.com/v1",
     }),
     ["minimal", "low", "medium", "high", "xhigh"],
   );
+  // Groq qwen/qwen3-32b（openai-completions 兼容端点）：目录覆盖到 xhigh，仍无 max。
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
       providerId: "codex",
       requestFormat: "openai-completions",
+      modelId: "qwen/qwen3-32b",
+      baseUrl: "https://api.groq.com/openai/v1",
     }),
     ["minimal", "low", "medium", "high", "xhigh"],
   );
-  assert.deepEqual(settings.getChatRuntimeReasoningLevelsForProvider({ providerId: "gemini" }), [
-    "minimal",
-    "low",
-    "medium",
-    "high",
-  ]);
+  // gemini-2.5-flash：预算档字段驱动，标准四档，无 xhigh/max。
+  assert.deepEqual(
+    settings.getChatRuntimeReasoningLevelsForProvider({
+      providerId: "gemini",
+      modelId: "gemini-2.5-flash",
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+    }),
+    ["minimal", "low", "medium", "high"],
+  );
+  // gemini-3-pro-preview：目录把 minimal/medium 显式置空，只剩两档（3.0/3.1 同档）。
+  assert.deepEqual(
+    settings.getChatRuntimeReasoningLevelsForProvider({
+      providerId: "gemini",
+      modelId: "gemini-3-pro-preview",
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+    }),
+    ["low", "high"],
+  );
 
   assert.deepEqual(
     settings.normalizeChatRuntimeControlsForProvider(
@@ -299,7 +336,11 @@ test("chat runtime controls default and follow provider reasoning support", () =
           gemini: "xhigh",
         },
       },
-      { providerId: "gemini" },
+      {
+        providerId: "gemini",
+        modelId: "gemini-2.5-flash",
+        baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+      },
     ),
     {
       thinkingEnabled: false,
@@ -323,7 +364,12 @@ test("chat runtime controls default and follow provider reasoning support", () =
           codex_openai_completions: "xhigh",
         },
       },
-      { providerId: "codex", requestFormat: "openai-completions" },
+      {
+        providerId: "codex",
+        requestFormat: "openai-completions",
+        modelId: "qwen/qwen3-32b",
+        baseUrl: "https://api.groq.com/openai/v1",
+      },
     ),
     {
       thinkingEnabled: true,
@@ -333,7 +379,9 @@ test("chat runtime controls default and follow provider reasoning support", () =
         claude_code: "xhigh",
         codex_openai_responses: "xhigh",
         codex_openai_completions: "xhigh",
-        gemini: "high",
+        // gemini 未在 reasoningByProvider 输入里显式给出，也未参与本次调用
+        // 的当前 provider key，因此只继承顶层 reasoning 原值，不做钳制。
+        gemini: "xhigh",
       },
     },
   );
@@ -342,7 +390,12 @@ test("chat runtime controls default and follow provider reasoning support", () =
     settings.updateChatRuntimeControlsForProvider(
       defaults.chatRuntimeControls,
       { reasoning: "xhigh" },
-      { providerId: "codex", requestFormat: "openai-responses" },
+      {
+        providerId: "codex",
+        requestFormat: "openai-responses",
+        modelId: "gpt-5.2",
+        baseUrl: "https://api.openai.com/v1",
+      },
     ),
     {
       thinkingEnabled: true,
@@ -366,7 +419,11 @@ test("chat runtime controls default and follow provider reasoning support", () =
           gemini: "low",
         },
       },
-      { providerId: "claude_code" },
+      {
+        providerId: "claude_code",
+        modelId: "claude-sonnet-5",
+        baseUrl: "https://api.anthropic.com",
+      },
     ).reasoning,
     "xhigh",
   );
@@ -380,7 +437,11 @@ test("chat runtime controls default and follow provider reasoning support", () =
           gemini: "low",
         },
       },
-      { providerId: "gemini" },
+      {
+        providerId: "gemini",
+        modelId: "gemini-2.5-flash",
+        baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+      },
     ).reasoning,
     "low",
   );
@@ -1444,7 +1505,8 @@ test("gateway settings sync applies redacted providers without clearing local ap
   assert.equal(redacted.chatRuntimeControls.reasoning, "xhigh");
   assert.equal(redacted.chatRuntimeControls.reasoningByProvider.claude_code, "xhigh");
   assert.equal(redacted.chatRuntimeControls.reasoningByProvider.codex_openai_responses, "minimal");
-  assert.equal(redacted.chatRuntimeControls.reasoningByProvider.gemini, "high");
+  // gateway sync 没有 model 上下文，无法按 provider 钳制，保留传入的原始合法档位。
+  assert.equal(redacted.chatRuntimeControls.reasoningByProvider.gemini, "xhigh");
   assert.deepEqual(redacted.customSettings.conversationTitleModel, {
     customProviderId: "provider-1",
     model: "gpt-5.4",

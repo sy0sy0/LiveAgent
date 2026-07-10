@@ -3,6 +3,7 @@ import type {
   AssistantMessage,
   Context,
   Message,
+  ModelThinkingLevel,
   ToolCall,
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
@@ -496,13 +497,13 @@ function toAssistantThinkingLevel(params: {
   providerId: ProviderId;
   reasoning?: ReasoningLevel;
   api: string;
-}): "off" | "minimal" | "low" | "medium" | "high" | "xhigh" {
+}): ModelThinkingLevel {
   if (params.providerId === "claude_code") {
     return params.reasoning && params.reasoning !== "off" ? params.reasoning : "off";
   }
   if (params.providerId === "gemini") {
     if (!params.reasoning || params.reasoning === "off") return "off";
-    return params.reasoning === "xhigh" ? "high" : params.reasoning;
+    return params.reasoning === "xhigh" || params.reasoning === "max" ? "high" : params.reasoning;
   }
   if (params.api !== "openai-responses" && params.api !== "openai-completions") {
     return "off";
@@ -517,6 +518,7 @@ function normalizeStreamReasoning(value: unknown): StreamOptionsEx["reasoning"] 
     case "medium":
     case "high":
     case "xhigh":
+    case "max":
       return value;
     default:
       return undefined;

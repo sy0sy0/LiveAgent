@@ -1,5 +1,6 @@
-import type { KnownProvider } from "@earendil-works/pi-ai";
-import { getModels } from "@earendil-works/pi-ai";
+import type { KnownProvider, ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
+import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { DEFAULT_LOCALE, type Locale, normalizeLocale } from "../../i18n/config";
 import { mergeAlwaysEnabledSkillNames } from "../skills/builtin";
 import { SYSTEM_TOOL_OPTIONS, type SystemToolId } from "../tools/systemToolOptions";
@@ -13,7 +14,7 @@ export type ExecutionMode = "text" | "tools" | "agent-dev";
 
 export type CodexRequestFormat = "openai-completions" | "openai-responses";
 
-export type ReasoningLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type ReasoningLevel = ModelThinkingLevel;
 
 export type McpTransport = "stdio" | "http" | "sse";
 
@@ -654,30 +655,18 @@ export function resolveWorkspaceProjects(
   };
 }
 
+const REASONING_LEVELS: ReasoningLevel[] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
 export function normalizeReasoningLevel(input: unknown): ReasoningLevel {
-  switch (input) {
-    case "minimal":
-    case "low":
-    case "medium":
-    case "high":
-    case "xhigh":
-      return input;
-    default:
-      return "off";
-  }
+  return typeof input === "string" && (REASONING_LEVELS as string[]).includes(input)
+    ? (input as ReasoningLevel)
+    : "off";
 }
 
 export function normalizeChatRuntimeReasoning(input: unknown): ReasoningLevel {
-  switch (input) {
-    case "minimal":
-    case "low":
-    case "medium":
-    case "high":
-    case "xhigh":
-      return input;
-    default:
-      return DEFAULT_CHAT_RUNTIME_CONTROLS.reasoning;
-  }
+  return typeof input === "string" && (REASONING_LEVELS as string[]).includes(input)
+    ? (input as ReasoningLevel)
+    : DEFAULT_CHAT_RUNTIME_CONTROLS.reasoning;
 }
 
 const CHAT_RUNTIME_REASONING_PROVIDER_KEYS: ChatRuntimeReasoningProviderKey[] = [
@@ -703,21 +692,6 @@ export function getChatRuntimeReasoningProviderKey(params: {
   return "codex_openai_responses";
 }
 
-function getChatRuntimeReasoningLevelsForProviderKey(
-  key: ChatRuntimeReasoningProviderKey,
-): ReasoningLevel[] {
-  if (key === "claude_code") {
-    return ["low", "medium", "high", "xhigh"];
-  }
-  if (key === "gemini") {
-    return ["minimal", "low", "medium", "high"];
-  }
-  if (key === "codex_openai_completions") {
-    return ["minimal", "low", "medium", "high", "xhigh"];
-  }
-  return ["minimal", "low", "medium", "high", "xhigh"];
-}
-
 function normalizeChatRuntimeReasoningForLevels(
   input: unknown,
   levels: ReasoningLevel[],
@@ -738,10 +712,8 @@ function normalizeChatRuntimeReasoningByProvider(
     ...DEFAULT_CHAT_RUNTIME_CONTROLS.reasoningByProvider,
   };
   CHAT_RUNTIME_REASONING_PROVIDER_KEYS.forEach((key) => {
-    const levels = getChatRuntimeReasoningLevelsForProviderKey(key);
-    normalized[key] = normalizeChatRuntimeReasoningForLevels(
+    normalized[key] = normalizeChatRuntimeReasoning(
       Object.hasOwn(obj, key) ? obj[key] : fallbackReasoning,
-      levels,
     );
   });
   return normalized;
@@ -764,8 +736,9 @@ export function normalizeChatRuntimeControls(input: unknown): ChatRuntimeControl
 export function getChatRuntimeReasoningLevelsForProvider(params: {
   providerId?: ProviderId;
   requestFormat?: CodexRequestFormat;
+  modelId?: string;
 }): ReasoningLevel[] {
-  return getChatRuntimeReasoningLevelsForProviderKey(getChatRuntimeReasoningProviderKey(params));
+  return getKnownModelThinkingLevels(params.providerId ?? "claude_code", params.modelId);
 }
 
 export function normalizeChatRuntimeControlsForProvider(
@@ -773,11 +746,12 @@ export function normalizeChatRuntimeControlsForProvider(
   params: {
     providerId?: ProviderId;
     requestFormat?: CodexRequestFormat;
+    modelId?: string;
   },
 ): ChatRuntimeControls {
   const controls = normalizeChatRuntimeControls(input);
   const key = getChatRuntimeReasoningProviderKey(params);
-  const levels = getChatRuntimeReasoningLevelsForProviderKey(key);
+  const levels = getChatRuntimeReasoningLevelsForProvider(params);
   const reasoningByProvider = {
     ...DEFAULT_CHAT_RUNTIME_CONTROLS.reasoningByProvider,
     ...controls.reasoningByProvider,
@@ -802,10 +776,11 @@ export function updateChatRuntimeControlsForProvider(
   params: {
     providerId?: ProviderId;
     requestFormat?: CodexRequestFormat;
+    modelId?: string;
   },
 ): ChatRuntimeControls {
   const key = getChatRuntimeReasoningProviderKey(params);
-  const levels = getChatRuntimeReasoningLevelsForProviderKey(key);
+  const levels = getChatRuntimeReasoningLevelsForProvider(params);
   const controls = normalizeChatRuntimeControls({
     ...normalizeChatRuntimeControls(input),
     ...patch,
@@ -939,15 +914,36 @@ function toKnownProvider(providerId: ProviderId): KnownProvider {
   return "anthropic";
 }
 
+function findKnownModel(providerId: ProviderId, modelId: string | undefined) {
+  const trimmedId = modelId?.trim();
+  if (!trimmedId) return undefined;
+  return getBuiltinModels(toKnownProvider(providerId)).find((model) => model.id === trimmedId);
+}
+
 function getKnownModelLimits(
   providerId: ProviderId,
   modelId: string | undefined,
 ): Pick<ProviderModelConfig, "contextWindow" | "maxOutputToken"> | undefined {
-  const trimmedId = modelId?.trim();
-  if (!trimmedId) return undefined;
-  const known = getModels(toKnownProvider(providerId)).find((model) => model.id === trimmedId);
+  const known = findKnownModel(providerId, modelId);
   if (!known) return undefined;
   return { contextWindow: known.contextWindow, maxOutputToken: known.maxTokens };
+}
+
+export function getKnownModelThinkingLevels(
+  providerId: ProviderId,
+  modelId: string | undefined,
+): ReasoningLevel[] {
+  const known = findKnownModel(providerId, modelId);
+  if (!known) return [];
+  return getSupportedThinkingLevels(known).filter((level) => level !== "off");
+}
+
+export function isThinkingAlwaysOnForModel(
+  providerId: ProviderId,
+  modelId: string | undefined,
+): boolean {
+  const known = findKnownModel(providerId, modelId);
+  return known ? !getSupportedThinkingLevels(known).includes("off") : false;
 }
 
 export function getProviderModelDefaults(
