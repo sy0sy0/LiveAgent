@@ -70,7 +70,6 @@ LiveAgent 是一个 **本地优先** 的 AI Agent 桌面客户端。它将大语
 
 - **浏览器随处访问** — Go + gRPC 网关,WebUI 远程操控本地 Agent
 - **断线可恢复** — 有界 seq window 补齐短时断线,桌面端持久化兜底
-- **一键部署** — Docker multi-stage 镜像(约 30MB),支持 Railway CI/CD
 
 ---
 
@@ -140,7 +139,7 @@ docker run -d \
 
 > Gateway 对外有两类流量：
 >
-> 桌面端的 **gRPC 双向流** (默认 50051) 与浏览器端的 **HTTP / WebSocket ** (默认 50052)。
+> 桌面端的 gRPC 双向流 (默认 50051) 与浏览器端的 HTTP / WebSocket  (默认 50052)。
 >
 > 经 Nginx 暴露时需要分别代理,注意 gRPC 与 WebSocket 均为长连接,超时需调大:
 
