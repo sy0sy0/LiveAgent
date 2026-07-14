@@ -44,7 +44,7 @@ LiveAgent 是一个 **本地优先** 的 AI Agent 桌面客户端。它将大语
 
 ### 🧠 多模型与对话
 
-- **多模型路由** — Claude(Anthropic)与 Codex(OpenAI)双协议,支持自定义 Base URL 接入第三方兼容服务
+- **多模型路由** — Claude(Anthropic)与 Codex(OpenAI)、Gemini 三协议,支持自定义 Base URL 接入第三方兼容服务
 - **富文本渲染** — Markdown 流式渲染,内建 KaTeX 公式、Mermaid 图表与 Monaco 代码预览
 - **历史压缩** — Segment + Summary Checkpoint 双层持久化,长对话不丢上下文
 - **国际化** — 内建 i18n 多语言框架
