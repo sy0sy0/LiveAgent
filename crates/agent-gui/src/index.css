@@ -2779,12 +2779,7 @@ body > div:not(#root) [data-streamdown="mermaid"] svg {
     #000 calc(100% - 1.25rem),
     transparent 100%
   );
-  mask-image: linear-gradient(
-    to right,
-    #000 0,
-    #000 calc(100% - 1.25rem),
-    transparent 100%
-  );
+  mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 1.25rem), transparent 100%);
 }
 
 /*

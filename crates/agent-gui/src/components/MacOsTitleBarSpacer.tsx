@@ -115,9 +115,7 @@ export function MacOsTitleBarToggle({
   const trafficLightHeight = trafficLightMetrics?.height ?? MAC_OS_TRAFFIC_LIGHT_GROUP_HEIGHT;
   const toggleTop = trafficLightTop - (MAC_OS_TITLEBAR_TOGGLE_BUTTON_SIZE - trafficLightHeight) / 2;
   const toggleLeft = sidebarOpen
-    ? MAC_OS_SIDEBAR_WIDTH -
-      MAC_OS_TITLEBAR_TOGGLE_BUTTON_SIZE -
-      MAC_OS_SIDEBAR_TOGGLE_RIGHT_INSET
+    ? MAC_OS_SIDEBAR_WIDTH - MAC_OS_TITLEBAR_TOGGLE_BUTTON_SIZE - MAC_OS_SIDEBAR_TOGGLE_RIGHT_INSET
     : trafficLightLeft + trafficLightWidth + MAC_OS_TITLEBAR_TOGGLE_GAP;
   return (
     <div
