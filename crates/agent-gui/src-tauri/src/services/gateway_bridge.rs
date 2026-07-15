@@ -937,9 +937,13 @@ fn is_builtin_share_tool_name(name: &str) -> bool {
             | "McpManager"
             | "MemoryManager"
             | "Read"
+            | "ReadTerminal"
+            | "SendMessage"
             | "SkillsManager"
             | "SSHManager"
             | "SshManager"
+            | "TodoWrite"
+            | "TunnelManager"
             | "Write"
     )
 }
@@ -1598,8 +1602,9 @@ mod tests {
 
     use super::{
         build_history_prefix_segments, flatten_history_messages_json,
-        flatten_history_messages_json_window, history_message_content_hash, parse_runs_limit,
-        redact_builtin_tool_content_json, sanitize_provider_summaries,
+        flatten_history_messages_json_window, history_message_content_hash,
+        is_builtin_share_tool_name, parse_runs_limit, redact_builtin_tool_content_json,
+        sanitize_provider_summaries,
     };
     use crate::commands::chat_history::ChatHistorySegmentRecord;
 
@@ -1902,5 +1907,24 @@ mod tests {
         assert_eq!(blocks[2]["redacted"], true);
         assert_eq!(items[3]["content"][0]["text"], "工具调用内容已脱敏");
         assert_eq!(items[3]["details"]["kind"], "redacted_tool_content");
+    }
+
+    #[test]
+    fn shared_chat_history_builtin_policy_covers_the_tool_catalog() {
+        let catalog = include_str!("../../../src/lib/tools/builtinToolCatalog.ts");
+        let tool_names = catalog.lines().filter_map(|line| {
+            line.trim()
+                .strip_prefix("toolName: \"")
+                .and_then(|value| value.strip_suffix("\","))
+        });
+        let mut count = 0;
+        for tool_name in tool_names {
+            count += 1;
+            assert!(
+                is_builtin_share_tool_name(tool_name),
+                "{tool_name} is missing from share redaction"
+            );
+        }
+        assert!(count > 0, "catalog parser found no tools");
     }
 }

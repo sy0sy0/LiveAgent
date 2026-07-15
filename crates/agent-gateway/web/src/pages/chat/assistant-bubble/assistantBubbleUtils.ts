@@ -345,9 +345,12 @@ export function isBuiltinShareToolName(name: string) {
     "McpManager",
     "MemoryManager",
     "Read",
+    "ReadTerminal",
+    "SendMessage",
     "SkillsManager",
     "SSHManager",
     "SshManager",
+    "TodoWrite",
     "TunnelManager",
     "Write",
   ].includes(trimmed);
