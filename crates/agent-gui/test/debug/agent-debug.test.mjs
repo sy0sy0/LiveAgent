@@ -67,3 +67,63 @@ test("debug sanitizer redacts base64 data URLs", () => {
     "[redacted inlineData: image/png, chars=8]",
   );
 });
+
+test("debug sanitizer redacts nested credentials without hiding token usage", () => {
+  const payload = {
+    apiKey: "raw-api-key",
+    headers: {
+      Authorization: "Bearer raw-authorization",
+      "X-API-Key": "raw-header-key",
+      Cookie: "session=raw-cookie",
+    },
+    provider: {
+      client_secret: "raw-client-secret",
+      refreshToken: "raw-refresh-token",
+      password: "raw-password",
+    },
+    hasApiKey: true,
+    inputTokens: 123,
+    maxTokens: 456,
+  };
+
+  const sanitized = agentDebug.__agentDebugTest.sanitizeDebugValue(payload);
+  const serialized = JSON.stringify(sanitized);
+
+  for (const secret of [
+    "raw-api-key",
+    "raw-authorization",
+    "raw-header-key",
+    "raw-cookie",
+    "raw-client-secret",
+    "raw-refresh-token",
+    "raw-password",
+  ]) {
+    assert.equal(serialized.includes(secret), false, `leaked ${secret}`);
+  }
+  assert.equal(sanitized.apiKey, "[redacted credential]");
+  assert.equal(sanitized.headers.Authorization, "[redacted credential]");
+  assert.equal(sanitized.provider.client_secret, "[redacted credential]");
+  assert.equal(sanitized.hasApiKey, true);
+  assert.equal(sanitized.inputTokens, 123);
+  assert.equal(sanitized.maxTokens, 456);
+});
+
+test("stream request debug payload never includes runtime or option credentials", () => {
+  const payload = agentDebug.buildStreamRequestDebugPayload({
+    runtime: {
+      baseUrl: "https://example.test/v1",
+      apiKey: "raw-runtime-key",
+    },
+    context: { messages: [] },
+    options: {
+      apiKey: "raw-option-key",
+      headers: { authorization: "Bearer raw-option-auth" },
+    },
+  });
+  const serialized = JSON.stringify(payload);
+
+  assert.equal(payload.runtime.hasApiKey, true);
+  assert.equal(serialized.includes("raw-runtime-key"), false);
+  assert.equal(serialized.includes("raw-option-key"), false);
+  assert.equal(serialized.includes("raw-option-auth"), false);
+});

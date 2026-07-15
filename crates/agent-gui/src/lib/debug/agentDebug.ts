@@ -24,6 +24,48 @@ export type StreamDebugLogger = {
 };
 
 const writeQueues = new Map<string, Promise<void>>();
+const REDACTED_DEBUG_CREDENTIAL = "[redacted credential]";
+
+const SAFE_TOKEN_METADATA_KEYS = new Set([
+  "hasapikey",
+  "inputtoken",
+  "inputtokens",
+  "outputtoken",
+  "outputtokens",
+  "maxtoken",
+  "maxtokens",
+  "totaltoken",
+  "totaltokens",
+  "contexttoken",
+  "contexttokens",
+  "prompttoken",
+  "prompttokens",
+  "completiontoken",
+  "completiontokens",
+]);
+
+function isSensitiveDebugKey(key: string) {
+  const normalized = key.replace(/[^a-z0-9]/gi, "").toLowerCase();
+  if (SAFE_TOKEN_METADATA_KEYS.has(normalized)) return false;
+  return [
+    "apikey",
+    "apikeys",
+    "authorization",
+    "cookie",
+    "cookies",
+    "credential",
+    "credentials",
+    "password",
+    "passwords",
+    "passwd",
+    "passphrase",
+    "privatekey",
+    "secret",
+    "secrets",
+    "token",
+    "tokens",
+  ].some((suffix) => normalized.endsWith(suffix));
+}
 
 function sanitizeDebugString(value: string) {
   const dataUrlMatch = value.match(/^data:([^;,]+);base64,(.*)$/s);
@@ -81,7 +123,9 @@ function sanitizeDebugValue(value: unknown, seen = new WeakSet<object>()): unkno
       inlineDataMimeType.trim().length > 0;
     const out: Record<string, unknown> = {};
     for (const [key, nested] of Object.entries(record)) {
-      if (isBase64Source && key === "data") {
+      if (isSensitiveDebugKey(key)) {
+        out[key] = REDACTED_DEBUG_CREDENTIAL;
+      } else if (isBase64Source && key === "data") {
         out[key] = `[redacted base64: ${sourceMimeType}, chars=${sourceData.length}]`;
       } else if (isTextDocumentSource && key === "data") {
         out[key] = `[redacted text document: ${sourceMimeType}, chars=${sourceData.length}]`;
