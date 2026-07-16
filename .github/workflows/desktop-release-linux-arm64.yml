@@ -39,7 +39,6 @@ jobs:
           RAW_VERSION: ${{ github.event.inputs.version_label || '0.0.0-dev' }}
         run: |
           set -euo pipefail
-          # 必须是 v + semver（脚本不接受 vdev 这类）
           ver="${RAW_VERSION#v}"
           tag="v${ver}"
           echo "Using version tag for script: ${tag}"
@@ -47,6 +46,22 @@ jobs:
             --github-env "$GITHUB_ENV" \
             --tauri-config src-tauri/tauri.version.generated.conf.json
           echo "LIVEAGENT_ARTIFACT_LABEL=${tag}" >> "$GITHUB_ENV"
+
+      # 覆盖 release 配置：关闭 updater 签名产物，避免要求 TAURI_SIGNING_PRIVATE_KEY
+      - name: Write no-sign Tauri config overlay
+        working-directory: crates/agent-gui
+        run: |
+          set -euo pipefail
+          cat > src-tauri/tauri.build-only.conf.json <<'EOF'
+          {
+            "$schema": "https://schema.tauri.app/config/2",
+            "bundle": {
+              "createUpdaterArtifacts": false
+            }
+          }
+          EOF
+          echo "Wrote src-tauri/tauri.build-only.conf.json"
+          cat src-tauri/tauri.build-only.conf.json
 
       - name: Install pnpm
         run: npm install -g pnpm@10.32.1
@@ -87,12 +102,15 @@ jobs:
       - name: Build Linux arm64 deb/rpm
         working-directory: crates/agent-gui
         env:
-          # 只要安装包：不注入签名密钥，避免 updater 私钥/密码导致失败
           LIVEAGENT_UPDATE_REPOSITORY: ${{ github.repository }}
+          # 明确不提供签名密钥
+          TAURI_SIGNING_PRIVATE_KEY: ""
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         run: >
           pnpm tauri build
           --config src-tauri/tauri.linux.release.conf.json
           --config "$LIVEAGENT_TAURI_VERSION_CONFIG"
+          --config src-tauri/tauri.build-only.conf.json
           --target aarch64-unknown-linux-gnu
           --bundles deb rpm
 
