@@ -176,6 +176,7 @@ func (c *websocketConnection) handleFsList(req websocketRequest) {
 		Depth      *int   `json:"depth"`
 		Offset     *int   `json:"offset"`
 		MaxResults *int   `json:"max_results"`
+		ShowHidden *bool  `json:"show_hidden"`
 	}
 
 	var body payload
@@ -216,6 +217,7 @@ func (c *websocketConnection) handleFsList(req websocketRequest) {
 				Depth:      depth,
 				Offset:     offset,
 				MaxResults: maxResults,
+				ShowHidden: body.ShowHidden,
 			},
 		},
 	})

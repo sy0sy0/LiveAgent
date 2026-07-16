@@ -16,6 +16,7 @@ export type FileTreeRowProps = {
   path: string;
   name: string;
   kind: FileTreeKind;
+  hidden: boolean;
   depth: number;
   expanded: boolean;
   selected: boolean;
@@ -34,6 +35,7 @@ export const FileTreeRow = memo(function FileTreeRow(props: FileTreeRowProps) {
     path,
     name,
     kind,
+    hidden,
     depth,
     expanded,
     selected,
@@ -62,7 +64,10 @@ export const FileTreeRow = memo(function FileTreeRow(props: FileTreeRowProps) {
       {kind === "dir" ? (
         <button
           type="button"
-          className="flex h-5 w-5 shrink-0 items-center justify-center rounded hover:bg-background"
+          className={cn(
+            "flex h-5 w-5 shrink-0 items-center justify-center rounded hover:bg-background",
+            hidden && "opacity-60 group-hover:opacity-80",
+          )}
           onClick={() => onToggle(path, expanded)}
           title={expanded ? t("projectTools.fileTree.collapse") : t("projectTools.fileTree.expand")}
         >
@@ -79,7 +84,10 @@ export const FileTreeRow = memo(function FileTreeRow(props: FileTreeRowProps) {
       )}
       <button
         type="button"
-        className="flex min-w-0 flex-1 items-center gap-1.5 bg-transparent p-0 text-left text-inherit leading-5"
+        className={cn(
+          "flex min-w-0 flex-1 items-center gap-1.5 bg-transparent p-0 text-left text-inherit leading-5",
+          hidden && "opacity-60 group-hover:opacity-80",
+        )}
         title={title}
         onClick={() => onSelect(path)}
         onDoubleClick={() => {

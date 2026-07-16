@@ -130,7 +130,7 @@ export type SshKnownHostResetResult = {
 };
 
 type MentionListResponse = {
-  entries: Array<{ path: string; kind: "file" | "dir" }>;
+  entries: Array<{ path: string; kind: "file" | "dir"; hidden: boolean }>;
   truncated: boolean;
 };
 
@@ -158,7 +158,7 @@ type FsListResponse = {
   maxResults: number;
   total: number;
   hasMore: boolean;
-  entries: Array<{ path: string; kind: "file" | "dir" }>;
+  entries: Array<{ path: string; kind: "file" | "dir"; hidden: boolean }>;
 };
 
 type FsWriteTextResponse = {
@@ -2245,11 +2245,13 @@ export class GatewayWebSocketClient {
     workdir: string,
     maxResults?: number,
     query?: string,
+    showHidden?: boolean,
   ): Promise<MentionListResponse> {
     return this.requestWithRecovery<MentionListResponse>("mentions.list", {
       workdir,
       max_results: maxResults,
       query,
+      show_hidden: showHidden,
     });
   }
 
@@ -2277,6 +2279,7 @@ export class GatewayWebSocketClient {
     depth?: number,
     offset?: number,
     maxResults?: number,
+    showHidden?: boolean,
   ): Promise<FsListResponse> {
     return this.requestWithRecovery<FsListResponse>("fs.list", {
       workdir,
@@ -2284,6 +2287,7 @@ export class GatewayWebSocketClient {
       depth,
       offset,
       max_results: maxResults,
+      show_hidden: showHidden,
     });
   }
 
@@ -3361,6 +3365,7 @@ export type GatewayWebSocketClientLike = {
     workdir: string,
     maxResults?: number,
     query?: string,
+    showHidden?: boolean,
   ): Promise<MentionListResponse>;
   listFsRoots(): Promise<FsRootsResponse>;
   listDirs(path: string, maxResults?: number): Promise<FsListDirsResponse>;
@@ -3371,6 +3376,7 @@ export type GatewayWebSocketClientLike = {
     depth?: number,
     offset?: number,
     maxResults?: number,
+    showHidden?: boolean,
   ): Promise<FsListResponse>;
   writeTextFile(params: {
     workdir: string;

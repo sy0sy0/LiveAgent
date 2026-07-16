@@ -8974,6 +8974,7 @@ type FileMentionListRequest struct {
 	Workdir       string                 `protobuf:"bytes,1,opt,name=workdir,proto3" json:"workdir,omitempty"`
 	MaxResults    uint32                 `protobuf:"varint,2,opt,name=max_results,json=maxResults,proto3" json:"max_results,omitempty"`
 	Query         string                 `protobuf:"bytes,3,opt,name=query,proto3" json:"query,omitempty"`
+	ShowHidden    *bool                  `protobuf:"varint,4,opt,name=show_hidden,json=showHidden,proto3,oneof" json:"show_hidden,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -9029,10 +9030,18 @@ func (x *FileMentionListRequest) GetQuery() string {
 	return ""
 }
 
+func (x *FileMentionListRequest) GetShowHidden() bool {
+	if x != nil && x.ShowHidden != nil {
+		return *x.ShowHidden
+	}
+	return false
+}
+
 type FileMentionEntry struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
 	Kind          string                 `protobuf:"bytes,2,opt,name=kind,proto3" json:"kind,omitempty"`
+	Hidden        bool                   `protobuf:"varint,3,opt,name=hidden,proto3" json:"hidden,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -9079,6 +9088,13 @@ func (x *FileMentionEntry) GetKind() string {
 		return x.Kind
 	}
 	return ""
+}
+
+func (x *FileMentionEntry) GetHidden() bool {
+	if x != nil {
+		return x.Hidden
+	}
+	return false
 }
 
 type FileMentionListResponse struct {
@@ -9548,6 +9564,7 @@ type FsListRequest struct {
 	Depth         uint32                 `protobuf:"varint,3,opt,name=depth,proto3" json:"depth,omitempty"`
 	Offset        uint32                 `protobuf:"varint,4,opt,name=offset,proto3" json:"offset,omitempty"`
 	MaxResults    uint32                 `protobuf:"varint,5,opt,name=max_results,json=maxResults,proto3" json:"max_results,omitempty"`
+	ShowHidden    *bool                  `protobuf:"varint,6,opt,name=show_hidden,json=showHidden,proto3,oneof" json:"show_hidden,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -9617,10 +9634,18 @@ func (x *FsListRequest) GetMaxResults() uint32 {
 	return 0
 }
 
+func (x *FsListRequest) GetShowHidden() bool {
+	if x != nil && x.ShowHidden != nil {
+		return *x.ShowHidden
+	}
+	return false
+}
+
 type FsListEntry struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
 	Kind          string                 `protobuf:"bytes,2,opt,name=kind,proto3" json:"kind,omitempty"`
+	Hidden        bool                   `protobuf:"varint,3,opt,name=hidden,proto3" json:"hidden,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -9667,6 +9692,13 @@ func (x *FsListEntry) GetKind() string {
 		return x.Kind
 	}
 	return ""
+}
+
+func (x *FsListEntry) GetHidden() bool {
+	if x != nil {
+		return x.Hidden
+	}
+	return false
 }
 
 type FsListResponse struct {
@@ -11447,15 +11479,19 @@ const file_proto_v1_gateway_proto_rawDesc = "" +
 	"\fpayload_json\x18\x01 \x01(\tR\vpayloadJson\"6\n" +
 	"\x13SkillManageResponse\x12\x1f\n" +
 	"\vresult_json\x18\x01 \x01(\tR\n" +
-	"resultJson\"i\n" +
+	"resultJson\"\x9f\x01\n" +
 	"\x16FileMentionListRequest\x12\x18\n" +
 	"\aworkdir\x18\x01 \x01(\tR\aworkdir\x12\x1f\n" +
 	"\vmax_results\x18\x02 \x01(\rR\n" +
 	"maxResults\x12\x14\n" +
-	"\x05query\x18\x03 \x01(\tR\x05query\":\n" +
+	"\x05query\x18\x03 \x01(\tR\x05query\x12$\n" +
+	"\vshow_hidden\x18\x04 \x01(\bH\x00R\n" +
+	"showHidden\x88\x01\x01B\x0e\n" +
+	"\f_show_hidden\"R\n" +
 	"\x10FileMentionEntry\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x12\n" +
-	"\x04kind\x18\x02 \x01(\tR\x04kind\"y\n" +
+	"\x04kind\x18\x02 \x01(\tR\x04kind\x12\x16\n" +
+	"\x06hidden\x18\x03 \x01(\bR\x06hidden\"y\n" +
 	"\x17FileMentionListResponse\x12@\n" +
 	"\aentries\x18\x01 \x03(\v2&.liveagent.gateway.v1.FileMentionEntryR\aentries\x12\x1c\n" +
 	"\ttruncated\x18\x02 \x01(\bR\ttruncated\"V\n" +
@@ -11483,17 +11519,21 @@ const file_proto_v1_gateway_proto_rawDesc = "" +
 	"\x06parent\x18\x01 \x01(\tR\x06parent\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\"3\n" +
 	"\x1dFsCreateProjectFolderResponse\x12\x12\n" +
-	"\x04path\x18\x01 \x01(\tR\x04path\"\x8c\x01\n" +
+	"\x04path\x18\x01 \x01(\tR\x04path\"\xc2\x01\n" +
 	"\rFsListRequest\x12\x18\n" +
 	"\aworkdir\x18\x01 \x01(\tR\aworkdir\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\x12\x14\n" +
 	"\x05depth\x18\x03 \x01(\rR\x05depth\x12\x16\n" +
 	"\x06offset\x18\x04 \x01(\rR\x06offset\x12\x1f\n" +
 	"\vmax_results\x18\x05 \x01(\rR\n" +
-	"maxResults\"5\n" +
+	"maxResults\x12$\n" +
+	"\vshow_hidden\x18\x06 \x01(\bH\x00R\n" +
+	"showHidden\x88\x01\x01B\x0e\n" +
+	"\f_show_hidden\"M\n" +
 	"\vFsListEntry\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x12\n" +
-	"\x04kind\x18\x02 \x01(\tR\x04kind\"\xfc\x01\n" +
+	"\x04kind\x18\x02 \x01(\tR\x04kind\x12\x16\n" +
+	"\x06hidden\x18\x03 \x01(\bR\x06hidden\"\xfc\x01\n" +
 	"\x0eFsListResponse\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x19\n" +
 	"\bhas_path\x18\x02 \x01(\bR\ahasPath\x12\x14\n" +
@@ -12025,6 +12065,8 @@ func file_proto_v1_gateway_proto_init() {
 	file_proto_v1_gateway_proto_msgTypes[17].OneofWrappers = []any{}
 	file_proto_v1_gateway_proto_msgTypes[25].OneofWrappers = []any{}
 	file_proto_v1_gateway_proto_msgTypes[76].OneofWrappers = []any{}
+	file_proto_v1_gateway_proto_msgTypes[103].OneofWrappers = []any{}
+	file_proto_v1_gateway_proto_msgTypes[114].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

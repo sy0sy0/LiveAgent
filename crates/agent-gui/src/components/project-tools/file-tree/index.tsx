@@ -17,6 +17,7 @@ import {
 } from "react";
 import { useLocale } from "../../../i18n";
 import type { RightDockFileTreeStatePatch } from "../../../lib/settings";
+import { cn } from "../../../lib/shared/utils";
 import { getFileTypeIcon } from "../../chat/fileTypeIcons";
 import { Check, FolderOpen, Loader2, RefreshCw, Search, Trash2, X } from "../../icons";
 import { Button } from "../../ui/button";
@@ -89,6 +90,7 @@ export function FileTreePanel(props: { active: boolean }) {
     workspaceActivityClient: context.clients.workspaceActivity ?? null,
     expandedPaths: syncState.expandedPaths,
     query,
+    showHidden: syncState.showHidden,
   });
 
   const nodesRef = useRef(nodes);
@@ -546,7 +548,10 @@ export function FileTreePanel(props: { active: boolean }) {
                 <button
                   key={`${entry.kind}:${entry.path}`}
                   type="button"
-                  className="flex w-full select-none items-center gap-1.5 rounded-md px-2 text-left text-xs leading-5 text-muted-foreground hover:bg-muted hover:text-foreground"
+                  className={cn(
+                    "flex w-full select-none items-center gap-1.5 rounded-md px-2 text-left text-xs leading-5 text-muted-foreground hover:bg-muted hover:text-foreground",
+                    entry.hidden && "opacity-60 hover:opacity-80",
+                  )}
                   style={{ minHeight: FILE_TREE_ROW_HEIGHT }}
                   title={entry.path}
                   onClick={() => void revealPath(entry.path, entry.kind)}
@@ -602,6 +607,7 @@ export function FileTreePanel(props: { active: boolean }) {
                   path={node.path}
                   name={node.name}
                   kind={node.kind}
+                  hidden={node.hidden}
                   depth={row.depth}
                   expanded={expandedSet.has(row.path)}
                   selected={selectedPath === row.path}
@@ -628,6 +634,7 @@ export function FileTreePanel(props: { active: boolean }) {
           canMutate={canMutate}
           canOpenFile={Boolean(fileTree.onOpenFile)}
           canInsertMention={Boolean(fileTree.onInsertFileMention)}
+          showHidden={syncState.showHidden}
           onClose={() => setContextMenu(null)}
           onOpenFile={handleOpenFile}
           onOpenExternal={handleOpenExternal}
@@ -636,6 +643,7 @@ export function FileTreePanel(props: { active: boolean }) {
           onDelete={(path) => void deletePath(path)}
           onInsertMention={handleInsertMention}
           onRefresh={handleMenuRefresh}
+          onToggleHidden={() => emitState({ showHidden: !syncState.showHidden })}
           onActionError={setActionError}
         />
       ) : null}

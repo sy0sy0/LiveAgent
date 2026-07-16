@@ -21,6 +21,7 @@ import {
   Edit3,
   ExternalLink,
   Eye,
+  EyeOff,
   FilePenLine,
   Folder,
   FolderOpen,
@@ -70,6 +71,7 @@ export type FileTreeContextMenuProps = {
   canMutate: boolean;
   canOpenFile: boolean;
   canInsertMention: boolean;
+  showHidden: boolean;
   onClose: () => void;
   onOpenFile: (path: string) => void;
   onOpenExternal: (path: string) => void;
@@ -78,6 +80,7 @@ export type FileTreeContextMenuProps = {
   onDelete: (path: string) => void;
   onInsertMention: (path: string) => void;
   onRefresh: (path: string, kind: FileTreeKind) => void;
+  onToggleHidden: () => void;
   onActionError: (message: string) => void;
 };
 
@@ -90,6 +93,7 @@ export function FileTreeContextMenu(props: FileTreeContextMenuProps) {
     canMutate,
     canOpenFile,
     canInsertMention,
+    showHidden,
     onClose,
     onOpenFile,
     onOpenExternal,
@@ -98,6 +102,7 @@ export function FileTreeContextMenu(props: FileTreeContextMenuProps) {
     onDelete,
     onInsertMention,
     onRefresh,
+    onToggleHidden,
     onActionError,
   } = props;
   const { t } = useLocale();
@@ -277,6 +282,23 @@ export function FileTreeContextMenu(props: FileTreeContextMenuProps) {
         {t("projectTools.fileTree.delete")}
       </button>
       <div className="mx-1 my-1 h-px bg-border/60" />
+      <button
+        type="button"
+        role="menuitemcheckbox"
+        aria-checked={showHidden}
+        className={MENU_ITEM_CLASS}
+        onClick={() => {
+          onToggleHidden();
+          onClose();
+        }}
+      >
+        {showHidden ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+        {t(
+          showHidden
+            ? "projectTools.fileTree.hideHiddenFiles"
+            : "projectTools.fileTree.showHiddenFiles",
+        )}
+      </button>
       <button
         type="button"
         role="menuitem"

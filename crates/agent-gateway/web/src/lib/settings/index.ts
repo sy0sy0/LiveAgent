@@ -103,6 +103,7 @@ export type RightDockFileTreeState = {
   query: string;
   selectedPath: string;
   expandedPaths: string[];
+  showHidden: boolean;
   // Reveal nonce: bumped (via bumpRevision) when another surface asks the
   // file tree to reveal selectedPath (expand ancestors + scroll into view).
   // Content refreshes are driven by workspace-activity invalidation, and
@@ -1642,6 +1643,7 @@ export const DEFAULT_RIGHT_DOCK_FILE_TREE_STATE: RightDockFileTreeState = {
   query: "",
   selectedPath: "",
   expandedPaths: [""],
+  showHidden: false,
   revision: 0,
 };
 
@@ -1667,6 +1669,7 @@ export function normalizeRightDockFileTreeState(input: unknown): RightDockFileTr
     query: normalizeRightDockFileTreeSearchQuery(obj.query),
     selectedPath: normalizeRightDockFileTreePath(obj.selectedPath),
     expandedPaths: normalizeRightDockFileTreeExpandedPaths(obj.expandedPaths),
+    showHidden: obj.showHidden === true,
     revision: normalizeIntegerInRange(obj.revision, 0, Number.MAX_SAFE_INTEGER, 0),
   };
 }
@@ -2117,6 +2120,7 @@ function rightDockFileTreeStateEqual(
   return (
     left.query === right.query &&
     left.selectedPath === right.selectedPath &&
+    left.showHidden === right.showHidden &&
     left.revision === right.revision &&
     left.expandedPaths.length === right.expandedPaths.length &&
     left.expandedPaths.every((path, index) => path === right.expandedPaths[index])
@@ -2300,6 +2304,7 @@ export function updateRightDockFileTreeState(
       patch.expandedPaths !== undefined
         ? normalizeRightDockFileTreeExpandedPaths(patch.expandedPaths)
         : current.expandedPaths,
+    showHidden: patch.showHidden ?? current.showHidden,
     revision: patch.bumpRevision
       ? current.revision + 1
       : patch.revision !== undefined

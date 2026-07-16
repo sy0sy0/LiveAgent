@@ -81,6 +81,7 @@ export type UseFileTreeDataOptions = {
   expandedPaths: string[];
   // Live search input (the panel debounces persistence separately).
   query: string;
+  showHidden: boolean;
 };
 
 export type UseFileTreeDataResult = {
@@ -104,6 +105,7 @@ export function useFileTreeData(options: UseFileTreeDataOptions): UseFileTreeDat
     workspaceActivityClient,
     expandedPaths,
     query,
+    showHidden,
   } = options;
   const { t } = useLocale();
 
@@ -131,6 +133,8 @@ export function useFileTreeData(options: UseFileTreeDataOptions): UseFileTreeDat
   useEffect(() => {
     queryRef.current = query;
   }, [query]);
+
+  const showHiddenRef = useRef(showHidden);
 
   const activeRef = useRef(active);
 
@@ -201,6 +205,7 @@ export function useFileTreeData(options: UseFileTreeDataOptions): UseFileTreeDat
           depth: 1,
           offset: 0,
           max_results: FILE_TREE_LIST_MAX_RESULTS,
+          show_hidden: showHiddenRef.current,
         });
         // Out-of-order protection: a response only lands if it belongs to the
         // newest request issued for this path.
@@ -272,6 +277,12 @@ export function useFileTreeData(options: UseFileTreeDataOptions): UseFileTreeDat
     },
     [bumpSearchRefresh, cwd, loadChildren, projectPathKey],
   );
+
+  useEffect(() => {
+    if (showHiddenRef.current === showHidden) return;
+    showHiddenRef.current = showHidden;
+    refreshVisible();
+  }, [refreshVisible, showHidden]);
 
   // ---------------------------------------------------------------------
   // Workspace-activity invalidation (replaces the old 3s full polling)
@@ -352,6 +363,7 @@ export function useFileTreeData(options: UseFileTreeDataOptions): UseFileTreeDat
         workdir: cwd,
         query,
         max_results: FILE_TREE_SEARCH_MAX_RESULTS,
+        show_hidden: showHiddenRef.current,
       })
         .then((response) => {
           if (cancelled) return;

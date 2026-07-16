@@ -6,7 +6,7 @@ use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::Url;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{self, Cursor, Read, Seek};
 use std::path::{Component, Path, PathBuf};
@@ -3452,6 +3452,7 @@ pub async fn fs_rename(
 pub struct ListEntry {
     pub path: String,
     pub kind: String,
+    pub hidden: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -3629,20 +3630,88 @@ pub async fn fs_list_dirs(
     run_blocking("fs_list_dirs", move || fs_list_dirs_sync(path, max_results)).await
 }
 
-fn build_ignore_walker(base: &Path, max_depth: Option<usize>) -> ignore::Walk {
+#[derive(Clone, Copy)]
+struct WalkerVisibility {
+    include_system_hidden: bool,
+    include_ignored: bool,
+}
+
+fn requested_visibility(
+    show_hidden: Option<bool>,
+    default_include_system_hidden: bool,
+) -> WalkerVisibility {
+    WalkerVisibility {
+        include_system_hidden: show_hidden.unwrap_or(default_include_system_hidden),
+        include_ignored: show_hidden == Some(true),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn has_macos_hidden_flag(entry: &ignore::DirEntry) -> bool {
+    use std::os::macos::fs::MetadataExt;
+
+    const UF_HIDDEN: u32 = 0x0000_8000;
+    entry
+        .metadata()
+        .is_ok_and(|metadata| metadata.st_flags() & UF_HIDDEN != 0)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn has_macos_hidden_flag(_entry: &ignore::DirEntry) -> bool {
+    false
+}
+
+fn build_workspace_walker(
+    base: &Path,
+    max_depth: Option<usize>,
+    visibility: WalkerVisibility,
+    skip_common_dirs: bool,
+) -> ignore::Walk {
     let mut builder = WalkBuilder::new(base);
     builder
-        .hidden(false)
-        .ignore(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
+        .hidden(!visibility.include_system_hidden)
+        .ignore(!visibility.include_ignored)
+        .git_ignore(!visibility.include_ignored)
+        .git_global(!visibility.include_ignored)
+        .git_exclude(!visibility.include_ignored)
         .require_git(false)
         .follow_links(false);
+    let filter_macos_hidden = cfg!(target_os = "macos") && !visibility.include_system_hidden;
+    if filter_macos_hidden || skip_common_dirs {
+        builder.filter_entry(move |entry| {
+            (!filter_macos_hidden || !has_macos_hidden_flag(entry))
+                && (!skip_common_dirs || should_visit_mention_entry(entry))
+        });
+    }
     if let Some(depth) = max_depth {
         builder.max_depth(Some(depth));
     }
     builder.build()
+}
+
+fn build_ignore_walker(base: &Path, max_depth: Option<usize>) -> ignore::Walk {
+    build_workspace_walker(
+        base,
+        max_depth,
+        requested_visibility(None, true),
+        false,
+    )
+}
+
+fn visible_paths_for_hidden_marking(
+    base: &Path,
+    max_depth: Option<usize>,
+    skip_common_dirs: bool,
+) -> HashSet<PathBuf> {
+    build_workspace_walker(
+        base,
+        max_depth,
+        requested_visibility(Some(false), false),
+        skip_common_dirs,
+    )
+    .filter_map(Result::ok)
+    .map(|entry| entry.into_path())
+    .collect()
 }
 
 pub(crate) fn fs_list_sync(
@@ -3651,9 +3720,10 @@ pub(crate) fn fs_list_sync(
     depth: Option<usize>,
     offset: Option<usize>,
     max_results: Option<usize>,
+    show_hidden: Option<bool>,
 ) -> Result<ListResponse, FsCommandError> {
     let wd = canonicalize_workdir(&workdir)?;
-    fs_list_impl(&wd, path, depth, offset, max_results)
+    fs_list_impl(&wd, path, depth, offset, max_results, show_hidden)
         .map_err(|e| FsCommandError::from(e).with_workdir(&wd))
 }
 
@@ -3663,6 +3733,7 @@ fn fs_list_impl(
     depth: Option<usize>,
     offset: Option<usize>,
     max_results: Option<usize>,
+    show_hidden: Option<bool>,
 ) -> Result<ListResponse, FsError> {
     let rel_opt = sanitize_optional_rel_path(path)?;
     let path_display = rel_opt.as_ref().map(|rel| logical_rel_path(rel));
@@ -3692,9 +3763,14 @@ fn fs_list_impl(
         entries.push(ListEntry {
             path: rel_to_workdir_str(wd, &base),
             kind: "file".to_string(),
+            hidden: false,
         });
     } else {
-        for result in build_ignore_walker(&base, Some(depth)) {
+        let visibility = requested_visibility(show_hidden, true);
+        let normally_visible = visibility
+            .include_ignored
+            .then(|| visible_paths_for_hidden_marking(&base, Some(depth), false));
+        for result in build_workspace_walker(&base, Some(depth), visibility, false) {
             let entry = match result {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -3713,6 +3789,9 @@ fn fs_list_impl(
             entries.push(ListEntry {
                 path: rel_to_workdir_str(wd, entry.path()),
                 kind: kind.to_string(),
+                hidden: normally_visible
+                    .as_ref()
+                    .is_some_and(|paths| !paths.contains(entry.path())),
             });
         }
     }
@@ -3745,9 +3824,10 @@ pub async fn fs_list(
     depth: Option<usize>,
     offset: Option<usize>,
     max_results: Option<usize>,
+    show_hidden: Option<bool>,
 ) -> Result<ListResponse, FsCommandError> {
     run_blocking_fs("fs_list", move || {
-        fs_list_sync(workdir, path, depth, offset, max_results)
+        fs_list_sync(workdir, path, depth, offset, max_results, show_hidden)
     })
     .await
 }
@@ -4273,6 +4353,7 @@ const MENTION_IGNORED_DIR_NAMES: &[&str] = &[
 pub struct MentionFileEntry {
     pub path: String,
     pub kind: String,
+    pub hidden: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -4348,6 +4429,7 @@ pub fn fs_mention_list_sync(
     workdir: String,
     max_results: Option<usize>,
     query: Option<String>,
+    show_hidden: Option<bool>,
 ) -> Result<MentionListResponse, String> {
     let wd = canonicalize_workdir(&workdir).map_err(|e| e.to_string())?;
     let max_results = max_results.unwrap_or(DEFAULT_MENTION_MAX_RESULTS).max(1);
@@ -4358,15 +4440,11 @@ pub fn fs_mention_list_sync(
         QUERY_MENTION_CANDIDATE_LIMIT.max(max_results)
     };
 
-    let walker = WalkBuilder::new(&wd)
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .require_git(false)
-        .follow_links(false)
-        .filter_entry(should_visit_mention_entry)
-        .build();
+    let visibility = requested_visibility(show_hidden, false);
+    let normally_visible = visibility
+        .include_ignored
+        .then(|| visible_paths_for_hidden_marking(&wd, None, true));
+    let walker = build_workspace_walker(&wd, None, visibility, !visibility.include_ignored);
 
     let mut entries: Vec<MentionFileEntry> = Vec::new();
     let mut truncated = false;
@@ -4402,6 +4480,9 @@ pub fn fs_mention_list_sync(
         entries.push(MentionFileEntry {
             path,
             kind: kind.to_string(),
+            hidden: normally_visible
+                .as_ref()
+                .is_some_and(|paths| !paths.contains(entry.path())),
         });
     }
 
@@ -4421,9 +4502,10 @@ pub async fn fs_mention_list(
     workdir: String,
     max_results: Option<usize>,
     query: Option<String>,
+    show_hidden: Option<bool>,
 ) -> Result<MentionListResponse, String> {
     run_blocking("fs_mention_list", move || {
-        fs_mention_list_sync(workdir, max_results, query)
+        fs_mention_list_sync(workdir, max_results, query, show_hidden)
     })
     .await
 }
@@ -4441,6 +4523,30 @@ mod tests {
             .expect("system time should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("liveagent-{name}-{suffix}"))
+    }
+
+    fn list_test_entries(workdir: &Path, show_hidden: Option<bool>) -> Vec<ListEntry> {
+        fs_list_sync(
+            workdir.display().to_string(),
+            None,
+            Some(3),
+            None,
+            Some(100),
+            show_hidden,
+        )
+        .expect("list should succeed")
+        .entries
+    }
+
+    fn mention_test_entries(workdir: &Path, show_hidden: Option<bool>) -> Vec<MentionFileEntry> {
+        fs_mention_list_sync(
+            workdir.display().to_string(),
+            Some(100),
+            None,
+            show_hidden,
+        )
+        .expect("mention list should succeed")
+        .entries
     }
 
     fn png_like_bytes() -> Vec<u8> {
@@ -5225,6 +5331,7 @@ mod tests {
             Some(3),
             None,
             Some(100),
+            None,
         )
         .expect("list should succeed");
         let paths = response
@@ -5249,12 +5356,110 @@ mod tests {
             Some(1),
             None,
             Some(10),
+            None,
         )
         .expect_err("outside path should fail");
         assert!(
             matches!(outside_error.code, FsErrorCode::InvalidPath),
             "unexpected error: {:?}",
             outside_error.code
+        );
+
+        let _ = fs::remove_dir_all(workdir);
+    }
+
+    #[test]
+    fn list_hidden_toggle_includes_and_marks_ignored_and_dot_entries() {
+        let workdir = unique_test_workdir("list-hidden-toggle");
+        fs::create_dir_all(workdir.join(".hidden_dir")).expect("create hidden dir");
+        fs::create_dir_all(workdir.join("ignored_dir")).expect("create ignored dir");
+        fs::write(workdir.join(".gitignore"), "ignored_dir/\nignored.txt\n")
+            .expect("write gitignore");
+        fs::write(workdir.join("visible.txt"), "visible").expect("write visible file");
+        fs::write(workdir.join(".hidden.txt"), "hidden").expect("write hidden file");
+        fs::write(workdir.join(".hidden_dir/child.txt"), "hidden").expect("write hidden child");
+        fs::write(workdir.join("ignored.txt"), "ignored").expect("write ignored file");
+        fs::write(workdir.join("ignored_dir/child.txt"), "ignored").expect("write ignored child");
+
+        let legacy_entries = list_test_entries(&workdir, None);
+        assert!(legacy_entries.iter().any(|entry| entry.path == ".hidden.txt"));
+        assert!(!legacy_entries.iter().any(|entry| entry.path == "ignored.txt"));
+
+        let hidden_entries = list_test_entries(&workdir, Some(false));
+        let hidden_paths = hidden_entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>();
+        assert!(hidden_paths.contains(&"visible.txt"));
+        assert!(!hidden_paths.iter().any(|path| path.starts_with('.')));
+        assert!(!hidden_paths.iter().any(|path| path.starts_with("ignored")));
+
+        let shown_entries = list_test_entries(&workdir, Some(true));
+        let entry = |path: &str| {
+            shown_entries
+                .iter()
+                .find(|entry| entry.path == path)
+                .unwrap_or_else(|| panic!("missing entry: {path}"))
+        };
+        assert!(!entry("visible.txt").hidden);
+        assert!(entry(".hidden.txt").hidden);
+        assert!(entry(".hidden_dir/child.txt").hidden);
+        assert!(entry("ignored.txt").hidden);
+        assert!(entry("ignored_dir/child.txt").hidden);
+
+        let _ = fs::remove_dir_all(workdir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn list_hidden_toggle_respects_macos_finder_hidden_flag() {
+        let workdir = unique_test_workdir("list-macos-hidden");
+        fs::create_dir_all(&workdir).expect("create workdir");
+        let hidden_path = workdir.join("finder-hidden.txt");
+        fs::write(&hidden_path, "hidden").expect("write hidden file");
+        let status = Command::new("chflags")
+            .arg("hidden")
+            .arg(&hidden_path)
+            .status()
+            .expect("run chflags");
+        assert!(status.success(), "chflags hidden failed");
+
+        let hidden_entries = list_test_entries(&workdir, Some(false));
+        assert!(!hidden_entries.iter().any(|entry| entry.path == "finder-hidden.txt"));
+
+        let shown_entries = list_test_entries(&workdir, Some(true));
+        assert!(
+            shown_entries
+                .iter()
+                .any(|entry| entry.path == "finder-hidden.txt" && entry.hidden)
+        );
+
+        let _ = fs::remove_dir_all(workdir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn list_hidden_toggle_respects_windows_hidden_attribute() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        let workdir = unique_test_workdir("list-windows-hidden");
+        fs::create_dir_all(&workdir).expect("create workdir");
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .attributes(FILE_ATTRIBUTE_HIDDEN)
+            .open(workdir.join("windows-hidden.txt"))
+            .expect("create hidden file");
+
+        let hidden_entries = list_test_entries(&workdir, Some(false));
+        assert!(!hidden_entries.iter().any(|entry| entry.path == "windows-hidden.txt"));
+
+        let shown_entries = list_test_entries(&workdir, Some(true));
+        assert!(
+            shown_entries
+                .iter()
+                .any(|entry| entry.path == "windows-hidden.txt" && entry.hidden)
         );
 
         let _ = fs::remove_dir_all(workdir);
@@ -5305,10 +5510,8 @@ mod tests {
         fs::write(workdir.join("src/app.ts"), "export {}").expect("write app");
         fs::write(workdir.join("node_modules/pkg/ignored.ts"), "export {}").expect("write ignored");
 
-        let response = fs_mention_list_sync(workdir.display().to_string(), Some(100), None)
-            .expect("mention list should succeed");
-        let paths = response
-            .entries
+        let entries = mention_test_entries(&workdir, None);
+        let paths = entries
             .iter()
             .map(|entry| entry.path.as_str())
             .collect::<Vec<_>>();
@@ -5337,10 +5540,8 @@ mod tests {
         fs::write(workdir.join("ignored_dir/hidden.ts"), "export {}").expect("write hidden");
         fs::write(workdir.join("ignored_file.txt"), "hidden").expect("write ignored file");
 
-        let response = fs_mention_list_sync(workdir.display().to_string(), Some(100), None)
-            .expect("mention list should succeed");
-        let paths = response
-            .entries
+        let entries = mention_test_entries(&workdir, None);
+        let paths = entries
             .iter()
             .map(|entry| entry.path.as_str())
             .collect::<Vec<_>>();
@@ -5359,6 +5560,32 @@ mod tests {
     }
 
     #[test]
+    fn mention_list_hidden_toggle_includes_and_marks_filtered_entries() {
+        let workdir = unique_test_workdir("mention-hidden-toggle");
+        fs::create_dir_all(workdir.join("node_modules/pkg")).expect("create node_modules");
+        fs::create_dir_all(workdir.join("ignored_dir")).expect("create ignored dir");
+        fs::write(workdir.join(".gitignore"), "ignored_dir/\n").expect("write gitignore");
+        fs::write(workdir.join("visible.txt"), "visible").expect("write visible file");
+        fs::write(workdir.join(".hidden.txt"), "hidden").expect("write hidden file");
+        fs::write(workdir.join("ignored_dir/child.txt"), "ignored")
+            .expect("write ignored file");
+
+        let shown_entries = mention_test_entries(&workdir, Some(true));
+        let entry = |path: &str| {
+            shown_entries
+                .iter()
+                .find(|entry| entry.path == path)
+                .unwrap_or_else(|| panic!("missing entry: {path}"))
+        };
+        assert!(!entry("visible.txt").hidden);
+        assert!(entry(".hidden.txt").hidden);
+        assert!(entry("node_modules").hidden);
+        assert!(entry("ignored_dir/child.txt").hidden);
+
+        let _ = fs::remove_dir_all(workdir);
+    }
+
+    #[test]
     fn mention_list_query_filters_and_ranks_filename_matches() {
         let workdir = unique_test_workdir("mention-query");
         fs::create_dir_all(workdir.join("src/deep")).expect("create dirs");
@@ -5370,6 +5597,7 @@ mod tests {
             workdir.display().to_string(),
             Some(10),
             Some("needle".to_string()),
+            None,
         )
         .expect("mention list should succeed");
         let paths = response
@@ -5451,6 +5679,7 @@ mod tests {
         let list = fs_list_sync(
             workdir.display().to_string(),
             Some("src/app.ts".to_string()),
+            None,
             None,
             None,
             None,

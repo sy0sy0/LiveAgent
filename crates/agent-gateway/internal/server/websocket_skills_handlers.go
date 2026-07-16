@@ -43,6 +43,7 @@ func (c *websocketConnection) handleFileMentionList(req websocketRequest) {
 		Workdir    string `json:"workdir"`
 		MaxResults *int   `json:"max_results"`
 		Query      string `json:"query"`
+		ShowHidden *bool  `json:"show_hidden"`
 	}
 
 	var body payload
@@ -72,6 +73,7 @@ func (c *websocketConnection) handleFileMentionList(req websocketRequest) {
 				Workdir:    workdir,
 				MaxResults: maxResults,
 				Query:      query,
+				ShowHidden: body.ShowHidden,
 			},
 		},
 	})
@@ -93,8 +95,9 @@ func (c *websocketConnection) handleFileMentionList(req websocketRequest) {
 	entries := make([]map[string]any, 0, len(resp.GetEntries()))
 	for _, entry := range resp.GetEntries() {
 		entries = append(entries, map[string]any{
-			"path": entry.GetPath(),
-			"kind": entry.GetKind(),
+			"path":   entry.GetPath(),
+			"kind":   entry.GetKind(),
+			"hidden": entry.GetHidden(),
 		})
 	}
 

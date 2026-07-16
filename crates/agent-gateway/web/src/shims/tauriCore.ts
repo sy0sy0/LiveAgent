@@ -229,6 +229,7 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
         typeof args?.depth === "number" ? args.depth : undefined,
         typeof args?.offset === "number" ? args.offset : undefined,
         typeof args?.max_results === "number" ? args.max_results : undefined,
+        typeof args?.show_hidden === "boolean" ? args.show_hidden : undefined,
       )) as T;
     case "fs_write_text":
       return (await getGatewayWebSocketClient(loadToken().trim()).writeTextFile({
@@ -272,6 +273,7 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
         String(args?.workdir ?? ""),
         typeof args?.max_results === "number" ? args.max_results : undefined,
         typeof args?.query === "string" ? args.query : undefined,
+        typeof args?.show_hidden === "boolean" ? args.show_hidden : undefined,
       )) as T;
     case "system_list_skill_files":
       return (await getGatewayWebSocketClient(loadToken().trim()).listSkillFiles()) as T;

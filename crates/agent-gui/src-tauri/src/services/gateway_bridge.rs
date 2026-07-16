@@ -341,7 +341,12 @@ pub async fn handle_file_mention_list(
         .filter(|value| *value > 0);
 
     tauri::async_runtime::spawn_blocking(move || {
-        fs_mention_list_sync(request.workdir, max_results, Some(request.query))
+        fs_mention_list_sync(
+            request.workdir,
+            max_results,
+            Some(request.query),
+            request.show_hidden,
+        )
     })
     .await
     .map_err(|e| format!("gateway file mention list join failed: {e}"))?
@@ -352,6 +357,7 @@ pub async fn handle_file_mention_list(
             .map(|entry| proto::FileMentionEntry {
                 path: entry.path,
                 kind: entry.kind,
+                hidden: entry.hidden,
             })
             .collect(),
         truncated: response.truncated,
@@ -431,7 +437,14 @@ pub async fn handle_fs_list(
         .filter(|value| *value > 0);
 
     tauri::async_runtime::spawn_blocking(move || {
-        fs_list_sync(request.workdir, path, depth, offset, max_results)
+        fs_list_sync(
+            request.workdir,
+            path,
+            depth,
+            offset,
+            max_results,
+            request.show_hidden,
+        )
     })
     .await
     .map_err(|e| format!("gateway fs list join failed: {e}"))?
@@ -452,6 +465,7 @@ pub async fn handle_fs_list(
                 .map(|entry| proto::FsListEntry {
                     path: entry.path,
                     kind: entry.kind,
+                    hidden: entry.hidden,
                 })
                 .collect(),
         }

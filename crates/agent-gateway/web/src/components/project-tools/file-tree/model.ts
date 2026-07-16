@@ -10,12 +10,13 @@ import type { WorkspaceActivityEventPayload } from "../../../lib/workspace-activ
 
 export type FileTreeKind = "file" | "dir";
 
-export type FileTreeEntry = { path: string; kind: FileTreeKind };
+export type FileTreeEntry = { path: string; kind: FileTreeKind; hidden: boolean };
 
 export type FileTreeNode = {
   path: string;
   name: string;
   kind: FileTreeKind;
+  hidden: boolean;
   children: string[];
   loaded: boolean;
   loading: boolean;
@@ -91,6 +92,7 @@ export function createRootNode(cwd: string): FileTreeNode {
     path: ROOT_PATH,
     name: rootName(cwd),
     kind: "dir",
+    hidden: false,
     children: [],
     loaded: false,
     loading: false,
@@ -167,13 +169,22 @@ export function applyFileTreeListResponse(
     if (!entry.path) continue;
     childPaths.push(entry.path);
     const name = basename(entry.path) || entry.path;
+    const hidden = parent.hidden || entry.hidden;
     const existing = nodes[entry.path];
-    if (existing && existing.kind === entry.kind && existing.name === name) continue;
+    if (
+      existing &&
+      existing.kind === entry.kind &&
+      existing.name === name &&
+      existing.hidden === hidden
+    ) {
+      continue;
+    }
     const sameKind = existing !== undefined && existing.kind === entry.kind;
     next[entry.path] = {
       path: entry.path,
       name,
       kind: entry.kind,
+      hidden,
       children: sameKind ? existing.children : [],
       loaded: sameKind ? existing.loaded : false,
       loading: false,

@@ -198,7 +198,7 @@ func TestWebsocketFsPayloadsUseFrontendFieldNames(t *testing.T) {
 		Total:      3,
 		HasMore:    true,
 		Entries: []*gatewayv1.FsListEntry{
-			{Path: "src/components", Kind: "dir"},
+			{Path: "src/components", Kind: "dir", Hidden: true},
 			{Path: "src/app.tsx", Kind: "file"},
 		},
 	})
@@ -217,6 +217,9 @@ func TestWebsocketFsPayloadsUseFrontendFieldNames(t *testing.T) {
 	}
 	if entries[0]["path"] != "src/components" || entries[0]["kind"] != "dir" {
 		t.Fatalf("fs.list first entry = %#v", entries[0])
+	}
+	if entries[0]["hidden"] != true || entries[1]["hidden"] != false {
+		t.Fatalf("fs.list hidden flags = %#v", entries)
 	}
 
 	readEditable := websocketFsReadEditableTextResponsePayload(&gatewayv1.FsReadEditableTextResponse{
