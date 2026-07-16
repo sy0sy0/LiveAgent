@@ -8,9 +8,9 @@ on:
         required: false
         default: main
       version_label:
-        description: 产物文件名里的版本标签（例如 1.1.1 或 dev）
+        description: semver 版本号（不要写 v 前缀），例如 0.0.0-dev 或 1.1.1
         required: false
-        default: dev
+        default: "0.0.0-dev"
 
 permissions:
   contents: read
@@ -22,37 +22,37 @@ jobs:
   linux-arm64:
     name: Linux arm64
     runs-on: ubuntu-24.04-arm
-    env:
-      # 仅用于产物命名；不要求远端存在同名 tag
-      LIVEAGENT_RELEASE_TAG: ${{ github.event.inputs.version_label || 'dev' }}
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.inputs.ref || 'main' }}
 
-      - uses: actions/setup-node@v6
+      - name: Setup Node
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
 
-      # 若仓库脚本强制要求 v* tag 格式，可改成固定假版本，或跳过这步用 tauri 默认配置
-      - name: Prepare version config (optional)
+      - name: Prepare version config
         working-directory: crates/agent-gui
         env:
-          # 脚本若要求 v 前缀，用 vdev / v0.0.0-dev 这类
-          TAG_FOR_SCRIPT: v${{ github.event.inputs.version_label || '0.0.0-dev' }}
+          RAW_VERSION: ${{ github.event.inputs.version_label || '0.0.0-dev' }}
         run: |
           set -euo pipefail
-          if [[ "$TAG_FOR_SCRIPT" != v* ]]; then
-            TAG_FOR_SCRIPT="v${TAG_FOR_SCRIPT}"
-          fi
-          node ../../scripts/release/prepare-app-version-from-tag.mjs "$TAG_FOR_SCRIPT" \
+          # 必须是 v + semver（脚本不接受 vdev 这类）
+          ver="${RAW_VERSION#v}"
+          tag="v${ver}"
+          echo "Using version tag for script: ${tag}"
+          node ../../scripts/release/prepare-app-version-from-tag.mjs "$tag" \
             --github-env "$GITHUB_ENV" \
             --tauri-config src-tauri/tauri.version.generated.conf.json
+          echo "LIVEAGENT_ARTIFACT_LABEL=${tag}" >> "$GITHUB_ENV"
 
       - name: Install pnpm
         run: npm install -g pnpm@10.32.1
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-gnu
 
@@ -60,27 +60,34 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential curl file \
-            libayatana-appindicator3-dev librsvg2-dev libssl-dev \
-            libwebkit2gtk-4.1-dev libxdo-dev patchelf \
-            protobuf-compiler rpm wget
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            protobuf-compiler \
+            rpm \
+            wget \
+            xdg-utils
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/agent-gui/src-tauri
-          key: linux-aarch64
+          key: linux-aarch64-build-only
 
       - name: Install frontend dependencies
         working-directory: crates/agent-gui
         run: pnpm install --frozen-lockfile
 
-      - name: Build Linux arm64 bundles
+      - name: Build Linux arm64 deb/rpm
         working-directory: crates/agent-gui
         env:
-          # 若 secrets 未配，构建可能仍能过，但没有 .sig；见下方 Stage 说明
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          LIVEAGENT_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
+          # 只要安装包：不注入签名密钥，避免 updater 私钥/密码导致失败
           LIVEAGENT_UPDATE_REPOSITORY: ${{ github.repository }}
         run: >
           pnpm tauri build
@@ -89,35 +96,27 @@ jobs:
           --target aarch64-unknown-linux-gnu
           --bundles deb rpm
 
-      - name: Stage Linux artifacts
+      - name: Stage artifacts
         run: |
           set -euo pipefail
           mkdir -p dist
-          appimage_path="$(find crates/agent-gui/src-tauri/target target -type f -name '*.AppImage' -path '*bundle*' -print -quit 2>/dev/null || true)"
+          label="${LIVEAGENT_ARTIFACT_LABEL:-v0.0.0-dev}"
+
           deb_path="$(find crates/agent-gui/src-tauri/target target -type f -name '*.deb' -path '*bundle*' -print -quit 2>/dev/null || true)"
           rpm_path="$(find crates/agent-gui/src-tauri/target target -type f -name '*.rpm' -path '*bundle*' -print -quit 2>/dev/null || true)"
-          test -n "$appimage_path"
+
+          echo "deb_path=${deb_path:-<empty>}"
+          echo "rpm_path=${rpm_path:-<empty>}"
+
           test -n "$deb_path"
           test -n "$rpm_path"
-          label="${LIVEAGENT_RELEASE_TAG}"
-          cp "$appimage_path" "dist/LiveAgent-${label}-Linux-aarch64.AppImage"
+
           cp "$deb_path" "dist/LiveAgent-${label}-Linux-aarch64.deb"
           cp "$rpm_path" "dist/LiveAgent-${label}-Linux-aarch64.rpm"
-          # 有签名再拷；没有也不失败（纯构建场景）
-          for f in "$appimage_path" "$deb_path" "$rpm_path"; do
-            if [[ -f "${f}.sig" ]]; then
-              base="$(basename "$f")"
-              # 映射到上面的标准名较麻烦，直接按扩展名附带 .sig
-              case "$f" in
-                *.AppImage) cp "${f}.sig" "dist/LiveAgent-${label}-Linux-aarch64.AppImage.sig" ;;
-                *.deb)      cp "${f}.sig" "dist/LiveAgent-${label}-Linux-aarch64.deb.sig" ;;
-                *.rpm)      cp "${f}.sig" "dist/LiveAgent-${label}-Linux-aarch64.rpm.sig" ;;
-              esac
-            fi
-          done
-          ls -la dist/
+          ls -lah dist/
 
-      - uses: actions/upload-artifact@v7
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
         with:
           name: liveagent-linux-aarch64
           path: dist/*
