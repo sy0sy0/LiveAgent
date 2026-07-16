@@ -59,6 +59,7 @@ import {
 } from "../lib/chat/conversation/run";
 import { createTurnCancellation } from "../lib/chat/conversation/turnCancellation";
 import {
+  branchChatHistory,
   type ChatHistoryShareStatus,
   type ChatHistorySummary,
   deleteChatHistory,
@@ -83,6 +84,7 @@ import {
   withPastedTextDisplayMetadata,
 } from "../lib/chat/messages/uploadedFiles";
 import {
+  BRANCH_CONVERSATION_DEFAULT_TITLE,
   buildFallbackConversationTitle,
   buildModelOptions,
   createConversationIdentity,
@@ -3919,6 +3921,12 @@ export function ChatPage(props: ChatPageProps) {
     const existingHistoryItem =
       sidebarStore.peek(conversationId) ??
       gatewayBridgeHistorySummaryRef.current.get(conversationId);
+    // Branched conversations start with the placeholder title; the first
+    // prompt sent inside the branch regenerates it like a first turn would.
+    const isBranchDefaultTitle =
+      !!existingHistoryItem &&
+      !existingHistoryItem.isPending &&
+      existingHistoryItem.title.trim() === BRANCH_CONVERSATION_DEFAULT_TITLE;
     const shouldCreatePendingHistoryItem = isFirstTurn && !existingHistoryItem;
     const pendingConversationTitle = t("chat.pendingTitle");
     const fallbackTitle =
@@ -3930,7 +3938,7 @@ export function ChatPage(props: ChatPageProps) {
           );
 
     let titlePromise: Promise<string | null> | null = null;
-    if (isFirstTurn) {
+    if (isFirstTurn || isBranchDefaultTitle) {
       const titleModelSelection = resolveConversationTitleModelSelection(
         settings,
         effectiveSelectedModel,
@@ -5276,6 +5284,45 @@ export function ChatPage(props: ChatPageProps) {
     sendActionRef,
   });
 
+  // Copies the conversation prefix up to (and including) the picked assistant
+  // reply into a fresh "新分支" conversation, then switches to it. Defined
+  // after the hydration flags above so the guard reads the same sources as
+  // useEditResend.
+  const branchInFlightRef = useRef(false);
+  // 驱动被点行的转圈与全行禁用；ref 仍是同步防重入的真源。
+  const [branchPendingMessageId, setBranchPendingMessageId] = useState<string | null>(null);
+  const handleBranchConversation = useCallback(
+    async (messageRef: HistoryMessageRef) => {
+      const conversationId = currentConversationIdRef.current.trim();
+      if (!conversationId) return;
+      if (isSending || isConversationHydrating || isConversationHydrationFailed) return;
+      // 分支 invoke 会排在同会话 persist 写锁后面，期间按钮仍可点：
+      // 用 ref 挡掉重复确认，避免一次点击风暴造出多份"新分支"。
+      if (branchInFlightRef.current) return;
+      branchInFlightRef.current = true;
+      setBranchPendingMessageId(messageRef.messageId);
+      try {
+        const summary = await branchChatHistory(conversationId, messageRef);
+        sidebarStore.upsertLocal({ ...summary, isPending: undefined });
+        handleSelectConversation(summary.id);
+      } catch (error) {
+        setErrorMessage(asErrorMessage(error, t("chat.branchFailed")));
+      } finally {
+        branchInFlightRef.current = false;
+        setBranchPendingMessageId(null);
+      }
+    },
+    [
+      currentConversationIdRef,
+      handleSelectConversation,
+      isConversationHydrating,
+      isConversationHydrationFailed,
+      isSending,
+      sidebarStore,
+      t,
+    ],
+  );
+
   return (
     <div className="flex h-full min-h-0 w-full overflow-hidden">
       <div className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
@@ -5477,6 +5524,14 @@ export function ChatPage(props: ChatPageProps) {
                 isCompactionRunning={isCompactionRunning}
                 bottomReservePx={composerOverlayHeight}
                 onResendFromEdit={handleResendFromEdit}
+                onBranchConversation={
+                  // 水合中/水合失败时 handler 只会静默 return——直接不传，
+                  // 让 AssistantRow 的 disabled 分支给出可见的禁用态。
+                  isConversationHydrating || isConversationHydrationFailed
+                    ? undefined
+                    : handleBranchConversation
+                }
+                branchPendingMessageId={branchPendingMessageId}
                 onOpenSettings={onOpenSettings}
                 onSuggestionSelect={handleEmptyStateSuggestion}
                 suggestionsDisabled={isSuggestionTyping}

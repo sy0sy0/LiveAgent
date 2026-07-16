@@ -350,6 +350,59 @@ func (c *websocketConnection) handleHistoryRename(req websocketRequest) {
 	_ = c.writeResponse(req.ID, websocketConversationSummaryPayload(conversation))
 }
 
+func (c *websocketConnection) handleHistoryBranch(req websocketRequest) {
+	type payload struct {
+		ConversationID string                 `json:"conversation_id"`
+		BaseMessageRef *chatCommandMessageRef `json:"base_message_ref"`
+	}
+
+	var body payload
+	if err := decodeWebSocketPayload(req.Payload, &body); err != nil {
+		_ = c.writeError(req.ID, "invalid history.branch payload")
+		return
+	}
+	conversationID, err := requireTrimmedWebSocketString(body.ConversationID, "conversation_id")
+	if err != nil {
+		_ = c.writeError(req.ID, err.Error())
+		return
+	}
+	if body.BaseMessageRef == nil {
+		_ = c.writeError(req.ID, "base_message_ref is required")
+		return
+	}
+	if err := validateChatMessageRef(body.BaseMessageRef); err != nil {
+		_ = c.writeError(req.ID, err.Error())
+		return
+	}
+
+	response, err := c.awaitAgentResponse(req.ID, &gatewayv1.GatewayEnvelope{
+		RequestId: req.ID,
+		Timestamp: time.Now().Unix(),
+		Payload: &gatewayv1.GatewayEnvelope_HistoryBranch{
+			HistoryBranch: &gatewayv1.HistoryBranchRequest{
+				ConversationId: conversationID,
+				BaseMessageRef: buildProtoChatMessageRef(body.BaseMessageRef),
+			},
+		},
+	})
+	if err != nil {
+		_ = c.writeError(req.ID, websocketErrorMessage(err))
+		return
+	}
+	if errResp := response.GetError(); errResp != nil {
+		_ = c.writeError(req.ID, errResp.GetMessage())
+		return
+	}
+
+	resp := response.GetHistoryBranchResp()
+	if resp == nil || resp.GetConversation() == nil {
+		_ = c.writeError(req.ID, "unexpected agent response")
+		return
+	}
+
+	_ = c.writeResponse(req.ID, websocketConversationSummaryPayload(resp.GetConversation()))
+}
+
 func (c *websocketConnection) handleHistoryPin(req websocketRequest) {
 	type payload struct {
 		ConversationID string `json:"conversation_id"`

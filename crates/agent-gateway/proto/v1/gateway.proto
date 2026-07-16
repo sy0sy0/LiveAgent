@@ -71,6 +71,7 @@ message GatewayEnvelope {
     TunnelFrame tunnel_frame = 82;
     WorkspaceWatchRequest workspace_watch = 90;
     ManagedProcessRequest managed_process_request = 91;
+    HistoryBranchRequest history_branch = 92;
   }
 
   // Legacy tunnel control/frame payloads (pre-rewrite protocol) and the
@@ -137,6 +138,7 @@ message AgentEnvelope {
     WorkspaceActivityEvent workspace_activity = 90;
     ManagedProcessResponse managed_process_response = 91;
     ManagedProcessSnapshot managed_process_snapshot = 92;
+    HistoryBranchResponse history_branch_resp = 93;
     ErrorResponse error = 99;
   }
 
@@ -767,6 +769,18 @@ message HistoryRenameRequest {
 }
 
 message HistoryRenameResponse {
+  ConversationSummary conversation = 1;
+}
+
+// Copies the conversation prefix up to and including the assistant response
+// that answers the anchored user message (base_message_ref) into a brand-new
+// conversation titled "新分支".
+message HistoryBranchRequest {
+  string conversation_id = 1;
+  ChatMessageRef base_message_ref = 2;
+}
+
+message HistoryBranchResponse {
   ConversationSummary conversation = 1;
 }
 

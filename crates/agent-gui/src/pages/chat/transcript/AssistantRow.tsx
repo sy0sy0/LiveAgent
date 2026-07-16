@@ -1,6 +1,6 @@
 import { memo } from "react";
 
-import { Check, Copy, RefreshCw } from "../../../components/icons";
+import { Check, Copy, GitBranch, Loader2, RefreshCw } from "../../../components/icons";
 import { ConfirmActionPopover } from "../../../components/ui/confirm-action-popover";
 import { useLocale } from "../../../i18n";
 import type { HistoryMessageRef } from "../../../lib/chat/conversation/conversationState";
@@ -32,6 +32,10 @@ export type AssistantRowProps = {
     text: string,
     attachments: PendingUploadedFile[],
   ) => void;
+  onBranchConversation?: (messageRef: HistoryMessageRef) => void;
+  // Anchor messageId of the in-flight branch request: the matching row swaps
+  // its branch icon for a spinner (and stays visible), all rows disable.
+  branchPendingMessageId?: string | null;
 };
 
 // One body for the streaming reply and the settled reply. The live row and
@@ -48,6 +52,8 @@ export const AssistantRow = memo(function AssistantRow(props: AssistantRowProps)
     isCompactionRunning,
     toolStatus,
     onResendFromEdit,
+    onBranchConversation,
+    branchPendingMessageId,
   } = props;
   const { t } = useLocale();
   const { copied, markCopied } = useCopiedFlag();
@@ -56,6 +62,9 @@ export const AssistantRow = memo(function AssistantRow(props: AssistantRowProps)
   const retryMessageRef = retryTarget?.messageRef;
   const retryDisabled = isSending || !retryMessageRef;
   const retryTitle = retryMessageRef ? t("chat.retry") : "旧历史缺少稳定消息标识，无法重试";
+  const branchPending = branchPendingMessageId != null;
+  const isRowBranchPending =
+    branchPending && !!retryMessageRef && branchPendingMessageId === retryMessageRef.messageId;
 
   return (
     <div className={`group/assistant w-full max-w-full ${row.compacted ? "opacity-70" : ""}`}>
@@ -98,7 +107,9 @@ export const AssistantRow = memo(function AssistantRow(props: AssistantRowProps)
           <span className="select-none text-[calc(11px*var(--zone-font-scale,1))] tabular-nums text-muted-foreground/70">
             {formatMessageTimestamp(row.timestamp ?? 0)}
           </span>
-          <div className="flex gap-0.5 opacity-0 transition-opacity group-focus-within/assistant:opacity-100 group-hover/assistant:opacity-100">
+          <div
+            className={`flex gap-0.5 transition-opacity group-focus-within/assistant:opacity-100 group-hover/assistant:opacity-100 ${isRowBranchPending ? "opacity-100" : "opacity-0"}`}
+          >
             <button
               type="button"
               className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
@@ -130,6 +141,33 @@ export const AssistantRow = memo(function AssistantRow(props: AssistantRowProps)
                   disabled={retryDisabled}
                 >
                   <RefreshCw className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </ConfirmActionPopover>
+            <ConfirmActionPopover
+              title={t("chat.branchConfirmTitle")}
+              description={t("chat.branchConfirmDescription")}
+              confirmLabel={t("chat.branch")}
+              tone="default"
+              align="start"
+              side="top"
+              onConfirm={() => {
+                if (!retryMessageRef) return;
+                onBranchConversation?.(retryMessageRef);
+              }}
+            >
+              {() => (
+                <button
+                  type="button"
+                  className={`rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground disabled:cursor-not-allowed ${isRowBranchPending ? "" : "disabled:opacity-40"}`}
+                  title={retryMessageRef ? t("chat.branch") : t("chat.branchUnavailable")}
+                  disabled={isSending || !retryMessageRef || !onBranchConversation || branchPending}
+                >
+                  {isRowBranchPending ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <GitBranch className="h-3.5 w-3.5" />
+                  )}
                 </button>
               )}
             </ConfirmActionPopover>

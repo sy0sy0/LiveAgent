@@ -44,6 +44,8 @@ export const ChatTranscript = memo(function ChatTranscript(props: ChatTranscript
     isCompactionRunning,
     bottomReservePx = 0,
     onResendFromEdit,
+    onBranchConversation,
+    branchPendingMessageId,
     onOpenSettings,
     onSuggestionSelect,
     suggestionsDisabled = false,
@@ -202,6 +204,8 @@ export const ChatTranscript = memo(function ChatTranscript(props: ChatTranscript
               workspaceRoot={workspaceRoot}
               gitClient={gitClient}
               onResendFromEdit={onResendFromEdit}
+              onBranchConversation={onBranchConversation}
+              branchPendingMessageId={branchPendingMessageId}
             />
           </div>
 

@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 
 use crate::commands::{
     chat_history,
+    chat_history::{history_message_content_hash, history_message_id_for_ref, message_matches_ref},
     fs::{
         fs_create_dir_sync, fs_delete_sync, fs_list_dirs_sync, fs_list_sync, fs_mention_list_sync,
         fs_read_editable_text_sync, fs_read_workspace_image_sync, fs_rename_sync, fs_roots_sync,
@@ -240,6 +241,31 @@ pub async fn handle_history_rename(
             .await?;
 
     Ok(proto::HistoryRenameResponse {
+        conversation: Some(build_proto_conversation_summary(summary)),
+    })
+}
+
+pub async fn handle_history_branch(
+    request: proto::HistoryBranchRequest,
+) -> Result<proto::HistoryBranchResponse, String> {
+    let base_message_ref = request
+        .base_message_ref
+        .as_ref()
+        .ok_or_else(|| "history.branch requires base_message_ref".to_string())?;
+    validate_stable_chat_message_ref(base_message_ref)?;
+
+    let anchor = chat_history::ChatHistoryBranchAnchor {
+        segment_index: i64::from(base_message_ref.segment_index),
+        message_index: i64::from(base_message_ref.message_index),
+        segment_id: base_message_ref.segment_id.clone(),
+        message_id: base_message_ref.message_id.clone(),
+        role: base_message_ref.role.clone(),
+        content_hash: base_message_ref.content_hash.clone(),
+    };
+    let summary =
+        chat_history::chat_history_branch_inner(request.conversation_id.clone(), anchor).await?;
+
+    Ok(proto::HistoryBranchResponse {
         conversation: Some(build_proto_conversation_summary(summary)),
     })
 }
@@ -1181,144 +1207,6 @@ fn validate_stable_chat_message_ref(ref_value: &proto::ChatMessageRef) -> Result
     Ok(())
 }
 
-fn read_json_trimmed_string(object: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
-    object
-        .get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn flatten_user_content(content: Option<&Value>) -> String {
-    match content {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .filter_map(|block| {
-                block.as_object().and_then(|object| {
-                    match object.get("type").and_then(Value::as_str) {
-                        Some("text") => object.get("text").and_then(Value::as_str),
-                        _ => None,
-                    }
-                })
-            })
-            .collect::<String>(),
-        _ => String::new(),
-    }
-}
-
-fn append_hash_part(parts: &mut Vec<String>, value: impl AsRef<str>) {
-    let value = value.as_ref();
-    parts.push(format!("{}:{value}", value.len()));
-}
-
-fn fnv1a32(input: &str) -> String {
-    let mut hash = 0x811c9dc5_u32;
-    for byte in input.as_bytes() {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(0x01000193);
-    }
-    format!("fnv1a32:{hash:08x}")
-}
-
-fn history_message_content_hash(message: &Value) -> String {
-    let object = message.as_object();
-    let role = object
-        .and_then(|object| object.get("role"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let mut parts = vec!["liveagent-history-ref-v1".to_string()];
-    append_hash_part(&mut parts, role);
-
-    if role == "user" {
-        let display_text = object
-            .and_then(|object| object.get("liveAgentDisplayContent"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                flatten_user_content(object.and_then(|object| object.get("content")))
-            });
-        append_hash_part(&mut parts, display_text);
-
-        let attachments = object
-            .and_then(|object| object.get("liveAgentAttachments"))
-            .and_then(Value::as_array);
-        let valid_attachments = attachments
-            .map(|attachments| {
-                attachments
-                    .iter()
-                    .filter_map(Value::as_object)
-                    .filter(|attachment| {
-                        attachment
-                            .get("relativePath")
-                            .and_then(Value::as_str)
-                            .is_some()
-                            && attachment.get("fileName").and_then(Value::as_str).is_some()
-                            && attachment.get("kind").and_then(Value::as_str).is_some()
-                            && attachment
-                                .get("sizeBytes")
-                                .and_then(Value::as_f64)
-                                .is_some()
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        append_hash_part(&mut parts, valid_attachments.len().to_string());
-        for attachment_object in valid_attachments {
-            append_hash_part(
-                &mut parts,
-                attachment_object
-                    .get("relativePath")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-            );
-            append_hash_part(
-                &mut parts,
-                attachment_object
-                    .get("fileName")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-            );
-            append_hash_part(
-                &mut parts,
-                attachment_object
-                    .get("kind")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-            );
-            append_hash_part(
-                &mut parts,
-                attachment_object
-                    .get("sizeBytes")
-                    .map(Value::to_string)
-                    .unwrap_or_else(|| "0".to_string()),
-            );
-        }
-    } else {
-        append_hash_part(
-            &mut parts,
-            object
-                .and_then(|object| object.get("content"))
-                .map(Value::to_string)
-                .unwrap_or_else(|| "null".to_string()),
-        );
-    }
-
-    fnv1a32(&parts.join("|"))
-}
-
-fn history_message_id_for_ref(message: &Value) -> Option<String> {
-    let object = message.as_object()?;
-    read_json_trimmed_string(object, "id").or_else(|| {
-        if object.get("role").and_then(Value::as_str) == Some("assistant") {
-            read_json_trimmed_string(object, "responseId")
-        } else {
-            None
-        }
-    })
-}
-
 fn build_history_message_ref_json(
     segment: &chat_history::ChatHistorySegmentRecord,
     message_index: usize,
@@ -1342,19 +1230,12 @@ fn build_history_message_ref_json(
 }
 
 fn message_matches_stable_ref(message: &Value, ref_value: &proto::ChatMessageRef) -> bool {
-    let Some(object) = message.as_object() else {
-        return false;
-    };
-    let Some(message_id) = history_message_id_for_ref(message) else {
-        return false;
-    };
-    let role = object
-        .get("role")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    message_id == ref_value.message_id.trim()
-        && role == ref_value.role.trim()
-        && history_message_content_hash(message) == ref_value.content_hash.trim()
+    message_matches_ref(
+        message,
+        &ref_value.message_id,
+        &ref_value.role,
+        &ref_value.content_hash,
+    )
 }
 
 fn build_history_prefix_segments(
@@ -1620,11 +1501,10 @@ mod tests {
 
     use super::{
         build_history_prefix_segments, flatten_history_messages_json,
-        flatten_history_messages_json_window, history_message_content_hash,
-        is_builtin_share_tool_name, parse_runs_limit, redact_builtin_tool_content_json,
-        sanitize_provider_summaries,
+        flatten_history_messages_json_window, is_builtin_share_tool_name, parse_runs_limit,
+        redact_builtin_tool_content_json, sanitize_provider_summaries,
     };
-    use crate::commands::chat_history::ChatHistorySegmentRecord;
+    use crate::commands::chat_history::{history_message_content_hash, ChatHistorySegmentRecord};
 
     fn make_segment(
         segment_index: i64,

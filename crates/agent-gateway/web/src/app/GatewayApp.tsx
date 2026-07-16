@@ -3174,6 +3174,45 @@ export default function GatewayApp() {
     [api, isConversationBusy, setPendingUploadsForConversation],
   );
 
+  // handleSidebarSelectConversation is a plain per-render function; route the
+  // branch handler through a ref (same pattern as sendChatRef) so the callback
+  // stays stable for the memoized transcript region.
+  const selectConversationRef = useRef(handleSidebarSelectConversation);
+  selectConversationRef.current = handleSidebarSelectConversation;
+  // The button stays clickable during the WS round-trip; a ref (not state)
+  // blocks duplicate confirms without changing the callback identity, while
+  // the pending-anchor state drives the clicked row's spinner.
+  const branchInFlightRef = useRef(false);
+  const [branchPendingMessageId, setBranchPendingMessageId] = useState<string | null>(null);
+
+  const handleBranchConversation = useCallback(
+    async (messageRef: HistoryMessageRef) => {
+      if (!api) return;
+      const activeConversationId = conversationIdRef.current.trim();
+      if (
+        !activeConversationId ||
+        isLocalDraftConversationId(activeConversationId) ||
+        isConversationBusy(activeConversationId)
+      ) {
+        return;
+      }
+      if (branchInFlightRef.current) return;
+      branchInFlightRef.current = true;
+      setBranchPendingMessageId(messageRef.messageId);
+      try {
+        const summary = await api.branchHistory(activeConversationId, messageRef);
+        sidebarStore.upsertLocal(normalizeGatewayConversationSummary(summary));
+        selectConversationRef.current(summary.id);
+      } catch (error) {
+        setChatError(asErrorMessage(error, translate("chat.branchFailed", settings.locale)));
+      } finally {
+        branchInFlightRef.current = false;
+        setBranchPendingMessageId(null);
+      }
+    },
+    [api, isConversationBusy, sidebarStore, settings.locale],
+  );
+
   const handleLoadUploadedImagePreview = useCallback(
     async (workspaceRoot: string, absolutePath: string) => {
       if (!api) {
@@ -4156,6 +4195,8 @@ export default function GatewayApp() {
                           gitClient={gitClient}
                           onLoadUploadedImagePreview={handleLoadUploadedImagePreview}
                           onResendFromEdit={handleResendFromEdit}
+                          onBranchConversation={handleBranchConversation}
+                          branchPendingMessageId={branchPendingMessageId}
                           onSuggestionSelect={handleEmptyStateSuggestion}
                           suggestionsDisabled={isSuggestionTyping}
                         />

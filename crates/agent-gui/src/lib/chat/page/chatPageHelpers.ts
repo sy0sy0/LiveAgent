@@ -10,6 +10,9 @@ const MODEL_GENERATING_STATUS_PATTERN = /^第\s*\d+\s*轮：模型生成中\.\.\
 
 export const VIBING_STATUS = "Vibing...";
 
+// Must match BRANCH_DEFAULT_TITLE in src-tauri/src/commands/history/chat_history/branch.rs.
+export const BRANCH_CONVERSATION_DEFAULT_TITLE = "新分支";
+
 export function buildModelOptions(
   settings: AppSettings,
   opts?: { floatSelectedFirst?: boolean },

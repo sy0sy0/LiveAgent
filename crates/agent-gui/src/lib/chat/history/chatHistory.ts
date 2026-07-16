@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { normalizeConversationSystemPrompt } from "../context/systemPrompt";
 import {
   type ConversationViewState,
+  type HistoryMessageRef,
   normalizeConversationState,
   type StoredChatContextMeta,
   type StoredContextSegment,
@@ -351,6 +352,12 @@ async function appendChatHistorySegmentRaw(input: ChatHistorySegmentMutationInpu
 export async function renameChatHistory(id: string, title: string) {
   return withConversationWriteLock(id, () =>
     invoke<ChatHistorySummary>("chat_history_rename", { id, title }),
+  );
+}
+
+export async function branchChatHistory(id: string, baseMessageRef: HistoryMessageRef) {
+  return withConversationWriteLock(id, () =>
+    invoke<ChatHistorySummary>("chat_history_branch", { id, baseMessageRef }),
   );
 }
 

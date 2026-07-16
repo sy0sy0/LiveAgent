@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn open_test_db() -> Result<Connection, String> {
         let conn =
@@ -1436,5 +1437,430 @@ mod tests {
             .optional()
             .expect("query schema after prune");
         assert_eq!(after.as_deref(), Some("subagentRun"));
+    }
+
+    fn branch_user_message(id: &str, text: &str, timestamp: i64) -> Value {
+        json!({
+            "id": id,
+            "role": "user",
+            "content": text,
+            "timestamp": timestamp,
+        })
+    }
+
+    fn branch_assistant_message(response_id: &str, text: &str, timestamp: i64) -> Value {
+        json!({
+            "role": "assistant",
+            "responseId": response_id,
+            "content": [{ "type": "text", "text": text }],
+            "timestamp": timestamp,
+        })
+    }
+
+    fn branch_tool_result_message(id: &str, text: &str, timestamp: i64) -> Value {
+        json!({
+            "id": id,
+            "role": "toolResult",
+            "toolName": "Bash",
+            "toolCallId": "call-1",
+            "content": [{ "type": "text", "text": text }],
+            "timestamp": timestamp,
+        })
+    }
+
+    fn branch_segment_record(
+        segment_index: i64,
+        segment_id: &str,
+        summary_json: Option<&str>,
+        messages: &[Value],
+    ) -> ChatHistorySegmentRecord {
+        let updated_at = messages
+            .last()
+            .map(read_message_timestamp)
+            .unwrap_or(1_700_000_000_000);
+        ChatHistorySegmentRecord {
+            segment_index,
+            segment_id: segment_id.to_string(),
+            summary_json: summary_json.map(str::to_string),
+            messages_json: serde_json::to_string(messages).expect("serialize branch test messages"),
+            message_count: messages.len() as i64,
+            start_message_id: messages.first().and_then(history_message_id_for_ref),
+            end_message_id: messages.last().and_then(history_message_id_for_ref),
+            created_at: 1_700_000_000_000,
+            updated_at,
+        }
+    }
+
+    fn seed_branch_source(conn: &Connection, id: &str, segments: &[ChatHistorySegmentRecord]) {
+        let total_message_count: i64 = segments.iter().map(|segment| segment.message_count).sum();
+        let mut conversation = sample_conversation();
+        conversation.id = id.to_string();
+        conversation.selected_model_json =
+            Some(r#"{"customProviderId":"provider-a","model":"claude-fable-5"}"#.to_string());
+        conversation.active_segment_index = segments.len() as i64 - 1;
+        conversation.total_segment_count = segments.len() as i64;
+        conversation.total_message_count = total_message_count;
+        conversation.context_meta_json = json!({
+            "schemaVersion": 3,
+            "systemPrompt": "keep me",
+            "activeSegmentIndex": conversation.active_segment_index,
+            "totalSegmentCount": conversation.total_segment_count,
+            "totalMessageCount": total_message_count,
+        })
+        .to_string();
+        upsert_chat_history_header(conn, &conversation).expect("upsert branch source header");
+        for segment in segments {
+            upsert_single_segment(conn, id, &record_to_segment_input(segment))
+                .expect("upsert branch source segment");
+        }
+        verify_chat_history_consistency(conn, id).expect("branch source consistency");
+    }
+
+    fn branch_anchor(
+        segment_index: i64,
+        message_index: i64,
+        segment_id: &str,
+        message: &Value,
+    ) -> ChatHistoryBranchAnchor {
+        ChatHistoryBranchAnchor {
+            segment_index,
+            message_index,
+            segment_id: segment_id.to_string(),
+            message_id: history_message_id_for_ref(message).expect("branch anchor message id"),
+            role: "user".to_string(),
+            content_hash: history_message_content_hash(message),
+        }
+    }
+
+    fn segment_message_ids(messages_json: &str) -> Vec<String> {
+        serde_json::from_str::<Value>(messages_json)
+            .expect("parse branch segment messages")
+            .as_array()
+            .expect("branch segment messages should be an array")
+            .iter()
+            .map(|message| history_message_id_for_ref(message).expect("branch message id"))
+            .collect()
+    }
+
+    #[test]
+    fn branch_copies_prefix_including_anchor_turn() {
+        let mut conn = open_test_db().expect("open test db");
+        let u1 = branch_user_message("u1", "第一问", 1_000);
+        let a1 = branch_assistant_message("a1", "第一答", 1_001);
+        let u2 = branch_user_message("u2", "第二问", 1_002);
+        let a2 = branch_assistant_message("a2", "第二答", 1_003);
+        seed_branch_source(
+            &conn,
+            "conv-source",
+            &[branch_segment_record(
+                0,
+                "seg-0",
+                None,
+                &[u1.clone(), a1, u2, a2],
+            )],
+        );
+
+        let anchor = branch_anchor(0, 0, "seg-0", &u1);
+        let summary =
+            chat_history_branch_sync(&mut conn, "conv-source", &anchor).expect("branch prefix");
+
+        assert_ne!(summary.id, "conv-source");
+        assert_eq!(summary.title, BRANCH_DEFAULT_TITLE);
+        assert_eq!(summary.message_count, 2);
+
+        let record = get_record_by_id(&conn, &summary.id).expect("load branch record");
+        assert_eq!(record.total_segment_count, 1);
+        assert_eq!(record.total_message_count, 2);
+        let segments = load_segments(&conn, &summary.id).expect("load branch segments");
+        assert_eq!(segments.len(), 1);
+        assert_eq!(
+            segment_message_ids(&segments[0].messages_json),
+            vec!["u1", "a1"]
+        );
+        verify_chat_history_consistency(&conn, &summary.id).expect("branch consistency");
+
+        let source = get_record_by_id(&conn, "conv-source").expect("load source record");
+        assert_eq!(source.total_message_count, 4);
+        assert_eq!(source.title, "Test Conversation");
+        let source_segments = load_segments(&conn, "conv-source").expect("load source segments");
+        assert_eq!(source_segments.len(), 1);
+        assert_eq!(
+            segment_message_ids(&source_segments[0].messages_json),
+            vec!["u1", "a1", "u2", "a2"]
+        );
+    }
+
+    #[test]
+    fn branch_full_copy_when_anchor_is_last_turn() {
+        let mut conn = open_test_db().expect("open test db");
+        let u1 = branch_user_message("u1", "第一问", 1_000);
+        let a1 = branch_assistant_message("a1", "第一答", 1_001);
+        let u2 = branch_user_message("u2", "第二问", 1_002);
+        let a2 = branch_assistant_message("a2", "第二答", 1_003);
+        seed_branch_source(
+            &conn,
+            "conv-source",
+            &[branch_segment_record(
+                0,
+                "seg-0",
+                None,
+                &[u1, a1, u2.clone(), a2],
+            )],
+        );
+
+        let anchor = branch_anchor(0, 2, "seg-0", &u2);
+        let summary =
+            chat_history_branch_sync(&mut conn, "conv-source", &anchor).expect("branch full copy");
+
+        assert_eq!(summary.message_count, 4);
+        let segments = load_segments(&conn, &summary.id).expect("load branch segments");
+        assert_eq!(segments.len(), 1);
+        assert_eq!(
+            segment_message_ids(&segments[0].messages_json),
+            vec!["u1", "a1", "u2", "a2"]
+        );
+        verify_chat_history_consistency(&conn, &summary.id).expect("branch consistency");
+    }
+
+    #[test]
+    fn branch_fails_when_anchor_reply_not_persisted() {
+        // persist-lag 竞态：done 事件先于落盘，锚点用户消息已写入但助手回复
+        // 还没有——此时分支必须报可重试错误，而不是静默复制出缺回复的前缀。
+        let mut conn = open_test_db().expect("open test db");
+        let u1 = branch_user_message("u1", "第一问", 1_000);
+        let a1 = branch_assistant_message("a1", "第一答", 1_001);
+        let u2 = branch_user_message("u2", "第二问", 1_002);
+        seed_branch_source(
+            &conn,
+            "conv-source",
+            &[branch_segment_record(0, "seg-0", None, &[u1, a1, u2.clone()])],
+        );
+
+        let anchor = branch_anchor(0, 2, "seg-0", &u2);
+        let error = chat_history_branch_sync(&mut conn, "conv-source", &anchor)
+            .expect_err("branch should fail while the reply is unpersisted");
+        assert!(error.contains("尚未写入"), "unexpected error: {error}");
+
+        let conversation_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chatHistory", [], |row| row.get(0))
+            .expect("count conversations");
+        assert_eq!(conversation_count, 1);
+    }
+
+    #[test]
+    fn branch_drops_following_segment_when_next_user_starts_it() {
+        let mut conn = open_test_db().expect("open test db");
+        let u1 = branch_user_message("u1", "第一问", 1_000);
+        let a1 = branch_assistant_message("a1", "第一答", 1_001);
+        let u2 = branch_user_message("u2", "第二问", 1_002);
+        let a2 = branch_assistant_message("a2", "第二答", 1_003);
+        let u3 = branch_user_message("u3", "第三问", 1_004);
+        let a3 = branch_assistant_message("a3", "第三答", 1_005);
+        seed_branch_source(
+            &conn,
+            "conv-source",
+            &[
+                branch_segment_record(0, "seg-0", None, &[u1, a1, u2.clone(), a2]),
+                branch_segment_record(
+                    1,
+                    "seg-1",
+                    Some(r#"{"role":"summary","id":"summary-1","content":"older"}"#),
+                    &[u3, a3],
+                ),
+            ],
+        );
+
+        let anchor = branch_anchor(0, 2, "seg-0", &u2);
+        let summary = chat_history_branch_sync(&mut conn, "conv-source", &anchor)
+            .expect("branch drops next segment");
+
+        assert_eq!(summary.message_count, 4);
+        let segments = load_segments(&conn, &summary.id).expect("load branch segments");
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].segment_id, "seg-0");
+        assert_eq!(
+            segment_message_ids(&segments[0].messages_json),
+            vec!["u1", "a1", "u2", "a2"]
+        );
+        verify_chat_history_consistency(&conn, &summary.id).expect("branch consistency");
+    }
+
+    #[test]
+    fn branch_slices_mid_segment_and_recomputes_ids() {
+        let mut conn = open_test_db().expect("open test db");
+        let u1 = branch_user_message("u1", "第一问", 1_000);
+        let a1 = branch_assistant_message("a1", "第一答", 1_001);
+        let u2 = branch_user_message("u2", "第二问", 1_002);
+        let a2 = branch_assistant_message("a2", "第二答", 1_003);
+        let u3 = branch_user_message("u3", "第三问", 1_004);
+        let a3 = branch_assistant_message("a3", "第三答", 1_005);
+        seed_branch_source(
+            &conn,
+            "conv-source",
+            &[
+                branch_segment_record(0, "seg-0", None, &[u1, a1]),
+                branch_segment_record(1, "seg-1", None, &[u2.clone(), a2, u3, a3]),
+            ],
+        );
+
+        let anchor = branch_anchor(1, 0, "seg-1", &u2);
+        let summary = chat_history_branch_sync(&mut conn, "conv-source", &anchor)
+            .expect("branch slices mid segment");
+
+        assert_eq!(summary.message_count, 4);
+        let segments = load_segments(&conn, &summary.id).expect("load branch segments");
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].segment_index, 0);
+        assert_eq!(segments[0].segment_id, "seg-0");
+        assert_eq!(segments[1].segment_index, 1);
+        assert_eq!(segments[1].segment_id, "seg-1");
+        assert_eq!(segments[1].message_count, 2);
+        assert_eq!(
+            segment_message_ids(&segments[1].messages_json),
+            vec!["u2", "a2"]
+        );
+        assert_eq!(segments[1].start_message_id.as_deref(), Some("u2"));
+        assert_eq!(segments[1].end_message_id.as_deref(), Some("a2"));
+        assert_eq!(segments[1].updated_at, 1_003);
+        verify_chat_history_consistency(&conn, &summary.id).expect("branch consistency");
+    }
+
+    #[test]
+    fn branch_fails_on_anchor_mismatch() {
+        let mut conn = open_test_db().expect("open test db");
+        let u1 = branch_user_message("u1", "第一问", 1_000);
+        let a1 = branch_assistant_message("a1", "第一答", 1_001);
+        seed_branch_source(
+            &conn,
+            "conv-source",
+            &[branch_segment_record(0, "seg-0", None, &[u1.clone(), a1])],
+        );
+
+        let mut anchor = branch_anchor(0, 0, "seg-0", &u1);
+        anchor.content_hash = "fnv1a32:deadbeef".to_string();
+        let error = chat_history_branch_sync(&mut conn, "conv-source", &anchor)
+            .expect_err("mismatched anchor should fail");
+        assert!(error.contains("锚点"), "unexpected error: {error}");
+
+        let conversation_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chatHistory", [], |row| row.get(0))
+            .expect("count conversations");
+        assert_eq!(conversation_count, 1);
+        let segment_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chatHistorySegment", [], |row| {
+                row.get(0)
+            })
+            .expect("count segments");
+        assert_eq!(segment_count, 1);
+    }
+
+    #[test]
+    fn branch_copies_model_cwd_and_patches_context_meta() {
+        let mut conn = open_test_db().expect("open test db");
+        let u1 = branch_user_message("u1", "第一问", 1_000);
+        let a1 = branch_assistant_message("a1", "第一答", 1_001);
+        let u2 = branch_user_message("u2", "第二问", 1_002);
+        let a2 = branch_assistant_message("a2", "第二答", 1_003);
+        seed_branch_source(
+            &conn,
+            "conv-source",
+            &[branch_segment_record(
+                0,
+                "seg-0",
+                None,
+                &[u1.clone(), a1, u2, a2],
+            )],
+        );
+
+        let anchor = branch_anchor(0, 0, "seg-0", &u1);
+        let summary = chat_history_branch_sync(&mut conn, "conv-source", &anchor)
+            .expect("branch copies conversation fields");
+
+        assert_eq!(
+            summary.selected_model_json.as_deref(),
+            Some(r#"{"customProviderId":"provider-a","model":"claude-fable-5"}"#)
+        );
+        assert_eq!(summary.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(summary.session_id, None);
+        assert!(!summary.is_pinned);
+        assert!(!summary.is_shared);
+
+        let record = get_record_by_id(&conn, &summary.id).expect("load branch record");
+        assert_eq!(record.provider_id, "codex");
+        assert_eq!(record.model, "gpt-5");
+        let session_id: Option<String> = conn
+            .query_row(
+                "SELECT session_id FROM chatHistory WHERE id = ?1",
+                params![summary.id],
+                |row| row.get(0),
+            )
+            .expect("query branch session id");
+        assert_eq!(session_id, None);
+        let is_pinned: i64 = conn
+            .query_row(
+                "SELECT is_pinned FROM chatHistory WHERE id = ?1",
+                params![summary.id],
+                |row| row.get(0),
+            )
+            .expect("query branch pin state");
+        assert_eq!(is_pinned, 0);
+
+        let context_meta =
+            serde_json::from_str::<Value>(&record.context_meta_json).expect("parse context meta");
+        assert_eq!(context_meta["activeSegmentIndex"], json!(0));
+        assert_eq!(context_meta["totalSegmentCount"], json!(1));
+        assert_eq!(context_meta["totalMessageCount"], json!(2));
+        assert_eq!(context_meta["schemaVersion"], json!(3));
+        assert_eq!(context_meta["systemPrompt"], json!("keep me"));
+    }
+
+    #[test]
+    fn branch_segments_cut_in_later_segment_midway() {
+        // 锚点轮次的助手回复跨过分段边界：更早分段整段复制，切点段裁剪。
+        let u1 = branch_user_message("u1", "第一问", 1_000);
+        let a1 = branch_assistant_message("a1", "第一答", 1_001);
+        let u2 = branch_user_message("u2", "第二问", 1_002);
+        let a2_head = branch_assistant_message("a2-head", "第二答上半", 1_003);
+        let a2_tail = branch_assistant_message("a2-tail", "第二答下半", 1_004);
+        let tr2 = branch_tool_result_message("tr2", "工具输出", 1_005);
+        let u3 = branch_user_message("u3", "第三问", 1_006);
+        let a3 = branch_assistant_message("a3", "第三答", 1_007);
+        let segments = [
+            branch_segment_record(0, "seg-0", None, &[u1, a1, u2.clone(), a2_head]),
+            branch_segment_record(
+                1,
+                "seg-1",
+                Some(r#"{"role":"summary","id":"summary-1","content":"older"}"#),
+                &[a2_tail, tr2, u3, a3],
+            ),
+        ];
+
+        let anchor = branch_anchor(0, 2, "seg-0", &u2);
+        let (kept, total_message_count) =
+            build_branch_segments(&segments, &anchor).expect("build branch segments");
+
+        assert_eq!(total_message_count, 6);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].segment_index, 0);
+        assert_eq!(kept[0].segment_id, "seg-0");
+        assert_eq!(kept[0].message_count, 4);
+        assert_eq!(
+            segment_message_ids(&kept[0].messages_json),
+            vec!["u1", "a1", "u2", "a2-head"]
+        );
+        assert_eq!(kept[1].segment_index, 1);
+        assert_eq!(kept[1].segment_id, "seg-1");
+        assert_eq!(kept[1].message_count, 2);
+        assert_eq!(
+            segment_message_ids(&kept[1].messages_json),
+            vec!["a2-tail", "tr2"]
+        );
+        assert_eq!(kept[1].start_message_id.as_deref(), Some("a2-tail"));
+        assert_eq!(kept[1].end_message_id.as_deref(), Some("tr2"));
+        assert_eq!(kept[1].updated_at, 1_005);
+        assert_eq!(
+            kept[1].summary_json.as_deref(),
+            Some(r#"{"role":"summary","id":"summary-1","content":"older"}"#)
+        );
     }
 }

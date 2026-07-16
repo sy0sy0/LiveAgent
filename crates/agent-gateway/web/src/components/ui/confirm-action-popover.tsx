@@ -17,6 +17,9 @@ export function ConfirmActionPopover(props: {
   align?: "start" | "end";
   // Preferred trigger side to open from; flips when that side lacks room.
   side?: "top" | "bottom";
+  // Visual intent; "destructive" (default) keeps the warning styling, while
+  // "default" suits non-destructive confirmations (e.g. branching a chat).
+  tone?: "destructive" | "default";
   children: (open: () => void) => ReactNode;
 }) {
   const {
@@ -26,6 +29,7 @@ export function ConfirmActionPopover(props: {
     onConfirm,
     align = "end",
     side = "bottom",
+    tone = "destructive",
     children,
   } = props;
   const { t } = useLocale();
@@ -104,8 +108,14 @@ export function ConfirmActionPopover(props: {
         >
           <div className="rounded-xl border border-border bg-popover p-3 shadow-lg">
             <div className="flex items-start gap-2.5">
-              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-destructive/10">
-                <AlertTriangle className="h-4 w-4 text-destructive" />
+              <div
+                className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${
+                  tone === "default" ? "bg-primary/10" : "bg-destructive/10"
+                }`}
+              >
+                <AlertTriangle
+                  className={`h-4 w-4 ${tone === "default" ? "text-primary" : "text-destructive"}`}
+                />
               </div>
               <div className="min-w-0 flex-1">
                 <p className="text-sm font-medium">{title}</p>
@@ -124,7 +134,7 @@ export function ConfirmActionPopover(props: {
                 {t("settings.cancel")}
               </Button>
               <Button
-                variant="destructive"
+                variant={tone === "default" ? "default" : "destructive"}
                 size="sm"
                 className="h-7 px-2.5 text-xs"
                 onClick={() => {

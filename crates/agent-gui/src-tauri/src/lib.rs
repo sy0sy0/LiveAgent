@@ -43,6 +43,7 @@ macro_rules! app_invoke_handler {
             commands::chat_history::chat_history_upsert_active_segment,
             commands::chat_history::chat_history_append_segment,
             commands::chat_history::chat_history_rename,
+            commands::chat_history::chat_history_branch,
             commands::chat_history::chat_history_set_pinned,
             commands::chat_history::chat_history_set_model,
             commands::chat_history::chat_history_share_get,

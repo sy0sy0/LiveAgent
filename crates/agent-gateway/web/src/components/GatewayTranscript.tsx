@@ -61,6 +61,7 @@ import {
   Copy,
   File,
   FileText,
+  GitBranch,
   Loader2,
   Pencil,
   RefreshCw,
@@ -104,6 +105,10 @@ type GatewayTranscriptProps = {
     text: string,
     uploadedFiles: PendingUploadedFile[],
   ) => void;
+  onBranchConversation?: (messageRef: HistoryMessageRef) => void;
+  // Anchor messageId of the branch request in flight; the matching row shows
+  // a spinner and every branch button disables until it settles.
+  branchPendingMessageId?: string | null;
   onSuggestionSelect?: (text: string) => void;
   suggestionsDisabled?: boolean;
   readOnly?: boolean;
@@ -957,9 +962,19 @@ function GatewayAssistantMessageActions(props: {
     text: string,
     uploadedFiles: PendingUploadedFile[],
   ) => void;
+  onBranchConversation?: (messageRef: HistoryMessageRef) => void;
+  branchPendingMessageId?: string | null;
 }) {
-  const { row, retryTarget, isStreaming, copiedMessageId, setCopiedMessageId, onResendFromEdit } =
-    props;
+  const {
+    row,
+    retryTarget,
+    isStreaming,
+    copiedMessageId,
+    setCopiedMessageId,
+    onResendFromEdit,
+    onBranchConversation,
+    branchPendingMessageId,
+  } = props;
   const { locale, t } = useLocale();
   const isCopied = copiedMessageId === row.key;
   const replyText = row.rounds
@@ -973,6 +988,11 @@ function GatewayAssistantMessageActions(props: {
     : locale === "en-US"
       ? "This reply cannot be retried because its prompt has no stable message identifier."
       : "旧历史缺少稳定消息标识，无法重试";
+  const branchPending = branchPendingMessageId != null;
+  const isRowBranchPending =
+    branchPending && !!retryMessageRef && branchPendingMessageId === retryMessageRef.messageId;
+  const branchDisabled = isStreaming || !onBranchConversation || !retryMessageRef || branchPending;
+  const branchTitle = retryMessageRef ? t("chat.branch") : t("chat.branchUnavailable");
 
   return (
     <div className="assistant-bubble-shell flex w-full max-w-full items-start gap-3">
@@ -981,7 +1001,9 @@ function GatewayAssistantMessageActions(props: {
         <span className="select-none text-[calc(11px*var(--zone-font-scale,1))] tabular-nums text-muted-foreground/70">
           {formatMessageTimestamp(row.timestamp)}
         </span>
-        <div className="flex gap-0.5 opacity-0 transition-opacity group-focus-within/assistant:opacity-100 group-hover/assistant:opacity-100">
+        <div
+          className={`flex gap-0.5 transition-opacity group-focus-within/assistant:opacity-100 group-hover/assistant:opacity-100 ${isRowBranchPending ? "opacity-100" : "opacity-0"}`}
+        >
           <button
             type="button"
             className="chat-assistant-action rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
@@ -1020,6 +1042,35 @@ function GatewayAssistantMessageActions(props: {
                 onClick={open}
               >
                 <RefreshCw className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </ConfirmActionPopover>
+          <ConfirmActionPopover
+            title={t("chat.branchConfirmTitle")}
+            description={t("chat.branchConfirmDescription")}
+            confirmLabel={t("chat.branch")}
+            tone="default"
+            align="start"
+            side="top"
+            onConfirm={() => {
+              if (!retryMessageRef) return;
+              onBranchConversation?.(retryMessageRef);
+            }}
+          >
+            {(open) => (
+              <button
+                type="button"
+                className={`chat-assistant-action rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground disabled:cursor-not-allowed ${isRowBranchPending ? "" : "disabled:opacity-40"}`}
+                title={branchTitle}
+                aria-label={branchTitle}
+                disabled={branchDisabled}
+                onClick={open}
+              >
+                {isRowBranchPending ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <GitBranch className="h-3.5 w-3.5" />
+                )}
               </button>
             )}
           </ConfirmActionPopover>
@@ -1096,6 +1147,8 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
     text: string,
     uploadedFiles: PendingUploadedFile[],
   ) => void;
+  onBranchConversation?: (messageRef: HistoryMessageRef) => void;
+  branchPendingMessageId?: string | null;
   toolStatus?: string | null;
   toolStatusIsCompaction: boolean;
   readOnly?: boolean;
@@ -1119,6 +1172,8 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
     gitClient,
     onLoadUploadedImagePreview,
     onResendFromEdit,
+    onBranchConversation,
+    branchPendingMessageId,
     toolStatus,
     toolStatusIsCompaction,
     readOnly = false,
@@ -1421,6 +1476,8 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
                     copiedMessageId={copiedMessageId}
                     setCopiedMessageId={setCopiedMessageId}
                     onResendFromEdit={onResendFromEdit}
+                    onBranchConversation={onBranchConversation}
+                    branchPendingMessageId={branchPendingMessageId}
                   />
                 ) : null}
               </div>
@@ -1487,6 +1544,8 @@ export function GatewayTranscript({
   gitClient,
   onLoadUploadedImagePreview,
   onResendFromEdit,
+  onBranchConversation,
+  branchPendingMessageId,
   onSuggestionSelect,
   suggestionsDisabled = false,
   readOnly = false,
@@ -1554,6 +1613,8 @@ export function GatewayTranscript({
           gitClient={gitClient}
           onLoadUploadedImagePreview={onLoadUploadedImagePreview}
           onResendFromEdit={onResendFromEdit}
+          onBranchConversation={onBranchConversation}
+          branchPendingMessageId={branchPendingMessageId}
           toolStatus={toolStatus}
           toolStatusIsCompaction={toolStatusIsCompaction}
           readOnly={readOnly}
