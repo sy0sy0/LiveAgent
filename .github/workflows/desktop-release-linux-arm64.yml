@@ -87,7 +87,7 @@ jobs:
           --config src-tauri/tauri.linux.release.conf.json
           --config "$LIVEAGENT_TAURI_VERSION_CONFIG"
           --target aarch64-unknown-linux-gnu
-          --bundles appimage deb rpm
+          --bundles deb rpm
 
       - name: Stage Linux artifacts
         run: |
