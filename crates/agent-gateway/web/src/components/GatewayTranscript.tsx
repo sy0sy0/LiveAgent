@@ -45,6 +45,7 @@ import {
 import {
   AssistantAvatar,
   AssistantBubble,
+  AssistantStatus,
   CompactingText,
   VibingText,
 } from "@/pages/chat/AssistantBubble";
@@ -130,29 +131,16 @@ function resolveNearestScrollViewport(element: HTMLElement | null) {
   return element?.closest("[data-radix-scroll-area-viewport]") as HTMLDivElement | null;
 }
 
-function TypingDots() {
-  return (
-    <div className="flex items-center gap-2 py-1">
-      <div className="flex gap-1">
-        <span className="typing-dot inline-block h-1.5 w-1.5 rounded-full bg-muted-foreground/40" />
-        <span className="typing-dot inline-block h-1.5 w-1.5 rounded-full bg-muted-foreground/40" />
-        <span className="typing-dot inline-block h-1.5 w-1.5 rounded-full bg-muted-foreground/40" />
-      </div>
-    </div>
-  );
-}
-
 function LiveStatusFooter(props: { status: string; isCompaction?: boolean }) {
   const { status, isCompaction = false } = props;
   return (
-    <div className="gateway-live-status-footer ml-9 flex items-center gap-2 pt-1 text-[calc(13px*var(--zone-font-scale,1))]">
-      <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+    <div className="gateway-live-status-footer ml-9 pt-1">
       {isCompaction ? (
-        <CompactingText className="font-medium text-muted-foreground" />
+        <CompactingText />
       ) : status === VIBING_STATUS ? (
-        <VibingText className="font-medium text-muted-foreground" />
+        <VibingText />
       ) : (
-        <span className="font-medium text-muted-foreground">{status}</span>
+        <AssistantStatus>{status}</AssistantStatus>
       )}
     </div>
   );
@@ -1333,28 +1321,34 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
                 <div className="min-w-0 flex-1 pt-1">
                   {displayedToolStatusIsCompaction ? (
                     <div className="flex items-center py-1">
-                      <CompactingText className="text-sm font-medium text-muted-foreground" />
+                      <CompactingText />
                     </div>
                   ) : isAgentMode ? (
                     displayedToolStatus === VIBING_STATUS ? (
                       <div className="flex items-center py-1">
-                        <VibingText className="text-sm font-medium text-muted-foreground" />
+                        <VibingText />
                       </div>
                     ) : displayedToolStatus ? (
-                      <div className="py-1 text-sm text-muted-foreground">
-                        {displayedToolStatus}
+                      <div className="py-1">
+                        <AssistantStatus>{displayedToolStatus}</AssistantStatus>
                       </div>
                     ) : (
-                      <TypingDots />
+                      <div className="py-1">
+                        <VibingText />
+                      </div>
                     )
                   ) : displayedToolStatus === VIBING_STATUS ? (
                     <div className="flex items-center py-1">
-                      <VibingText className="text-sm font-medium text-muted-foreground" />
+                      <VibingText />
                     </div>
                   ) : displayedToolStatus ? (
-                    <div className="py-1 text-sm text-muted-foreground">{displayedToolStatus}</div>
+                    <div className="py-1">
+                      <AssistantStatus>{displayedToolStatus}</AssistantStatus>
+                    </div>
                   ) : (
-                    <TypingDots />
+                    <div className="py-1">
+                      <VibingText />
+                    </div>
                   )}
                 </div>
               </div>

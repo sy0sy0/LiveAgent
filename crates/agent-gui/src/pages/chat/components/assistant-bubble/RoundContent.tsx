@@ -1,39 +1,33 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 
-import { ChevronRight, Loader2, Sparkles } from "../../../../components/icons";
+import { ChevronRight, Lightbulb } from "../../../../components/icons";
 import { Markdown } from "../../../../components/Markdown";
 import { useLocale } from "../../../../i18n";
-import type { UiRound } from "../../../../lib/chat/messages/uiMessages";
+import type { ToolTraceItem, UiRound } from "../../../../lib/chat/messages/uiMessages";
 import { normalizeLiveToolStatus, VIBING_STATUS } from "../../../../lib/chat/page/chatPageHelpers";
-import { useScrollFollow } from "../../../../lib/chat-scroll/useScrollFollow";
 import { groupRoundBlocks } from "./assistantBubbleUtils";
 import { HostedSearchGroupView } from "./HostedSearchGroupView";
-import { CompactingText, VibingText } from "./StatusText";
-import { TodoListBlock } from "./TodoListView";
+import { AssistantStatus, CompactingText, VibingText } from "./StatusText";
 import { MemoToolCallItem } from "./ToolCallItem";
 import { getNativeDisplayImagePayload, NativeDisplayImageBlock } from "./ToolImages";
 import { ToolTraceGroup } from "./ToolTraceGroup";
 import { UsagePanel } from "./UsagePanel";
 
-function ThinkingBlock({ text, open }: { text: string; open?: boolean }) {
+function ThinkingBlock({
+  text,
+  open,
+  isRunning,
+  renderMode,
+}: {
+  text: string;
+  open?: boolean;
+  isRunning?: boolean;
+  renderMode: "streaming" | "static";
+}) {
   const hasText = /\S/.test(text || "");
   const { t } = useLocale();
   const [isOpen, setIsOpen] = useState(typeof open === "boolean" ? open : false);
   const userInteractedRef = useRef(false);
-  const [thinkingPre, setThinkingPre] = useState<HTMLPreElement | null>(null);
-  const [thinkingContent, setThinkingContent] = useState<HTMLElement | null>(null);
-
-  // Same engine as the transcript viewport, minus the reattach zone (there is
-  // no reserve band inside the <pre>). The ResizeObserver target must be the
-  // inner content element: once max-h-64 clamps the <pre>, its border box
-  // stops resizing while scrollHeight keeps growing.
-  useScrollFollow({
-    viewport: thinkingPre,
-    content: thinkingContent,
-    enabled: isOpen && hasText,
-    config: { reattachZonePx: 0 },
-  });
-
   useEffect(() => {
     if (!userInteractedRef.current && typeof open === "boolean") {
       setIsOpen(open);
@@ -43,7 +37,7 @@ function ThinkingBlock({ text, open }: { text: string; open?: boolean }) {
   if (!hasText) return null;
 
   return (
-    <div className="group/think rounded-lg border border-border/40 bg-muted/30">
+    <div className="group/think w-full">
       <button
         type="button"
         aria-expanded={isOpen}
@@ -51,33 +45,41 @@ function ThinkingBlock({ text, open }: { text: string; open?: boolean }) {
           userInteractedRef.current = true;
           setIsOpen((prev) => !prev);
         }}
-        className="thinking-block-toggle flex w-full cursor-pointer select-none items-center gap-2 px-3 py-2 text-[calc(13px*var(--zone-font-scale,1))] text-muted-foreground transition-colors hover:text-foreground"
+        className="thinking-block-toggle flex w-full cursor-pointer select-none items-center gap-2 py-1.5 text-left text-[calc(13px*var(--zone-font-scale,1))] font-normal text-muted-foreground/80 hover:text-foreground"
       >
-        <Sparkles className="h-3.5 w-3.5 text-muted-foreground/70" />
-        <span className="thinking-block-label font-medium">{t("chat.thinkingProcess")}</span>
+        {isRunning ? (
+          <AssistantStatus className="min-h-0">{t("chat.thinking")}</AssistantStatus>
+        ) : (
+          <>
+            <Lightbulb className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
+            <span className="thinking-block-label">{t("chat.thinkingProcess")}</span>
+          </>
+        )}
         <ChevronRight
-          className={`ml-auto h-3 w-3 transition-transform ${isOpen ? "rotate-90" : ""}`}
+          className={`ml-auto h-3.5 w-3.5 text-muted-foreground/60 transition-transform duration-200 ease-out ${isOpen ? "rotate-90" : ""}`}
         />
       </button>
-      {isOpen ? (
-        <div className="border-t border-border/30 px-3 pb-3 pt-2">
-          <pre
-            ref={setThinkingPre}
-            className="thinking-block-pre max-h-64 overflow-auto whitespace-pre-wrap rounded-md bg-muted/40 p-3 text-[calc(12.5px*var(--zone-font-scale,1))] leading-relaxed text-muted-foreground"
-          >
-            <code ref={setThinkingContent} className="block font-[inherit]">
-              {text}
-            </code>
-          </pre>
+      <div
+        aria-hidden={!isOpen}
+        className={`grid transition-[grid-template-rows,opacity] duration-200 ease-out ${isOpen ? "grid-rows-[1fr] opacity-100" : "pointer-events-none grid-rows-[0fr] opacity-0"}`}
+      >
+        <div className="min-h-0 overflow-hidden">
+          <div className="pb-1 pt-1.5">
+            <Markdown
+              content={text}
+              className="thinking-markdown space-y-1.5"
+              renderMode={renderMode}
+              showCaret={false}
+            />
+          </div>
         </div>
-      ) : null}
+      </div>
     </div>
   );
 }
 
 export const RoundContent = memo(function RoundContent(props: {
   round: UiRound;
-  showLabel: boolean;
   showUsage?: boolean;
   usageContextWindow?: number;
   isLive?: boolean;
@@ -89,10 +91,10 @@ export const RoundContent = memo(function RoundContent(props: {
   toolStatusVariant?: "default" | "compaction";
   runningToolCallIds?: string[];
   thinkingOpen?: boolean;
+  latestTodoItem?: ToolTraceItem | null;
 }) {
   const {
     round,
-    showLabel,
     showUsage,
     usageContextWindow,
     isLive,
@@ -102,10 +104,30 @@ export const RoundContent = memo(function RoundContent(props: {
     toolStatusVariant,
     runningToolCallIds,
     thinkingOpen,
+    latestTodoItem,
   } = props;
+  const groupedBlocks = useMemo(() => groupRoundBlocks(round.blocks), [round.blocks]);
+  const visibleGroupedBlocks = useMemo(
+    () =>
+      groupedBlocks.filter(
+        (block) =>
+          !latestTodoItem ||
+          block.kind !== "tool" ||
+          block.item.toolCall.name !== "TodoWrite" ||
+          block.item === latestTodoItem,
+      ),
+    [groupedBlocks, latestTodoItem],
+  );
   const hasContent =
-    round.blocks.some((block) => {
-      if (block.kind === "tool" || block.kind === "hostedSearch") return true;
+    visibleGroupedBlocks.some((block) => {
+      if (
+        block.kind === "tool" ||
+        block.kind === "toolGroup" ||
+        block.kind === "hostedSearch" ||
+        block.kind === "hostedSearchGroup"
+      ) {
+        return true;
+      }
       return block.text.trim().length > 0;
     }) ||
     (isActive && isLive);
@@ -113,42 +135,56 @@ export const RoundContent = memo(function RoundContent(props: {
     isActive && isLive ? normalizeLiveToolStatus(toolStatus ?? null) : null;
   const isCompactionStatus = toolStatusVariant === "compaction";
   const isVibingStatus = normalizedToolStatus === VIBING_STATUS;
-  const groupedBlocks = useMemo(() => groupRoundBlocks(round.blocks), [round.blocks]);
+  const hasRunningToolCall = useMemo(() => {
+    const runningIds = new Set(runningToolCallIds ?? []);
+    return visibleGroupedBlocks.some((block) => {
+      if (block.kind === "tool")
+        return Boolean(block.item.toolCall.id && runningIds.has(block.item.toolCall.id));
+      if (block.kind === "toolGroup") {
+        return block.items.some((item) =>
+          Boolean(item.toolCall.id && runningIds.has(item.toolCall.id)),
+        );
+      }
+      return false;
+    });
+  }, [runningToolCallIds, visibleGroupedBlocks]);
   const latestThinkingKey = useMemo(() => {
-    for (let index = groupedBlocks.length - 1; index >= 0; index -= 1) {
-      const block = groupedBlocks[index];
+    for (let index = visibleGroupedBlocks.length - 1; index >= 0; index -= 1) {
+      const block = visibleGroupedBlocks[index];
       if (block?.kind === "thinking") return block.key;
     }
     return null;
-  }, [groupedBlocks]);
+  }, [visibleGroupedBlocks]);
   const autoOpenThinking = isLive ? Boolean(isActive && thinkingOpen) : false;
 
   if (!hasContent) return null;
 
   return (
-    <div className="space-y-3">
-      {showLabel ? <div className="h-px bg-border/40" /> : null}
-
-      {isActive && isLive && normalizedToolStatus ? (
-        <div className="flex items-center gap-2 py-1 text-[calc(13px*var(--zone-font-scale,1))]">
-          <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+    <div className="space-y-2">
+      {isActive &&
+      isLive &&
+      normalizedToolStatus &&
+      (!hasRunningToolCall || isCompactionStatus || isVibingStatus) ? (
+        <div className="py-1.5">
           {isCompactionStatus ? (
-            <CompactingText className="font-medium text-muted-foreground" />
+            <CompactingText />
           ) : isVibingStatus ? (
-            <VibingText className="font-medium text-muted-foreground" />
+            <VibingText />
           ) : (
-            <span className="font-medium text-muted-foreground">{normalizedToolStatus}</span>
+            <AssistantStatus>{normalizedToolStatus}</AssistantStatus>
           )}
         </div>
       ) : null}
 
-      {groupedBlocks.map((block) => {
+      {visibleGroupedBlocks.map((block) => {
         if (block.kind === "thinking") {
           return (
             <ThinkingBlock
               key={block.key}
               text={block.text}
               open={autoOpenThinking && block.key === latestThinkingKey}
+              isRunning={autoOpenThinking && block.key === latestThinkingKey}
+              renderMode={renderMode ?? (isLive ? "streaming" : "static")}
             />
           );
         }
@@ -161,12 +197,6 @@ export const RoundContent = memo(function RoundContent(props: {
 
           if (block.item.toolCall.name === "Image" && !block.item.toolResult?.isError) {
             return null;
-          }
-
-          // TodoWrite renders as a bare checklist in the reply flow; only
-          // failed calls fall through to the tool card so the error is visible.
-          if (block.item.toolCall.name === "TodoWrite" && !block.item.toolResult?.isError) {
-            return <TodoListBlock key={block.key} item={block.item} />;
           }
 
           return (

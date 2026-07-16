@@ -1681,12 +1681,7 @@ export const ChatHistorySidebar = memo(function ChatHistorySidebar(props: ChatHi
               <span className="truncate">{t("tooltip.settings")}</span>
             </Button>
             {appUpdate?.showUpdateButton ? (
-              <AppUpdateButton
-                appUpdate={appUpdate}
-                iconOnly
-                iconClassName="h-4 w-4"
-                className="h-8 w-8 rounded-lg bg-transparent px-0 text-foreground/75 shadow-none hover:bg-foreground/[0.08] hover:text-foreground active:bg-foreground/[0.1]"
-              />
+              <AppUpdateButton appUpdate={appUpdate} iconOnly />
             ) : null}
           </div>
         </div>

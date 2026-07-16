@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 
 import { ChevronRight, Terminal } from "../../../../components/icons";
 import { useLocale } from "../../../../i18n";
@@ -11,6 +11,7 @@ import {
   getToolMeta,
   getToolTraceKey,
 } from "./assistantBubbleUtils";
+import { AssistantStatus } from "./StatusText";
 import { MemoToolCallItem } from "./ToolCallItem";
 
 export function ToolTraceGroup(props: { items: ToolTraceItem[]; runningToolCallIds?: string[] }) {
@@ -28,24 +29,7 @@ export function ToolTraceGroup(props: { items: ToolTraceItem[]; runningToolCallI
     [allBash, dominantToolName],
   );
   const ToolIcon = allBash ? Terminal : meta.Icon;
-  const shouldAutoOpen = counts.failed > 0 || (counts.running > 0 && items.length <= 3);
-  // Auto-collapse is state-driven, not remount-driven: the live bubble can
-  // keep this instance mounted long after the burst settles, so the group
-  // must fold itself once every call has a non-error result. Failed groups
-  // stay open (mirroring auto-open); `waiting` keeps groups whose results
-  // never landed (e.g. aborted runs) untouched.
-  const shouldAutoClose = counts.running === 0 && counts.waiting === 0 && counts.failed === 0;
-  const [open, setOpen] = useState(shouldAutoOpen);
-  const userInteractedRef = useRef(false);
-
-  useEffect(() => {
-    if (userInteractedRef.current) return;
-    if (shouldAutoOpen) {
-      setOpen(true);
-    } else if (shouldAutoClose) {
-      setOpen(false);
-    }
-  }, [shouldAutoOpen, shouldAutoClose]);
+  const [open, setOpen] = useState(false);
 
   const statusLabel =
     counts.failed > 0
@@ -56,93 +40,74 @@ export function ToolTraceGroup(props: { items: ToolTraceItem[]; runningToolCallI
           ? `${counts.waiting} ${t("chat.tool.waiting")}`
           : t("chat.tool.success");
 
-  const statusBgClass =
-    counts.failed > 0
-      ? "bg-[hsl(var(--chat-error)/0.1)] text-[hsl(var(--chat-error))]"
-      : counts.running > 0
-        ? "bg-[hsl(var(--chat-running)/0.1)] text-[hsl(var(--chat-running))]"
-        : counts.waiting > 0
-          ? "bg-black/[0.05] text-muted-foreground dark:bg-white/[0.08]"
-          : "bg-[hsl(var(--chat-success)/0.1)] text-[hsl(var(--chat-success))]";
-
-  const dotClass =
-    counts.failed > 0
-      ? "bg-[hsl(var(--chat-error))]"
-      : counts.running > 0
-        ? "bg-[hsl(var(--chat-running))] animate-pulse"
-        : counts.waiting > 0
-          ? "bg-zinc-400"
-          : "bg-[hsl(var(--chat-success))]";
+  const statusTextClass =
+    counts.failed > 0 ? "text-[hsl(var(--chat-error))]" : "text-muted-foreground/60";
 
   const countLabel = `${items.length} tools`;
   const title = allBash ? "Bash Batch" : "Tool Activity";
 
   return (
-    <div className="tool-trace-group overflow-hidden rounded-[12px] border border-black/[0.06] bg-white/[0.62] shadow-[0_1px_2px_rgba(0,0,0,0.03)] backdrop-blur-xl backdrop-saturate-[1.6] dark:border-white/[0.1] dark:bg-white/[0.055] dark:shadow-none">
+    <div className="group/tool-trace min-w-0 max-w-full">
       <button
         type="button"
         aria-expanded={open}
         aria-label={open ? t("chat.tool.collapseActivity") : t("chat.tool.expandActivity")}
-        className="grid w-full cursor-pointer select-none grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 px-2.5 py-2 text-left transition-colors hover:bg-black/[0.018] dark:hover:bg-white/[0.025]"
-        onClick={() => {
-          userInteractedRef.current = true;
-          setOpen((prev) => !prev);
-        }}
+        className="grid w-full cursor-pointer select-none grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 py-1.5 text-left"
+        onClick={() => setOpen((prev) => !prev)}
       >
-        <div
-          className="flex h-[24px] w-[24px] shrink-0 items-center justify-center rounded-[7px]"
-          style={{
-            background: `linear-gradient(135deg, hsl(${meta.accent} / 0.13), hsl(${meta.accent} / 0.06))`,
-          }}
-        >
-          <ToolIcon className="h-3.5 w-3.5" style={{ color: `hsl(${meta.accent})` }} />
-        </div>
+        <ToolIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60 group-hover/tool-trace:text-foreground/75" />
 
-        <div className="grid min-w-0 grid-cols-[auto_auto_minmax(0,1fr)] items-center gap-2">
-          <span className="min-w-0 truncate text-[calc(12.5px*var(--zone-font-scale,1))] font-semibold leading-5 text-foreground/90">
+        <div className="min-w-0 truncate text-[calc(11px*var(--zone-font-scale,1))] leading-5 text-muted-foreground/55">
+          <span className="font-sans text-[calc(13px*var(--zone-font-scale,1))] font-normal text-muted-foreground/80 group-hover/tool-trace:text-foreground">
             {title}
           </span>
-          <span className="inline-flex h-5 shrink-0 items-center rounded-full bg-black/[0.04] px-1.5 text-[calc(10.5px*var(--zone-font-scale,1))] font-semibold leading-none text-muted-foreground/70 dark:bg-white/[0.06]">
-            {countLabel}
-          </span>
-          {composition ? (
-            <span className="inline-flex h-5 min-w-0 items-center truncate font-mono text-[calc(11px*var(--zone-font-scale,1))] leading-none text-muted-foreground/55">
-              {composition}
-            </span>
-          ) : null}
+          <span className="ml-2">{countLabel}</span>
+          {composition ? <span className="ml-2 font-mono">{composition}</span> : null}
         </div>
 
-        <div className="flex h-5 shrink-0 items-center gap-1.5">
-          <span className={cn("inline-block h-1.5 w-1.5 rounded-full", dotClass)} />
-          <span
-            className={cn(
-              "inline-flex h-5 items-center rounded-full px-1.5 text-[calc(10px*var(--zone-font-scale,1))] font-semibold leading-none",
-              statusBgClass,
-            )}
-          >
-            {statusLabel}
-          </span>
+        <div className="flex shrink-0 items-center gap-2">
+          {counts.running > 0 ? (
+            <AssistantStatus
+              className="min-h-0 gap-1.5 text-[calc(11px*var(--zone-font-scale,1))] text-muted-foreground/60"
+              iconClassName="h-3 w-3"
+            >
+              {statusLabel}
+            </AssistantStatus>
+          ) : (
+            <span className={cn("text-[calc(11px*var(--zone-font-scale,1))]", statusTextClass)}>
+              {statusLabel}
+            </span>
+          )}
           <ChevronRight
             className={cn(
-              "h-3 w-3 text-muted-foreground/35 transition-transform duration-200 ease-out",
+              "h-3.5 w-3.5 text-muted-foreground/60 transition-transform duration-200 ease-out",
               open ? "rotate-90" : "",
             )}
           />
         </div>
       </button>
 
-      {open ? (
-        <div className="tool-trace-group-body space-y-1.5 border-t border-black/[0.04] p-1.5 dark:border-white/[0.05]">
-          {items.map((item, index) => (
-            <MemoToolCallItem
-              key={getToolTraceKey(item, index)}
-              item={item}
-              variant="grouped"
-              isRunning={Boolean(item.toolCall.id && runningToolCallIds.includes(item.toolCall.id))}
-            />
-          ))}
+      <div
+        aria-hidden={!open}
+        className={cn(
+          "grid transition-[grid-template-rows,opacity] duration-200 ease-out",
+          open ? "grid-rows-[1fr] opacity-100" : "pointer-events-none grid-rows-[0fr] opacity-0",
+        )}
+      >
+        <div className="min-h-0 overflow-hidden">
+          <div className="space-y-0.5 pb-2 pl-[22px] pt-1">
+            {items.map((item, index) => (
+              <MemoToolCallItem
+                key={getToolTraceKey(item, index)}
+                item={item}
+                isRunning={Boolean(
+                  item.toolCall.id && runningToolCallIds.includes(item.toolCall.id),
+                )}
+              />
+            ))}
+          </div>
         </div>
-      ) : null}
+      </div>
     </div>
   );
 }

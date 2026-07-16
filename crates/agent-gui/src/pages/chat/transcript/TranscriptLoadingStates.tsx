@@ -1,18 +1,6 @@
 import { LoaderCircle } from "../../../components/icons";
 import { useLocale } from "../../../i18n";
 
-export function TypingDots() {
-  return (
-    <div className="flex items-center gap-2 py-1">
-      <div className="flex gap-1">
-        <span className="typing-dot inline-block h-1.5 w-1.5 rounded-full bg-muted-foreground/40" />
-        <span className="typing-dot inline-block h-1.5 w-1.5 rounded-full bg-muted-foreground/40" />
-        <span className="typing-dot inline-block h-1.5 w-1.5 rounded-full bg-muted-foreground/40" />
-      </div>
-    </div>
-  );
-}
-
 export function HistorySwitchLoadingOverlay() {
   const { locale } = useLocale();
   const label = locale === "en-US" ? "Loading conversation..." : "正在加载对话...";

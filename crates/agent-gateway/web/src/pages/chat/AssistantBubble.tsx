@@ -1,10 +1,10 @@
-import { memo } from "react";
+import { memo, useMemo } from "react";
 import type { UiRound } from "../../lib/chat/uiMessages";
 import { AssistantAvatar } from "./assistant-bubble/AssistantAvatar";
 import { RoundContent } from "./assistant-bubble/RoundContent";
 
 export { AssistantAvatar } from "./assistant-bubble/AssistantAvatar";
-export { CompactingText, VibingText } from "./assistant-bubble/StatusText";
+export { AssistantStatus, CompactingText, VibingText } from "./assistant-bubble/StatusText";
 
 const EMPTY_RUNNING_TOOL_CALL_IDS: string[] = [];
 
@@ -44,17 +44,27 @@ export const AssistantBubble = memo(function AssistantBubble(props: {
     readOnly = false,
     redactToolContent = false,
   } = props;
-  const showLabels = rounds.length > 1;
+  const latestTodoItem = useMemo(() => {
+    for (let roundIndex = rounds.length - 1; roundIndex >= 0; roundIndex -= 1) {
+      const blocks = rounds[roundIndex]?.blocks ?? [];
+      for (let blockIndex = blocks.length - 1; blockIndex >= 0; blockIndex -= 1) {
+        const block = blocks[blockIndex];
+        if (block?.kind === "tool" && block.item.toolCall.name === "TodoWrite") {
+          return block.item;
+        }
+      }
+    }
+    return null;
+  }, [rounds]);
 
   return (
     <div className="assistant-bubble-shell flex w-full max-w-full items-start gap-3">
       <AssistantAvatar className="assistant-bubble-avatar" />
-      <div className="assistant-bubble-content min-w-0 flex-1 space-y-3 pt-0.5">
+      <div className="assistant-bubble-content min-w-0 flex-1 space-y-2 pt-0.5">
         {rounds.map((round, idx) => (
           <RoundContent
             key={"key" in round && round.key ? round.key : `round-${round.round}`}
             round={round}
-            showLabel={showLabels}
             showUsage={showUsage}
             usageContextWindow={usageContextWindow}
             isLive={isLive}
@@ -67,6 +77,7 @@ export const AssistantBubble = memo(function AssistantBubble(props: {
             thinkingOpen={round.thinkingOpen}
             readOnly={readOnly}
             redactToolContent={redactToolContent}
+            latestTodoItem={latestTodoItem}
           />
         ))}
       </div>

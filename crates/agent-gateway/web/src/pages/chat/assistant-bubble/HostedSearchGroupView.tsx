@@ -1,8 +1,9 @@
 import { useMemo, useState } from "react";
-import { ChevronRight, Search } from "../../../components/icons";
+import { ChevronRight, Globe } from "../../../components/icons";
 import { useLocale } from "../../../i18n";
 import type { HostedSearchBlock } from "../../../lib/chat/hostedSearch";
 import { cn } from "../../../lib/shared/utils";
+import { AssistantStatus } from "./StatusText";
 
 function getHostedSearchStatusLabel(
   t: (key: string) => string,
@@ -13,7 +14,6 @@ function getHostedSearchStatusLabel(
       return t("chat.search.failed");
     case "completed":
       return t("chat.search.completed");
-    case "searching":
     default:
       return t("chat.search.searching");
   }
@@ -93,135 +93,112 @@ export function HostedSearchGroupView({
   const status = getHostedSearchGroupStatus(items);
   const statusLabel = getHostedSearchStatusLabel(t, status);
   const latestTitle = getLatestHostedSearchTitle(items, t, status);
-  const isSearching = status === "searching";
   const hasDetails = queries.length > 0 || visibleSources.length > 0;
-  const statusBgClass =
-    status === "failed"
-      ? "bg-[hsl(var(--chat-error)/0.1)] text-[hsl(var(--chat-error))]"
-      : status === "searching"
-        ? "bg-[hsl(var(--chat-running)/0.1)] text-[hsl(var(--chat-running))]"
-        : "bg-[hsl(var(--chat-success)/0.1)] text-[hsl(var(--chat-success))]";
-  const dotClass =
-    status === "failed"
-      ? "bg-[hsl(var(--chat-error))]"
-      : status === "searching"
-        ? "bg-[hsl(var(--chat-running))] animate-pulse"
-        : "bg-[hsl(var(--chat-success))]";
 
   return (
-    <div
-      className={cn(
-        "tool-card-enter min-w-0 max-w-full overflow-hidden rounded-[12px] border border-black/[0.06] bg-white/[0.72] shadow-[0_0_0_0.5px_rgba(0,0,0,0.03),0_1px_2px_rgba(0,0,0,0.03),0_2px_6px_rgba(0,0,0,0.02)] backdrop-blur-xl backdrop-saturate-[1.8] transition-shadow duration-200 dark:border-white/[0.1] dark:bg-white/[0.06] dark:shadow-[0_0_0_0.5px_rgba(255,255,255,0.04),0_1px_2px_rgba(0,0,0,0.2),0_3px_8px_rgba(0,0,0,0.12)] dark:backdrop-saturate-[1.4]",
-        !readOnly &&
-          "hover:shadow-[0_0_0_0.5px_rgba(0,0,0,0.04),0_1px_3px_rgba(0,0,0,0.05),0_4px_14px_rgba(0,0,0,0.04)] dark:hover:shadow-[0_0_0_0.5px_rgba(255,255,255,0.06),0_1px_3px_rgba(0,0,0,0.25),0_4px_14px_rgba(0,0,0,0.18)]",
-      )}
-    >
+    <div className="min-w-0 max-w-full">
       <button
         type="button"
         aria-expanded={open}
         aria-label={open ? t("chat.search.collapseActivity") : t("chat.search.expandActivity")}
         className={cn(
-          "grid w-full select-none grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-2 gap-y-1 px-2.5 py-2 text-left transition-colors sm:items-center",
-          "cursor-pointer hover:bg-black/[0.018] active:bg-black/[0.035] dark:hover:bg-white/[0.025] dark:active:bg-white/[0.045]",
+          "group/search flex w-full select-none items-center justify-between gap-3 py-1.5 text-left",
+          !readOnly && "cursor-pointer",
         )}
         onClick={() => setOpen((prev) => !prev)}
       >
-        <div
-          className="relative mt-0.5 flex h-[24px] w-[24px] shrink-0 items-center justify-center rounded-[7px] sm:mt-0"
-          style={{
-            background:
-              "linear-gradient(135deg, hsl(var(--tool-search-accent) / 0.13), hsl(var(--tool-search-accent) / 0.06))",
-          }}
-        >
-          {isSearching ? (
-            <span className="absolute inset-0 animate-ping rounded-[7px] bg-[hsl(var(--tool-search-accent)/0.16)]" />
-          ) : null}
-          <Search className="relative h-3.5 w-3.5 text-[hsl(var(--tool-search-accent))]" />
-        </div>
-
-        <div className="min-w-0 space-y-0.5 sm:grid sm:grid-cols-[auto_minmax(0,1fr)] sm:items-center sm:gap-2 sm:space-y-0">
-          <div className="flex min-w-0 items-center gap-1.5">
-            <span className="inline-flex h-5 shrink-0 items-center text-[calc(12.5px*var(--zone-font-scale,1))] font-semibold leading-none text-foreground/90">
-              {t("chat.search.webSearch")}
-            </span>
-            <span className="inline-flex h-5 max-w-[5.75rem] shrink-0 items-center truncate rounded-full bg-black/[0.04] px-1.5 text-[calc(10.5px*var(--zone-font-scale,1))] font-semibold leading-none text-muted-foreground/70 dark:bg-white/[0.06]">
-              {getHostedSearchCountLabel(items.length, t)}
-            </span>
-          </div>
-          <span
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <Globe className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60 group-hover/search:text-foreground/75" />
+          <div
             key={latestTitle}
-            className={cn(
-              "block h-4 min-w-0 truncate text-[calc(11px*var(--zone-font-scale,1))] leading-4 text-muted-foreground/60 transition-opacity duration-200 sm:inline-flex sm:h-5 sm:items-center sm:leading-none",
-              isSearching ? "animate-pulse" : "",
-            )}
+            className="min-w-0 truncate text-[calc(11px*var(--zone-font-scale,1))] leading-5 text-muted-foreground/55"
             title={latestTitle}
           >
-            {latestTitle}
-          </span>
+            <span className="font-sans text-[calc(13px*var(--zone-font-scale,1))] text-muted-foreground/80 group-hover/search:text-foreground">
+              {t("chat.search.webSearch")}
+            </span>
+            <span className="ml-2">{getHostedSearchCountLabel(items.length, t)}</span>
+            <span className="ml-2">{latestTitle}</span>
+          </div>
         </div>
 
-        <div className="flex h-5 min-w-0 shrink-0 items-center gap-1.5 justify-self-end">
-          <span className={cn("inline-block h-1.5 w-1.5 rounded-full", dotClass)} />
-          <span
-            className={cn(
-              "inline-flex h-5 max-w-[5.5rem] items-center truncate rounded-full px-1.5 text-[calc(10px*var(--zone-font-scale,1))] font-semibold leading-none",
-              statusBgClass,
-            )}
-          >
-            {statusLabel}
-          </span>
+        <div className="flex shrink-0 items-center gap-2">
+          {status === "searching" ? (
+            <AssistantStatus
+              className="min-h-0 gap-1.5 text-[calc(11px*var(--zone-font-scale,1))] text-muted-foreground/60"
+              iconClassName="h-3 w-3"
+            >
+              {statusLabel}
+            </AssistantStatus>
+          ) : (
+            <span className="text-[calc(11px*var(--zone-font-scale,1))] text-muted-foreground/60">
+              {statusLabel}
+            </span>
+          )}
           <ChevronRight
             className={cn(
-              "h-3 w-3 text-muted-foreground/35 transition-transform duration-200 ease-out",
+              "h-3.5 w-3.5 text-muted-foreground/60 transition-transform duration-200 ease-out",
               open ? "rotate-90" : "",
             )}
           />
         </div>
       </button>
 
-      {open && hasDetails ? (
-        <div className="tool-trace-group-body space-y-2 border-t border-black/[0.04] px-2.5 py-2.5 dark:border-white/[0.05]">
-          {queries.length > 0 ? (
-            <div className="flex flex-wrap gap-1.5">
-              {queries.map((query) => (
-                <span
-                  key={query}
-                  className="tool-arg-pill min-w-0 max-w-full truncate rounded-[6px] border border-border/35 bg-background/65 px-2 py-1 text-[calc(12px*var(--zone-font-scale,1))] text-foreground/85"
-                  title={query}
-                >
-                  {query}
-                </span>
-              ))}
-            </div>
-          ) : null}
-
-          {visibleSources.length > 0 ? (
-            <div className="space-y-1.5">
-              <div className="text-[calc(11px*var(--zone-font-scale,1))] font-medium uppercase tracking-normal text-muted-foreground/70">
-                {t("chat.search.sources")}
-              </div>
-              <div className="grid gap-1 sm:grid-cols-2">
-                {visibleSources.map((source) => {
-                  const label = source.title || getSourceHost(source.url);
-                  return (
-                    <a
-                      key={source.url}
-                      href={source.url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="block min-w-0 max-w-full rounded-[6px] border border-transparent px-2 py-1 text-[calc(12px*var(--zone-font-scale,1))] transition-colors hover:border-border/45 hover:bg-background/60"
-                      title={source.url}
+      {hasDetails ? (
+        <div
+          aria-hidden={!open}
+          className={cn(
+            "grid transition-[grid-template-rows,opacity] duration-200 ease-out",
+            open ? "grid-rows-[1fr] opacity-100" : "pointer-events-none grid-rows-[0fr] opacity-0",
+          )}
+        >
+          <div className="min-h-0 overflow-hidden">
+            <div className="space-y-2 pb-2 pt-1.5">
+              {queries.length > 0 ? (
+                <div className="flex flex-wrap gap-x-3 gap-y-1">
+                  {queries.map((query) => (
+                    <span
+                      key={query}
+                      className="min-w-0 max-w-full truncate text-[calc(12px*var(--zone-font-scale,1))] leading-5 text-muted-foreground/75"
+                      title={query}
                     >
-                      <span className="block truncate font-medium text-foreground/85">{label}</span>
-                      <span className="block truncate text-muted-foreground">
-                        {getSourceHost(source.url)}
-                      </span>
-                    </a>
-                  );
-                })}
-              </div>
+                      {query}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+
+              {visibleSources.length > 0 ? (
+                <div className="space-y-1.5">
+                  <div className="text-[calc(11px*var(--zone-font-scale,1))] font-medium uppercase tracking-normal text-muted-foreground/70">
+                    {t("chat.search.sources")}
+                  </div>
+                  <div className="grid gap-1 sm:grid-cols-2">
+                    {visibleSources.map((source) => {
+                      const label = source.title || getSourceHost(source.url);
+                      return (
+                        <a
+                          key={source.url}
+                          href={source.url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="block min-w-0 max-w-full py-0.5 text-[calc(12px*var(--zone-font-scale,1))] hover:text-foreground"
+                          title={source.url}
+                        >
+                          <span className="block truncate font-medium text-foreground/85">
+                            {label}
+                          </span>
+                          <span className="block truncate text-muted-foreground">
+                            {getSourceHost(source.url)}
+                          </span>
+                        </a>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : null}
             </div>
-          ) : null}
+          </div>
         </div>
       ) : null}
     </div>

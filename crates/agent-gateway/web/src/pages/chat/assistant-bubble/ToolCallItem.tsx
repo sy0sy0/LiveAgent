@@ -12,6 +12,7 @@ import {
   toolResultMessageToText,
 } from "../../../lib/chat/uiMessages";
 import { cn } from "../../../lib/shared/utils";
+import { sanitizeTodoItems } from "../TodoListView";
 import { ToolScrollablePre, ToolSection } from "../ToolSurfaces";
 import {
   areStableValuesEqual,
@@ -23,18 +24,17 @@ import {
   isBuiltinShareToolName,
   isSubagentCardToolCall,
 } from "./assistantBubbleUtils";
+import { AssistantStatus } from "./StatusText";
 import { ToolArgsDisplay, ToolResultDisplay } from "./ToolResultDisplay";
 
 function ToolCallItem({
   item,
   isRunning,
-  variant = "standalone",
   readOnly = false,
   redactToolContent = false,
 }: {
   item: ToolTraceItem;
   isRunning?: boolean;
-  variant?: "standalone" | "grouped";
   readOnly?: boolean;
   redactToolContent?: boolean;
 }) {
@@ -42,11 +42,22 @@ function ToolCallItem({
   const result = item.toolResult;
   const builtinResultKind = getBuiltinResultKind(result);
   const isRedactedToolContent = redactToolContent && isBuiltinShareToolName(item.toolCall.name);
+  const isTodo = !isRedactedToolContent && item.toolCall.name === "TodoWrite";
+  const todoItems = isTodo
+    ? sanitizeTodoItems(
+        builtinResultKind === "todo_write"
+          ? (result?.details as { todos?: unknown } | undefined)?.todos
+          : item.toolCall.arguments?.todos,
+      )
+    : [];
+  const hasIncompleteTodo = todoItems.some((todo) => todo.status !== "completed");
+  const shouldKeepTodoOpen =
+    isTodo && (Boolean(isRunning) || !result || Boolean(result.isError) || hasIncompleteTodo);
+  const shouldCloseCompletedTodo =
+    isTodo && Boolean(result && !result.isError) && todoItems.length > 0 && !hasIncompleteTodo;
   const shouldAutoOpen =
     !isRedactedToolContent &&
-    (item.toolCall.name === "Image" ||
-      item.toolCall.name === "TodoWrite" ||
-      builtinResultKind === "display_image");
+    (item.toolCall.name === "Image" || builtinResultKind === "display_image" || shouldKeepTodoOpen);
   const [open, setOpen] = useState(readOnly || isRedactedToolContent ? false : shouldAutoOpen);
   const isSubagentCard = isSubagentCardToolCall(item.toolCall);
   const hasArgs = Object.keys(item.toolCall.arguments || {}).length > 0;
@@ -54,6 +65,7 @@ function ToolCallItem({
   const shouldShowArgs =
     !isRedactedToolContent &&
     (!isSubagentCard || !result) &&
+    (item.toolCall.name !== "TodoWrite" || !result) &&
     (isStreamingFilePreviewTool ? !result : hasArgs);
   const isBash = item.toolCall.name === "Bash";
   const isManagedProcess = item.toolCall.name === "ManagedProcess";
@@ -79,17 +91,12 @@ function ToolCallItem({
   );
   const meta = getToolMeta(item.toolCall.name);
   const ToolIcon = meta.Icon;
-  const title = isRedactedToolContent
-    ? { name: getToolDisplayName(item.toolCall.name), action: "" }
-    : getToolDisplayTitle(item.toolCall);
-
-  const dotClass = isRunning
-    ? "bg-[hsl(var(--chat-running))] animate-pulse"
-    : result
-      ? result.isError
-        ? "bg-[hsl(var(--chat-error))]"
-        : "bg-[hsl(var(--chat-success))]"
-      : "bg-zinc-400";
+  const title =
+    item.toolCall.name === "TodoWrite"
+      ? { name: t("chat.tool.todoTitle"), action: "" }
+      : isRedactedToolContent
+        ? { name: getToolDisplayName(item.toolCall.name), action: "" }
+        : getToolDisplayTitle(item.toolCall);
 
   const statusLabel = isRunning
     ? t("chat.tool.running")
@@ -99,39 +106,37 @@ function ToolCallItem({
         : t("chat.tool.success")
       : t("chat.tool.waiting");
 
-  const statusBgClass = isRunning
-    ? "bg-[hsl(var(--chat-running)/0.1)] text-[hsl(var(--chat-running))]"
-    : result
-      ? result.isError
-        ? "bg-[hsl(var(--chat-error)/0.1)] text-[hsl(var(--chat-error))]"
-        : "bg-[hsl(var(--chat-success)/0.1)] text-[hsl(var(--chat-success))]"
-      : "bg-black/[0.05] text-muted-foreground dark:bg-white/[0.08]";
+  const statusTextClass = result?.isError
+    ? "text-[hsl(var(--chat-error))]"
+    : "text-muted-foreground/60";
 
   useEffect(() => {
-    if (!readOnly && !isRedactedToolContent && shouldAutoOpen) {
+    if (readOnly || isRedactedToolContent) return;
+    if (shouldKeepTodoOpen) {
+      setOpen(true);
+    } else if (shouldCloseCompletedTodo) {
+      setOpen(false);
+    } else if (shouldAutoOpen) {
       setOpen(true);
     }
-  }, [isRedactedToolContent, readOnly, shouldAutoOpen]);
+  }, [
+    isRedactedToolContent,
+    readOnly,
+    shouldAutoOpen,
+    shouldCloseCompletedTodo,
+    shouldKeepTodoOpen,
+  ]);
 
-  const canExpand = !isRedactedToolContent;
+  const canExpand = !isRedactedToolContent && (shouldShowArgs || Boolean(result));
   const effectiveOpen = canExpand && open;
   const summaryClassName = cn(
-    "flex select-none items-center gap-2",
-    canExpand
-      ? "cursor-pointer hover:bg-black/[0.015] dark:hover:bg-white/[0.025]"
-      : "cursor-default",
-    variant === "grouped" ? "px-2 py-[6px]" : "px-2.5 py-[7px]",
+    "flex w-full select-none items-center gap-2 text-left",
+    canExpand ? "cursor-pointer" : "cursor-default",
+    "py-1.5",
   );
   const summaryContent = (
     <>
-      <div
-        className="flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-[6px]"
-        style={{
-          background: `linear-gradient(135deg, hsl(${meta.accent} / 0.13), hsl(${meta.accent} / 0.06))`,
-        }}
-      >
-        <ToolIcon className="h-3 w-3" style={{ color: `hsl(${meta.accent})` }} />
-      </div>
+      <ToolIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60 group-hover/tool:text-foreground/75" />
 
       {/* Tool name + inline summary on same line. Name and summary must stay in
           one inline context (shared baseline): centering them as separate flex
@@ -143,10 +148,10 @@ function ToolCallItem({
           className="min-w-0 truncate font-mono text-[calc(11px*var(--zone-font-scale,1))] leading-5 text-muted-foreground/55"
           title={!isBash && !inlineCommand && toolArgsSummary ? toolArgsSummary : undefined}
         >
-          <span className="font-sans text-[calc(12.5px*var(--zone-font-scale,1))] font-semibold tracking-[-0.01em] text-foreground/90">
+          <span className="font-sans text-[calc(13px*var(--zone-font-scale,1))] font-normal text-muted-foreground/80 group-hover/tool:text-foreground">
             {title.name}
             {title.action ? (
-              <span className="font-mono font-semibold text-muted-foreground/70">
+              <span className="font-mono text-[calc(11px*var(--zone-font-scale,1))] font-normal text-muted-foreground/60">
                 {" · "}
                 {title.action}
               </span>
@@ -168,112 +173,114 @@ function ToolCallItem({
         ) : null}
       </div>
 
-      <div className="flex shrink-0 items-center gap-1.5">
-        <span className={cn("inline-block h-1.5 w-1.5 rounded-full", dotClass)} />
-        <span
-          className={cn(
-            "inline-flex items-center rounded-full px-1.5 py-[1px] text-[calc(10px*var(--zone-font-scale,1))] font-semibold",
-            statusBgClass,
-          )}
-        >
-          {statusLabel}
-        </span>
+      <div className="flex shrink-0 items-center gap-2">
+        {isRunning ? (
+          <AssistantStatus
+            className="min-h-0 gap-1.5 text-[calc(11px*var(--zone-font-scale,1))] text-muted-foreground/60"
+            iconClassName="h-3 w-3"
+          >
+            {statusLabel}
+          </AssistantStatus>
+        ) : (
+          <span className={cn("text-[calc(11px*var(--zone-font-scale,1))]", statusTextClass)}>
+            {statusLabel}
+          </span>
+        )}
         {canExpand ? (
-          <ChevronRight className="h-3 w-3 text-muted-foreground/35 transition-transform duration-200 ease-out group-open/tool:rotate-90" />
+          <ChevronRight
+            className={cn(
+              "h-3.5 w-3.5 text-muted-foreground/60 transition-transform duration-200 ease-out",
+              effectiveOpen ? "rotate-90" : "",
+            )}
+          />
         ) : null}
       </div>
     </>
   );
-  const body = effectiveOpen ? (
-    <div className="space-y-3 border-t border-black/[0.04] px-2.5 py-2.5 dark:border-white/[0.05]">
-      {shouldShowArgs ? (
-        <ToolSection label={isBash || inlineCommand ? t("chat.tool.command") : t("chat.tool.args")}>
-          <ToolArgsDisplay item={item} />
-        </ToolSection>
-      ) : null}
+  const body = (
+    <div
+      aria-hidden={!effectiveOpen}
+      className={cn(
+        "grid transition-[grid-template-rows,opacity] duration-200 ease-out",
+        effectiveOpen
+          ? "grid-rows-[1fr] opacity-100"
+          : "pointer-events-none grid-rows-[0fr] opacity-0",
+      )}
+    >
+      <div className="min-h-0 overflow-hidden">
+        <div className="space-y-3 pb-2 pl-[22px] pt-1">
+          {shouldShowArgs ? (
+            <ToolSection
+              label={isBash || inlineCommand ? t("chat.tool.command") : t("chat.tool.args")}
+            >
+              <ToolArgsDisplay item={item} />
+            </ToolSection>
+          ) : null}
 
-      {result ? (
-        <ToolSection
-          label={t("chat.tool.return")}
-          trailing={
-            result.isError ? (
-              <span className="inline-flex items-center rounded-full bg-red-500/10 px-2 py-[1px] text-[calc(10px*var(--zone-font-scale,1))] font-bold text-red-500 dark:bg-red-500/15">
-                {t("chat.tool.error")}
-              </span>
-            ) : null
-          }
-        >
-          <div className="space-y-1.5">
-            <ToolResultDisplay item={item} result={result} readOnly={readOnly} />
-
-            {(() => {
-              const resultText = toolResultMessageToText(result);
-              if (!/\S/.test(resultText)) return null;
-              if (builtinResultKind && builtinResultKind !== "read_image") return null;
-
-              if (isBash || readOnly) {
-                return (
-                  <ToolScrollablePre
-                    className={cn(
-                      "max-h-56",
-                      isBash
-                        ? "bg-zinc-950/85 text-zinc-300/90 shadow-[inset_0_1px_2px_rgba(0,0,0,0.25)] dark:bg-zinc-900/80"
-                        : "bg-black/[0.02] dark:bg-white/[0.03]",
-                    )}
-                  >
-                    {previewText(resultText, 6000)}
-                  </ToolScrollablePre>
-                );
+          {result ? (
+            <ToolSection
+              label={isTodo ? undefined : t("chat.tool.return")}
+              trailing={
+                result.isError ? (
+                  <span className="text-[calc(11px*var(--zone-font-scale,1))] font-medium text-red-500">
+                    {t("chat.tool.error")}
+                  </span>
+                ) : null
               }
+            >
+              <div className="space-y-1.5">
+                <ToolResultDisplay item={item} result={result} readOnly={readOnly} />
 
-              // Errors must be readable at a glance — never behind the
-              // collapsed "view return" toggle.
-              if (result.isError) {
-                return (
-                  <ToolScrollablePre className="max-h-56 bg-red-500/[0.05] text-red-700/90 dark:bg-red-500/[0.08] dark:text-red-300/90">
-                    {previewText(resultText, 6000)}
-                  </ToolScrollablePre>
-                );
-              }
+                {(() => {
+                  const resultText = toolResultMessageToText(result);
+                  if (!/\S/.test(resultText)) return null;
+                  if (builtinResultKind && builtinResultKind !== "read_image") return null;
 
-              return (
-                <details className="group/result">
-                  <summary className="flex cursor-pointer select-none items-center gap-1 text-[calc(10.5px*var(--zone-font-scale,1))] text-muted-foreground/50 transition-colors duration-150 hover:text-foreground/60">
-                    <ChevronRight className="h-2.5 w-2.5 transition-transform duration-200 group-open/result:rotate-90" />
-                    {t("chat.tool.viewReturn")}
-                  </summary>
-                  <ToolScrollablePre className="mt-1.5 max-h-56 bg-black/[0.02] dark:bg-white/[0.03]">
-                    {previewText(resultText, 6000)}
-                  </ToolScrollablePre>
-                </details>
-              );
-            })()}
-          </div>
-        </ToolSection>
-      ) : null}
+                  if (isBash || readOnly) {
+                    return (
+                      <ToolScrollablePre
+                        className={cn(
+                          "max-h-56",
+                          isBash
+                            ? "bg-zinc-950/85 text-zinc-300/90 dark:bg-zinc-900/80"
+                            : "bg-black/[0.02] dark:bg-white/[0.03]",
+                        )}
+                      >
+                        {previewText(resultText, 6000)}
+                      </ToolScrollablePre>
+                    );
+                  }
+
+                  // Errors must be readable at a glance — never behind the
+                  // collapsed "view return" toggle.
+                  if (result.isError) {
+                    return (
+                      <ToolScrollablePre className="max-h-56 bg-red-500/[0.05] text-red-700/90 dark:bg-red-500/[0.08] dark:text-red-300/90">
+                        {previewText(resultText, 6000)}
+                      </ToolScrollablePre>
+                    );
+                  }
+
+                  return (
+                    <details className="group/result">
+                      <summary className="flex cursor-pointer select-none items-center gap-1 text-[calc(10.5px*var(--zone-font-scale,1))] text-muted-foreground/50 transition-colors duration-150 hover:text-foreground/60">
+                        <ChevronRight className="h-2.5 w-2.5 transition-transform duration-200 group-open/result:rotate-90" />
+                        {t("chat.tool.viewReturn")}
+                      </summary>
+                      <ToolScrollablePre className="mt-1.5 max-h-56 bg-black/[0.02] dark:bg-white/[0.03]">
+                        {previewText(resultText, 6000)}
+                      </ToolScrollablePre>
+                    </details>
+                  );
+                })()}
+              </div>
+            </ToolSection>
+          ) : null}
+        </div>
+      </div>
     </div>
-  ) : null;
-  const containerClassName = cn(
-    "group/tool overflow-hidden",
-    variant === "grouped" ? "tool-card-grouped rounded-[10px]" : "tool-card-enter rounded-[12px]",
-    "border border-black/[0.06] bg-white/[0.72] backdrop-blur-xl backdrop-saturate-[1.8]",
-    variant === "grouped"
-      ? "shadow-none"
-      : [
-          "shadow-[0_0_0_0.5px_rgba(0,0,0,0.03),0_1px_2px_rgba(0,0,0,0.03),0_2px_6px_rgba(0,0,0,0.02)]",
-          "transition-shadow duration-200",
-          !readOnly &&
-            "hover:shadow-[0_0_0_0.5px_rgba(0,0,0,0.04),0_1px_3px_rgba(0,0,0,0.05),0_4px_14px_rgba(0,0,0,0.04)]",
-        ],
-    "dark:border-white/[0.1] dark:bg-white/[0.06] dark:backdrop-saturate-[1.4]",
-    variant === "grouped"
-      ? "dark:shadow-none"
-      : [
-          "dark:shadow-[0_0_0_0.5px_rgba(255,255,255,0.04),0_1px_2px_rgba(0,0,0,0.2),0_3px_8px_rgba(0,0,0,0.12)]",
-          !readOnly &&
-            "dark:hover:shadow-[0_0_0_0.5px_rgba(255,255,255,0.06),0_1px_3px_rgba(0,0,0,0.25),0_4px_14px_rgba(0,0,0,0.18)]",
-        ],
   );
+  const containerClassName = "group/tool min-w-0 max-w-full";
 
   if (!canExpand) {
     return (
@@ -284,14 +291,17 @@ function ToolCallItem({
   }
 
   return (
-    <details
-      open={effectiveOpen}
-      className={containerClassName}
-      onToggle={(e) => setOpen((e.currentTarget as HTMLDetailsElement).open)}
-    >
-      <summary className={summaryClassName}>{summaryContent}</summary>
+    <div className={containerClassName}>
+      <button
+        type="button"
+        aria-expanded={effectiveOpen}
+        className={summaryClassName}
+        onClick={() => setOpen((prev) => !prev)}
+      >
+        {summaryContent}
+      </button>
       {body}
-    </details>
+    </div>
   );
 }
 
@@ -331,7 +341,6 @@ export const MemoToolCallItem = memo(
   ToolCallItem,
   (previousProps, nextProps) =>
     previousProps.isRunning === nextProps.isRunning &&
-    previousProps.variant === nextProps.variant &&
     previousProps.readOnly === nextProps.readOnly &&
     previousProps.redactToolContent === nextProps.redactToolContent &&
     areToolTraceItemsEqual(previousProps.item, nextProps.item),

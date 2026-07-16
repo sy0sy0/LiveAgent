@@ -240,10 +240,20 @@ function ToolImageStatusCard(props: {
           isError ? "border-red-500/20" : "border-black/[0.06] dark:border-white/[0.08]",
         )}
       >
-        <Icon className={cn("h-4 w-4", !isError && "animate-spin text-primary")} />
+        <Icon
+          className={cn(
+            "h-4 w-4",
+            !isError && "animate-spin text-primary motion-reduce:animate-none",
+          )}
+        />
       </div>
       <div className="max-w-full space-y-1">
-        <div className="text-[calc(12px*var(--zone-font-scale,1))] font-medium">
+        <div
+          className={cn(
+            "text-[calc(12px*var(--zone-font-scale,1))] font-medium",
+            !isError && "shimmer",
+          )}
+        >
           {title ?? (isError ? t("chat.image.unavailable") : t("chat.image.loading"))}
         </div>
         {detail ? (
@@ -258,11 +268,6 @@ function ToolImageStatusCard(props: {
           </div>
         ) : null}
       </div>
-      {!isError ? (
-        <div className="h-1 w-24 overflow-hidden rounded-full bg-black/[0.06] dark:bg-white/[0.08]">
-          <div className="h-full w-1/2 animate-pulse rounded-full bg-primary/55" />
-        </div>
-      ) : null}
     </div>
   );
 }

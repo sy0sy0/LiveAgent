@@ -3,7 +3,16 @@ import { code } from "@streamdown/code";
 import { math } from "@streamdown/math";
 import { mermaid } from "@streamdown/mermaid";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { type ComponentProps, memo, useLayoutEffect, useMemo, useRef } from "react";
+import {
+  type ComponentProps,
+  cloneElement,
+  isValidElement,
+  memo,
+  type ReactElement,
+  type ReactNode,
+  useMemo,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 import remarkBreaks from "remark-breaks";
 import {
@@ -15,8 +24,9 @@ import {
   Streamdown,
   type StreamdownTranslations,
 } from "streamdown";
+import { useLocale } from "../i18n";
 import { cn } from "../lib/shared/utils";
-import { Copy, ExternalLink, X } from "./icons";
+import { Check, ChevronDown, ChevronUp, Copy, ExternalLink, X } from "./icons";
 import { Button } from "./ui/button";
 
 type MarkdownProps = {
@@ -71,6 +81,15 @@ const relativeUrlRehypePlugins = (() => {
 
 type MarkdownImageFallbackProps = ComponentProps<"img"> & ExtraProps;
 type MarkdownAnchorFallbackProps = ComponentProps<"a"> & ExtraProps;
+type MarkdownPreProps = ComponentProps<"pre"> & ExtraProps;
+type StreamdownCodeChildProps = {
+  children?: ReactNode;
+  className?: string;
+  "data-block"?: string;
+};
+
+const CODE_BLOCK_COLLAPSE_LINE_THRESHOLD = 16;
+const DEFAULT_CODE_BLOCK_LANGUAGE = "markdown";
 
 function MarkdownImageFallback(props: MarkdownImageFallbackProps) {
   const { alt, title } = props;
@@ -94,6 +113,7 @@ function MarkdownImageFallback(props: MarkdownImageFallbackProps) {
 
 export const markdownComponents: Components = {
   img: MarkdownImageFallback,
+  pre: CollapsibleCodePre,
 };
 
 function MarkdownReadOnlyLink(props: MarkdownAnchorFallbackProps) {
@@ -116,84 +136,129 @@ export const markdownReadOnlyComponents: Components = {
   a: MarkdownReadOnlyLink,
 };
 
-const codeBlockSelector = '[data-streamdown="code-block"]';
-const codeCopyButtonSelector =
-  '[data-streamdown="code-block"] [data-streamdown="code-block-copy-button"]';
-const codeBlockBodySelector = '[data-streamdown="code-block-body"] pre';
-
-function enableCodeCopyButtons(root: HTMLElement) {
-  root.querySelectorAll<HTMLButtonElement>(codeCopyButtonSelector).forEach((button) => {
-    if (!button.disabled && !button.hasAttribute("disabled")) return;
-    button.disabled = false;
-    button.removeAttribute("disabled");
-  });
-}
-
-function getCodeBlockText(button: HTMLButtonElement) {
-  const codeBlock = button.closest(codeBlockSelector);
-  const codeBody = codeBlock?.querySelector<HTMLElement>(codeBlockBodySelector);
-  return codeBody?.textContent ?? null;
-}
-
 async function copyCodeBlockText(text: string) {
   try {
     await navigator.clipboard.writeText(text);
+    return true;
   } catch (error) {
     console.error("Failed to copy code block", error);
+    return false;
   }
 }
 
-function useEnabledCodeCopyButtons(enabled: boolean) {
-  const rootRef = useRef<HTMLDivElement | null>(null);
+function getCodeTextFromChild(child: ReactElement<StreamdownCodeChildProps>) {
+  const raw = child.props.children;
+  if (typeof raw === "string") return raw;
+  if (Array.isArray(raw)) {
+    return raw.filter((item): item is string => typeof item === "string").join("");
+  }
+  return "";
+}
 
-  useLayoutEffect(() => {
-    if (!enabled) return;
+function getCodeLanguage(className?: string) {
+  return className?.match(/language-([^\s]+)/)?.[1] ?? "";
+}
 
-    const root = rootRef.current;
-    if (!root) return;
+function ensureCodeBlockLanguage(child: ReactElement<StreamdownCodeChildProps>) {
+  if (getCodeLanguage(child.props.className)) return child;
+  return cloneElement(child, {
+    className: cn(child.props.className, `language-${DEFAULT_CODE_BLOCK_LANGUAGE}`),
+  });
+}
 
-    // Streamdown disables copy controls while animating, but the copy handler
-    // can safely copy the current partial code during streaming.
-    enableCodeCopyButtons(root);
+function getLineCount(value: string) {
+  if (!value) return 0;
+  return value.replace(/\n$/, "").split("\n").length;
+}
 
-    const handleCopyClick = (event: MouseEvent) => {
-      const target = event.target;
-      if (!(target instanceof Element)) return;
+function CodeBlockActions({ code }: { code: string }) {
+  const { t } = useLocale();
+  const [copied, setCopied] = useState(false);
 
-      const button = target.closest(codeCopyButtonSelector);
-      if (!(button instanceof HTMLButtonElement) || !root.contains(button)) return;
+  const handleCopy = async () => {
+    if (!(await copyCodeBlockText(code))) return;
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1600);
+  };
 
-      const codeText = getCodeBlockText(button);
-      if (codeText === null) return;
+  return (
+    <div className="pointer-events-none absolute right-0 top-0 z-20 flex h-8 items-center justify-end">
+      <div className="pointer-events-auto flex shrink-0 items-center gap-2 rounded-md bg-background/80 px-1.5 py-1 backdrop-blur">
+        <button
+          type="button"
+          aria-label={copied ? t("chat.markdown.copied") : t("chat.markdown.copyCode")}
+          title={copied ? t("chat.markdown.copied") : t("chat.markdown.copyCode")}
+          className="inline-flex h-6 w-6 items-center justify-center rounded-md p-1 text-muted-foreground transition-colors hover:bg-foreground/[0.04] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35"
+          onClick={() => void handleCopy()}
+        >
+          {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+        </button>
+      </div>
+    </div>
+  );
+}
 
-      event.preventDefault();
-      event.stopPropagation();
-      event.stopImmediatePropagation();
-      void copyCodeBlockText(codeText);
-    };
+function CollapsibleCodePre({ children }: MarkdownPreProps) {
+  const { t } = useLocale();
+  const childElement = isValidElement<StreamdownCodeChildProps>(children)
+    ? ensureCodeBlockLanguage(children)
+    : null;
+  const codeContent = childElement ? getCodeTextFromChild(childElement) : "";
+  const language = childElement ? getCodeLanguage(childElement.props.className) : "";
+  const lineCount = getLineCount(codeContent);
+  const isMermaid = language === "mermaid" || language === "mmd";
+  const isCollapsible = Boolean(
+    childElement && !isMermaid && lineCount > CODE_BLOCK_COLLAPSE_LINE_THRESHOLD,
+  );
+  const [expanded, setExpanded] = useState(false);
 
-    root.addEventListener("click", handleCopyClick, true);
+  if (!childElement) return children;
 
-    let observer: MutationObserver | undefined;
-    if (typeof MutationObserver !== "undefined") {
-      observer = new MutationObserver(() => {
-        enableCodeCopyButtons(root);
-      });
-      observer.observe(root, {
-        attributes: true,
-        attributeFilter: ["disabled"],
-        childList: true,
-        subtree: true,
-      });
-    }
+  const codeBlock = cloneElement(childElement, { "data-block": "true" });
+  if (!isCollapsible) {
+    return (
+      <div className="relative w-full">
+        {isMermaid ? null : <CodeBlockActions code={codeContent} />}
+        {codeBlock}
+      </div>
+    );
+  }
 
-    return () => {
-      root.removeEventListener("click", handleCopyClick, true);
-      observer?.disconnect();
-    };
-  }, [enabled]);
-
-  return rootRef;
+  return (
+    <div className="relative w-full">
+      <CodeBlockActions code={codeContent} />
+      <div
+        className={cn(
+          "w-full [&_[data-streamdown='code-block-body']]:transition-[max-height] [&_[data-streamdown='code-block-body']]:duration-300 [&_[data-streamdown='code-block-body']]:ease-out",
+          !expanded &&
+            "[&_[data-streamdown='code-block-body']]:max-h-[22rem] [&_[data-streamdown='code-block-body']]:overflow-hidden",
+        )}
+      >
+        {codeBlock}
+      </div>
+      {expanded ? null : (
+        <div className="pointer-events-none absolute inset-x-0 bottom-7 h-20 bg-gradient-to-b from-transparent via-background/70 to-background" />
+      )}
+      <div className="flex justify-center">
+        <button
+          type="button"
+          onClick={() => setExpanded((current) => !current)}
+          className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-foreground/[0.04] hover:text-foreground"
+        >
+          {expanded ? (
+            <ChevronUp className="h-3.5 w-3.5" />
+          ) : (
+            <ChevronDown className="h-3.5 w-3.5" />
+          )}
+          <span>
+            {expanded
+              ? t("chat.markdown.collapseCode")
+              : t("chat.markdown.expandCode").replace("{count}", String(lineCount))}
+          </span>
+        </button>
+      </div>
+    </div>
+  );
 }
 
 const streamdownTranslations = {
@@ -215,7 +280,7 @@ const streamdownTranslations = {
   downloadTableAsCsv: "下载为 CSV",
   downloadTableAsMarkdown: "下载为 Markdown",
   exitFullscreen: "退出全屏",
-  externalLinkWarning: "即将打开外部链接，请确认目标站点可信。",
+  externalLinkWarning: "请确认目标站点可信后再继续。",
   imageNotAvailable: "图片暂不可用",
   mermaidFormatMmd: "Mermaid 源码",
   mermaidFormatPng: "PNG 图片",
@@ -254,57 +319,67 @@ export function ExternalLinkModal({ isOpen, onClose, onConfirm, url }: LinkSafet
 
   const modal = (
     <div
-      className="external-link-modal-overlay fixed inset-0 z-[100] flex items-center justify-center bg-black/18 px-4 py-6 backdrop-blur-sm"
+      className="external-link-modal-overlay fixed inset-0 z-[100] flex items-center justify-center px-4 py-6"
       data-state="open"
-      onClick={onClose}
-      role="presentation"
     >
+      <button
+        type="button"
+        className="absolute inset-0 cursor-default bg-black/25 backdrop-blur-[2px]"
+        onClick={onClose}
+        aria-label={streamdownTranslations.close}
+      />
       <div
-        className="external-link-modal-panel w-full max-w-[34rem] rounded-[22px] border border-border/70 bg-background/98 shadow-[0_24px_80px_-28px_rgba(15,23,42,0.38)]"
-        onClick={(event) => event.stopPropagation()}
+        className="external-link-modal-panel relative w-full max-w-[28rem] overflow-hidden rounded-2xl border border-border/60 bg-background shadow-[0_20px_60px_-28px_rgba(0,0,0,0.45)]"
         role="dialog"
         aria-modal="true"
         aria-label={streamdownTranslations.openExternalLink}
       >
-        <div className="flex items-start justify-between gap-4 px-8 pb-4 pt-7">
-          <div className="space-y-3">
-            <div className="flex items-center gap-2 text-[1.65rem] font-semibold tracking-[-0.02em] text-foreground">
-              <ExternalLink className="size-5" />
+        <div className="flex items-start justify-between gap-4 px-5 pb-3 pt-5">
+          <div className="min-w-0 space-y-1.5">
+            <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+              <ExternalLink className="size-4 text-muted-foreground" />
               <span>{streamdownTranslations.openExternalLink}</span>
             </div>
-            <p className="text-[15px] leading-7 text-muted-foreground">
+            <p className="text-xs leading-5 text-muted-foreground">
               {streamdownTranslations.externalLinkWarning}
             </p>
           </div>
           <button
             type="button"
-            className="inline-flex size-9 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
+            className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
             onClick={onClose}
             aria-label={streamdownTranslations.close}
           >
-            <X className="size-5" />
+            <X className="size-3.5" />
           </button>
         </div>
-        <div className="px-8 pb-8">
-          <div className="rounded-2xl bg-muted/80 px-5 py-4 font-mono text-sm leading-6 text-foreground">
-            <p className="truncate">{url}</p>
+        <div className="px-5 pb-5">
+          <div className="flex min-h-10 items-center gap-2 rounded-xl bg-muted/55 px-3 py-2.5 text-muted-foreground">
+            <ExternalLink className="size-3.5 shrink-0" />
+            <p
+              className="min-w-0 truncate font-mono text-xs leading-5 text-foreground/85"
+              title={url}
+            >
+              {url}
+            </p>
           </div>
-          <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <div className="mt-4 flex items-center justify-end gap-2">
             <Button
               type="button"
-              variant="outline"
-              className="h-11 gap-2 rounded-xl border-border/80 text-sm"
+              variant="ghost"
+              className="h-8 gap-1.5 rounded-lg px-3 text-xs font-normal text-muted-foreground shadow-none hover:bg-muted hover:text-foreground"
               onClick={handleCopyLink}
             >
-              <Copy className="size-4" />
+              <Copy className="size-3.5" />
               <span>{streamdownTranslations.copyLink}</span>
             </Button>
             <Button
               type="button"
-              className="h-11 gap-2 rounded-xl text-sm"
+              variant="secondary"
+              className="h-8 gap-1.5 rounded-lg bg-muted px-3 text-xs font-normal shadow-none hover:bg-muted/80"
               onClick={handleOpenLink}
             >
-              <ExternalLink className="size-4" />
+              <ExternalLink className="size-3.5" />
               <span>{streamdownTranslations.openLink}</span>
             </Button>
           </div>
@@ -315,6 +390,34 @@ export function ExternalLinkModal({ isOpen, onClose, onConfirm, url }: LinkSafet
 
   return createPortal(modal, document.body);
 }
+
+const MARKDOWN_EMBED_CLASSNAME = cn(
+  "min-w-0 max-w-full overflow-hidden [overflow-wrap:anywhere]",
+  "[&_[data-streamdown='mermaid-block']]:my-4 [&_[data-streamdown='mermaid-block']]:flex [&_[data-streamdown='mermaid-block']]:!w-full [&_[data-streamdown='mermaid-block']]:min-w-0 [&_[data-streamdown='mermaid-block']]:gap-2 [&_[data-streamdown='mermaid-block']]:rounded-none [&_[data-streamdown='mermaid-block']]:border-0 [&_[data-streamdown='mermaid-block']]:bg-transparent [&_[data-streamdown='mermaid-block']]:p-0 [&_[data-streamdown='mermaid-block']]:shadow-none",
+  "[&_[data-streamdown='mermaid-block']>div:last-child]:!w-full [&_[data-streamdown='mermaid-block']>div:last-child]:min-w-0 [&_[data-streamdown='mermaid-block']>div:last-child]:rounded-none [&_[data-streamdown='mermaid-block']>div:last-child]:border-0 [&_[data-streamdown='mermaid-block']>div:last-child]:bg-transparent [&_[data-streamdown='mermaid-block']>div:last-child]:p-0 [&_[data-streamdown='mermaid-block']>div:last-child]:shadow-none",
+  "[&_[data-streamdown='mermaid']]:my-0 [&_[data-streamdown='mermaid']]:block [&_[data-streamdown='mermaid']]:!w-full [&_[data-streamdown='mermaid']]:max-h-[280px] [&_[data-streamdown='mermaid']]:min-w-0 [&_[data-streamdown='mermaid']]:overflow-hidden [&_[data-streamdown='mermaid']]:rounded-none [&_[data-streamdown='mermaid']]:border-0 [&_[data-streamdown='mermaid']]:bg-transparent [&_[data-streamdown='mermaid']]:shadow-none",
+  "[&_[data-streamdown='mermaid']>div]:!w-full [&_[data-streamdown='mermaid']>div]:min-w-0 [&_[data-streamdown='mermaid']>div]:max-w-none",
+  "[&_[data-streamdown='mermaid']_svg]:mx-auto [&_[data-streamdown='mermaid']_svg]:block [&_[data-streamdown='mermaid']_svg]:h-auto [&_[data-streamdown='mermaid']_svg]:max-h-[280px] [&_[data-streamdown='mermaid']_svg]:max-w-full [&_[data-streamdown='mermaid']_svg]:bg-transparent",
+  "[&_[data-streamdown='mermaid']>div>div:first-child]:!left-0 [&_[data-streamdown='mermaid']>div>div:first-child]:rounded-none [&_[data-streamdown='mermaid']>div>div:first-child]:border-0 [&_[data-streamdown='mermaid']>div>div:first-child]:bg-transparent [&_[data-streamdown='mermaid']>div>div:first-child]:p-0 [&_[data-streamdown='mermaid']>div>div:first-child]:shadow-none [&_[data-streamdown='mermaid']>div>div:first-child]:backdrop-blur-none",
+  "[&_[data-streamdown='mermaid-block-actions']]:gap-2 [&_[data-streamdown='mermaid-block-actions']]:rounded-none [&_[data-streamdown='mermaid-block-actions']]:border-0 [&_[data-streamdown='mermaid-block-actions']]:bg-transparent [&_[data-streamdown='mermaid-block-actions']]:p-0 [&_[data-streamdown='mermaid-block-actions']]:shadow-none [&_[data-streamdown='mermaid-block-actions']]:backdrop-blur-none",
+  "[&_[data-streamdown='mermaid-block-actions']_svg]:size-3 [&_[data-streamdown='mermaid-block']_button>svg]:size-3",
+  "[&_[data-streamdown='table-wrapper']]:my-4 [&_[data-streamdown='table-wrapper']]:!w-full [&_[data-streamdown='table-wrapper']]:min-w-0 [&_[data-streamdown='table-wrapper']]:gap-0 [&_[data-streamdown='table-wrapper']]:rounded-none [&_[data-streamdown='table-wrapper']]:border-0 [&_[data-streamdown='table-wrapper']]:bg-transparent [&_[data-streamdown='table-wrapper']]:p-0 [&_[data-streamdown='table-wrapper']]:shadow-none [&_[data-streamdown='table-wrapper']]:outline-none [&_[data-streamdown='table-wrapper']]:ring-0",
+  "[&_[data-streamdown='table-wrapper']>div:last-child]:!w-full [&_[data-streamdown='table-wrapper']>div:last-child]:min-w-0 [&_[data-streamdown='table-wrapper']>div:last-child]:overflow-x-auto [&_[data-streamdown='table-wrapper']>div:last-child]:overflow-y-hidden [&_[data-streamdown='table-wrapper']>div:last-child]:rounded-none [&_[data-streamdown='table-wrapper']>div:last-child]:border-0 [&_[data-streamdown='table-wrapper']>div:last-child]:bg-transparent [&_[data-streamdown='table-wrapper']>div:last-child]:p-0 [&_[data-streamdown='table-wrapper']>div:last-child]:shadow-none [&_[data-streamdown='table-wrapper']>div:last-child]:outline-none [&_[data-streamdown='table-wrapper']>div:last-child]:ring-0",
+  "[&_table]:my-2 [&_table]:!w-full [&_table]:!min-w-full [&_table]:max-w-none [&_table]:table-auto [&_table]:border-collapse [&_table]:rounded-none [&_table]:border-0 [&_table]:bg-transparent [&_table]:shadow-none [&_table]:outline-none [&_table]:ring-0",
+  "[&_thead]:bg-transparent [&_tbody]:bg-transparent [&_tr]:border-b [&_tr]:border-border/50 [&_tr]:bg-transparent [&_tbody_tr:last-child]:border-b-0",
+  "[&_th]:border-0 [&_th]:px-0 [&_th]:py-2 [&_th]:pr-8 [&_th]:text-left [&_th]:align-bottom [&_th]:font-semibold [&_th]:tracking-[-0.01em] [&_th]:text-foreground",
+  "[&_td]:border-0 [&_td]:px-0 [&_td]:py-1 [&_td]:pr-8 [&_td]:align-middle [&_td]:leading-8 [&_td]:text-foreground/90",
+  "[&_th:last-child]:pr-0 [&_td:last-child]:pr-0 [&_table_*]:outline-none [&_table_*]:ring-0",
+  "[&_div:has(>table)]:rounded-none [&_div:has(>table)]:border-0 [&_div:has(>table)]:bg-transparent [&_div:has(>table)]:shadow-none [&_div:has(>table)]:outline-none [&_div:has(>table)]:ring-0",
+  "[&_code:not(pre_code)]:whitespace-pre-wrap [&_code:not(pre_code)]:break-words [&_code:not(pre_code)]:rounded-md [&_code:not(pre_code)]:bg-foreground/[0.05] [&_code:not(pre_code)]:px-1.5 [&_code:not(pre_code)]:py-0.5 [&_code:not(pre_code)]:font-mono [&_code:not(pre_code)]:text-[0.92em] [&_code:not(pre_code)]:text-foreground [&_code:not(pre_code)]:[overflow-wrap:anywhere]",
+  "[&_[data-streamdown='code-block']]:my-4 [&_[data-streamdown='code-block']]:!w-full [&_[data-streamdown='code-block']]:min-w-0 [&_[data-streamdown='code-block']]:gap-0 [&_[data-streamdown='code-block']]:rounded-none [&_[data-streamdown='code-block']]:border-0 [&_[data-streamdown='code-block']]:bg-transparent [&_[data-streamdown='code-block']]:p-0 [&_[data-streamdown='code-block']]:shadow-none [&_[data-streamdown='code-block']]:outline-none [&_[data-streamdown='code-block']]:ring-0",
+  "[&_[data-streamdown='code-block']>div:first-child]:mt-2 [&_[data-streamdown='code-block']>div:first-child]:min-h-0 [&_[data-streamdown='code-block']>div:first-child]:justify-between [&_[data-streamdown='code-block']>div:first-child]:gap-2 [&_[data-streamdown='code-block']>div:first-child]:border-0 [&_[data-streamdown='code-block']>div:first-child]:bg-transparent [&_[data-streamdown='code-block']>div:first-child]:pb-6 [&_[data-streamdown='code-block']>div:first-child]:text-[11px] [&_[data-streamdown='code-block']>div:first-child]:font-medium [&_[data-streamdown='code-block']>div:first-child]:tracking-[0.06em] [&_[data-streamdown='code-block']>div:first-child]:text-muted-foreground/85 [&_[data-streamdown='code-block']>div:first-child]:shadow-none",
+  "[&_[data-streamdown='code-block']>div:last-child]:!w-full [&_[data-streamdown='code-block']>div:last-child]:min-w-0 [&_[data-streamdown='code-block']>div:last-child]:rounded-none [&_[data-streamdown='code-block']>div:last-child]:border-0 [&_[data-streamdown='code-block']>div:last-child]:bg-transparent [&_[data-streamdown='code-block']>div:last-child]:p-0 [&_[data-streamdown='code-block']>div:last-child]:shadow-none",
+  "[&_[data-streamdown='code-block-body']]:!rounded-xl [&_[data-streamdown='code-block-body']]:!bg-muted/40",
+  "[&_pre]:my-0 [&_pre]:block [&_pre]:!w-full [&_pre]:!min-w-0 [&_pre]:max-w-full [&_pre]:overflow-x-auto [&_pre]:overflow-y-hidden [&_pre]:border-0 [&_pre]:bg-transparent [&_pre]:px-0 [&_pre]:pb-2 [&_pre]:pt-0 [&_pre]:shadow-none [&_pre]:outline-none [&_pre]:ring-0",
+  "[&_pre>code]:block [&_pre>code]:w-max [&_pre>code]:min-w-full [&_pre>code]:max-w-none [&_pre>code]:border-0 [&_pre>code]:bg-transparent [&_pre>code]:py-4 [&_pre>code]:font-mono [&_pre>code]:text-[13px] [&_pre>code]:leading-5 [&_pre>code]:text-foreground/92 [&_pre>code]:shadow-none [&_pre>code]:outline-none [&_pre>code]:ring-0",
+  "[&_strong]:font-medium [&_[data-streamdown='strong']]:font-medium",
+);
 
 export const Markdown = memo(function Markdown(props: MarkdownProps) {
   const {
@@ -327,7 +430,6 @@ export const Markdown = memo(function Markdown(props: MarkdownProps) {
     preserveRelativeUrls = false,
   } = props;
   const streaming = renderMode === "streaming";
-  const codeCopyRootRef = useEnabledCodeCopyButtons(!readOnly && showCaret);
   const baseComponents = readOnly ? markdownReadOnlyComponents : markdownComponents;
   const components = useMemo(
     () => (componentOverrides ? { ...baseComponents, ...componentOverrides } : baseComponents),
@@ -335,10 +437,11 @@ export const Markdown = memo(function Markdown(props: MarkdownProps) {
   );
 
   return (
-    <div ref={codeCopyRootRef}>
+    <div>
       <Streamdown
         className={cn(
           "chat-markdown max-w-none break-words",
+          MARKDOWN_EMBED_CLASSNAME,
           streaming ? "chat-markdown--streaming" : "chat-markdown--static",
           // Streamdown's memo equality does not include `caret` in its check,
           // so toggling the caret prop alone does not invalidate the render.
@@ -364,9 +467,9 @@ export const Markdown = memo(function Markdown(props: MarkdownProps) {
         }}
         shikiTheme={["github-light", "github-dark"] as const}
         controls={{
-          code: { copy: !readOnly, download: false },
+          code: false,
           mermaid: { copy: !readOnly, download: false, fullscreen: !readOnly, panZoom: !readOnly },
-          table: { copy: !readOnly, download: false, fullscreen: !readOnly },
+          table: false,
         }}
         translations={streamdownTranslations}
       >

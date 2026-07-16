@@ -27,6 +27,7 @@ import type {
   ReadPdfResultDetails,
   ReadTextResultDetails,
   SkillsManagerResultDetails,
+  TodoWriteResultDetails,
   WriteResultDetails,
 } from "../../../lib/tools/builtinTypes";
 import { EditDiffView } from "../EditDiffView";
@@ -280,12 +281,10 @@ export function ToolArgsDisplay({ item }: { item: ToolTraceItem }) {
     if (!cmd) return null;
     return (
       <div className="tool-expand flex flex-col gap-2">
-        <ToolSurface className="overflow-hidden border-emerald-500/15 bg-zinc-950/90 px-0 py-0 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] dark:border-white/[0.08] dark:bg-zinc-950/90">
-          <ToolScrollablePre className="max-h-44 rounded-none text-emerald-300/90">
-            <span className="mr-1 select-none text-emerald-500/30">$</span>
-            {cmd}
-          </ToolScrollablePre>
-        </ToolSurface>
+        <ToolScrollablePre className="max-h-44 bg-zinc-950/90 text-emerald-300/90 dark:bg-zinc-950/90">
+          <span className="mr-1 select-none text-emerald-500/30">$</span>
+          {cmd}
+        </ToolScrollablePre>
         {display.tags.length > 0 ? <MetaTags tags={display.tags} /> : null}
       </div>
     );
@@ -434,6 +433,11 @@ export function ToolResultDisplay({
         />
       </ToolSurface>
     );
+  }
+
+  if (kind === "todo_write") {
+    const details = result.details as TodoWriteResultDetails;
+    return <TodoListView todos={details.todos} />;
   }
 
   if (kind === "read_text") {

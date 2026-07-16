@@ -44,7 +44,9 @@ export function AppUpdateButton({
       variant="default"
       size="sm"
       className={cn(
-        "h-[22px] shrink-0 gap-[3px] rounded-full bg-[#4096ff] px-2 text-[11px] font-medium leading-none text-white shadow-none hover:bg-[#1677ff] hover:text-white active:bg-[#0958d9]",
+        iconOnly
+          ? "group/update relative h-6 w-6 shrink-0 gap-0 overflow-hidden rounded-full bg-[#4096ff] px-0 text-[11px] font-medium leading-none text-white shadow-none transition-[width,background-color] duration-150 hover:w-10 hover:bg-[#1677ff] hover:text-white active:bg-[#0958d9]"
+          : "h-[22px] shrink-0 gap-[3px] rounded-full bg-[#4096ff] px-2 text-[11px] font-medium leading-none text-white shadow-none hover:bg-[#1677ff] hover:text-white active:bg-[#0958d9]",
         className,
       )}
       disabled={busy}
@@ -54,12 +56,27 @@ export function AppUpdateButton({
     >
       {busy ? (
         <Loader2
-          className={cn(iconOnly ? "h-4 w-4" : "h-[13px] w-[13px]", iconClassName, "animate-spin")}
+          className={cn(iconOnly ? "h-3 w-3" : "h-[13px] w-[13px]", iconClassName, "animate-spin")}
         />
       ) : (
-        <Download className={cn(iconOnly ? "h-4 w-4" : "h-[13px] w-[13px]", iconClassName)} />
+        <Download
+          className={cn(
+            iconOnly
+              ? "h-3 w-3 transition-opacity duration-150 group-hover/update:opacity-0"
+              : "h-[13px] w-[13px]",
+            iconClassName,
+          )}
+        />
       )}
-      {iconOnly ? null : t("appUpdate.update")}
+      {iconOnly ? (
+        busy ? null : (
+          <span className="pointer-events-none absolute whitespace-nowrap opacity-0 transition-opacity duration-150 group-hover/update:opacity-100">
+            {t("appUpdate.update")}
+          </span>
+        )
+      ) : (
+        t("appUpdate.update")
+      )}
     </Button>
   );
 }

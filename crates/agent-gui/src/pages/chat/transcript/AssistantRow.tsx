@@ -9,11 +9,11 @@ import { VIBING_STATUS } from "../../../lib/chat/page/chatPageHelpers";
 import {
   AssistantAvatar,
   AssistantBubble,
+  AssistantStatus,
   CompactingText,
   VibingText,
 } from "../components/AssistantBubble";
 import type { AssistantRow as AssistantRowData } from "./rowModel";
-import { TypingDots } from "./TranscriptLoadingStates";
 import { formatMessageTimestamp } from "./transcriptUtils";
 import { useCopiedFlag } from "./useCopiedFlag";
 
@@ -75,16 +75,20 @@ export const AssistantRow = memo(function AssistantRow(props: AssistantRowProps)
           <div className={`min-w-0 flex-1 ${isAgentMode ? "pt-1" : "pt-0.5"}`}>
             {isCompactionRunning ? (
               <div className="flex items-center py-1">
-                <CompactingText className="text-sm font-medium text-muted-foreground" />
+                <CompactingText />
               </div>
             ) : toolStatus === VIBING_STATUS ? (
               <div className="flex items-center py-1">
-                <VibingText className="text-sm font-medium text-muted-foreground" />
+                <VibingText />
               </div>
             ) : toolStatus ? (
-              <div className="py-1 text-sm text-muted-foreground">{toolStatus}</div>
+              <div className="py-1">
+                <AssistantStatus>{toolStatus}</AssistantStatus>
+              </div>
             ) : (
-              <TypingDots />
+              <div className="py-1">
+                <VibingText />
+              </div>
             )}
           </div>
         </div>
