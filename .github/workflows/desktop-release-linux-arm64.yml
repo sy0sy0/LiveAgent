@@ -1,0 +1,228 @@
+name: Desktop Release (Linux arm64)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish, for example v0.1.0
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  NODE_VERSION: 22.19.0
+
+jobs:
+  release-metadata:
+    name: Release Metadata
+    runs-on: ubuntu-latest
+    outputs:
+      app_version: ${{ steps.version.outputs.app_version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Resolve release version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: node scripts/release/prepare-app-version-from-tag.mjs "$RELEASE_TAG" --github-output "$GITHUB_OUTPUT" --json
+
+  linux-arm64:
+    name: Linux arm64
+    runs-on: ubuntu-24.04-arm
+    needs: release-metadata
+    env:
+      LIVEAGENT_APP_VERSION: ${{ needs.release-metadata.outputs.app_version }}
+      LIVEAGENT_IS_PRERELEASE: ${{ needs.release-metadata.outputs.is_prerelease }}
+      LIVEAGENT_RELEASE_TAG: ${{ needs.release-metadata.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-metadata.outputs.release_tag }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Prepare release version config
+        working-directory: crates/agent-gui
+        run: node ../../scripts/release/prepare-app-version-from-tag.mjs "$LIVEAGENT_RELEASE_TAG" --github-env "$GITHUB_ENV" --tauri-config src-tauri/tauri.version.generated.conf.json
+
+      - name: Install pnpm
+        run: npm install -g pnpm@10.32.1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            protobuf-compiler \
+            rpm \
+            wget
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/agent-gui/src-tauri
+          key: linux-aarch64
+
+      - name: Install frontend dependencies
+        working-directory: crates/agent-gui
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Linux arm64 bundles
+        working-directory: crates/agent-gui
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          LIVEAGENT_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
+          LIVEAGENT_UPDATE_REPOSITORY: ${{ github.repository }}
+        run: >
+          pnpm tauri build
+          --config src-tauri/tauri.linux.release.conf.json
+          --config "$LIVEAGENT_TAURI_VERSION_CONFIG"
+          --target aarch64-unknown-linux-gnu
+          --bundles appimage deb rpm
+
+      - name: Stage Linux artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          appimage_path="$(find crates/agent-gui/src-tauri/target target -type f -name '*.AppImage' -path '*bundle*' -print -quit 2>/dev/null || true)"
+          deb_path="$(find crates/agent-gui/src-tauri/target target -type f -name '*.deb' -path '*bundle*' -print -quit 2>/dev/null || true)"
+          rpm_path="$(find crates/agent-gui/src-tauri/target target -type f -name '*.rpm' -path '*bundle*' -print -quit 2>/dev/null || true)"
+          test -n "$appimage_path"
+          test -n "$deb_path"
+          test -n "$rpm_path"
+          test -f "$appimage_path.sig"
+          test -f "$deb_path.sig"
+          test -f "$rpm_path.sig"
+          cp "$appimage_path" "dist/LiveAgent-${LIVEAGENT_RELEASE_TAG}-Linux-aarch64.AppImage"
+          cp "$appimage_path.sig" "dist/LiveAgent-${LIVEAGENT_RELEASE_TAG}-Linux-aarch64.AppImage.sig"
+          cp "$deb_path" "dist/LiveAgent-${LIVEAGENT_RELEASE_TAG}-Linux-aarch64.deb"
+          cp "$deb_path.sig" "dist/LiveAgent-${LIVEAGENT_RELEASE_TAG}-Linux-aarch64.deb.sig"
+          cp "$rpm_path" "dist/LiveAgent-${LIVEAGENT_RELEASE_TAG}-Linux-aarch64.rpm"
+          cp "$rpm_path.sig" "dist/LiveAgent-${LIVEAGENT_RELEASE_TAG}-Linux-aarch64.rpm.sig"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: liveagent-linux-aarch64
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - release-metadata
+      - linux-arm64
+    env:
+      LIVEAGENT_APP_VERSION: ${{ needs.release-metadata.outputs.app_version }}
+      LIVEAGENT_IS_PRERELEASE: ${{ needs.release-metadata.outputs.is_prerelease }}
+      LIVEAGENT_RELEASE_TAG: ${{ needs.release-metadata.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Publish assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.release-metadata.outputs.release_tag }}
+          PACKYCODE_API_KEY: ${{ secrets.PACKYCODE_API_KEY }}
+          AI_RELEASE_NOTES_API_KEY: ${{ secrets.AI_RELEASE_NOTES_API_KEY }}
+          AI_RELEASE_NOTES_BASE_URL: ${{ vars.AI_RELEASE_NOTES_BASE_URL }}
+          AI_RELEASE_NOTES_MODEL: ${{ vars.AI_RELEASE_NOTES_MODEL }}
+        run: |
+          set -euo pipefail
+          is_prerelease="$LIVEAGENT_IS_PRERELEASE"
+
+          github_notes_path="$RUNNER_TEMP/liveagent-github-release-notes.md"
+          notes_path="$RUNNER_TEMP/liveagent-release-notes.md"
+          if ! gh api "repos/$GH_REPO/releases/generate-notes" \
+            -f tag_name="$RELEASE_TAG" \
+            --jq ".body" > "$github_notes_path"; then
+            printf 'LiveAgent %s\n' "$RELEASE_TAG" > "$github_notes_path"
+          fi
+          if [ ! -s "$github_notes_path" ]; then
+            printf 'LiveAgent %s\n' "$RELEASE_TAG" > "$github_notes_path"
+          fi
+
+          node scripts/release/create-ai-release-notes.mjs "$RELEASE_TAG" "$notes_path" "$github_notes_path"
+          if [ ! -s "$notes_path" ]; then
+            printf 'LiveAgent %s\n' "$RELEASE_TAG" > "$notes_path"
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            edit_args=(--title "LiveAgent $RELEASE_TAG" --notes-file "$notes_path")
+            if [ "$is_prerelease" = true ]; then
+              edit_args+=(--prerelease)
+            else
+              edit_args+=(--prerelease=false --latest)
+            fi
+            gh release edit "$RELEASE_TAG" "${edit_args[@]}"
+          else
+            create_args=(--verify-tag --title "LiveAgent $RELEASE_TAG" --notes-file "$notes_path")
+            if [ "$is_prerelease" = true ]; then
+              create_args+=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" "${create_args[@]}"
+          fi
+
+          # 只清理本 workflow 产出的 Linux-aarch64 .sig，避免误删其他平台签名
+          mapfile -t signature_assets < <(
+            gh release view "$RELEASE_TAG" --json assets --jq '
+              .assets[].name
+              | select(endswith(".sig"))
+              | select(test("Linux-aarch64"; "i"))
+            '
+          )
+          for asset in "${signature_assets[@]}"; do
+            gh release delete-asset "$RELEASE_TAG" "$asset" --yes
+          done
+
+          rm -rf public-release-assets
+          mkdir -p public-release-assets
+          find release-artifacts -maxdepth 1 -type f ! -name '*.sig' ! -name latest.json -exec cp {} public-release-assets/ \;
+
+          shopt -s nullglob
+          public_assets=(public-release-assets/*)
+          if [ "${#public_assets[@]}" -eq 0 ]; then
+            echo "No public release assets were found."
+            exit 1
+          fi
+          # 只覆盖同名 arm64 安装包，不会删除 release 里已有的 macOS/Windows/x64
+          gh release upload "$RELEASE_TAG" "${public_assets[@]}" --clobber
+
+          # ---------- latest.json 策略（二选一）----------
+          # 默认：不生成/不上传 latest.json，避免把多平台 updater 冲成「只有 arm64」。
+          # 若你确认这是独立 arm64 tag，或已合并好 manifest，可取消下面两行注释：
+          # node scripts/release/create-tauri-updater-manifest.mjs release-artifacts release-artifacts/latest.json "$notes_path"
+          # gh release upload "$RELEASE_TAG" release-artifacts/latest.json --clobber
