@@ -43,6 +43,9 @@ function targetForArtifact(filename) {
   if (/Linux-x86_64\.AppImage$/i.test(filename)) return "linux-x86_64-appimage";
   if (/Linux-x86_64\.deb$/i.test(filename)) return "linux-x86_64-deb";
   if (/Linux-x86_64\.rpm$/i.test(filename)) return "linux-x86_64-rpm";
+  if (/Linux-aarch64\.AppImage$/i.test(filename)) return "linux-aarch64-appimage";
+  if (/Linux-aarch64\.deb$/i.test(filename)) return "linux-aarch64-deb";
+  if (/Linux-aarch64\.rpm$/i.test(filename)) return "linux-aarch64-rpm";
   return null;
 }
 
@@ -94,6 +97,9 @@ if (platforms["windows-x86_64-nsis"]) {
 // the payload as an AppImage, so the bare key must point at the AppImage asset.
 if (platforms["linux-x86_64-appimage"]) {
   platforms["linux-x86_64"] = platforms["linux-x86_64-appimage"];
+}
+if (platforms["linux-aarch64-appimage"]) {
+  platforms["linux-aarch64"] = platforms["linux-aarch64-appimage"];
 }
 
 if (Object.keys(platforms).length === 0) {
