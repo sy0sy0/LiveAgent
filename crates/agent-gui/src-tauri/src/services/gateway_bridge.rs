@@ -365,6 +365,7 @@ pub async fn handle_provider_models(
         request.provider_type.trim(),
         request.base_url.trim(),
         request.api_key.trim(),
+        request.use_system_proxy,
     )
     .await?;
     Ok(proto::ProviderModelsResponse { models_json })

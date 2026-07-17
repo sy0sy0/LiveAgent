@@ -1,9 +1,13 @@
+use std::{future::Future, time::Duration};
+
 use futures_util::StreamExt;
 use reqwest::{Client, StatusCode, Url};
 use serde_json::Value;
 
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const MAX_PROVIDER_MODELS_RESPONSE_BYTES: usize = 2 << 20;
+const PROVIDER_MODELS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const PROVIDER_MODELS_TIMEOUT_MESSAGE: &str = "供应商模型列表请求超时（10 秒）";
 const CODEX_MODELS_SUFFIXES: [&str; 3] = ["/chat/completions", "/responses", "/response"];
 
 #[derive(Clone, Debug)]
@@ -22,10 +26,33 @@ pub async fn fetch_provider_models(
     provider_type: &str,
     base_url: &str,
     api_key: &str,
+    use_system_proxy: bool,
 ) -> Result<String, String> {
-    let client = crate::services::system_proxy::cached_client()
-        .map_err(|error| format!("System proxy unavailable: {error}"))?;
-    fetch_provider_models_with_client(&client, provider_type, base_url, api_key).await
+    // 与本地反代的 x-liveagent-use-system-proxy 语义一致：勾选时代理配置异常
+    // fail fast，绝不静默降级；未勾选一律直连（忽略环境代理）。
+    let client = if use_system_proxy {
+        crate::services::system_proxy::cached_client()
+            .map_err(|error| format!("System proxy unavailable: {error}"))?
+    } else {
+        direct_client()?
+    };
+    with_provider_models_timeout(
+        PROVIDER_MODELS_REQUEST_TIMEOUT,
+        fetch_provider_models_with_client(&client, provider_type, base_url, api_key),
+    )
+    .await
+}
+
+fn direct_client() -> Result<Client, String> {
+    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let client = Client::builder()
+        .no_proxy()
+        .build()
+        .map_err(|_| "创建直连 HTTP 客户端失败".to_string())?;
+    Ok(CLIENT.get_or_init(|| client).clone())
 }
 
 async fn fetch_provider_models_with_client(
@@ -93,6 +120,15 @@ async fn fetch_provider_models_with_client(
         return Ok(result);
     }
     Err(pick_provider_models_failure(failures))
+}
+
+async fn with_provider_models_timeout(
+    timeout: Duration,
+    request: impl Future<Output = Result<String, String>>,
+) -> Result<String, String> {
+    tokio::time::timeout(timeout, request)
+        .await
+        .map_err(|_| PROVIDER_MODELS_TIMEOUT_MESSAGE.to_string())?
 }
 
 async fn read_limited_response(response: reqwest::Response) -> Result<Vec<u8>, String> {
@@ -385,5 +421,19 @@ mod tests {
             serde_json::from_str::<Value>(&result).expect("models json"),
             serde_json::json!({ "data": [{ "id": "gpt-test" }] })
         );
+    }
+
+    #[tokio::test]
+    async fn provider_models_request_has_total_timeout() {
+        assert_eq!(PROVIDER_MODELS_REQUEST_TIMEOUT, Duration::from_secs(10));
+
+        let error = with_provider_models_timeout(
+            Duration::from_millis(25),
+            std::future::pending::<Result<String, String>>(),
+        )
+        .await
+        .expect_err("provider model request should time out");
+
+        assert_eq!(error, PROVIDER_MODELS_TIMEOUT_MESSAGE);
     }
 }
