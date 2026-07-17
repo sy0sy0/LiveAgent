@@ -11,6 +11,12 @@ function fillFallbackBytes(bytes: Uint8Array) {
   }
 }
 
+/**
+ * UUID v4 with fallbacks for legacy/embedded WebViews where crypto.randomUUID
+ * is missing or throws when called. The last-resort path is Math.random-based
+ * and NOT cryptographically secure — use only for identifiers, never for
+ * security tokens or secrets.
+ */
 export function createUuid(): string {
   const crypto = globalThis.crypto;
   if (typeof crypto?.randomUUID === "function") {

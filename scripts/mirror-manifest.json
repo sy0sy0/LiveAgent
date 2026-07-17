@@ -75,6 +75,7 @@
     "lib/tools/systemToolOptions.ts",
     "lib/tools/builtinToolCatalog.ts",
     "lib/skills/builtin.ts",
+    "lib/shared/id.ts",
     "pages/settings/SystemToolsSection.tsx"
   ]
 }

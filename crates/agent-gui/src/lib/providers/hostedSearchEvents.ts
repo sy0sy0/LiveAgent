@@ -6,6 +6,7 @@ import {
   normalizeHostedSearchStatus,
 } from "../chat/messages/hostedSearch";
 import type { ProviderId } from "../settings";
+import { createUuid } from "../shared/id";
 
 type HostedSearchUpdate = {
   id?: string;
@@ -39,16 +40,11 @@ type HostedSearchFetchProbeController = {
 
 const activeFetchProbes = new Set<FetchProbe>();
 let originalFetch: typeof globalThis.fetch | null = null;
-let hostedSearchProbeSequence = 0;
 
 export const HOSTED_SEARCH_PROBE_HEADER = "x-liveagent-hosted-search-probe";
 
 export function createHostedSearchProbeId(providerId: ProviderId) {
-  const random =
-    typeof globalThis.crypto?.randomUUID === "function"
-      ? globalThis.crypto.randomUUID()
-      : `${Date.now().toString(36)}-${++hostedSearchProbeSequence}`;
-  return `hosted-search-${providerId}-${random}`;
+  return `hosted-search-${providerId}-${createUuid()}`;
 }
 
 export function withHostedSearchProbeHeader(

@@ -8,6 +8,7 @@ import {
   runtimePlatformLabel,
 } from "../runtimePlatform";
 import type { ProviderId } from "../settings";
+import { createUuid } from "../shared/id";
 import {
   type BashTimeoutPolicy,
   GLOBAL_BASH_MAX_TIMEOUT_MS,
@@ -86,11 +87,7 @@ function asErrorMessage(err: unknown) {
 }
 
 function createShellRunId(toolCallId: string) {
-  const suffix =
-    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-      ? crypto.randomUUID()
-      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  return `bash-${toolCallId || "tool"}-${suffix}`;
+  return `bash-${toolCallId || "tool"}-${createUuid()}`;
 }
 
 function delay(ms: number) {

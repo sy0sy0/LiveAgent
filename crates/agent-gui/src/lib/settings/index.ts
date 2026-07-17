@@ -2097,11 +2097,7 @@ const RIGHT_DOCK_WRITER_ID_STORAGE_KEY = "liveagent.client-id";
 let cachedRightDockWriterId = "";
 
 function generateRightDockWriterId(): string {
-  const uuid =
-    typeof globalThis.crypto?.randomUUID === "function"
-      ? globalThis.crypto.randomUUID()
-      : `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
-  return uuid.replace(/-/g, "").slice(0, 12);
+  return createUuid().replace(/-/g, "").slice(0, 12);
 }
 
 // Stable per-client id used to break stateVersion ties deterministically in

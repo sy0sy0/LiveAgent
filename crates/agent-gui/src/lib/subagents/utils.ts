@@ -1,5 +1,6 @@
 import type { Message } from "@earendil-works/pi-ai";
 
+import { createUuid } from "../shared/id";
 import { MAX_SUMMARY_CHARS } from "./types";
 
 export function asObject(value: unknown): Record<string, unknown> {
@@ -60,10 +61,7 @@ export function createSequentialQueue() {
 }
 
 export function randomIdSuffix() {
-  if (typeof globalThis.crypto?.randomUUID === "function") {
-    return globalThis.crypto.randomUUID();
-  }
-  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return createUuid();
 }
 
 export async function runWithConcurrency<T, R>(

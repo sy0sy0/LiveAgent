@@ -21,6 +21,7 @@ import type {
   SftpTransferEvent,
   SftpTransferResponse,
 } from "@/lib/sftp/types";
+import { createUuid } from "@/lib/shared/id";
 import { BrowserGatewayTerminalStreamClient } from "@/lib/terminal/gatewayTerminalStreamClient";
 import type {
   SshTerminalTab,
@@ -553,14 +554,10 @@ function buildWebSocketUrl() {
 function createChatClientRequestId(input: GatewayChatCommandInput) {
   const commandType = input.type.trim() || "chat.command";
   const conversationId = input.conversationId?.trim() || "new";
-  const randomPart =
-    typeof globalThis.crypto?.randomUUID === "function"
-      ? globalThis.crypto.randomUUID()
-      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   return `webui-${commandType.replace(/[^a-z0-9._-]/gi, "_")}-${conversationId.replace(
     /[^a-z0-9._-]/gi,
     "_",
-  )}-${randomPart}`;
+  )}-${createUuid()}`;
 }
 
 function buildChatCommandPayload(input: GatewayChatCommandInput) {

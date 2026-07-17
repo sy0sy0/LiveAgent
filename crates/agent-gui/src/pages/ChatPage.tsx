@@ -148,6 +148,7 @@ import {
   workspaceProjectPathKey,
 } from "../lib/settings";
 import { tauriSftpClient } from "../lib/sftp/tauriSftpClient";
+import { createUuid } from "../lib/shared/id";
 import { cn } from "../lib/shared/utils";
 import { createGuiSidebarBackend } from "../lib/sidebar/guiSidebarBackend";
 import {
@@ -279,11 +280,7 @@ const WorkspaceSshTerminalOverlay = lazy(async () => {
 });
 
 function createLocalGatewayChatRunId(conversationId: string) {
-  const suffix =
-    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-      ? crypto.randomUUID()
-      : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  return `conversation-live-${conversationId}-${suffix}`;
+  return `conversation-live-${conversationId}-${createUuid()}`;
 }
 
 type ChatPageProps = {
