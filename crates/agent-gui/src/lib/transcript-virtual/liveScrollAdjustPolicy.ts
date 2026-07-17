@@ -1,23 +1,26 @@
 import type { VirtualItem, Virtualizer } from "@tanstack/react-virtual";
 
-// Resize-compensation policy for the transcript virtualizer.
+// Resize-compensation policy for the transcript virtualizer (virtual-core
+// 3.17.x semantics).
 //
-// virtual-core's default shouldAdjustScrollPositionOnItemSizeChange treats any
-// resize of a row whose START sits above the viewport top as "content above
-// the reader changed" and shifts scrollTop by the delta. That is correct for
-// rows entirely above the viewport, but wrong for the live streaming row once
-// it grows taller than the viewport: a reader scrolled up into that row has
-// the row's start above the viewport top while the stream appends at the
-// row's BOTTOM edge, below everything visible. The default then drags
-// scrollTop down by exactly the growth delta on every stream flush — the
-// view creeps toward the bottom and the transcript is unreadable.
+// With `anchorTo: 'end'`, virtual-core handles the bottom-pinned case itself:
+// while the viewport is virtually at the end, `resizeItem` compensates by the
+// total-size delta and this predicate's verdict is ignored. This policy
+// therefore only governs the detached reader.
 //
-// This policy replicates the upstream default and carves out exactly that
-// case: growth (delta > 0) of a live row that still extends past the viewport
-// top never adjusts while the user is detached from the bottom. Everything
-// else keeps the default:
-// - rows entirely above the viewport compensate as before (estimate→measured
-//   corrections must not jump the view);
+// It replicates the upstream default and carves out exactly one case the
+// default gets wrong: the live streaming row grown taller than the viewport.
+// A reader scrolled up into that row has the row's start above the viewport
+// top while the stream appends at the row's BOTTOM edge, below everything
+// visible. The default would drag scrollTop down by the growth delta on
+// every stream flush — the view creeps toward the bottom and the transcript
+// is unreadable. Growth (delta > 0) of a live row that still extends past
+// the viewport top never adjusts while the user is detached from the bottom.
+// Everything else keeps the default:
+// - rows entirely above the viewport compensate as before, where a first
+//   measurement always compensates (the estimate→actual delta must land
+//   regardless of scroll direction) and a re-measurement is skipped during
+//   backward scroll (the upstream "items jump while scrolling up" fix);
 // - while following, the compensation cooperates with the scroll-follow pin,
 //   so it stays on;
 // - live-row shrinks (delta < 0, e.g. a thinking block collapsing near the
@@ -49,9 +52,13 @@ export function createLiveRowScrollAdjustPolicy<
       (instance as unknown as { scrollAdjustments?: number }).scrollAdjustments ?? 0;
     const viewportTop = (instance.scrollOffset ?? 0) + pendingAdjustments;
 
-    // Upstream default: only above-viewport resizes may shift scrollTop, and
-    // never while the user is actively scrolling backward.
-    if (item.start >= viewportTop || instance.scrollDirection === "backward") {
+    // Upstream default: only above-viewport resizes may shift scrollTop.
+    if (item.start >= viewportTop) {
+      return false;
+    }
+    // Upstream default: re-measurements are skipped during backward scroll;
+    // first measurements always compensate.
+    if (instance.itemSizeCache.has(item.key) && instance.scrollDirection === "backward") {
       return false;
     }
 

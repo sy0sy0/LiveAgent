@@ -1287,11 +1287,24 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
     gap: TRANSCRIPT_ROW_GAP,
     overscan: TRANSCRIPT_ROW_OVERSCAN_COUNT,
     enabled: scrollViewport !== null,
+    // End-anchored: prepends (loading earlier history) keep the visible item
+    // stable upstream via keyed anchoring, growth of the last row while the
+    // viewport is virtually at the end compensates by the total-size delta,
+    // and estimate→measure corrections keep the bottom pinned. The threshold
+    // matches scrollFollowCore's BOTTOM_ATTACH_THRESHOLD_PX so both engines
+    // agree on what "at the bottom" means. followOnAppend stays off: its
+    // DOM-distance re-follow would conflict with the follow reducer's
+    // "shrink clamps never re-attach" contract — appends while following are
+    // already pinned by the reducer.
+    anchorTo: "end",
+    scrollEndThreshold: 8,
     rangeExtractor: (range) => extractLiveRange(range, forceMountStartRef.current),
   });
 
   // TanStack exposes the resize-compensation predicate as an instance field,
   // not an option; reassigning per render keeps the closure's inputs current.
+  // It only governs the detached reader — while virtually at the end, the
+  // upstream end-anchor compensation takes priority over this predicate.
   transcriptVirtualizer.shouldAdjustScrollPositionOnItemSizeChange =
     createLiveRowScrollAdjustPolicy({
       getLiveStartIndex: () => forceMountStartRef.current,
@@ -1299,35 +1312,6 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
     });
 
   const virtualRows = transcriptVirtualizer.getVirtualItems();
-
-  // Prepend anchor: when loading earlier history inserts rows above the
-  // viewport, shift scrollTop by the inserted height so the visible content
-  // does not jump. Skipped while bottom-attached (the follow engine pins).
-  // getOffsetForIndex(_, "start") is the public offset accessor; the anchor
-  // and the restore read through the same function, so the delta is exact.
-  const prependAnchorRef = useRef<{ key: string; start: number } | null>(null);
-  // Intentionally no dependency array: the anchor must re-read on every
-  // commit, since any render can be the one that prepends rows.
-  useLayoutEffect(() => {
-    const firstRowKey = virtualItems[leadingOffset]?.key ?? null;
-    const startOf = (index: number) => transcriptVirtualizer.getOffsetForIndex(index, "start")?.[0];
-    const anchor = prependAnchorRef.current;
-    if (anchor && firstRowKey && anchor.key !== firstRowKey && scrollViewport) {
-      const anchorIndex = virtualItems.findIndex((item) => item.key === anchor.key);
-      const anchorStart = anchorIndex >= 0 ? startOf(anchorIndex) : undefined;
-      if (anchorStart !== undefined) {
-        const bottomGap =
-          scrollViewport.scrollHeight - scrollViewport.scrollTop - scrollViewport.clientHeight;
-        const delta = anchorStart - anchor.start;
-        if (delta > 0 && bottomGap > 8) {
-          scrollViewport.scrollTop += delta;
-        }
-      }
-    }
-    const firstStart = firstRowKey ? startOf(leadingOffset) : undefined;
-    prependAnchorRef.current =
-      firstRowKey && firstStart !== undefined ? { key: firstRowKey, start: firstStart } : null;
-  });
 
   return (
     <div className="relative" style={{ height: transcriptVirtualizer.getTotalSize() }}>
