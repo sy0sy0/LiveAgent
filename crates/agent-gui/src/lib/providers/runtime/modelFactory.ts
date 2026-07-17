@@ -170,6 +170,18 @@ function normalizeCompatBaseUrl(baseUrl: string | undefined) {
   return baseUrl?.trim().replace(/\/+$/, "").toLowerCase() ?? "";
 }
 
+function resolveCodexOpenAIResponsesCompat(params: {
+  baseUrl: string;
+  upstreamBaseUrl?: string;
+}): Model<"openai-responses">["compat"] | undefined {
+  const compatBaseUrl = normalizeCompatBaseUrl(params.upstreamBaseUrl ?? params.baseUrl);
+  if (isOfficialOpenAIBaseUrl(compatBaseUrl)) return undefined;
+
+  return {
+    supportsDeveloperRole: false,
+  };
+}
+
 function resolveCodexOpenAICompletionsOverrides(params: {
   baseUrl: string;
   upstreamBaseUrl?: string;
@@ -303,6 +315,13 @@ export function createModelFromConfig(
       modelId,
     });
     const api = isDeepSeekCodex ? "openai-completions" : inferCodexApi(requestFormat, preferredApi);
+    const responsesCompat =
+      api === "openai-responses"
+        ? resolveCodexOpenAIResponsesCompat({
+            baseUrl: normalizedBaseUrl,
+            upstreamBaseUrl,
+          })
+        : undefined;
     const known = resolveKnownModel("openai", modelId, normalizedBaseUrl);
     if (known && known.api === api) {
       return applyDeepSeekModelDefaults(
@@ -310,6 +329,14 @@ export function createModelFromConfig(
           ...known,
           contextWindow,
           maxTokens,
+          ...(responsesCompat
+            ? {
+                compat: {
+                  ...(known.compat ?? {}),
+                  ...responsesCompat,
+                },
+              }
+            : {}),
         },
         {
           providerId,
@@ -335,7 +362,9 @@ export function createModelFromConfig(
       contextWindow,
       maxTokens,
     };
-    if (api === "openai-completions") {
+    if (api === "openai-responses" && responsesCompat) {
+      custom.compat = responsesCompat;
+    } else if (api === "openai-completions") {
       const overrides = resolveCodexOpenAICompletionsOverrides({
         baseUrl: normalizedBaseUrl,
         upstreamBaseUrl,

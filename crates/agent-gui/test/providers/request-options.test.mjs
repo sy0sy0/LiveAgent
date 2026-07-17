@@ -227,6 +227,33 @@ test("custom Codex Responses models prefer native image-capable input metadata",
   assert.deepEqual(model.input, ["text", "image"]);
 });
 
+test("third-party Codex Responses models use the system role compatibility mode", () => {
+  const custom = providers.createModelFromConfig(
+    "codex",
+    "custom-responses-model",
+    "https://relay.example.test/v1",
+    "openai-responses",
+  );
+  const known = providers.createModelFromConfig(
+    "codex",
+    "gpt-5",
+    "https://relay.example.test/v1",
+    "openai-responses",
+  );
+  const proxiedOfficial = providers.createModelFromConfig(
+    "codex",
+    "gpt-5",
+    "http://127.0.0.1:18080/proxy/codex/v1",
+    "openai-responses",
+    undefined,
+    "https://api.openai.com/v1",
+  );
+
+  assert.equal(custom.compat.supportsDeveloperRole, false);
+  assert.equal(known.compat.supportsDeveloperRole, false);
+  assert.notEqual(proxiedOfficial.compat?.supportsDeveloperRole, false);
+});
+
 test("custom Codex models append v1 to bare and prefixed base URLs", () => {
   const bare = providers.createModelFromConfig(
     "codex",
