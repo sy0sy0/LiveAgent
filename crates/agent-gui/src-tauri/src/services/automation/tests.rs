@@ -59,6 +59,13 @@ fn validate_cron_expression_rejects_five_field_syntax() {
 }
 
 #[test]
+fn cron_run_now_response_uses_camel_case() {
+    let value = serde_json::to_value(CronRunNowResponse { started_at: 1234 })
+        .expect("serialize run-now response");
+    assert_eq!(value, json!({ "startedAt": 1234 }));
+}
+
+#[test]
 fn cron_apply_rejects_stale_revision() {
     let store = AutomationStore::open_in_memory().expect("open store");
     let base = store.snapshot().expect("snapshot").cron.revision;
@@ -207,13 +214,17 @@ fn prompt_run_lifecycle_queue_claim_complete() {
     let (store, task) = store_with_task(create_prompt_task_op("p1"));
 
     assert!(matches!(
-        store.queue_prompt_run(&task).expect("queue prompt run"),
+        store.queue_prompt_run(&task, true).expect("queue prompt run"),
         super::store::PromptQueueOutcome::Queued
     ));
 
+    let pending_runs = store.list_runs("p1", 10).expect("list pending runs");
+    assert_eq!(pending_runs.len(), 1);
+    assert_eq!(pending_runs[0].state, RunState::Pending);
+
     // Second fire while pending is skipped.
     assert!(matches!(
-        store.queue_prompt_run(&task).expect("second queue"),
+        store.queue_prompt_run(&task, true).expect("second queue"),
         super::store::PromptQueueOutcome::SkippedActiveRun
     ));
 
@@ -250,10 +261,131 @@ fn prompt_run_lifecycle_queue_claim_complete() {
 }
 
 #[test]
+fn complete_prompt_run_input_uses_camel_case_wire_fields() {
+    let input: CompletePromptRunInput = serde_json::from_value(json!({
+        "executionId": "execution-1",
+        "success": true,
+        "durationMs": 1200,
+        "output": "conclusion",
+    }))
+    .expect("deserialize camelCase completion input");
+    assert_eq!(input.execution_id, "execution-1");
+    assert_eq!(input.duration_ms, 1200);
+
+    let error = serde_json::from_value::<CompletePromptRunInput>(json!({
+        "execution_id": "execution-1",
+        "success": true,
+        "duration_ms": 1200,
+        "output": "conclusion",
+    }))
+    .expect_err("reject snake_case completion input");
+    assert!(error.to_string().contains("executionId"));
+
+    let legacy_request: PromptRunRequest = serde_json::from_value(json!({
+        "executionId": "execution-1",
+        "taskId": "task-1",
+        "taskName": "Task",
+        "prompt": "Run",
+        "providerId": "provider-a",
+        "model": "gpt-5",
+        "startedAt": 100,
+        "leaseExpiresAt": 200,
+    }))
+    .expect("deserialize legacy prompt request");
+    assert!(legacy_request.counted);
+}
+
+#[test]
+fn manual_prompt_run_does_not_consume_remaining_execution() {
+    let (store, task) = store_with_task(AutomationOp::Create {
+        item: json!({
+            "id": "manual-prompt",
+            "name": "Manual Prompt",
+            "cron": "0 * * * * *",
+            "enabled": true,
+            "remainingExecutions": 1,
+            "type": "prompt",
+            "prompt": "Summarize the repo",
+            "selectedModel": { "customProviderId": "provider-a", "model": "gpt-5" },
+        }),
+    });
+
+    store
+        .queue_prompt_run(&task, false)
+        .expect("queue manual prompt run");
+    let claims = store.claim_prompt_runs().expect("claim manual prompt run");
+    assert_eq!(claims.len(), 1);
+    assert!(!claims[0].counted);
+    store
+        .complete_prompt_run(CompletePromptRunInput {
+            execution_id: claims[0].execution_id.clone(),
+            success: true,
+            duration_ms: 10,
+            output: "manual conclusion".to_string(),
+        })
+        .expect("complete manual prompt run");
+
+    let snapshot = store.snapshot().expect("snapshot after manual run").cron;
+    assert_eq!(snapshot.tasks[0].remaining_executions, Some(1));
+    assert!(snapshot.tasks[0].enabled);
+}
+
+#[test]
+fn interrupted_manual_prompt_run_does_not_consume_remaining_execution() {
+    let (store, task) = store_with_task(AutomationOp::Create {
+        item: json!({
+            "id": "manual-prompt",
+            "name": "Manual Prompt",
+            "cron": "0 * * * * *",
+            "enabled": true,
+            "remainingExecutions": 1,
+            "type": "prompt",
+            "prompt": "Summarize the repo",
+            "selectedModel": { "customProviderId": "provider-a", "model": "gpt-5" },
+        }),
+    });
+
+    store
+        .queue_prompt_run(&task, false)
+        .expect("queue manual prompt run");
+    assert_eq!(
+        store
+            .recover_interrupted_prompt_runs()
+            .expect("expire manual prompt run"),
+        1
+    );
+
+    let snapshot = store.snapshot().expect("snapshot after manual expiry").cron;
+    assert_eq!(snapshot.tasks[0].remaining_executions, Some(1));
+    assert!(snapshot.tasks[0].enabled);
+}
+
+#[test]
+fn manual_run_context_allows_disabled_exhausted_task() {
+    let (store, task) = store_with_task(AutomationOp::Create {
+        item: json!({
+            "id": "manual-bash",
+            "name": "Manual Bash",
+            "cron": "0 * * * * *",
+            "enabled": false,
+            "remainingExecutions": 0,
+            "type": "bash",
+            "script": "echo manual",
+        }),
+    });
+
+    let (_, manual_task) = store
+        .cron_task_for_manual_run(&task.id)
+        .expect("load disabled exhausted task for manual run");
+    assert!(!manual_task.enabled);
+    assert_eq!(manual_task.remaining_executions, Some(0));
+}
+
+#[test]
 fn released_prompt_run_returns_to_pending() {
     let (store, task) = store_with_task(create_prompt_task_op("p1"));
     assert!(matches!(
-        store.queue_prompt_run(&task).expect("queue"),
+        store.queue_prompt_run(&task, true).expect("queue"),
         super::store::PromptQueueOutcome::Queued
     ));
     let claims = store.claim_prompt_runs().expect("claim");
@@ -268,7 +400,7 @@ fn released_prompt_run_returns_to_pending() {
 #[test]
 fn recover_marks_interrupted_runs_expired() {
     let (store, task) = store_with_task(create_prompt_task_op("p1"));
-    store.queue_prompt_run(&task).expect("queue");
+    store.queue_prompt_run(&task, true).expect("queue");
     let recovered = store
         .recover_interrupted_prompt_runs()
         .expect("recover");

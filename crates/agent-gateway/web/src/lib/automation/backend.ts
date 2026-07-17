@@ -12,6 +12,7 @@ import type {
   AutomationApplyInput,
   AutomationSnapshot,
   CronApplyResponse,
+  CronRunNowResponse,
   CronRunRecord,
   CronSnapshot,
   HooksApplyResponse,
@@ -63,6 +64,10 @@ export const backend = {
   async clearRuns(taskId: string): Promise<number> {
     const payload = await cronManage<{ clearedCount?: number }>("clear_runs", taskId);
     return typeof payload.clearedCount === "number" ? payload.clearedCount : 0;
+  },
+
+  runNow(taskId: string): Promise<CronRunNowResponse> {
+    return cronManage<CronRunNowResponse>("run_now", taskId);
   },
 
   async validateCronExpression(expression: string): Promise<void> {

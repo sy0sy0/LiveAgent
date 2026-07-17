@@ -22,6 +22,8 @@ import {
 import { cn } from "../../lib/shared/utils";
 import {
   AlertCircle,
+  Archive,
+  ArchiveRestore,
   Blend,
   Cable,
   ChevronRight,
@@ -101,6 +103,11 @@ type ChatHistorySidebarProps = {
   onCancelProjectRename?: () => void;
   onSetProjectPinned?: (project: WorkspaceProject, isPinned: boolean) => void;
   onRemoveProject?: (project: WorkspaceProject) => void;
+  onArchiveProject?: (project: WorkspaceProject) => void;
+  onUnarchiveProject?: (project: WorkspaceProject) => void;
+  // Path keys of archived workspaces; those rows render disabled in a
+  // collapsed group at the end of the list.
+  archivedProjectPathKeys?: ReadonlySet<string>;
   onNewConversation: () => void;
   onSelectConversation: (id: string) => void;
   onStartRenaming: (item: ChatHistorySummary) => void;
@@ -143,6 +150,7 @@ const SIDEBAR_MOBILE_PROJECTS_BODY_DEFAULT_RATIO = 0.4;
 // Projects are not virtualized; cap the rendered rows and offer an explicit
 // "show all (N)" expansion instead.
 const SIDEBAR_PROJECT_RENDER_CAP = 30;
+const EMPTY_PROJECT_PATH_KEYS = new Set<string>();
 const HISTORY_LOADING_SKELETON_ROWS = [
   { title: "w-36", meta: "w-20" },
   { title: "w-44", meta: "w-24" },
@@ -760,6 +768,13 @@ const ProjectRow = memo(function ProjectRow(props: {
   onCancelProjectRename: () => void;
   onSetProjectPinned: (project: WorkspaceProject, isPinned: boolean) => void;
   onRemoveProject: (project: WorkspaceProject) => void;
+  // Archived rows render disabled: no selection (so no new conversations),
+  // no pin — but rename/remove/browse stay available from the menu.
+  isArchived: boolean;
+  // Offered only while at least one other non-archived workspace remains.
+  canArchive: boolean;
+  onArchiveProject: (project: WorkspaceProject) => void;
+  onUnarchiveProject: (project: WorkspaceProject) => void;
   onSetPendingRemove: (projectId: string | null) => void;
   menuOpen: boolean;
   onMenuOpenChange: (projectId: string, open: boolean) => void;
@@ -781,6 +796,10 @@ const ProjectRow = memo(function ProjectRow(props: {
     onCancelProjectRename,
     onSetProjectPinned,
     onRemoveProject,
+    isArchived,
+    canArchive,
+    onArchiveProject,
+    onUnarchiveProject,
     onSetPendingRemove,
     menuOpen,
     onMenuOpenChange,
@@ -833,6 +852,20 @@ const ProjectRow = memo(function ProjectRow(props: {
     onBrowseProjectInFileTree?.(project);
   }, [isInteractionDisabled, onBrowseProjectInFileTree, project]);
 
+  const handleArchive = useCallback(() => {
+    if (isInteractionDisabled) {
+      return;
+    }
+    onArchiveProject(project);
+  }, [isInteractionDisabled, onArchiveProject, project]);
+
+  const handleUnarchive = useCallback(() => {
+    if (isInteractionDisabled) {
+      return;
+    }
+    onUnarchiveProject(project);
+  }, [isInteractionDisabled, onUnarchiveProject, project]);
+
   const handleMenuOpenChange = useCallback(
     (open: boolean) => {
       if (open && isInteractionDisabled) {
@@ -884,9 +917,11 @@ const ProjectRow = memo(function ProjectRow(props: {
         "group/project grid h-[30px] grid-cols-[minmax(0,1fr)_auto] items-center rounded-lg pl-1 transition-colors",
         isMissing
           ? "text-destructive hover:bg-destructive/10"
-          : isActive
-            ? "bg-foreground/[0.07] text-foreground hover:bg-foreground/[0.09]"
-            : "text-foreground/85 hover:bg-foreground/[0.05] hover:text-foreground",
+          : isArchived
+            ? "text-muted-foreground/60 hover:bg-foreground/[0.03]"
+            : isActive
+              ? "bg-foreground/[0.07] text-foreground hover:bg-foreground/[0.09]"
+              : "text-foreground/85 hover:bg-foreground/[0.05] hover:text-foreground",
       )}
     >
       {isRenaming ? (
@@ -894,7 +929,13 @@ const ProjectRow = memo(function ProjectRow(props: {
           <ProjectFolderIcon
             className={cn(
               "h-4 w-4 shrink-0 transition-colors",
-              isMissing ? "text-destructive" : isActive ? "text-amber-500" : "text-foreground/65",
+              isMissing
+                ? "text-destructive"
+                : isArchived
+                  ? "text-muted-foreground/40"
+                  : isActive
+                    ? "text-amber-500"
+                    : "text-foreground/65",
             )}
           />
           <Input
@@ -933,13 +974,22 @@ const ProjectRow = memo(function ProjectRow(props: {
             render={
               <button
                 type="button"
+                aria-disabled={isArchived || undefined}
                 className={cn(
                   "flex h-[30px] min-w-0 items-center gap-3 rounded-md px-2 text-left outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring",
                   isMissing
                     ? "hover:text-destructive focus-visible:bg-destructive/10"
-                    : "hover:text-foreground focus-visible:bg-foreground/[0.06]",
+                    : isArchived
+                      ? "cursor-default"
+                      : "hover:text-foreground focus-visible:bg-foreground/[0.06]",
                 )}
-                onClick={() => onSelectProject(project)}
+                onClick={() => {
+                  // Archived workspaces cannot be selected, so no new
+                  // conversations can start in them.
+                  if (!isArchived) {
+                    onSelectProject(project);
+                  }
+                }}
                 onDoubleClick={(event) => {
                   event.preventDefault();
                   if (!isDefaultProject && !isInteractionDisabled) {
@@ -953,9 +1003,11 @@ const ProjectRow = memo(function ProjectRow(props: {
                     "h-4 w-4 shrink-0 transition-colors",
                     isMissing
                       ? "text-destructive"
-                      : isActive
-                        ? "text-amber-500"
-                        : "text-foreground/65",
+                      : isArchived
+                        ? "text-muted-foreground/40"
+                        : isActive
+                          ? "text-amber-500"
+                          : "text-foreground/65",
                   )}
                 />
                 <span
@@ -1023,7 +1075,7 @@ const ProjectRow = memo(function ProjectRow(props: {
               menuOpen && "opacity-100",
             )}
           >
-            {isMissing ? (
+            {isMissing && !isArchived ? (
               !isDefaultProject ? (
                 <Button
                   type="button"
@@ -1043,18 +1095,24 @@ const ProjectRow = memo(function ProjectRow(props: {
               ) : null
             ) : (
               <>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  className={PROJECT_ICON_BUTTON_CLASS}
-                  title={isPinned ? t("chat.workspaceUnpin") : t("chat.workspacePin")}
-                  aria-label={isPinned ? t("chat.workspaceUnpin") : t("chat.workspacePin")}
-                  onClick={handleTogglePinned}
-                  disabled={isInteractionDisabled}
-                >
-                  {isPinned ? <PinOff className="h-3.5 w-3.5" /> : <Pin className="h-3.5 w-3.5" />}
-                </Button>
+                {!isArchived ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className={PROJECT_ICON_BUTTON_CLASS}
+                    title={isPinned ? t("chat.workspaceUnpin") : t("chat.workspacePin")}
+                    aria-label={isPinned ? t("chat.workspaceUnpin") : t("chat.workspacePin")}
+                    onClick={handleTogglePinned}
+                    disabled={isInteractionDisabled}
+                  >
+                    {isPinned ? (
+                      <PinOff className="h-3.5 w-3.5" />
+                    ) : (
+                      <Pin className="h-3.5 w-3.5" />
+                    )}
+                  </Button>
+                ) : null}
                 <DropdownMenu
                   open={!isInteractionDisabled && menuOpen}
                   onOpenChange={handleMenuOpenChange}
@@ -1098,6 +1156,26 @@ const ProjectRow = memo(function ProjectRow(props: {
                           {t("chat.workspaceRemove")}
                         </DropdownMenuItem>
                       </>
+                    ) : null}
+                    {!isArchived && canArchive ? (
+                      <DropdownMenuItem
+                        disabled={isInteractionDisabled}
+                        onSelect={handleArchive}
+                        className="gap-2"
+                      >
+                        <Archive className="h-3.5 w-3.5" />
+                        {t("chat.workspaceArchive")}
+                      </DropdownMenuItem>
+                    ) : null}
+                    {isArchived ? (
+                      <DropdownMenuItem
+                        disabled={isInteractionDisabled}
+                        onSelect={handleUnarchive}
+                        className="gap-2"
+                      >
+                        <ArchiveRestore className="h-3.5 w-3.5" />
+                        {t("chat.workspaceUnarchive")}
+                      </DropdownMenuItem>
                     ) : null}
                     {onBrowseProjectInFileTree ? (
                       <DropdownMenuItem
@@ -1190,6 +1268,9 @@ export const ChatHistorySidebar = memo(function ChatHistorySidebar(props: ChatHi
     onCancelProjectRename,
     onSetProjectPinned,
     onRemoveProject,
+    onArchiveProject,
+    onUnarchiveProject,
+    archivedProjectPathKeys = EMPTY_PROJECT_PATH_KEYS,
     onNewConversation,
     onSelectConversation,
     onStartRenaming,
@@ -1351,13 +1432,42 @@ export const ChatHistorySidebar = memo(function ChatHistorySidebar(props: ChatHi
       onRemoveProject?.(project);
     }
   });
+  const handleArchiveProject = useStableEvent((project: WorkspaceProject) => {
+    if (!sectionsDisabled) {
+      onArchiveProject?.(project);
+    }
+  });
+  const handleUnarchiveProject = useStableEvent((project: WorkspaceProject) => {
+    if (!sectionsDisabled) {
+      onUnarchiveProject?.(project);
+    }
+  });
+  // Archived rows are split into their own collapsed group at the list end;
+  // the render cap only applies to the active rows.
+  const activeProjects = useMemo(
+    () =>
+      projects.filter(
+        (project) => !archivedProjectPathKeys.has(workspaceProjectPathKey(project.path)),
+      ),
+    [archivedProjectPathKeys, projects],
+  );
+  const archivedProjects = useMemo(
+    () =>
+      projects.filter((project) =>
+        archivedProjectPathKeys.has(workspaceProjectPathKey(project.path)),
+      ),
+    [archivedProjectPathKeys, projects],
+  );
   // Projects arrive pre-sorted from the container; only the render cap is
   // applied here.
   const renderedProjects = useMemo(
-    () => (showAllProjects ? projects : projects.slice(0, SIDEBAR_PROJECT_RENDER_CAP)),
-    [projects, showAllProjects],
+    () => (showAllProjects ? activeProjects : activeProjects.slice(0, SIDEBAR_PROJECT_RENDER_CAP)),
+    [activeProjects, showAllProjects],
   );
-  const hasCappedProjects = projects.length > SIDEBAR_PROJECT_RENDER_CAP;
+  // Archiving must always leave at least one active workspace behind.
+  const canArchiveProjects = Boolean(onArchiveProject) && activeProjects.length > 1;
+  const [archivedGroupOpen, setArchivedGroupOpen] = useState(false);
+  const hasCappedProjects = activeProjects.length > SIDEBAR_PROJECT_RENDER_CAP;
   const sidebarSectionLayout = useMemo(() => {
     const {
       containerHeight,
@@ -1961,6 +2071,10 @@ export const ChatHistorySidebar = memo(function ChatHistorySidebar(props: ChatHi
                         onCancelProjectRename={handleCancelProjectRename}
                         onSetProjectPinned={handleSetProjectPinned}
                         onRemoveProject={handleRemoveProject}
+                        isArchived={false}
+                        canArchive={canArchiveProjects}
+                        onArchiveProject={handleArchiveProject}
+                        onUnarchiveProject={handleUnarchiveProject}
                         onSetPendingRemove={handleSetPendingProjectRemove}
                         menuOpen={!sectionsDisabled && openProjectMenuId === project.id}
                         onMenuOpenChange={handleProjectMenuOpenChange}
@@ -1978,9 +2092,67 @@ export const ChatHistorySidebar = memo(function ChatHistorySidebar(props: ChatHi
                         ? t("chat.workspaceShowLessProjects")
                         : t("chat.workspaceShowAllProjects").replace(
                             "{count}",
-                            String(projects.length),
+                            String(activeProjects.length),
                           )}
                     </button>
+                  ) : null}
+                  {archivedProjects.length > 0 ? (
+                    <div className="pt-0.5">
+                      <button
+                        type="button"
+                        onClick={() => setArchivedGroupOpen((current) => !current)}
+                        disabled={sectionsDisabled}
+                        className="flex w-full items-center gap-1 rounded-md px-2 py-1.5 text-[calc(11.5px*var(--zone-font-scale,1))] font-medium text-muted-foreground/80 outline-hidden transition-colors hover:!bg-foreground/[0.06] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                      >
+                        <ChevronRight
+                          className={cn(
+                            "h-3 w-3 shrink-0 transition-transform duration-200",
+                            archivedGroupOpen && "rotate-90",
+                          )}
+                        />
+                        {t("chat.workspaceArchivedGroup").replace(
+                          "{count}",
+                          String(archivedProjects.length),
+                        )}
+                      </button>
+                      {archivedGroupOpen
+                        ? archivedProjects.map((project) => {
+                            const pathKey = workspaceProjectPathKey(project.path);
+                            return (
+                              <ProjectRow
+                                key={project.id}
+                                project={project}
+                                isActive={activeProjectId === project.id}
+                                isMissing={missingProjectPathKeys.has(pathKey)}
+                                isRunning={runningProjectPathKeys.has(pathKey)}
+                                isRenaming={projectRenamingId === project.id}
+                                isPendingRemove={pendingProjectRemoveId === project.id}
+                                isInteractionDisabled={sectionsDisabled}
+                                renameDraft={projectRenameDraft}
+                                onSelectProject={handleSelectProject}
+                                onBrowseProjectInFileTree={
+                                  onBrowseProjectInFileTree
+                                    ? handleBrowseProjectInFileTree
+                                    : undefined
+                                }
+                                onStartRenamingProject={handleStartRenamingProject}
+                                onProjectRenameDraftChange={handleProjectRenameDraftChange}
+                                onCommitProjectRename={handleCommitProjectRename}
+                                onCancelProjectRename={handleCancelProjectRename}
+                                onSetProjectPinned={handleSetProjectPinned}
+                                onRemoveProject={handleRemoveProject}
+                                isArchived
+                                canArchive={false}
+                                onArchiveProject={handleArchiveProject}
+                                onUnarchiveProject={handleUnarchiveProject}
+                                onSetPendingRemove={handleSetPendingProjectRemove}
+                                menuOpen={!sectionsDisabled && openProjectMenuId === project.id}
+                                onMenuOpenChange={handleProjectMenuOpenChange}
+                              />
+                            );
+                          })
+                        : null}
+                    </div>
                   ) : null}
                 </div>
               </div>

@@ -5,6 +5,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
+import { createUuid } from "../shared/id";
 import type { HookDef, HookEvent, HookType } from "./types";
 
 export type HookRunWarning = {
@@ -90,7 +91,7 @@ export function createHookRunScope(params: {
   workdir?: string;
   onWarning?: (warning: HookRunWarning) => void;
 }): HookRunScope {
-  const scopeId = crypto.randomUUID();
+  const scopeId = createUuid();
   const hooksByEvent = new Map<HookEvent, HookDef[]>();
   for (const hook of params.hooks) {
     if (!hook.enabled) continue;

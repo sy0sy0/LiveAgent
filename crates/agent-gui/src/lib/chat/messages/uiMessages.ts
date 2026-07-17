@@ -7,9 +7,9 @@ import type {
 } from "@earendil-works/pi-ai";
 import { assistantMessageToText } from "../../providers/llm";
 import { isProviderNativeWebSearchToolName } from "../../providers/nativeWebSearch";
+import { isSubagentCardToolCall } from "../../subagents/card";
 import {
   buildSubagentCardToolCallId,
-  isSubagentCardArguments,
   type SubagentBatchDetails,
   type SubagentCardDetails,
 } from "../../subagents/protocol";
@@ -619,6 +619,11 @@ function appendTextLikeBlock(
 }
 
 function rebalanceHostedSearchTextBoundaries(blocks: UiRoundContentBlock[]): UiRoundContentBlock[] {
+  // Boundary rebalancing only matters around hostedSearch blocks; the common
+  // round has none, and this runs on every streamed text delta.
+  if (!blocks.some((block) => block.kind === "hostedSearch")) {
+    return blocks;
+  }
   const out: UiRoundContentBlock[] = [];
   for (let index = 0; index < blocks.length; index += 1) {
     const current = blocks[index];
@@ -650,10 +655,6 @@ function rebalanceHostedSearchTextBoundaries(blocks: UiRoundContentBlock[]): UiR
     out.push(current);
   }
   return out;
-}
-
-function isSubagentCardToolCall(toolCall: ToolCall) {
-  return toolCall.name === "Agent" && isSubagentCardArguments(toolCall.arguments);
 }
 
 function isParentAgentToolCall(toolCall: ToolCall) {
@@ -1159,7 +1160,10 @@ function buildUiRoundBlocks(
   return blocks;
 }
 
-export function buildUiMessages(messages: Message[]): UiMessage[] {
+// `indexOffset` lets callers build UI messages for a suffix of a larger list
+// (incremental timeline appends) while keeping keys and messageIndex values
+// identical to a full build: pass `messages.slice(offset)` plus the offset.
+export function buildUiMessages(messages: Message[], indexOffset = 0): UiMessage[] {
   const out: UiMessage[] = [];
   let i = 0;
 
@@ -1168,11 +1172,11 @@ export function buildUiMessages(messages: Message[]): UiMessage[] {
 
     if (message.role === "user") {
       out.push({
-        key: `user-${i}-${message.timestamp}`,
+        key: `user-${indexOffset + i}-${message.timestamp}`,
         role: "user",
         text: getMessageText(message),
         attachments: getUserMessageAttachments(message as Message & Record<string, unknown>),
-        messageIndex: i,
+        messageIndex: indexOffset + i,
       });
       i += 1;
       continue;
@@ -1228,7 +1232,7 @@ export function buildUiMessages(messages: Message[]): UiMessage[] {
     if (rounds.length > 0) {
       const lastText = getRoundText(rounds[rounds.length - 1]);
       out.push({
-        key: `assistant-${groupStartIndex}-${i}-${lastAssistantTimestamp}`,
+        key: `assistant-${indexOffset + groupStartIndex}-${indexOffset + i}-${lastAssistantTimestamp}`,
         role: "assistant",
         text: lastText,
         rounds,

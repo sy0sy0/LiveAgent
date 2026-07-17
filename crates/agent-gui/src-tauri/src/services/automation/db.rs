@@ -452,7 +452,7 @@ pub fn read_runs(
             "SELECT execution_id, task_id, state, success, started_at, finished_at,
                     duration_ms, exit_code, output
              FROM automation_cron_runs
-             WHERE task_id = ?1 AND state IN ('done', 'expired')
+             WHERE task_id = ?1
              ORDER BY started_at DESC, execution_id DESC
              LIMIT ?2",
         )

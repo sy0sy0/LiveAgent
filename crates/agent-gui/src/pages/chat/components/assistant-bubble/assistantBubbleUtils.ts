@@ -92,13 +92,6 @@ export function compactInlineText(value: unknown, maxChars = 120) {
   return `${text.slice(0, maxChars)}...`;
 }
 
-export function isSubagentCardToolCall(toolCall: {
-  name: string;
-  arguments?: Record<string, unknown>;
-}) {
-  return toolCall.name === "Agent" && toolCall.arguments?.subagent_card === true;
-}
-
 export function getSubagentTask(agent: { prompt?: unknown }) {
   return displayString(agent.prompt);
 }

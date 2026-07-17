@@ -37,10 +37,12 @@ import type { GitClient } from "@/lib/git/types";
 import { cn } from "@/lib/shared/utils";
 import { extractLiveRange } from "@/lib/transcript-virtual/liveRangeExtractor";
 import { createLiveRowScrollAdjustPolicy } from "@/lib/transcript-virtual/liveScrollAdjustPolicy";
+import { createTranscriptMeasurementsLru } from "@/lib/transcript-virtual/measurementsLru";
 import {
   CHECKPOINT_ROW_ESTIMATE_PX,
   estimateAssistantRowHeight,
   estimateUserRowHeight,
+  measureEstimateText,
 } from "@/lib/transcript-virtual/rowEstimates";
 import {
   AssistantAvatar,
@@ -61,6 +63,7 @@ import {
   Copy,
   File,
   FileText,
+  GitBranch,
   Loader2,
   Pencil,
   RefreshCw,
@@ -104,6 +107,10 @@ type GatewayTranscriptProps = {
     text: string,
     uploadedFiles: PendingUploadedFile[],
   ) => void;
+  onBranchConversation?: (messageRef: HistoryMessageRef) => void;
+  // Anchor messageId of the branch request in flight; the matching row shows
+  // a spinner and every branch button disables until it settles.
+  branchPendingMessageId?: string | null;
   onSuggestionSelect?: (text: string) => void;
   suggestionsDisabled?: boolean;
   readOnly?: boolean;
@@ -121,6 +128,11 @@ function rowRenderMode(row: Extract<TranscriptRow, { kind: "assistant" }>) {
 const TRANSCRIPT_ROW_ESTIMATED_HEIGHT = 260;
 const TRANSCRIPT_ROW_GAP = 18;
 const TRANSCRIPT_ROW_OVERSCAN_COUNT = 5;
+
+// Measured row heights survive conversation switches: saved on unmount,
+// restored (width-gated) on the next open so the switch lays out with exact
+// heights instead of estimates.
+const transcriptMeasurementsLru = createTranscriptMeasurementsLru();
 
 type GatewayTranscriptVirtualItem =
   | { key: string; kind: "loadRemoteHistory" }
@@ -240,7 +252,7 @@ function CheckpointCard(props: {
     <div className="checkpoint-row flex w-full max-w-full items-start gap-3">
       <div className="checkpoint-row-spacer mt-0.5 h-6 w-6 shrink-0" aria-hidden="true" />
       <div className="checkpoint-row-body min-w-0 flex-1">
-        <div className="checkpoint-card w-full overflow-hidden rounded-[14px] border border-black/[0.06] bg-white/[0.72] shadow-[0_1px_3px_rgba(0,0,0,0.04),0_4px_12px_rgba(0,0,0,0.03)] backdrop-blur-xl dark:border-white/[0.1] dark:bg-white/[0.06] dark:shadow-[0_1px_3px_rgba(0,0,0,0.2),0_4px_12px_rgba(0,0,0,0.15)]">
+        <div className="checkpoint-card w-full overflow-hidden rounded-[14px] border border-black/[0.06] bg-white/[0.85] shadow-[0_1px_3px_rgba(0,0,0,0.04),0_4px_12px_rgba(0,0,0,0.03)] dark:border-white/[0.1] dark:bg-white/[0.06] dark:shadow-[0_1px_3px_rgba(0,0,0,0.2),0_4px_12px_rgba(0,0,0,0.15)]">
           <button
             type="button"
             aria-expanded={isExpanded}
@@ -356,7 +368,7 @@ function GatewayUserImageAttachmentCard(props: {
     <div
       title={file.relativePath}
       className={cn(
-        "group relative overflow-hidden rounded-xl border border-white/60 bg-white/50 shadow-[0_1px_3px_rgba(0,0,0,0.06),0_1px_2px_rgba(0,0,0,0.04)] backdrop-blur-xl transition-shadow hover:shadow-[0_2px_8px_rgba(0,0,0,0.1)] dark:border-white/[0.12] dark:bg-white/[0.06]",
+        "group relative overflow-hidden rounded-xl border border-white/60 bg-white/75 shadow-[0_1px_3px_rgba(0,0,0,0.06),0_1px_2px_rgba(0,0,0,0.04)] transition-shadow hover:shadow-[0_2px_8px_rgba(0,0,0,0.1)] dark:border-white/[0.12] dark:bg-white/[0.06]",
         compact ? "min-w-0 basis-[calc(33.333%-5.33px)] grow" : "w-full max-w-[280px]",
       )}
     >
@@ -441,7 +453,7 @@ function GatewayUserFileAttachmentCard(props: {
     <div
       title={file.relativePath}
       className={cn(
-        "group relative flex items-center gap-2 rounded-xl border border-white/60 bg-white/50 px-2.5 py-2 text-left shadow-[0_1px_3px_rgba(0,0,0,0.06),0_1px_2px_rgba(0,0,0,0.04)] backdrop-blur-xl transition-shadow hover:shadow-[0_2px_8px_rgba(0,0,0,0.1)] dark:border-white/[0.12] dark:bg-white/[0.06]",
+        "group relative flex items-center gap-2 rounded-xl border border-white/60 bg-white/75 px-2.5 py-2 text-left shadow-[0_1px_3px_rgba(0,0,0,0.06),0_1px_2px_rgba(0,0,0,0.04)] transition-shadow hover:shadow-[0_2px_8px_rgba(0,0,0,0.1)] dark:border-white/[0.12] dark:bg-white/[0.06]",
         compact ? "min-w-0 basis-[calc(33.333%-5.33px)] grow" : "w-full",
       )}
     >
@@ -817,12 +829,15 @@ function useGatewayCommitDetailsLoader(
 // inline editor while this row is being edited. Both transcript regions
 // render it; the per-row copied/editing state lives in the owning region so
 // folds and conversation switches reset it there.
-function GatewayUserMessageRowBody(props: {
+// Memoized with per-row `isCopied`/`isEditing` booleans (instead of the raw
+// region-level ids) so copying or editing one row never re-renders the
+// others, and streaming flushes bail on every settled user row.
+const GatewayUserMessageRowBody = memo(function GatewayUserMessageRowBody(props: {
   row: Extract<TranscriptRow, { kind: "user" }>;
   isStreaming: boolean;
   readOnly?: boolean;
-  copiedMessageId: string | null;
-  editingMessageId: string | null;
+  isCopied: boolean;
+  isEditing: boolean;
   setCopiedMessageId: Dispatch<SetStateAction<string | null>>;
   setEditingMessageId: Dispatch<SetStateAction<string | null>>;
   workspaceRoot?: string;
@@ -838,8 +853,8 @@ function GatewayUserMessageRowBody(props: {
     row,
     isStreaming,
     readOnly = false,
-    copiedMessageId,
-    editingMessageId,
+    isCopied,
+    isEditing,
     setCopiedMessageId,
     setEditingMessageId,
     workspaceRoot,
@@ -848,8 +863,6 @@ function GatewayUserMessageRowBody(props: {
     onResendFromEdit,
   } = props;
   const { locale, t } = useLocale();
-  const isCopied = copiedMessageId === row.key;
-  const isEditing = editingMessageId === row.key;
   const effectiveMessageRef = row.messageRef;
   const missingStableRef = !effectiveMessageRef;
   const editDisabled = readOnly || isStreaming || !onResendFromEdit || missingStableRef;
@@ -925,7 +938,7 @@ function GatewayUserMessageRowBody(props: {
       </div>
     </div>
   );
-}
+});
 
 // Maps each assistant row to the nearest preceding user row — the prompt a
 // retry re-sends.
@@ -946,22 +959,31 @@ function buildRetryTargetMap(rows: readonly TranscriptRow[]) {
 // nearest preceding user prompt through the edit-resend pipeline: this reply
 // and everything after it are discarded, same as editing that prompt
 // unchanged. Both transcript regions render it below the bubble.
-function GatewayAssistantMessageActions(props: {
+const GatewayAssistantMessageActions = memo(function GatewayAssistantMessageActions(props: {
   row: Extract<TranscriptRow, { kind: "assistant" }>;
   retryTarget: Extract<TranscriptRow, { kind: "user" }> | null;
   isStreaming: boolean;
-  copiedMessageId: string | null;
+  isCopied: boolean;
   setCopiedMessageId: Dispatch<SetStateAction<string | null>>;
   onResendFromEdit?: (
     messageRef: HistoryMessageRef,
     text: string,
     uploadedFiles: PendingUploadedFile[],
   ) => void;
+  onBranchConversation?: (messageRef: HistoryMessageRef) => void;
+  branchPendingMessageId?: string | null;
 }) {
-  const { row, retryTarget, isStreaming, copiedMessageId, setCopiedMessageId, onResendFromEdit } =
-    props;
+  const {
+    row,
+    retryTarget,
+    isStreaming,
+    isCopied,
+    setCopiedMessageId,
+    onResendFromEdit,
+    onBranchConversation,
+    branchPendingMessageId,
+  } = props;
   const { locale, t } = useLocale();
-  const isCopied = copiedMessageId === row.key;
   const replyText = row.rounds
     .map((round) => getRoundText(round).trim())
     .filter((text) => text.length > 0)
@@ -973,6 +995,11 @@ function GatewayAssistantMessageActions(props: {
     : locale === "en-US"
       ? "This reply cannot be retried because its prompt has no stable message identifier."
       : "旧历史缺少稳定消息标识，无法重试";
+  const branchPending = branchPendingMessageId != null;
+  const isRowBranchPending =
+    branchPending && !!retryMessageRef && branchPendingMessageId === retryMessageRef.messageId;
+  const branchDisabled = isStreaming || !onBranchConversation || !retryMessageRef || branchPending;
+  const branchTitle = retryMessageRef ? t("chat.branch") : t("chat.branchUnavailable");
 
   return (
     <div className="assistant-bubble-shell flex w-full max-w-full items-start gap-3">
@@ -981,7 +1008,9 @@ function GatewayAssistantMessageActions(props: {
         <span className="select-none text-[calc(11px*var(--zone-font-scale,1))] tabular-nums text-muted-foreground/70">
           {formatMessageTimestamp(row.timestamp)}
         </span>
-        <div className="flex gap-0.5 opacity-0 transition-opacity group-focus-within/assistant:opacity-100 group-hover/assistant:opacity-100">
+        <div
+          className={`flex gap-0.5 transition-opacity group-focus-within/assistant:opacity-100 group-hover/assistant:opacity-100 ${isRowBranchPending ? "opacity-100" : "opacity-0"}`}
+        >
           <button
             type="button"
             className="chat-assistant-action rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
@@ -1023,11 +1052,40 @@ function GatewayAssistantMessageActions(props: {
               </button>
             )}
           </ConfirmActionPopover>
+          <ConfirmActionPopover
+            title={t("chat.branchConfirmTitle")}
+            description={t("chat.branchConfirmDescription")}
+            confirmLabel={t("chat.branch")}
+            tone="default"
+            align="start"
+            side="top"
+            onConfirm={() => {
+              if (!retryMessageRef) return;
+              onBranchConversation?.(retryMessageRef);
+            }}
+          >
+            {(open) => (
+              <button
+                type="button"
+                className={`chat-assistant-action rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground disabled:cursor-not-allowed ${isRowBranchPending ? "" : "disabled:opacity-40"}`}
+                title={branchTitle}
+                aria-label={branchTitle}
+                disabled={branchDisabled}
+                onClick={open}
+              >
+                {isRowBranchPending ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <GitBranch className="h-3.5 w-3.5" />
+                )}
+              </button>
+            )}
+          </ConfirmActionPopover>
         </div>
       </div>
     </div>
   );
-}
+});
 
 const rowEstimateCache = new WeakMap<TranscriptRow, number>();
 
@@ -1042,15 +1100,20 @@ function estimateRowHeight(row: TranscriptRow): number {
   }
   let estimate: number;
   if (row.kind === "user") {
-    estimate = estimateUserRowHeight(row.text.length);
+    estimate = estimateUserRowHeight(row.text.length, row.attachments.length);
   } else if (row.kind === "assistant") {
-    let textChars = 0;
+    let proseChars = 0;
+    let codeLines = 0;
+    let codeFences = 0;
     let toolCount = 0;
     let thinkingCount = 0;
     for (const round of row.rounds) {
       for (const block of round.blocks) {
         if (block.kind === "text") {
-          textChars += block.text.length;
+          const measured = measureEstimateText(block.text);
+          proseChars += measured.proseChars;
+          codeLines += measured.codeLines;
+          codeFences += measured.codeFences;
         } else if (block.kind === "thinking") {
           thinkingCount += 1;
         } else {
@@ -1058,7 +1121,13 @@ function estimateRowHeight(row: TranscriptRow): number {
         }
       }
     }
-    estimate = estimateAssistantRowHeight({ textChars, toolCount, thinkingCount });
+    estimate = estimateAssistantRowHeight({
+      proseChars,
+      codeLines,
+      codeFences,
+      toolCount,
+      thinkingCount,
+    });
   } else if (row.kind === "checkpoint") {
     estimate = CHECKPOINT_ROW_ESTIMATE_PX;
   } else {
@@ -1096,6 +1165,8 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
     text: string,
     uploadedFiles: PendingUploadedFile[],
   ) => void;
+  onBranchConversation?: (messageRef: HistoryMessageRef) => void;
+  branchPendingMessageId?: string | null;
   toolStatus?: string | null;
   toolStatusIsCompaction: boolean;
   readOnly?: boolean;
@@ -1119,6 +1190,8 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
     gitClient,
     onLoadUploadedImagePreview,
     onResendFromEdit,
+    onBranchConversation,
+    branchPendingMessageId,
     toolStatus,
     toolStatusIsCompaction,
     readOnly = false,
@@ -1221,6 +1294,16 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
     (index: number) => virtualItems[index]?.key ?? `virtual-${index}`,
     [virtualItems],
   );
+
+  // Restored once per mount: at conversation-switch remounts the viewport is
+  // already live, so a same-width snapshot skips straight to exact layout.
+  const [initialMeasurementsCache] = useState(
+    () =>
+      (conversationId && scrollViewport
+        ? transcriptMeasurementsLru.restore(conversationId, scrollViewport.clientWidth)
+        : null) ?? [],
+  );
+
   const transcriptVirtualizer = useVirtualizer({
     count: virtualItems.length,
     getScrollElement: () => scrollViewport,
@@ -1232,47 +1315,62 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
     gap: TRANSCRIPT_ROW_GAP,
     overscan: TRANSCRIPT_ROW_OVERSCAN_COUNT,
     enabled: scrollViewport !== null,
+    // End-anchored: prepends (loading earlier history) keep the visible item
+    // stable upstream via keyed anchoring, growth of the last row while the
+    // viewport is virtually at the end compensates by the total-size delta,
+    // and estimate→measure corrections keep the bottom pinned. The threshold
+    // matches scrollFollowCore's BOTTOM_ATTACH_THRESHOLD_PX so both engines
+    // agree on what "at the bottom" means. followOnAppend stays off: its
+    // DOM-distance re-follow would conflict with the follow reducer's
+    // "shrink clamps never re-attach" contract — appends while following are
+    // already pinned by the reducer.
+    anchorTo: "end",
+    scrollEndThreshold: 8,
+    initialMeasurementsCache,
     rangeExtractor: (range) => extractLiveRange(range, forceMountStartRef.current),
   });
 
   // TanStack exposes the resize-compensation predicate as an instance field,
   // not an option; reassigning per render keeps the closure's inputs current.
+  // It only governs the detached reader — while virtually at the end, the
+  // upstream end-anchor compensation takes priority over this predicate.
   transcriptVirtualizer.shouldAdjustScrollPositionOnItemSizeChange =
     createLiveRowScrollAdjustPolicy({
       getLiveStartIndex: () => forceMountStartRef.current,
       isFollowing: () => isViewportFollowing?.() ?? false,
     });
 
-  const virtualRows = transcriptVirtualizer.getVirtualItems();
-
-  // Prepend anchor: when loading earlier history inserts rows above the
-  // viewport, shift scrollTop by the inserted height so the visible content
-  // does not jump. Skipped while bottom-attached (the follow engine pins).
-  // getOffsetForIndex(_, "start") is the public offset accessor; the anchor
-  // and the restore read through the same function, so the delta is exact.
-  const prependAnchorRef = useRef<{ key: string; start: number } | null>(null);
-  // Intentionally no dependency array: the anchor must re-read on every
-  // commit, since any render can be the one that prepends rows.
+  // First paint of a conversation lands at the bottom before the user sees
+  // anything: scrollToEnd re-targets as dynamic measurements land. The region
+  // remounts per conversation (keyed by the parent), so this runs once per
+  // open; read-only shared views keep their own initial position.
+  const scrollToEndOnceRef = useRef(false);
   useLayoutEffect(() => {
-    const firstRowKey = virtualItems[leadingOffset]?.key ?? null;
-    const startOf = (index: number) => transcriptVirtualizer.getOffsetForIndex(index, "start")?.[0];
-    const anchor = prependAnchorRef.current;
-    if (anchor && firstRowKey && anchor.key !== firstRowKey && scrollViewport) {
-      const anchorIndex = virtualItems.findIndex((item) => item.key === anchor.key);
-      const anchorStart = anchorIndex >= 0 ? startOf(anchorIndex) : undefined;
-      if (anchorStart !== undefined) {
-        const bottomGap =
-          scrollViewport.scrollHeight - scrollViewport.scrollTop - scrollViewport.clientHeight;
-        const delta = anchorStart - anchor.start;
-        if (delta > 0 && bottomGap > 8) {
-          scrollViewport.scrollTop += delta;
-        }
-      }
+    if (
+      scrollToEndOnceRef.current ||
+      readOnly ||
+      scrollViewport === null ||
+      virtualItems.length === 0
+    ) {
+      return;
     }
-    const firstStart = firstRowKey ? startOf(leadingOffset) : undefined;
-    prependAnchorRef.current =
-      firstRowKey && firstStart !== undefined ? { key: firstRowKey, start: firstStart } : null;
-  });
+    scrollToEndOnceRef.current = true;
+    transcriptVirtualizer.scrollToEnd();
+  }, [readOnly, scrollViewport, virtualItems.length, transcriptVirtualizer]);
+
+  // Snapshot measured heights for the next open of this conversation.
+  const saveMeasurementsRef = useRef(() => {});
+  saveMeasurementsRef.current = () => {
+    if (!conversationId || !scrollViewport) return;
+    transcriptMeasurementsLru.save(
+      conversationId,
+      scrollViewport.clientWidth,
+      transcriptVirtualizer.takeSnapshot(),
+    );
+  };
+  useEffect(() => () => saveMeasurementsRef.current(), []);
+
+  const virtualRows = transcriptVirtualizer.getVirtualItems();
 
   return (
     <div className="relative" style={{ height: transcriptVirtualizer.getTotalSize() }}>
@@ -1370,8 +1468,8 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
                 row={row}
                 isStreaming={isStreaming}
                 readOnly={readOnly}
-                copiedMessageId={copiedMessageId}
-                editingMessageId={editingMessageId}
+                isCopied={copiedMessageId === row.key}
+                isEditing={editingMessageId === row.key}
                 setCopiedMessageId={setCopiedMessageId}
                 setEditingMessageId={setEditingMessageId}
                 workspaceRoot={workspaceRoot}
@@ -1418,9 +1516,11 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
                     row={row}
                     retryTarget={retryTargetByAssistantKey.get(row.key) ?? null}
                     isStreaming={isStreaming}
-                    copiedMessageId={copiedMessageId}
+                    isCopied={copiedMessageId === row.key}
                     setCopiedMessageId={setCopiedMessageId}
                     onResendFromEdit={onResendFromEdit}
+                    onBranchConversation={onBranchConversation}
+                    branchPendingMessageId={branchPendingMessageId}
                   />
                 ) : null}
               </div>
@@ -1487,6 +1587,8 @@ export function GatewayTranscript({
   gitClient,
   onLoadUploadedImagePreview,
   onResendFromEdit,
+  onBranchConversation,
+  branchPendingMessageId,
   onSuggestionSelect,
   suggestionsDisabled = false,
   readOnly = false,
@@ -1519,7 +1621,10 @@ export function GatewayTranscript({
     return (
       <div className="gateway-transcript-shell">
         <div className="gateway-chat-column gateway-empty-state">
+          {/* Keyed per conversation so the hero entrance replays when
+              switching between empty conversations, not just on mount. */}
           <ChatEmptyState
+            key={conversationId ?? "shared"}
             variant={showNoModelsState ? "no-models" : "start-chat"}
             onOpenSettings={onOpenSettings}
             onSuggestionSelect={readOnly ? undefined : onSuggestionSelect}
@@ -1536,7 +1641,11 @@ export function GatewayTranscript({
         ref={transcriptListRef}
         className="gateway-chat-column gateway-transcript-list select-text"
       >
+        {/* Keyed remount per conversation: per-conversation state (measured
+            heights, scroll-to-end latch) initializes fresh, and row keys can
+            never collide across conversations in the itemSizeCache. */}
         <GatewayTranscriptListRegion
+          key={conversationId ?? "shared"}
           conversationId={conversationId}
           rows={rows}
           liveStartIndex={liveStartIndex}
@@ -1554,6 +1663,8 @@ export function GatewayTranscript({
           gitClient={gitClient}
           onLoadUploadedImagePreview={onLoadUploadedImagePreview}
           onResendFromEdit={onResendFromEdit}
+          onBranchConversation={onBranchConversation}
+          branchPendingMessageId={branchPendingMessageId}
           toolStatus={toolStatus}
           toolStatusIsCompaction={toolStatusIsCompaction}
           readOnly={readOnly}

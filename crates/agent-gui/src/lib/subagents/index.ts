@@ -1,5 +1,6 @@
 export { createSubagentTools, type SubagentRuntimeConfig } from "./agentTool";
 export { renderMessageBusSnapshot } from "./bus";
+export { isSubagentCardToolCall } from "./card";
 export type { SubagentStoreIpc } from "./ipc/store";
 export type { SubagentWorktreeIpc } from "./ipc/worktree";
 export type {

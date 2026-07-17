@@ -523,6 +523,46 @@ test("runAssistantWithTools calls onBeforeNextTurn only for toolUse turns with t
   );
 });
 
+// Mocked turn tests (agent-turn-cancelled-history.test.mjs) replay this payload
+// shape by hand; the assertions here are what keep those replicas honest.
+test("runAssistantWithTools reports 1-based monotonic rounds and paired tool results to onBeforeNextTurn", async () => {
+  const firstToolCall = createToolCall("call-read-1", "Read", { path: "a.ts" });
+  const secondToolCall = createToolCall("call-read-2", "Read", { path: "b.ts" });
+  resetFakeStreams(
+    createToolUseAssistant(firstToolCall),
+    createToolUseAssistant(secondToolCall),
+    createTextAssistant("final answer"),
+  );
+  const beforeNextTurnSnapshots = [];
+  const { params } = createBaseParams({
+    onBeforeNextTurn: async (snapshot) => {
+      beforeNextTurnSnapshots.push(snapshot);
+      return null;
+    },
+  });
+
+  await runAssistantWithTools(params);
+
+  assert.deepEqual(
+    beforeNextTurnSnapshots.map((snapshot) => snapshot.round),
+    [1, 2],
+  );
+  assert.deepEqual(
+    beforeNextTurnSnapshots.map((snapshot) =>
+      snapshot.assistant.content
+        .filter((block) => block.type === "toolCall")
+        .map((block) => block.id),
+    ),
+    [[firstToolCall.id], [secondToolCall.id]],
+  );
+  assert.deepEqual(
+    beforeNextTurnSnapshots.map((snapshot) =>
+      snapshot.toolResults.map((toolResult) => toolResult.toolCallId),
+    ),
+    [[firstToolCall.id], [secondToolCall.id]],
+  );
+});
+
 test("runAssistantWithTools canonicalizes builtin tool call name casing before execution", async () => {
   const lowerCaseWriteCall = createToolCall("call-write", "write", {
     path: "report.html",

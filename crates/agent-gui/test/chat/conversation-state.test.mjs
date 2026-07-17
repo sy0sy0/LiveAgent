@@ -282,6 +282,262 @@ test("display-only Image tool results keep UI images but omit inline image bytes
   assert.match(requestContext.messages[0].content[0].text, /display-only UI tool/);
 });
 
+function toolCallAssistant(callId, timestamp, name = "Bash") {
+  return assistant("", timestamp, {
+    content: [{ type: "toolCall", id: callId, name, arguments: { command: "ls" } }],
+    stopReason: "toolUse",
+  });
+}
+
+function toolResultMessage(callId, timestamp, text = "ok") {
+  return {
+    role: "toolResult",
+    toolCallId: callId,
+    toolName: "Bash",
+    content: [{ type: "text", text }],
+    isError: false,
+    timestamp,
+  };
+}
+
+// The incremental append path must be indistinguishable from a full rebuild
+// of the active segment — same keys, deep-equal content — while preserving
+// every untouched item by identity so memoized rows bail.
+function fullRebuildReference(state) {
+  return conversationState.normalizeConversationState({
+    meta: { systemPrompt: state.meta.systemPrompt, tools: state.meta.tools },
+    segments: state.segments,
+  }).historyRenderItems;
+}
+
+function assertMatchesFullRebuild(state) {
+  assert.deepEqual(state.historyRenderItems, fullRebuildReference(state));
+}
+
+test("incremental append: send twin extends the timeline and preserves item identity", () => {
+  const base = conversationState.createConversationStateFromContext({
+    messages: [user("q1", 1), assistant("a1", 2), user("q2", 3), assistant("a2", 4)],
+  });
+  const next = conversationState.appendMessagesToConversation(base, [user("q3", 5)]);
+
+  assertMatchesFullRebuild(next);
+  assert.equal(next.historyRenderItems.length, base.historyRenderItems.length + 1);
+  for (let index = 0; index < base.historyRenderItems.length; index += 1) {
+    assert.equal(next.historyRenderItems[index], base.historyRenderItems[index]);
+  }
+});
+
+test("incremental append: settle batch builds only the new assistant group", () => {
+  const base = conversationState.createConversationStateFromContext({
+    messages: [user("q1", 1), assistant("a1", 2)],
+  });
+  const withTwin = conversationState.appendMessagesToConversation(base, [user("q2", 3)]);
+  const settled = conversationState.appendMessagesToConversation(withTwin, [
+    toolCallAssistant("call-1", 4),
+    toolResultMessage("call-1", 5),
+    assistant("a2", 6),
+  ]);
+
+  assertMatchesFullRebuild(settled);
+  for (let index = 0; index < withTwin.historyRenderItems.length; index += 1) {
+    assert.equal(settled.historyRenderItems[index], withTwin.historyRenderItems[index]);
+  }
+  const lastItem = settled.historyRenderItems[settled.historyRenderItems.length - 1];
+  assert.equal(lastItem.kind, "assistant");
+  assert.equal(lastItem.rounds.length, 2);
+});
+
+test("incremental append: trailing assistant run extension rebuilds only that item", () => {
+  const base = conversationState.createConversationStateFromContext({
+    messages: [user("q1", 1), assistant("a1", 2), user("q2", 3), assistant("a2", 4)],
+  });
+  const next = conversationState.appendMessagesToConversation(base, [assistant("a2-more", 5)]);
+
+  assertMatchesFullRebuild(next);
+  assert.equal(next.historyRenderItems.length, base.historyRenderItems.length);
+  for (let index = 0; index < base.historyRenderItems.length - 1; index += 1) {
+    assert.equal(next.historyRenderItems[index], base.historyRenderItems[index]);
+  }
+  const extended = next.historyRenderItems[next.historyRenderItems.length - 1];
+  assert.notEqual(extended, base.historyRenderItems[base.historyRenderItems.length - 1]);
+  assert.equal(extended.rounds.length, 2);
+});
+
+test("incremental append: contentless trailing run gains content without dropping items", () => {
+  const base = conversationState.createConversationStateFromContext({
+    messages: [user("q1", 1), assistant("", 2, { content: [] })],
+  });
+  assert.equal(base.historyRenderItems.length, 1);
+
+  const next = conversationState.appendMessagesToConversation(base, [assistant("late", 3)]);
+  assertMatchesFullRebuild(next);
+  assert.equal(next.historyRenderItems.length, 2);
+  assert.equal(next.historyRenderItems[0], base.historyRenderItems[0]);
+});
+
+test("incremental append: compaction checkpoint compacts prior items and appends new segments", () => {
+  const base = conversationState.createConversationStateFromContext({
+    messages: [user("q1", 1), assistant("a1", 2), user("q2", 3), assistant("a2", 4)],
+  });
+  const checkpoint = assistant("Compressed", 5, {
+    api: "liveagent-compaction",
+    provider: "liveagent",
+    model: "summary",
+    responseId: "summary-x",
+  });
+  const compacted = conversationState.appendMessagesToConversation(base, [
+    checkpoint,
+    user("q3", 6),
+  ]);
+
+  assertMatchesFullRebuild(compacted);
+  assert.equal(compacted.activeSegmentIndex, 1);
+  const summaryItem = compacted.historyRenderItems.find((item) => item.kind === "summary");
+  assert.ok(summaryItem);
+  for (const item of compacted.historyRenderItems) {
+    if (item.segmentIndex < compacted.activeSegmentIndex && item.kind !== "summary") {
+      assert.equal(item.isFromCompactedSegment, true);
+    }
+  }
+
+  // Appending to the already-compacted state keeps compacted items by identity.
+  const more = conversationState.appendMessagesToConversation(compacted, [assistant("a3", 7)]);
+  assertMatchesFullRebuild(more);
+  for (let index = 0; index < compacted.historyRenderItems.length - 1; index += 1) {
+    if (compacted.historyRenderItems[index].segmentIndex < compacted.activeSegmentIndex) {
+      assert.equal(more.historyRenderItems[index], compacted.historyRenderItems[index]);
+    }
+  }
+});
+
+test("incremental append: first post-checkpoint batch does not duplicate the summary card", () => {
+  const base = conversationState.createConversationStateFromContext({
+    messages: [user("q1", 1), assistant("a1", 2)],
+  });
+  const checkpoint = assistant("Compressed", 3, {
+    api: "liveagent-compaction",
+    provider: "liveagent",
+    model: "summary",
+    responseId: "summary-empty-segment",
+  });
+  const compacted = conversationState.applyCompactionCheckpoint(base, checkpoint);
+  const continued = conversationState.appendMessagesToConversation(compacted, [
+    toolCallAssistant("call-after-checkpoint", 4),
+    toolResultMessage("call-after-checkpoint", 5),
+    assistant("continued", 6),
+  ]);
+
+  assertMatchesFullRebuild(continued);
+  const checkpointSummary = compacted.historyRenderItems.find((item) => item.kind === "summary");
+  const continuedSummaries = continued.historyRenderItems.filter((item) => item.kind === "summary");
+  assert.equal(continuedSummaries.length, 1);
+  assert.equal(continuedSummaries[0], checkpointSummary);
+  assert.equal(continuedSummaries[0].summaryId, "summary-empty-segment");
+
+  const extended = conversationState.appendMessagesToConversation(continued, [
+    assistant("continued again", 7),
+  ]);
+  assertMatchesFullRebuild(extended);
+  const extendedSummaries = extended.historyRenderItems.filter((item) => item.kind === "summary");
+  assert.equal(extendedSummaries.length, 1);
+  assert.equal(extendedSummaries[0], checkpointSummary);
+});
+
+test("incremental append: sequential turns equal a one-shot build", () => {
+  const messages = [];
+  for (let turn = 0; turn < 12; turn += 1) {
+    messages.push(user(`q${turn}`, turn * 10 + 1));
+    messages.push(toolCallAssistant(`call-${turn}`, turn * 10 + 2));
+    messages.push(toolResultMessage(`call-${turn}`, turn * 10 + 3));
+    messages.push(assistant(`a${turn}`, turn * 10 + 4));
+  }
+
+  let sequential = conversationState.createConversationStateFromContext({ messages: [] });
+  for (const message of messages) {
+    sequential = conversationState.appendMessagesToConversation(sequential, [message]);
+  }
+  const oneShot = conversationState.createConversationStateFromContext({ messages });
+
+  // The two builds mint independent segment UUIDs, and render keys embed the
+  // segmentId — compare everything but the id-bearing fields.
+  const withoutSegmentIds = (items) =>
+    items.map(({ key, messageRef, ...rest }) => ({
+      ...rest,
+      messageRef: messageRef ? { ...messageRef, segmentId: "(segment-id)" } : undefined,
+    }));
+  assert.deepEqual(
+    withoutSegmentIds(sequential.historyRenderItems),
+    withoutSegmentIds(oneShot.historyRenderItems),
+  );
+  assertMatchesFullRebuild(sequential);
+});
+
+test("mergeHydratedConversationState reuses warm items for an unchanged active segment", () => {
+  const messages = [user("q1", 1), assistant("a1", 2), user("q2", 3), assistant("a2", 4)];
+  const warm = conversationState.createConversationStateFromContext({ messages });
+  // Simulate the disk round-trip: same content, fresh object identities.
+  const full = conversationState.normalizeConversationState({
+    meta: {},
+    segments: structuredClone(warm.segments),
+  });
+
+  const merged = conversationState.mergeHydratedConversationState(warm, full);
+  assert.equal(merged.segments, full.segments);
+  assert.deepEqual(merged.historyRenderItems, full.historyRenderItems);
+  for (let index = 0; index < merged.historyRenderItems.length; index += 1) {
+    assert.equal(merged.historyRenderItems[index], warm.historyRenderItems[index]);
+  }
+});
+
+test("mergeHydratedConversationState keeps re-homed warm keys stable across hydration", () => {
+  const base = conversationState.createConversationStateFromContext({
+    messages: [user("q1", 1), assistant("a1", 2)],
+  });
+  const checkpoint = assistant("Compressed", 3, {
+    api: "liveagent-compaction",
+    provider: "liveagent",
+    model: "summary",
+    responseId: "summary-h",
+  });
+  const full = conversationState.appendMessagesToConversation(base, [
+    checkpoint,
+    user("q2", 4),
+    assistant("a2", 5),
+  ]);
+
+  // Warm phase-1 state: only the active segment, re-homed at index 0. The
+  // index mismatch forces the full state (warm items carry the stale
+  // segmentIndex), which must be remount-free: every warm render key must
+  // reappear verbatim in the full state so rows reconcile in place and keep
+  // their measured heights — the post-hydration jump regression guard.
+  const warmRehomed = conversationState.normalizeConversationState({
+    meta: {},
+    segments: [structuredClone(full.segments[full.activeSegmentIndex])],
+  });
+  assert.equal(conversationState.mergeHydratedConversationState(warmRehomed, full), full);
+
+  const fullKeys = new Set(full.historyRenderItems.map((item) => item.key));
+  for (const item of warmRehomed.historyRenderItems) {
+    assert.ok(fullKeys.has(item.key), `warm key ${item.key} must survive hydration`);
+  }
+});
+
+test("mergeHydratedConversationState falls back when the active segment changed on disk", () => {
+  const warm = conversationState.createConversationStateFromContext({
+    messages: [user("q1", 1), assistant("a1", 2)],
+  });
+  const full = conversationState.appendMessagesToConversation(
+    conversationState.normalizeConversationState({
+      meta: {},
+      segments: structuredClone(warm.segments),
+    }),
+    [user("q2", 3)],
+  );
+
+  assert.equal(conversationState.mergeHydratedConversationState(warm, full), full);
+  assert.equal(conversationState.mergeHydratedConversationState(null, full), full);
+});
+
 test("model context sanitizer preserves user image content", () => {
   const userImageMessage = {
     role: "user",

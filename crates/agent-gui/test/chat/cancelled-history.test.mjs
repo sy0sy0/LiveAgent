@@ -100,6 +100,73 @@ test("persistable cancelled snapshot keeps visible provider hosted search blocks
   assert.deepEqual(messages[0].content, [hostedSearch]);
 });
 
+test("persistable cancelled snapshot restores suppressed parent Agent trace without card artifacts", () => {
+  const parentId = "call-parent|fc_parent";
+  const cardId = `${parentId}:agent:1`;
+
+  const parentToolCall = toolCall(parentId, "Agent", { agents: [] });
+  const parentToolResult = {
+    ...toolResult(parentId, "Agent", "batch done"),
+    details: { kind: "subagent_batch" },
+  };
+  const messages = chatAbort.buildPersistableMessagesFromSnapshot({
+    executionMode: "agent",
+    model: {
+      api: "openai-responses",
+      provider: "codex",
+      id: "gpt-5",
+    },
+    draftAssistantText: "",
+    liveRounds: [
+      {
+        round: 1,
+        blocks: [
+          {
+            kind: "tool",
+            item: {
+              toolCall: toolCall(cardId, "Agent", {
+                subagent_card: true,
+                parent_tool_call_id: parentId,
+                id: "reviewer",
+              }),
+              toolResult: {
+                ...toolResult(cardId, "Agent", "done"),
+                details: { kind: "subagent_card" },
+              },
+            },
+          },
+        ],
+      },
+      {
+        round: 2,
+        blocks: [{ kind: "text", text: "Final visible text." }],
+      },
+    ],
+    completedThroughRound: 1,
+    suppressedToolTrace: [
+      {
+        round: 1,
+        toolCall: parentToolCall,
+        toolResult: parentToolResult,
+      },
+    ],
+    timestamp: 10,
+  });
+
+  assert.deepEqual(
+    messages.map((message) => message.role),
+    ["assistant", "toolResult", "assistant"],
+  );
+  assert.equal(messages[0].stopReason, "toolUse");
+  assert.deepEqual(
+    messages[0].content.map((block) => (block.type === "toolCall" ? block.id : block.type)),
+    [parentId],
+  );
+  assert.equal(messages[1].toolCallId, parentId);
+  assert.equal(messages[2].stopReason, "aborted");
+  assert.equal(JSON.stringify(messages).includes(cardId), false);
+});
+
 test("continuation request context skips cancelled rounds by default but can include them explicitly", () => {
   const state = conversationState.createConversationStateFromContext({
     messages: [
@@ -249,4 +316,53 @@ test("model request sanitizer drops assistant rounds that only contain hosted se
   const serialized = JSON.stringify(context.messages);
   assert.equal(serialized.includes("Provider-hosted web search"), false);
   assert.equal(serialized.includes("example.com/source"), false);
+});
+
+test("model request sanitizer removes persisted synthetic subagent cards", () => {
+  const parentId = "call-parent|fc_parent";
+  const cardId = `${parentId}:agent:1`;
+  const context = requestContextSanitizer.sanitizeContextForModelRequest({
+    messages: [
+      user("delegate", 1),
+      {
+        role: "assistant",
+        provider: "codex",
+        api: "openai-responses",
+        model: "gpt-5",
+        content: [
+          { type: "text", text: "Delegating work." },
+          toolCall(cardId, "Agent", {
+            subagent_card: true,
+            parent_tool_call_id: parentId,
+            id: "reviewer",
+          }),
+          toolCall(parentId, "Agent", { agents: [] }),
+        ],
+        stopReason: "toolUse",
+        timestamp: 2,
+      },
+      {
+        ...toolResult(cardId, "Agent", "done", 3),
+        details: { kind: "subagent_card" },
+      },
+      {
+        ...toolResult(parentId, "Agent", "batch done", 4),
+        details: { kind: "subagent_batch" },
+      },
+      user("continue", 5),
+    ],
+  });
+
+  assert.deepEqual(
+    context.messages.map((message) => message.role),
+    ["user", "assistant", "toolResult", "user"],
+  );
+  assert.deepEqual(
+    context.messages[1].content.map((block) =>
+      block.type === "toolCall" ? block.id : block.type,
+    ),
+    ["text", parentId],
+  );
+  assert.equal(context.messages[2].toolCallId, parentId);
+  assert.equal(JSON.stringify(context.messages).includes(cardId), false);
 });

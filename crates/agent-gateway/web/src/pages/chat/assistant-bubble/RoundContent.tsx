@@ -6,6 +6,7 @@ import { normalizeLiveToolStatus, VIBING_STATUS } from "../../../lib/chat/chatPa
 import type { ToolTraceItem, UiRound } from "../../../lib/chat/uiMessages";
 import { groupRoundBlocks, isBuiltinShareToolName } from "./assistantBubbleUtils";
 import { HostedSearchGroupView } from "./HostedSearchGroupView";
+import { LazyCollapse } from "./LazyCollapse";
 import { AssistantStatus, CompactingText, VibingText } from "./StatusText";
 import { MemoToolCallItem } from "./ToolCallItem";
 import { getNativeDisplayImagePayload, NativeDisplayImageBlock } from "./ToolImages";
@@ -14,7 +15,7 @@ import { UsagePanel } from "./UsagePanel";
 
 const EMPTY_RUNNING_TOOL_CALL_IDS: string[] = [];
 
-function ThinkingBlock({
+const ThinkingBlock = memo(function ThinkingBlock({
   text,
   open,
   isRunning,
@@ -60,11 +61,8 @@ function ThinkingBlock({
           className={`ml-auto h-3.5 w-3.5 text-muted-foreground/60 transition-transform duration-200 ease-out ${isOpen ? "rotate-90" : ""}`}
         />
       </button>
-      <div
-        aria-hidden={!isOpen}
-        className={`grid transition-[grid-template-rows,opacity] duration-200 ease-out ${isOpen ? "grid-rows-[1fr] opacity-100" : "pointer-events-none grid-rows-[0fr] opacity-0"}`}
-      >
-        <div className="min-h-0 overflow-hidden">
+      <LazyCollapse open={isOpen}>
+        {() => (
           <div className="pb-1 pt-1.5">
             <Markdown
               content={text}
@@ -73,11 +71,11 @@ function ThinkingBlock({
               showCaret={false}
             />
           </div>
-        </div>
-      </div>
+        )}
+      </LazyCollapse>
     </div>
   );
-}
+});
 
 export const RoundContent = memo(function RoundContent(props: {
   round: UiRound;

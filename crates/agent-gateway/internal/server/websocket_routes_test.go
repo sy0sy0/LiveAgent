@@ -25,6 +25,7 @@ func TestWebsocketRequestHandlersCoverKnownProtocolTypes(t *testing.T) {
 		"history.get",
 		"history.prefix",
 		"history.rename",
+		"history.branch",
 		"history.pin",
 		"history.share.get",
 		"history.share.set",

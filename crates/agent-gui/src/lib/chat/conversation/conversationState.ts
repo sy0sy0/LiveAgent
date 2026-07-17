@@ -1,6 +1,7 @@
 import type { AssistantMessage, Context, Message } from "@earendil-works/pi-ai";
 
 import { assistantMessageToText } from "../../providers/llm";
+import { createUuid } from "../../shared/id";
 import {
   type FileLedger,
   formatFileLedgerBlock,
@@ -144,7 +145,7 @@ export type ConversationViewState = {
 function createEmptySegment(index: number, timestamp = Date.now()): StoredContextSegment {
   return {
     segmentIndex: index,
-    segmentId: crypto.randomUUID(),
+    segmentId: createUuid(),
     messages: [],
     messageCount: 0,
     createdAt: timestamp,
@@ -548,7 +549,7 @@ function normalizeSegment(
 
   return {
     segmentIndex,
-    segmentId: segment.segmentId || crypto.randomUUID(),
+    segmentId: segment.segmentId || createUuid(),
     summary: segment.summary,
     messages,
     messageCount,
@@ -599,13 +600,20 @@ export function flattenSegmentsToTimeline(
 function buildTimelineItemsForSegment(
   segment: StoredContextSegment,
   isCompacted: boolean,
+  startMessageIndex = 0,
+  options?: { includeSummary?: boolean },
 ): RenderTimelineItem[] {
   const items: RenderTimelineItem[] = [];
 
-  if (segment.summary) {
+  // Render keys derive from the segmentId, never the segmentIndex: the
+  // phase-1 warm view re-homes the active segment at index 0 while the full
+  // record keeps its true index, and index-based keys would remount every
+  // row (and drop its measured height) when hydration lands — the visible
+  // post-load jump. segmentIds are persisted and identical in both views.
+  if (options?.includeSummary !== false && startMessageIndex === 0 && segment.summary) {
     items.push({
       kind: "summary",
-      key: `summary-${segment.segmentIndex}-${segment.summary.id}`,
+      key: `summary-${segment.segmentId}-${segment.summary.id}`,
       segmentIndex: segment.segmentIndex,
       summaryId: segment.summary.id,
       content: segment.summary.content,
@@ -617,7 +625,13 @@ function buildTimelineItemsForSegment(
     });
   }
 
-  const uiMessages = buildUiMessages(segment.messages);
+  // UI-group boundaries are fully determined by user-message positions, so a
+  // suffix build starting at a group boundary reproduces the full build's
+  // items exactly (keys and messageIndex stay absolute via the offset).
+  const uiMessages =
+    startMessageIndex > 0
+      ? buildUiMessages(segment.messages.slice(startMessageIndex), startMessageIndex)
+      : buildUiMessages(segment.messages);
   for (const uiMessage of uiMessages) {
     if (uiMessage.role === "user") {
       const localMessageIndex = uiMessage.messageIndex ?? 0;
@@ -629,7 +643,7 @@ function buildTimelineItemsForSegment(
       });
       items.push({
         kind: "user",
-        key: `segment-${segment.segmentIndex}-${uiMessage.key}`,
+        key: `segment-${segment.segmentId}-${uiMessage.key}`,
         segmentIndex: segment.segmentIndex,
         messageRef,
         text: uiMessage.text,
@@ -642,7 +656,7 @@ function buildTimelineItemsForSegment(
 
     items.push({
       kind: "assistant",
-      key: `segment-${segment.segmentIndex}-${uiMessage.key}`,
+      key: `segment-${segment.segmentId}-${uiMessage.key}`,
       segmentIndex: segment.segmentIndex,
       rounds: uiMessage.rounds ?? [],
       // 使用本组自身的回复时间；仅在缺失时才回退到段内最后一条消息的时间
@@ -666,7 +680,7 @@ function markTimelineItemCompacted(item: RenderTimelineItem): RenderTimelineItem
   };
 }
 
-function buildUpdatedTimelineForActiveSegment(params: {
+function rebuildTimelineForActiveSegment(params: {
   previousItems: RenderTimelineItem[];
   segments: StoredContextSegment[];
   activeSegmentIndex: number;
@@ -678,6 +692,105 @@ function buildUpdatedTimelineForActiveSegment(params: {
   const activeSegment = segments[activeSegmentIndex];
   const activeItems = activeSegment ? buildTimelineItemsForSegment(activeSegment, false) : [];
   return [...preserved, ...activeItems];
+}
+
+// Extends a segment's timeline items after messages were appended to it.
+// Because UI-group boundaries are determined solely by user-message
+// positions, an append can only ever extend the trailing non-user run —
+// every earlier item is returned by identity so memoized rows bail. Returns
+// null when the previous message list is not a reference-identical prefix of
+// the next one (caller falls back to a full rebuild).
+function extendSegmentTimelineItems(
+  previousItems: RenderTimelineItem[],
+  previousSegment: StoredContextSegment,
+  nextSegment: StoredContextSegment,
+): RenderTimelineItem[] | null {
+  const prevMessages = previousSegment.messages;
+  const nextMessages = nextSegment.messages;
+  if (nextMessages.length < prevMessages.length) return null;
+  for (let index = 0; index < prevMessages.length; index += 1) {
+    if (nextMessages[index] !== prevMessages[index]) return null;
+  }
+  if (nextMessages.length === prevMessages.length) return previousItems;
+
+  let runStart = prevMessages.length;
+  while (runStart > 0 && prevMessages[runStart - 1].role !== "user") {
+    runStart -= 1;
+  }
+
+  let boundary = prevMessages.length;
+  let reused = previousItems;
+  if (runStart < prevMessages.length && nextMessages[prevMessages.length].role !== "user") {
+    // The trailing assistant run grows: rebuild it from its start. If it had
+    // emitted an item it is the last one and carries the run's exact key
+    // (a contentless run emitted nothing and there is nothing to drop).
+    boundary = runStart;
+    let lastAssistantTimestamp = 0;
+    for (let index = runStart; index < prevMessages.length; index += 1) {
+      const message = prevMessages[index];
+      if (message.role === "assistant") {
+        lastAssistantTimestamp = message.timestamp ?? lastAssistantTimestamp;
+      }
+    }
+    const expectedKey = `segment-${previousSegment.segmentId}-assistant-${runStart}-${prevMessages.length}-${lastAssistantTimestamp}`;
+    if (previousItems[previousItems.length - 1]?.key === expectedKey) {
+      reused = previousItems.slice(0, -1);
+    }
+  }
+
+  return [
+    ...reused,
+    ...buildTimelineItemsForSegment(nextSegment, false, boundary, { includeSummary: false }),
+  ];
+}
+
+// Timeline update for the append hot path (send twin, settle, checkpoint):
+// O(appended messages) instead of a full active-segment rebuild, with every
+// untouched item preserved by identity so the row layer's caches hold.
+function updateTimelineForAppend(params: {
+  previousItems: RenderTimelineItem[];
+  previousSegments: StoredContextSegment[];
+  previousActiveSegmentIndex: number;
+  segments: StoredContextSegment[];
+  activeSegmentIndex: number;
+}): RenderTimelineItem[] {
+  const {
+    previousItems,
+    previousSegments,
+    previousActiveSegmentIndex,
+    segments,
+    activeSegmentIndex,
+  } = params;
+
+  const previousActive = previousSegments[previousActiveSegmentIndex];
+  const nextOfPrevious = segments[previousActiveSegmentIndex];
+  const fallback = () =>
+    rebuildTimelineForActiveSegment({ previousItems, segments, activeSegmentIndex });
+  if (!previousActive || !nextOfPrevious || previousActive.segmentId !== nextOfPrevious.segmentId) {
+    return fallback();
+  }
+
+  const extended = extendSegmentTimelineItems(previousItems, previousActive, nextOfPrevious);
+  if (extended === null) {
+    return fallback();
+  }
+  if (activeSegmentIndex === previousActiveSegmentIndex) {
+    return extended;
+  }
+
+  // A compaction checkpoint advanced the active segment: everything before
+  // the new active segment is compacted now, and the checkpoint-born
+  // segments (summary card plus any trailing messages) build from scratch —
+  // they are new and small.
+  const compacted = extended.map((item) =>
+    item.segmentIndex < activeSegmentIndex ? markTimelineItemCompacted(item) : item,
+  );
+  const appendedSegmentItems = segments
+    .filter((segment) => segment.segmentIndex > previousActiveSegmentIndex)
+    .flatMap((segment) =>
+      buildTimelineItemsForSegment(segment, segment.segmentIndex < activeSegmentIndex),
+    );
+  return [...compacted, ...appendedSegmentItems];
 }
 
 function rebuildTimelineFromSegment(params: {
@@ -698,6 +811,50 @@ function rebuildTimelineFromSegment(params: {
       buildTimelineItemsForSegment(segment, segment.segmentIndex < activeSegmentIndex),
     );
   return [...preserved, ...rebuilt];
+}
+
+// Phase-2 hydration merge: when the full record's active segment matches the
+// already-painted warm state (same segmentId at the same index with identical
+// content markers), reuse the warm timeline items for it by identity — the
+// hydration then only prepends the older segments' items and the mounted tail
+// rows never re-render. Any mismatch falls back to the full state as-is:
+// content advanced on disk, or a compacted conversation whose warm view
+// re-homed the active segment at index 0 (its items carry that stale
+// segmentIndex, so reusing them by identity would poison index-based logic
+// like compaction marking). The fallback is still remount-free — render keys
+// derive from segmentIds, so the full state's items reconcile onto the same
+// rows and their measured heights survive.
+export function mergeHydratedConversationState(
+  warmState: ConversationViewState | null | undefined,
+  fullState: ConversationViewState,
+): ConversationViewState {
+  if (!warmState) return fullState;
+
+  const warmActive = warmState.segments[warmState.activeSegmentIndex];
+  if (!warmActive) return fullState;
+  const target = fullState.segments.find((segment) => segment.segmentId === warmActive.segmentId);
+  if (
+    !target ||
+    target.segmentIndex !== warmState.activeSegmentIndex ||
+    fullState.activeSegmentIndex !== target.segmentIndex ||
+    target.messageCount !== warmActive.messageCount ||
+    target.startMessageId !== warmActive.startMessageId ||
+    target.endMessageId !== warmActive.endMessageId ||
+    getSummaryId(target.summary) !== getSummaryId(warmActive.summary)
+  ) {
+    return fullState;
+  }
+
+  const warmActiveItems = warmState.historyRenderItems.filter(
+    (item) => item.segmentIndex === warmActive.segmentIndex,
+  );
+  const olderItems = fullState.historyRenderItems.filter(
+    (item) => item.segmentIndex < target.segmentIndex,
+  );
+  return {
+    ...fullState,
+    historyRenderItems: [...olderItems, ...warmActiveItems],
+  };
 }
 
 export function normalizeConversationState(input: {
@@ -796,6 +953,7 @@ export function appendMessagesToConversation(
     Math.max(0, state.activeSegmentIndex),
     Math.max(0, segments.length - 1),
   );
+  const previousActiveSegmentIndex = activeSegmentIndex;
   const changedSegmentIndexes = new Set<number>();
 
   for (const message of incomingMessages) {
@@ -834,8 +992,10 @@ export function appendMessagesToConversation(
     meta,
     segments: normalizedSegments,
     activeSegmentIndex,
-    historyRenderItems: buildUpdatedTimelineForActiveSegment({
+    historyRenderItems: updateTimelineForAppend({
       previousItems: state.historyRenderItems,
+      previousSegments: state.segments,
+      previousActiveSegmentIndex,
       segments: normalizedSegments,
       activeSegmentIndex,
     }),
@@ -896,7 +1056,7 @@ export function appendRenderOnlyMessagesToConversation(
 
     historyRenderItems.push({
       kind: "assistant",
-      key: `render-only-${state.activeSegmentIndex}-${historyRenderItems.length}-${timestamp}`,
+      key: `render-only-${getActiveSegment(state)?.segmentId ?? state.activeSegmentIndex}-${historyRenderItems.length}-${timestamp}`,
       segmentIndex: state.activeSegmentIndex,
       rounds: sourceRounds,
       timestamp,
@@ -984,7 +1144,7 @@ export function replaceActiveSegmentMessages(
     meta,
     segments: normalizedSegments,
     activeSegmentIndex: state.activeSegmentIndex,
-    historyRenderItems: buildUpdatedTimelineForActiveSegment({
+    historyRenderItems: rebuildTimelineForActiveSegment({
       previousItems: state.historyRenderItems,
       segments: normalizedSegments,
       activeSegmentIndex: state.activeSegmentIndex,

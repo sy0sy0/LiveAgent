@@ -12,6 +12,7 @@ const { createLiveRowScrollAdjustPolicy } = loader.loadModule(
   "src/lib/transcript-virtual/liveScrollAdjustPolicy.ts",
 );
 
+
 const makeItem = ({ index = 5, start, size }) => ({
   index,
   key: index,
@@ -21,10 +22,16 @@ const makeItem = ({ index = 5, start, size }) => ({
   lane: 0,
 });
 
-const makeInstance = ({ scrollOffset = 1000, scrollDirection = null, scrollAdjustments = 0 } = {}) => ({
+const makeInstance = ({
+  scrollOffset = 1000,
+  scrollDirection = null,
+  scrollAdjustments = 0,
+  measuredKeys = [],
+} = {}) => ({
   scrollOffset,
   scrollDirection,
   scrollAdjustments,
+  itemSizeCache: new Map(measuredKeys.map((key) => [key, 1])),
 });
 
 const makePolicy = ({ liveStartIndex = -1, following = false } = {}) =>
@@ -46,11 +53,21 @@ test("row starting at or below the viewport top never adjusts", () => {
   assert.equal(policy(makeItem({ start: 1200, size: 200 }), 40, makeInstance()), false);
 });
 
-test("active backward scrolling suppresses compensation (upstream default)", () => {
+test("backward scroll suppresses re-measurements only (upstream 3.17.1 default)", () => {
   const policy = makePolicy();
   const item = makeItem({ index: 1, start: 100, size: 200 });
-  assert.equal(policy(item, 40, makeInstance({ scrollDirection: "backward" })), false);
-  assert.equal(policy(item, 40, makeInstance({ scrollDirection: "forward" })), true);
+  // A row measured before jumps when re-measured during backward scroll.
+  assert.equal(
+    policy(item, 40, makeInstance({ scrollDirection: "backward", measuredKeys: [1] })),
+    false,
+  );
+  // A first-ever measurement must land its estimate→actual delta regardless
+  // of direction — this is the upstream "items jump while scrolling up" fix.
+  assert.equal(policy(item, 40, makeInstance({ scrollDirection: "backward" })), true);
+  assert.equal(
+    policy(item, 40, makeInstance({ scrollDirection: "forward", measuredKeys: [1] })),
+    true,
+  );
 });
 
 test("detached reader inside the growing live row is left alone (streaming creep)", () => {
@@ -58,38 +75,38 @@ test("detached reader inside the growing live row is left alone (streaming creep
   // Live row spans 400..5400, viewport top at 3000: the reader scrolled up
   // into the streaming reply. Growth appends below the reading line.
   const item = makeItem({ index: 5, start: 400, size: 5000 });
-  assert.equal(policy(item, 60, makeInstance({ scrollOffset: 3000 })), false);
+  assert.equal(policy(item, 60, makeInstance({ scrollOffset: 3000, measuredKeys: [5] })), false);
 });
 
 test("the same live-row growth while following keeps compensating (pin assist)", () => {
   const policy = makePolicy({ liveStartIndex: 5, following: true });
   const item = makeItem({ index: 5, start: 400, size: 5000 });
-  assert.equal(policy(item, 60, makeInstance({ scrollOffset: 3000 })), true);
+  assert.equal(policy(item, 60, makeInstance({ scrollOffset: 3000, measuredKeys: [5] })), true);
 });
 
 test("live-row shrink keeps compensating so content under the reader stays put", () => {
   const policy = makePolicy({ liveStartIndex: 5, following: false });
   const item = makeItem({ index: 5, start: 400, size: 5000 });
-  assert.equal(policy(item, -80, makeInstance({ scrollOffset: 3000 })), true);
+  assert.equal(policy(item, -80, makeInstance({ scrollOffset: 3000, measuredKeys: [5] })), true);
 });
 
 test("settled row straddling the viewport keeps the default", () => {
   const policy = makePolicy({ liveStartIndex: 5, following: false });
   const item = makeItem({ index: 2, start: 400, size: 5000 });
-  assert.equal(policy(item, 60, makeInstance({ scrollOffset: 3000 })), true);
+  assert.equal(policy(item, 60, makeInstance({ scrollOffset: 3000, measuredKeys: [2] })), true);
 });
 
 test("idle transcript (liveStartIndex -1) keeps the default everywhere", () => {
   const policy = makePolicy({ liveStartIndex: -1, following: false });
   const item = makeItem({ index: 5, start: 400, size: 5000 });
-  assert.equal(policy(item, 60, makeInstance({ scrollOffset: 3000 })), true);
+  assert.equal(policy(item, 60, makeInstance({ scrollOffset: 3000, measuredKeys: [5] })), true);
 });
 
 test("live row entirely above the viewport still compensates", () => {
   const policy = makePolicy({ liveStartIndex: 5, following: false });
   // end (300) <= viewport top (1000): the growth lands above the reader.
   const item = makeItem({ index: 5, start: 100, size: 200 });
-  assert.equal(policy(item, 40, makeInstance({ scrollOffset: 1000 })), true);
+  assert.equal(policy(item, 40, makeInstance({ scrollOffset: 1000, measuredKeys: [5] })), true);
 });
 
 test("pending scroll adjustments fold into the viewport-top comparison", () => {
@@ -104,5 +121,8 @@ test("pending scroll adjustments fold into the viewport-top comparison", () => {
 test("missing private scrollAdjustments field falls back to zero", () => {
   const policy = makePolicy();
   const item = makeItem({ index: 1, start: 100, size: 200 });
-  assert.equal(policy(item, 40, { scrollOffset: 1000, scrollDirection: null }), true);
+  assert.equal(
+    policy(item, 40, { scrollOffset: 1000, scrollDirection: null, itemSizeCache: new Map() }),
+    true,
+  );
 });

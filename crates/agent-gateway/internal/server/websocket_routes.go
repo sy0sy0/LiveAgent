@@ -22,6 +22,7 @@ var websocketRequestHandlers = map[string]websocketRequestHandler{
 	"history.get":                    (*websocketConnection).handleHistoryGet,
 	"history.prefix":                 (*websocketConnection).handleHistoryPrefix,
 	"history.rename":                 (*websocketConnection).handleHistoryRename,
+	"history.branch":                 (*websocketConnection).handleHistoryBranch,
 	"history.pin":                    (*websocketConnection).handleHistoryPin,
 	"history.share.get":              (*websocketConnection).handleHistoryShareGet,
 	"history.share.set":              (*websocketConnection).handleHistoryShareSet,

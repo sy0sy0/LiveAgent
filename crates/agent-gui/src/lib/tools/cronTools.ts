@@ -10,6 +10,7 @@ import {
   listCronRuns,
   refreshAutomationSnapshot,
 } from "../automation";
+import { createUuid } from "../shared/id";
 import { type BuiltinToolBundle, createBuiltinMetadataMap } from "./builtinTypes";
 
 type SelectedModelInput = {
@@ -191,7 +192,7 @@ function collectTaskFields(
       const request = asRecord(entry) ?? {};
       return {
         ...request,
-        id: normalizeText(request.id) || crypto.randomUUID(),
+        id: normalizeText(request.id) || createUuid(),
       };
     });
   }

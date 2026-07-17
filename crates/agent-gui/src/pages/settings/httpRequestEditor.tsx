@@ -16,6 +16,7 @@ import {
   type HttpMethod,
   type HttpRequestSpec,
 } from "../../lib/automation";
+import { createUuid } from "../../lib/shared/id";
 
 export type HttpRequestDraft = {
   id: string;
@@ -27,7 +28,7 @@ export type HttpRequestDraft = {
 
 export function createEmptyRequestDraft(): HttpRequestDraft {
   return {
-    id: crypto.randomUUID(),
+    id: createUuid(),
     url: "",
     method: "POST",
     headersText: "",

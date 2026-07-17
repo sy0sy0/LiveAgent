@@ -3,7 +3,10 @@ import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
 import type { StreamDebugLogger } from "../../debug/agentDebug";
 import { assistantMessageToText } from "../../providers/llm";
 import type { ProviderModelConfig } from "../../settings";
-import { sanitizeMessageForModelContext } from "../context/requestContextSanitizer";
+import {
+  sanitizeMessageForModelContext,
+  sanitizeMessagesForModelContext,
+} from "../context/requestContextSanitizer";
 import {
   type ConversationViewState,
   getActiveSegment,
@@ -198,6 +201,7 @@ export function buildCompactionPayload(params: {
   threshold: number;
 }): CompactionPayload {
   const activeSegment = getActiveSegment(params.state);
+  const activeSegmentMessages = sanitizeMessagesForModelContext(activeSegment.messages);
   return {
     compaction_reason: {
       trigger:
@@ -215,7 +219,7 @@ export function buildCompactionPayload(params: {
           summaryMeta: summaryMetaForPayload(activeSegment.summary.summaryMeta),
         }
       : null,
-    active_segment_messages: activeSegment.messages.map((message, index) =>
+    active_segment_messages: activeSegmentMessages.map((message, index) =>
       serializeMessageForCompaction(message, index),
     ),
     next_user_message: params.incomingUserText?.trim() ? params.incomingUserText : undefined,

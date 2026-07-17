@@ -3,6 +3,7 @@ import { ChevronRight, Globe } from "../../../components/icons";
 import { useLocale } from "../../../i18n";
 import type { HostedSearchBlock } from "../../../lib/chat/hostedSearch";
 import { cn } from "../../../lib/shared/utils";
+import { LazyCollapse } from "./LazyCollapse";
 import { AssistantStatus } from "./StatusText";
 
 function getHostedSearchStatusLabel(
@@ -145,14 +146,8 @@ export function HostedSearchGroupView({
       </button>
 
       {hasDetails ? (
-        <div
-          aria-hidden={!open}
-          className={cn(
-            "grid transition-[grid-template-rows,opacity] duration-200 ease-out",
-            open ? "grid-rows-[1fr] opacity-100" : "pointer-events-none grid-rows-[0fr] opacity-0",
-          )}
-        >
-          <div className="min-h-0 overflow-hidden">
+        <LazyCollapse open={open}>
+          {() => (
             <div className="space-y-2 pb-2 pt-1.5">
               {queries.length > 0 ? (
                 <div className="flex flex-wrap gap-x-3 gap-y-1">
@@ -198,8 +193,8 @@ export function HostedSearchGroupView({
                 </div>
               ) : null}
             </div>
-          </div>
-        </div>
+          )}
+        </LazyCollapse>
       ) : null}
     </div>
   );

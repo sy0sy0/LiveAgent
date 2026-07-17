@@ -81,6 +81,15 @@ You MUST write the summary in English regardless of what language the user used 
 - <next_steps> must be ordered by priority and dependency. The first item is the immediate next action.
 - Keep the total output as concise as possible while preserving all decision-relevant information. Target density, not length.`;
 
-export function buildRepairPromptText(validationError: string) {
-  return `Your previous compaction summary was invalid. Error: ${validationError}. Please re-generate a valid <summary>...</summary> XML structure based on the same context. Do not include any additional explanation.`;
+export function buildRepairPromptText(
+  validationError: string,
+  requiredTechnicalRefs: string[] = [],
+) {
+  const verificationRequirement =
+    requiredTechnicalRefs.length > 0
+      ? `\nThe validation pass also requires at least one of these recent technical references to appear verbatim in the XML:\n${requiredTechnicalRefs
+          .map((reference) => `- ${JSON.stringify(reference)}`)
+          .join("\n")}`
+      : "";
+  return `Your previous compaction summary was invalid. Error: ${validationError}.${verificationRequirement}\nPlease re-generate a valid <summary>...</summary> XML structure based on the same context. Do not include any additional explanation.`;
 }

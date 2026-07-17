@@ -82,6 +82,10 @@ type LiveTranscriptArtifacts = {
   draftFlushCancel: (() => void) | null;
   pendingLRUpdates: Array<(prev: LiveRound[]) => LiveRound[]>;
   lrFlushCancel: (() => void) | null;
+  // Last-wins tool-status coalescing: a burst of status changes lands as one
+  // store emit per frame.
+  pendingToolStatus: { value: string | null } | null;
+  toolStatusFlushCancel: (() => void) | null;
   abortSnapshot: AbortSnapshot | null;
 };
 
@@ -92,6 +96,8 @@ function createLiveTranscriptArtifacts(): LiveTranscriptArtifacts {
     draftFlushCancel: null,
     pendingLRUpdates: [],
     lrFlushCancel: null,
+    pendingToolStatus: null,
+    toolStatusFlushCancel: null,
     abortSnapshot: null,
   };
 }
@@ -150,6 +156,10 @@ export function useLiveTranscriptController(params: UseLiveTranscriptControllerP
     artifacts.lrFlushCancel?.();
     artifacts.lrFlushCancel = null;
     artifacts.pendingLRUpdates.length = 0;
+
+    artifacts.toolStatusFlushCancel?.();
+    artifacts.toolStatusFlushCancel = null;
+    artifacts.pendingToolStatus = null;
   }, []);
 
   const flushPendingLiveUpdates = useCallback(
@@ -176,6 +186,14 @@ export function useLiveTranscriptController(params: UseLiveTranscriptControllerP
           }
           return nextRounds;
         });
+      }
+
+      artifacts.toolStatusFlushCancel?.();
+      artifacts.toolStatusFlushCancel = null;
+      if (artifacts.pendingToolStatus) {
+        const pending = artifacts.pendingToolStatus;
+        artifacts.pendingToolStatus = null;
+        targetStore.setToolStatus(pending.value);
       }
     },
     [liveTranscriptStore, resolveLiveTranscriptArtifacts],
@@ -236,16 +254,6 @@ export function useLiveTranscriptController(params: UseLiveTranscriptControllerP
       targetStore.reset();
     },
     [flushPendingLiveUpdates, liveTranscriptStore],
-  );
-
-  const updateLiveRounds = useCallback(
-    (
-      updater: (prev: LiveRound[]) => LiveRound[],
-      targetStore: LiveTranscriptStore = liveTranscriptStore,
-    ) => {
-      targetStore.updateLiveRounds(updater);
-    },
-    [liveTranscriptStore],
   );
 
   const appendDraftAssistantText = useCallback(
@@ -324,9 +332,27 @@ export function useLiveTranscriptController(params: UseLiveTranscriptControllerP
 
   const updateToolStatus = useCallback(
     (status: string | null, targetStore: LiveTranscriptStore = liveTranscriptStore) => {
-      targetStore.setToolStatus(status);
+      const artifacts = resolveLiveTranscriptArtifacts(targetStore);
+      if (!artifacts) {
+        targetStore.setToolStatus(status);
+        return;
+      }
+
+      // Last-wins: only the newest status of a frame reaches the store. A
+      // pending flush (settle, abort snapshot) delivers it early.
+      artifacts.pendingToolStatus = { value: status };
+      if (artifacts.toolStatusFlushCancel !== null) return;
+
+      artifacts.toolStatusFlushCancel = scheduleLiveTranscriptFlush(() => {
+        artifacts.toolStatusFlushCancel = null;
+        const pending = artifacts.pendingToolStatus;
+        artifacts.pendingToolStatus = null;
+        if (pending) {
+          targetStore.setToolStatus(pending.value);
+        }
+      });
     },
-    [liveTranscriptStore],
+    [liveTranscriptStore, resolveLiveTranscriptArtifacts],
   );
 
   useEffect(
@@ -347,7 +373,6 @@ export function useLiveTranscriptController(params: UseLiveTranscriptControllerP
     captureAbortSnapshot,
     getAbortSnapshot,
     resetLiveTranscript,
-    updateLiveRounds,
     appendDraftAssistantText,
     batchLiveRoundsUpdate,
     updateToolStatus,

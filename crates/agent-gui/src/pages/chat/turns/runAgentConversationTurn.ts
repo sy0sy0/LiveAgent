@@ -7,7 +7,10 @@ import type {
 } from "@earendil-works/pi-ai";
 import type { CompactionController } from "../../../lib/chat/compaction/controller";
 import type { ProviderRuntimeConfig } from "../../../lib/chat/compaction/types";
-import { isAbortedAssistantMessage } from "../../../lib/chat/conversation/chatAbort";
+import {
+  isAbortedAssistantMessage,
+  type SuppressedToolTraceSnapshot,
+} from "../../../lib/chat/conversation/chatAbort";
 import {
   appendMessagesToConversation,
   appendRenderOnlyMessagesToConversation,
@@ -54,7 +57,7 @@ import {
   AGENT_TOOL_NAME,
   buildRosterReminder,
   createSubagentScheduler,
-  isSubagentCardArguments,
+  isSubagentCardToolCall,
   renderMessageBusSnapshot,
   SUBAGENT_PARENT_ID,
   type SubagentConversationStore,
@@ -173,10 +176,6 @@ function finishAgentPerfSpan(
   return durationMs;
 }
 
-function isSubagentCardToolCall(toolCall: ToolCall) {
-  return toolCall.name === AGENT_TOOL_NAME && isSubagentCardArguments(toolCall.arguments);
-}
-
 // Only enabled, non-empty templates are resolvable from Agent calls.
 function enabledSubagentTemplates(agentTemplates: AppSettings["agents"]): SubagentTemplate[] {
   return (agentTemplates ?? [])
@@ -249,15 +248,15 @@ export type RunAgentConversationTurnParams = {
   compaction: CompactionController;
   cancellation: TurnCancellation;
   resetLiveTranscript: (store: LiveTranscriptStore) => void;
-  updateLiveRounds: (
-    updater: (prev: LiveRound[]) => LiveRound[],
-    store: LiveTranscriptStore,
-  ) => void;
   batchLiveRoundsUpdate: (
     updater: (prev: LiveRound[]) => LiveRound[],
     store: LiveTranscriptStore,
   ) => void;
   updateToolStatus: (status: string | null, store: LiveTranscriptStore) => void;
+  updatePersistableAgentProgress: (progress: {
+    completedThroughRound: number;
+    suppressedToolTrace: SuppressedToolTraceSnapshot[];
+  }) => void;
   commitVisibleAbortedConversation: () => boolean;
   updateConversationRuntimeEntry: (
     conversationId: string,
@@ -310,9 +309,9 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
     compaction,
     cancellation,
     resetLiveTranscript,
-    updateLiveRounds,
     batchLiveRoundsUpdate,
     updateToolStatus,
+    updatePersistableAgentProgress,
     commitVisibleAbortedConversation,
     updateConversationRuntimeEntry,
     persistConversationWithHistorySync,
@@ -465,6 +464,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
   hookLifecycle.startAgent();
   let result: Awaited<ReturnType<typeof runAssistantWithTools>> | null = null;
   let latestAgentEmittedMessages: Message[] = [];
+  let suppressedToolTrace: SuppressedToolTraceSnapshot[] = [];
   let activeAgentRound = 0;
   let pendingAgentContext: Context | null = null;
   const pendingTerminalAssistantMetaRef: {
@@ -475,6 +475,45 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
   } = {
     current: null,
   };
+
+  function publishPersistableAgentProgress(
+    round: number,
+    assistant: AssistantMessage,
+    toolResults: ToolResultMessage[],
+  ) {
+    const toolResultsById = new Map(
+      toolResults.map((toolResult) => [toolResult.toolCallId, toolResult]),
+    );
+    const roundTrace = assistant.content
+      .filter(
+        (block): block is ToolCall =>
+          block.type === "toolCall" &&
+          block.name === AGENT_TOOL_NAME &&
+          !isSubagentCardToolCall(block),
+      )
+      .map((toolCall) => ({
+        round,
+        toolCall,
+        toolResult: toolResultsById.get(toolCall.id),
+      }));
+
+    suppressedToolTrace = [
+      ...suppressedToolTrace.filter((item) => item.round !== round),
+      ...roundTrace,
+    ];
+    updatePersistableAgentProgress({
+      completedThroughRound: round,
+      suppressedToolTrace: suppressedToolTrace.slice(),
+    });
+  }
+
+  function clearPersistableAgentProgress() {
+    suppressedToolTrace = [];
+    updatePersistableAgentProgress({
+      completedThroughRound: 0,
+      suppressedToolTrace: [],
+    });
+  }
 
   function commitAssistantRoundMeta(assistant: AssistantMessage, round: number) {
     gatewayBridgeEvents.queueToken("", {
@@ -629,7 +668,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
           protectionCheckChars = 0;
           sawToolCallInRound = false;
           hookLifecycle.startTurn(round);
-          updateLiveRounds(
+          batchLiveRoundsUpdate(
             (prev) => [
               ...prev,
               {
@@ -791,7 +830,8 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
           gatewayBridgeEvents.queueToolStatus(s, false);
           updateToolStatus(s, transcriptStore);
         },
-        onBeforeNextTurn: async ({ emittedMessages }) => {
+        onBeforeNextTurn: async ({ round, assistant, toolResults, emittedMessages }) => {
+          publishPersistableAgentProgress(round, assistant, toolResults);
           latestAgentEmittedMessages = emittedMessages.slice();
           await refreshParentMessageBusSnapshot();
           const tempState = appendMessagesToConversation(
@@ -819,6 +859,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
               : null;
           }
           latestAgentEmittedMessages = [];
+          clearPersistableAgentProgress();
           return {
             context: withSubagentRuntimeContext(compactedContext),
             emittedMessages: [],
@@ -858,6 +899,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
       ]);
       latestAgentEmittedMessages = [];
       applyConversationState(tempState);
+      clearPersistableAgentProgress();
 
       const compactedContext = await compaction.compactDuringRun({
         trigger: "mid-stream",
@@ -945,7 +987,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
     const extraction = await runPostTurnMemoryExtraction({
       roundOffset: memoryRoundOffset,
       onTurnStart: (round) => {
-        updateLiveRounds(
+        batchLiveRoundsUpdate(
           (prev) => [
             ...prev,
             {

@@ -10,7 +10,8 @@ import type { StreamRetryConfig } from "./streamRetry";
 export type ModelOption = {
   value: string; // encodes customProviderId::model
   label: string; // model id
-  providerName: string; // provider display name (for grouping)
+  providerId: string; // stable custom provider identity (for grouping)
+  providerName: string; // provider display name
   providerType: ProviderId; // routes Claude Code, Codex, Gemini, etc.
   model: string;
 };
@@ -49,4 +50,5 @@ export type StreamOptionsEx = SimpleStreamOptions & {
   deepSeekAnthropicPayloadToolBlockFlattening?: boolean;
   /** Escape hatch for the unified provider stream retry in streamByApi.ts. */
   streamRetry?: StreamRetryConfig;
+  recoverMissingFinishReason?: boolean;
 };

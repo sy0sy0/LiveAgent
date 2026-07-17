@@ -31,6 +31,7 @@ import {
   type SshProxyType,
   updateSsh,
 } from "../../lib/settings";
+import { createUuid } from "../../lib/shared/id";
 import { useModalMotion } from "../../lib/shared/modalMotion";
 import {
   type SshImportCandidate,
@@ -1058,7 +1059,7 @@ export function SshSection(props: SettingsSectionProps) {
         hosts: [
           ...prev.ssh.hosts,
           {
-            id: crypto.randomUUID(),
+            id: createUuid(),
             ...data,
           },
         ],
@@ -1125,7 +1126,7 @@ export function SshSection(props: SettingsSectionProps) {
           ...candidates.map((candidate) => {
             const { id: _id, source: _source, duplicate: _duplicate, ...host } = candidate;
             return {
-              id: crypto.randomUUID(),
+              id: createUuid(),
               ...host,
             };
           }),

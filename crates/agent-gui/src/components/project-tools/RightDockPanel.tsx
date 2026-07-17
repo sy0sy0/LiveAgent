@@ -3,6 +3,7 @@ import {
   type CSSProperties,
   memo,
   type PointerEvent as ReactPointerEvent,
+  type WheelEvent as ReactWheelEvent,
   type RefObject,
   useCallback,
   useEffect,
@@ -533,6 +534,37 @@ export const RightDockPanel = memo(function RightDockPanel(props: RightDockPanel
     reorderLabel: t("projectTools.reorderTab"),
   });
 
+  const handleTabsWheel = useCallback(
+    (event: ReactWheelEvent<HTMLDivElement>) => {
+      if (
+        event.ctrlKey ||
+        event.metaKey ||
+        event.deltaY === 0 ||
+        Math.abs(event.deltaX) >= Math.abs(event.deltaY)
+      ) {
+        return;
+      }
+
+      const element = tabsScrollRef.current;
+      if (!element) return;
+
+      const maxScrollLeft = element.scrollWidth - element.clientWidth;
+      if (maxScrollLeft <= 0) return;
+
+      const deltaScale =
+        event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? element.clientWidth : 1;
+      const nextScrollLeft = Math.min(
+        maxScrollLeft,
+        Math.max(0, element.scrollLeft + event.deltaY * deltaScale),
+      );
+      if (Math.abs(nextScrollLeft - element.scrollLeft) < 0.5) return;
+
+      event.preventDefault();
+      element.scrollLeft = nextScrollLeft;
+    },
+    [tabsScrollRef],
+  );
+
   const showDisabledMessage = Boolean(
     disabledMessage && !tunnelAvailable && !tunnelInitialized && !sshTunnelInitialized,
   );
@@ -737,7 +769,10 @@ export const RightDockPanel = memo(function RightDockPanel(props: RightDockPanel
                 />
               </button>
               <div className="project-tools-panel-header flex h-11 shrink-0 items-center gap-2 border-b border-border px-3">
-                <div className="project-tools-panel-tabs-shell flex min-w-0 flex-1 flex-col justify-center gap-1">
+                <div
+                  className="project-tools-panel-tabs-shell flex min-w-0 flex-1 flex-col justify-center gap-1"
+                  onWheel={handleTabsWheel}
+                >
                   <div
                     ref={tabsScrollRef}
                     className="project-tools-panel-tabs flex h-8 min-w-0 items-center gap-1 overflow-x-auto overflow-y-hidden"

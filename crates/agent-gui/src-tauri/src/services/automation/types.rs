@@ -197,6 +197,12 @@ impl RunState {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CronRunNowResponse {
+    pub started_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CronRunRecord {
     pub id: String,
     pub task_id: String,
@@ -222,6 +228,12 @@ pub struct PromptRunRequest {
     pub model: String,
     pub started_at: i64,
     pub lease_expires_at: i64,
+    #[serde(default = "default_true")]
+    pub counted: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]

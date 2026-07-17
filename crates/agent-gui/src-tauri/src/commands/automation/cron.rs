@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use crate::services::automation::{
     validate_cron_expression, AutomationApplyInput, AutomationSnapshot, AutomationStore,
-    CompletePromptRunInput, CronApplyResponse, CronRunRecord, HooksApplyResponse,
-    PromptCompletionResponse, PromptRunRequest,
+    CompletePromptRunInput, CronApplyResponse, CronRunNowResponse, CronRunRecord,
+    HooksApplyResponse, PromptCompletionResponse, PromptRunRequest,
 };
 
 #[tauri::command(rename_all = "snake_case")]
@@ -66,6 +66,17 @@ pub async fn automation_clear_runs(
     tauri::async_runtime::spawn_blocking(move || store.clear_runs(&task_id))
         .await
         .map_err(|e| format!("automation_clear_runs join 失败：{e}"))?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn automation_run_cron_now(
+    task_id: String,
+    store: tauri::State<'_, Arc<AutomationStore>>,
+) -> Result<CronRunNowResponse, String> {
+    let store = Arc::clone(store.inner());
+    tauri::async_runtime::spawn_blocking(move || store.run_cron_task_now(&task_id))
+        .await
+        .map_err(|e| format!("automation_run_cron_now join 失败：{e}"))?
 }
 
 #[tauri::command(rename_all = "snake_case")]

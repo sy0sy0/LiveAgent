@@ -166,6 +166,23 @@ fn normalize_missing_workspace_project_paths(raw: Option<&Value>) -> Value {
     Value::Array(out)
 }
 
+fn normalize_archived_workspace_project_paths(raw: Option<&Value>) -> Value {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(Value::Array(items)) = raw {
+        for item in items {
+            let Some(path) = item.as_str().map(str::trim).filter(|path| !path.is_empty()) else {
+                continue;
+            };
+            if !seen.insert(path.to_string()) {
+                continue;
+            }
+            out.push(Value::String(path.to_string()));
+        }
+    }
+    Value::Array(out)
+}
+
 fn system_value_with_defaults(raw: Option<Value>, default_workdir: &str) -> Value {
     let mut system = match raw {
         Some(Value::Object(system)) => system,
@@ -279,6 +296,12 @@ fn system_value_with_defaults(raw: Option<Value>, default_workdir: &str) -> Valu
             system.get(SYSTEM_MISSING_WORKSPACE_PROJECT_PATHS_KEY),
         ),
     );
+    system.insert(
+        SYSTEM_ARCHIVED_WORKSPACE_PROJECT_PATHS_KEY.to_string(),
+        normalize_archived_workspace_project_paths(
+            system.get(SYSTEM_ARCHIVED_WORKSPACE_PROJECT_PATHS_KEY),
+        ),
+    );
 
     Value::Object(system)
 }
@@ -324,6 +347,7 @@ fn save_system_with_default_workdir(
         SYSTEM_ACTIVE_WORKSPACE_PROJECT_ID_KEY,
         SYSTEM_HIDDEN_WORKSPACE_PROJECT_PATHS_KEY,
         SYSTEM_MISSING_WORKSPACE_PROJECT_PATHS_KEY,
+        SYSTEM_ARCHIVED_WORKSPACE_PROJECT_PATHS_KEY,
     ] {
         let value = system.get(key).cloned().unwrap_or(Value::Null);
         tx.execute(

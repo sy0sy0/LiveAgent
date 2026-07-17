@@ -1,6 +1,14 @@
-import type { AssistantMessage, Message, Model, Usage } from "@earendil-works/pi-ai";
+import type {
+  AssistantMessage,
+  Message,
+  Model,
+  ToolCall,
+  ToolResultMessage,
+  Usage,
+} from "@earendil-works/pi-ai";
 
 import type { ExecutionMode } from "../../settings";
+import { isSubagentCardToolCall } from "../../subagents/card";
 import {
   getRoundToolTrace,
   hasRoundContent,
@@ -14,6 +22,12 @@ export type LiveRoundSnapshot = {
   round: number;
   blocks: UiRoundContentBlock[];
   meta?: UiRoundMeta;
+};
+
+export type SuppressedToolTraceSnapshot = {
+  round: number;
+  toolCall: ToolCall;
+  toolResult?: ToolResultMessage;
 };
 
 const ZERO_USAGE: Usage = {
@@ -50,11 +64,14 @@ export function cloneLiveRoundSnapshots(rounds: LiveRoundSnapshot[]): LiveRoundS
 function buildAssistantMessage(params: {
   model: Model<any>;
   blocks?: UiRoundContentBlock[];
+  suppressedToolCalls?: ToolCall[];
   stopReason: AssistantMessage["stopReason"];
   timestamp: number;
 }): AssistantMessage | null {
   const content: AssistantMessage["content"] = [];
   for (const block of params.blocks ?? []) {
+    if (block.kind === "tool" && isSubagentCardToolCall(block.item.toolCall)) continue;
+
     if (block.kind === "thinking") {
       if (!block.text) continue;
       content.push({
@@ -78,6 +95,13 @@ function buildAssistantMessage(params: {
     content.push({
       ...block.item.toolCall,
       arguments: cloneValue(block.item.toolCall.arguments ?? {}),
+    });
+  }
+
+  for (const toolCall of params.suppressedToolCalls ?? []) {
+    content.push({
+      ...toolCall,
+      arguments: cloneValue(toolCall.arguments ?? {}),
     });
   }
 
@@ -107,6 +131,8 @@ export function buildAbortedMessagesFromSnapshot(params: {
   model: Model<any>;
   draftAssistantText: string;
   liveRounds: LiveRoundSnapshot[];
+  completedThroughRound?: number;
+  suppressedToolTrace?: SuppressedToolTraceSnapshot[];
   timestamp?: number;
 }): Message[] {
   const timestamp = params.timestamp ?? Date.now();
@@ -123,15 +149,36 @@ export function buildAbortedMessagesFromSnapshot(params: {
 
   const messages: Message[] = [];
   const rounds = params.liveRounds.filter((round) => hasRoundContent(round));
+  const completedThroughRound = params.completedThroughRound ?? 0;
 
   rounds.forEach((round, index) => {
     const isLastRound = index === rounds.length - 1;
-    const toolTrace = getRoundToolTrace(round);
+    const visibleToolTrace = getRoundToolTrace(round).filter(
+      (item) => !isSubagentCardToolCall(item.toolCall),
+    );
+    const visibleToolCallIds = new Set(visibleToolTrace.map((item) => item.toolCall.id));
+    const suppressedToolTrace = (params.suppressedToolTrace ?? []).filter(
+      (item) =>
+        item.round === round.round &&
+        !isSubagentCardToolCall(item.toolCall) &&
+        !visibleToolCallIds.has(item.toolCall.id),
+    );
+    const toolTrace = [...visibleToolTrace, ...suppressedToolTrace];
     const hasToolCalls = toolTrace.length > 0;
+    const roundCompleted = round.round <= completedThroughRound;
     const assistant = buildAssistantMessage({
       model: params.model,
       blocks: round.blocks,
-      stopReason: isLastRound ? "aborted" : hasToolCalls ? "toolUse" : "stop",
+      suppressedToolCalls: suppressedToolTrace.map((item) => item.toolCall),
+      stopReason: roundCompleted
+        ? hasToolCalls
+          ? "toolUse"
+          : "stop"
+        : isLastRound
+          ? "aborted"
+          : hasToolCalls
+            ? "toolUse"
+            : "stop",
       timestamp: timestamp + index,
     });
 
@@ -205,6 +252,8 @@ export function buildPersistableMessagesFromSnapshot(params: {
   model: Model<any>;
   draftAssistantText: string;
   liveRounds: LiveRoundSnapshot[];
+  completedThroughRound?: number;
+  suppressedToolTrace?: SuppressedToolTraceSnapshot[];
   timestamp?: number;
 }) {
   return sanitizeAbortedHistoryMessages(buildAbortedMessagesFromSnapshot(params));

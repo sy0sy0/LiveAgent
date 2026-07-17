@@ -9,6 +9,7 @@ import {
   CHECKPOINT_ROW_ESTIMATE_PX,
   estimateAssistantRowHeight,
   estimateUserRowHeight,
+  measureEstimateText,
 } from "../../../lib/transcript-virtual/rowEstimates";
 
 // The transcript's single row list: committed history rows plus (while a run
@@ -64,13 +65,18 @@ export type LiveTailInput = LiveTranscriptState & {
 };
 
 function computeAssistantEstimate(rounds: (UiRound | LiveRound)[]): number {
-  let textChars = 0;
+  let proseChars = 0;
+  let codeLines = 0;
+  let codeFences = 0;
   let toolCount = 0;
   let thinkingCount = 0;
   for (const round of rounds) {
     for (const block of round.blocks) {
       if (block.kind === "text") {
-        textChars += block.text.length;
+        const measured = measureEstimateText(block.text);
+        proseChars += measured.proseChars;
+        codeLines += measured.codeLines;
+        codeFences += measured.codeFences;
       } else if (block.kind === "thinking") {
         thinkingCount += 1;
       } else {
@@ -78,7 +84,13 @@ function computeAssistantEstimate(rounds: (UiRound | LiveRound)[]): number {
       }
     }
   }
-  return estimateAssistantRowHeight({ textChars, toolCount, thinkingCount });
+  return estimateAssistantRowHeight({
+    proseChars,
+    codeLines,
+    codeFences,
+    toolCount,
+    thinkingCount,
+  });
 }
 
 function buildReplyText(rounds: (UiRound | LiveRound)[]): string {
@@ -88,19 +100,33 @@ function buildReplyText(rounds: (UiRound | LiveRound)[]): string {
     .join("\n\n");
 }
 
+export type TranscriptRowModelOptions = {
+  // Fired once per build that discovers new row keys (always fired for the
+  // first build, even when empty, so the entrance registry can stamp the
+  // initial rows as never-animating).
+  onRowsBorn?: (keys: readonly string[], isInitialBuild: boolean) => void;
+};
+
 export type TranscriptRowModel = {
   build: (historyItems: RenderTimelineItem[], live: LiveTailInput) => TranscriptRowsSnapshot;
   reset: () => void;
 };
 
-export function createTranscriptRowModel(): TranscriptRowModel {
+export function createTranscriptRowModel(options?: TranscriptRowModelOptions): TranscriptRowModel {
   // Settled rows cache by item identity: a streaming commit leaves history
   // item objects untouched, so per-frame builds reuse every settled row and
   // memoized row components bail on identity.
   let rowCache = new WeakMap<RenderTimelineItem, TranscriptRow>();
+  // The composed history-row array, reused while the historyItems array
+  // identity is unchanged — live-store emits then skip the per-item walk
+  // entirely instead of paying O(history) per frame.
+  let historyRowsCache: { items: RenderTimelineItem[]; rows: TranscriptRow[] } | null = null;
   // Committed keys of stream-born replies → their live row key. Keying the
   // committed row with the live key is what makes settle remount-free.
   let streamOrigins = new Map<string, string>();
+  // Every key ever produced, for O(new) birth reporting.
+  let knownKeys = new Set<string>();
+  let hasBuilt = false;
   let turnSeq = 0;
   // The active live turn, or a settled turn still waiting for its committed
   // twin to land in history (desktop persistence can lag the run's end).
@@ -110,7 +136,10 @@ export function createTranscriptRowModel(): TranscriptRowModel {
 
   const reset = () => {
     rowCache = new WeakMap();
+    historyRowsCache = null;
     streamOrigins = new Map();
+    knownKeys = new Set();
+    hasBuilt = false;
     turnSeq = 0;
     activeTurn = null;
     pendingSettle = null;
@@ -143,6 +172,13 @@ export function createTranscriptRowModel(): TranscriptRowModel {
       const item = historyItems[index];
       if (item?.kind === "assistant") {
         streamOrigins.set(item.key, turn.rowKey);
+        // The twin can land while the run is still sending; drop any
+        // un-aliased row built for it so the next build re-keys it onto the
+        // live row instead of remounting.
+        if (rowCache.has(item)) {
+          rowCache.delete(item);
+          historyRowsCache = null;
+        }
         return true;
       }
     }
@@ -164,7 +200,7 @@ export function createTranscriptRowModel(): TranscriptRowModel {
       row = {
         kind: "user",
         key: item.key,
-        estimate: estimateUserRowHeight(item.text.length),
+        estimate: estimateUserRowHeight(item.text.length, item.attachments.length),
         item,
       };
     } else {
@@ -191,6 +227,8 @@ export function createTranscriptRowModel(): TranscriptRowModel {
     live: LiveTailInput,
   ): TranscriptRowsSnapshot => {
     const liveTailVisible = live.isSending;
+    const isInitialBuild = !hasBuilt;
+    hasBuilt = true;
 
     if (liveTailVisible && !activeTurn) {
       // A settled turn still waiting for its twin is superseded by the new
@@ -211,15 +249,32 @@ export function createTranscriptRowModel(): TranscriptRowModel {
       }
     }
 
-    const rows: TranscriptRow[] = [];
-    let retryTarget: RenderUserMessage | null = null;
-    for (const item of historyItems) {
-      rows.push(buildHistoryRow(item, item.kind === "assistant" ? retryTarget : null));
-      if (item.kind === "user") {
-        retryTarget = item;
+    const bornKeys: string[] = [];
+    const trackBirth = (key: string) => {
+      if (!knownKeys.has(key)) {
+        knownKeys.add(key);
+        bornKeys.push(key);
       }
+    };
+
+    let historyRows: TranscriptRow[];
+    if (historyRowsCache?.items === historyItems) {
+      historyRows = historyRowsCache.rows;
+    } else {
+      historyRows = [];
+      let retryTarget: RenderUserMessage | null = null;
+      for (const item of historyItems) {
+        const row = buildHistoryRow(item, item.kind === "assistant" ? retryTarget : null);
+        historyRows.push(row);
+        trackBirth(row.key);
+        if (item.kind === "user") {
+          retryTarget = item;
+        }
+      }
+      historyRowsCache = { items: historyItems, rows: historyRows };
     }
 
+    let rows = historyRows;
     let liveStartIndex = -1;
     if (liveTailVisible && activeTurn) {
       const rounds: (UiRound | LiveRound)[] =
@@ -228,18 +283,26 @@ export function createTranscriptRowModel(): TranscriptRowModel {
           : live.draftAssistantText
             ? [draftRound(live.draftAssistantText)]
             : [];
-      liveStartIndex = rows.length;
-      rows.push({
-        kind: "assistant",
-        key: activeTurn.rowKey,
-        estimate: rounds.length > 0 ? computeAssistantEstimate(rounds) : 80,
-        live: true,
-        renderMode: "streaming",
-        rounds,
-        compacted: false,
-        replyText: "",
-        retryTarget: null,
-      });
+      liveStartIndex = historyRows.length;
+      trackBirth(activeTurn.rowKey);
+      rows = [
+        ...historyRows,
+        {
+          kind: "assistant",
+          key: activeTurn.rowKey,
+          estimate: rounds.length > 0 ? computeAssistantEstimate(rounds) : 80,
+          live: true,
+          renderMode: "streaming",
+          rounds,
+          compacted: false,
+          replyText: "",
+          retryTarget: null,
+        },
+      ];
+    }
+
+    if (bornKeys.length > 0 || isInitialBuild) {
+      options?.onRowsBorn?.(bornKeys, isInitialBuild);
     }
 
     return { rows, liveStartIndex };

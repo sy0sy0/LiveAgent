@@ -4,6 +4,7 @@ import { useEffect, useRef } from "react";
 
 import type { HistoryMessageRef } from "../../../lib/chat/conversation/conversationState";
 import { normalizeChatRuntimeControls, normalizeSystemToolSelection } from "../../../lib/settings";
+import { createUuid } from "../../../lib/shared/id";
 import {
   type ActiveGatewayBridgeRequest,
   type GatewayBridgeRuntimeRefs,
@@ -140,10 +141,7 @@ export function useGatewayBridgeListeners(params: UseGatewayBridgeListenersParam
   latestParamsRef.current = params;
   const workerIdRef = useRef("");
   if (!workerIdRef.current) {
-    workerIdRef.current =
-      typeof crypto !== "undefined" && "randomUUID" in crypto
-        ? `gateway-chat-runtime-${crypto.randomUUID()}`
-        : `gateway-chat-runtime-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    workerIdRef.current = `gateway-chat-runtime-${createUuid()}`;
   }
 
   useEffect(() => {

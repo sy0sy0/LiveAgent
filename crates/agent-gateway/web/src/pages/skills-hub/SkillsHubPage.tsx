@@ -7,6 +7,7 @@ import {
   BookOpen,
   Check,
   Cloud,
+  Copy,
   Download,
   ExternalLink,
   FileText,
@@ -66,6 +67,7 @@ const EXTERNAL_TOOL_LABELS: Record<string, string> = {
 
 const STORE_PAGE_LIMIT = 24;
 const INSTALLED_SKILL_PREVIEW_LINES = 10_000;
+const COPY_FEEDBACK_MS = 1600;
 const TERMINAL_INSTALL_PHASES = new Set(["done", "error", "cancelled"]);
 const STORE_SORT_OPTIONS: Array<{ value: ClawHubSort; labelKey: string }> = [
   { value: "downloads", labelKey: "settings.skillsStoreSortMostDownloaded" },
@@ -100,6 +102,37 @@ function emptyInstalledSkillPreviewState(): InstalledSkillPreviewState {
     loading: false,
     error: null,
   };
+}
+
+function fallbackCopyText(text: string) {
+  let textarea: HTMLTextAreaElement | null = null;
+  try {
+    textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.top = "-9999px";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  } finally {
+    textarea?.remove();
+  }
+}
+
+async function copyText(text: string) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      return fallbackCopyText(text);
+    }
+  }
+  return fallbackCopyText(text);
 }
 
 function normalizePreviewMetadataText(value: string) {
@@ -1764,6 +1797,7 @@ function InstalledSkillPreviewDrawer(props: {
   const { t } = useLocale();
   const alwaysEnabled = isAlwaysEnabledSkillName(skill.name);
   const source = skill.source;
+  const description = skill.description.trim();
   const previewIsMarkdown = /\.(md|mdx|markdown)$/i.test(skill.skillFile);
   const previewContent = stripInstalledSkillPreviewMetadata(preview.content, skill);
   const statusLabel = alwaysEnabled
@@ -1878,8 +1912,14 @@ function InstalledSkillPreviewDrawer(props: {
                       {t("settings.skillsInstalledPreviewDescription")}
                     </div>
                     <p className="mt-1.5 text-[13px] leading-6 text-muted-foreground">
-                      {skill.description || t("settings.skillsInstalledPreviewNoDescription")}
+                      {description || t("settings.skillsInstalledPreviewNoDescription")}
                     </p>
+                    <div className="mt-2 flex justify-end">
+                      <SkillPreviewCopyButton
+                        value={description}
+                        label={t("settings.skillsInstalledPreviewCopyDescription")}
+                      />
+                    </div>
                   </div>
                 </div>
               </div>
@@ -1931,8 +1971,14 @@ function InstalledSkillPreviewDrawer(props: {
                 <div className="text-[12px] font-semibold text-foreground">
                   {t("settings.skillsInstalledPreviewFilePreview")}
                 </div>
-                <div className="truncate text-[10.5px] text-muted-foreground/70">
-                  {preview.skillFile || skill.skillFile}
+                <div className="flex min-w-0 items-center gap-1">
+                  <div className="truncate text-[10.5px] text-muted-foreground/70">
+                    {preview.skillFile || skill.skillFile}
+                  </div>
+                  <SkillPreviewCopyButton
+                    value={previewContent}
+                    label={t("settings.skillsInstalledPreviewCopyFile")}
+                  />
                 </div>
               </div>
 
@@ -1988,6 +2034,49 @@ function InstalledSkillPreviewDrawer(props: {
       </aside>
     </div>,
     document.body,
+  );
+}
+
+function SkillPreviewCopyButton(props: { value: string; label: string }) {
+  const { value, label } = props;
+  const { t } = useLocale();
+  const [copied, setCopied] = useState(false);
+  const resetTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (resetTimerRef.current !== null) {
+        window.clearTimeout(resetTimerRef.current);
+        resetTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const handleCopy = useCallback(async () => {
+    if (!value || !(await copyText(value))) return;
+    setCopied(true);
+    if (resetTimerRef.current !== null) {
+      window.clearTimeout(resetTimerRef.current);
+    }
+    resetTimerRef.current = window.setTimeout(() => {
+      setCopied(false);
+      resetTimerRef.current = null;
+    }, COPY_FEEDBACK_MS);
+  }, [value]);
+
+  const accessibleLabel = copied ? t("settings.skillsInstalledPreviewCopied") : label;
+
+  return (
+    <button
+      type="button"
+      disabled={!value}
+      aria-label={accessibleLabel}
+      title={accessibleLabel}
+      className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35 disabled:pointer-events-none disabled:opacity-35"
+      onClick={() => void handleCopy()}
+    >
+      {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+    </button>
   );
 }
 

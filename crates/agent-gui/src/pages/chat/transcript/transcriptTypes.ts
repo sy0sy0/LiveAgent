@@ -32,6 +32,10 @@ export type ChatTranscriptProps = {
     text: string,
     attachments: PendingUploadedFile[],
   ) => void;
+  onBranchConversation?: (messageRef: HistoryMessageRef) => void;
+  // Anchor messageId of the branch request in flight; the matching row shows
+  // a spinner and every branch button disables until it settles.
+  branchPendingMessageId?: string | null;
   onOpenSettings: (section?: SectionId) => void;
   onSuggestionSelect?: (text: string) => void;
   suggestionsDisabled?: boolean;

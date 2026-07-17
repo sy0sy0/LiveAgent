@@ -32,6 +32,7 @@ const SYSTEM_WORKSPACE_PROJECTS_KEY: &str = "workspaceProjects";
 const SYSTEM_ACTIVE_WORKSPACE_PROJECT_ID_KEY: &str = "activeWorkspaceProjectId";
 const SYSTEM_HIDDEN_WORKSPACE_PROJECT_PATHS_KEY: &str = "hiddenWorkspaceProjectPaths";
 const SYSTEM_MISSING_WORKSPACE_PROJECT_PATHS_KEY: &str = "missingWorkspaceProjectPaths";
+const SYSTEM_ARCHIVED_WORKSPACE_PROJECT_PATHS_KEY: &str = "archivedWorkspaceProjectPaths";
 const DEFAULT_WORKSPACE_PROJECT_ID: &str = "default-project";
 const DEFAULT_WORKSPACE_PROJECT_NAME: &str = "Default Project";
 pub(crate) const PROVIDER_API_KEY_UPDATES_FIELD: &str = "providerApiKeyUpdates";

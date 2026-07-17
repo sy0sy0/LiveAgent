@@ -73,6 +73,8 @@ const DEFAULT_MESSAGES: AppUpdateMessages = {
   restartFailed: "Failed to restart app.",
 };
 
+export const APP_UPDATE_CHECK_INTERVAL_MS = 20 * 60 * 1000;
+
 function asErrorMessage(error: unknown, fallback: string) {
   if (error instanceof Error && error.message.trim()) return error.message.trim();
   const text = String(error ?? "").trim();
@@ -108,6 +110,15 @@ export function shouldShowAppUpdateButton(state: AppUpdateState) {
   const result = getAppUpdateStateResult(state);
   return Boolean(
     result?.available || state.status === "installing" || state.status === "restarting",
+  );
+}
+
+export function shouldRunAutomaticAppUpdateCheck(state: AppUpdateState) {
+  return (
+    state.status !== "checking" &&
+    state.status !== "installing" &&
+    state.status !== "installed" &&
+    state.status !== "restarting"
   );
 }
 
@@ -170,14 +181,21 @@ export function useAppUpdateController({
   useEffect(() => {
     if (!enabled) {
       setUpdateState({ status: "idle" });
-      return;
+      return undefined;
     }
 
-    if (stateRef.current.status === "installing" || stateRef.current.status === "restarting") {
-      return;
-    }
+    const checkForUpdates = () => {
+      if (!shouldRunAutomaticAppUpdateCheck(stateRef.current)) {
+        return;
+      }
 
-    void runCheck().catch(() => undefined);
+      void runCheck().catch(() => undefined);
+    };
+
+    checkForUpdates();
+    const intervalId = window.setInterval(checkForUpdates, APP_UPDATE_CHECK_INTERVAL_MS);
+
+    return () => window.clearInterval(intervalId);
   }, [enabled, runCheck, setUpdateState]);
 
   const installOnly = useCallback(async () => {

@@ -146,6 +146,64 @@ test("buildCompactionPayload carries the previous summary and the pending user t
   assert.equal(protectionPayload.next_user_message, undefined);
 });
 
+test("buildCompactionPayload removes synthetic subagent card calls and paired results", () => {
+  const parentId = "fc_parent";
+  const cardId = `${parentId}:agent:1`;
+  const state = buildState([
+    {
+      ...assistant("Delegating work."),
+      content: [
+        { type: "text", text: "Delegating work." },
+        { type: "toolCall", id: parentId, name: "Agent", arguments: { agents: [] } },
+        {
+          type: "toolCall",
+          id: cardId,
+          name: "Agent",
+          arguments: {
+            subagent_card: true,
+            parent_tool_call_id: parentId,
+            id: "reviewer",
+          },
+        },
+      ],
+      stopReason: "toolUse",
+    },
+    {
+      role: "toolResult",
+      toolCallId: cardId,
+      toolName: "Agent",
+      content: [{ type: "text", text: "synthetic card result" }],
+      isError: false,
+      timestamp: 3,
+    },
+    {
+      role: "toolResult",
+      toolCallId: parentId,
+      toolName: "Agent",
+      content: [{ type: "text", text: "real parent result" }],
+      details: { kind: "subagent_batch" },
+      isError: false,
+      timestamp: 4,
+    },
+  ]);
+
+  const payload = buildCompactionPayload({
+    state,
+    intent: "protection",
+    contextTokens: 1,
+    threshold: 1,
+  });
+
+  assert.deepEqual(
+    payload.active_segment_messages.map((message) => message.role),
+    ["assistant", "toolResult"],
+  );
+  assert.equal(payload.active_segment_messages[1].toolCallId, parentId);
+  assert.match(payload.active_segment_messages[0].toolCalls[0], /^Agent /);
+  assert.equal(JSON.stringify(payload).includes(cardId), false);
+  assert.equal(JSON.stringify(payload).includes("synthetic card result"), false);
+});
+
 test("shrink keeps head+tail and records the omitted count; summary-backed payloads drop the head", () => {
   const messages = Array.from({ length: 20 }, (_, i) =>
     serializeMessageForCompaction(user(`msg-${i}`, i), i),

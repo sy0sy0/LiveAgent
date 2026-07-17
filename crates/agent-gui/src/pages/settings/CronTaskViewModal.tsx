@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   AlertTriangle,
@@ -7,7 +7,9 @@ import {
   ChevronDown,
   Clock3,
   Globe,
+  Loader2,
   MessageSquare,
+  Play,
   ScrollText,
   Terminal,
   X,
@@ -20,7 +22,11 @@ import {
   type CronTask,
   type CronTaskType,
   clearCronRuns,
+  isManualCronRunFinished,
   listCronRuns,
+  MANUAL_CRON_RUN_POLL_INTERVAL_MS,
+  MANUAL_CRON_RUN_TIMEOUT_MS,
+  runCronNow,
   useAutomation,
 } from "../../lib/automation";
 import { useModalMotion } from "../../lib/shared/modalMotion";
@@ -105,10 +111,16 @@ function LeftPanel({
   task,
   t,
   cfg,
+  isRunningNow,
+  runNowError,
+  onRunNow,
 }: {
   task: CronTask;
   t: (key: string) => string;
   cfg: (typeof TYPE_CONFIG)[CronTaskType];
+  isRunningNow: boolean;
+  runNowError: string | null;
+  onRunNow: () => void;
 }) {
   const TypeIcon = cfg.icon;
   const script = task.script?.trim() ?? "";
@@ -179,7 +191,32 @@ function LeftPanel({
                 <span>{t("settings.cronRemainingExecutionsUnitShort")}</span>
               )}
             </div>
+            <button
+              type="button"
+              onClick={onRunNow}
+              disabled={isRunningNow}
+              title={isRunningNow ? t("settings.cronViewRunningNow") : t("settings.cronViewRunNow")}
+              aria-label={
+                isRunningNow ? t("settings.cronViewRunningNow") : t("settings.cronViewRunNow")
+              }
+              className={`ml-auto flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border transition-colors ${cfg.accent} ${cfg.accentBg} ${cfg.accentBorder} hover:brightness-110 disabled:cursor-wait disabled:opacity-60`}
+            >
+              {isRunningNow ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Play className="h-3.5 w-3.5" />
+              )}
+            </button>
           </div>
+
+          {runNowError ? (
+            <div className="mt-3 flex items-start gap-1.5 rounded-lg border border-red-500/20 bg-red-500/[0.04] px-2.5 py-2 text-[11px] leading-relaxed text-red-700 dark:text-red-300">
+              <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+              <span className="min-w-0 break-all">
+                {t("settings.cronViewRunNowFailed")}: {runNowError}
+              </span>
+            </div>
+          ) : null}
 
           {task.lastError ? (
             <div className="mt-3 flex items-start gap-1.5 rounded-lg border border-red-500/20 bg-red-500/[0.04] px-2.5 py-2 text-[11px] leading-relaxed text-red-700 dark:text-red-300">
@@ -366,11 +403,17 @@ function RightPanel({
     };
   }, [task.id]);
 
-  const successCount = logs.filter((l) => l.success).length;
-  const failCount = logs.length - successCount;
+  const runningCount = logs.filter(
+    (log) => log.state === "pending" || log.state === "leased",
+  ).length;
+  const successCount = logs.filter((log) => log.state === "done" && log.success).length;
+  const failCount = logs.filter(
+    (log) => (log.state === "done" || log.state === "expired") && !log.success,
+  ).length;
+  const clearableCount = successCount + failCount;
 
   async function handleClearLogs() {
-    if (logs.length === 0 || isClearing) {
+    if (clearableCount === 0 || isClearing) {
       return;
     }
 
@@ -379,7 +422,9 @@ function RightPanel({
       setClearError(null);
       await clearCronRuns(task.id);
       setExpandedLogId(null);
-      setLogs([]);
+      setLogs((current) =>
+        current.filter((log) => log.state === "pending" || log.state === "leased"),
+      );
     } catch {
       setClearError(t("settings.cronViewClearLogsFailed"));
     } finally {
@@ -412,7 +457,7 @@ function RightPanel({
               <button
                 type="button"
                 onClick={open}
-                disabled={logs.length === 0 || isClearing}
+                disabled={clearableCount === 0 || isClearing}
                 title={
                   isClearing ? t("settings.cronViewClearingLogs") : t("settings.cronViewClearLogs")
                 }
@@ -435,6 +480,12 @@ function RightPanel({
             <span className="inline-flex items-center gap-1 rounded-full bg-red-500/10 px-1.5 py-0.5 text-[10px] font-semibold leading-none text-red-600 dark:text-red-400">
               <XCircle className="h-2.5 w-2.5" />
               {failCount}
+            </span>
+          ) : null}
+          {runningCount > 0 ? (
+            <span className="inline-flex items-center gap-1 rounded-full bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-semibold leading-none text-sky-600 dark:text-sky-400">
+              <Loader2 className="h-2.5 w-2.5 animate-spin" />
+              {runningCount}
             </span>
           ) : null}
         </div>
@@ -470,14 +521,17 @@ function RightPanel({
             {logs.map((log) => {
               const isExpanded = expandedLogId === log.id;
               const isExpired = log.state === "expired";
+              const isRunning = log.state === "pending" || log.state === "leased";
 
               return (
                 <div
                   key={log.id}
                   className={`overflow-hidden rounded-xl border transition-colors ${
-                    log.success
-                      ? "border-border/50 bg-muted/20"
-                      : "border-red-500/20 bg-red-500/[0.03]"
+                    isRunning
+                      ? "border-sky-500/20 bg-sky-500/[0.03]"
+                      : log.success
+                        ? "border-border/50 bg-muted/20"
+                        : "border-red-500/20 bg-red-500/[0.03]"
                   }`}
                 >
                   {/* Summary — fixed-width columns for vertical alignment */}
@@ -487,7 +541,9 @@ function RightPanel({
                     className="settings-log-row flex w-full items-center gap-2 px-3 py-2.5 text-left"
                   >
                     {/* Status icon */}
-                    {log.success ? (
+                    {isRunning ? (
+                      <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-sky-500" />
+                    ) : log.success ? (
                       <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-500" />
                     ) : (
                       <XCircle className="h-3.5 w-3.5 shrink-0 text-red-500" />
@@ -499,20 +555,24 @@ function RightPanel({
                     {/* Status tag — fixed width for alignment */}
                     <span
                       className={`w-[36px] shrink-0 text-center rounded-full px-1.5 py-0.5 text-[10px] font-semibold leading-none ${
-                        log.success
-                          ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
-                          : "bg-red-500/10 text-red-600 dark:text-red-400"
+                        isRunning
+                          ? "bg-sky-500/10 text-sky-600 dark:text-sky-400"
+                          : log.success
+                            ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                            : "bg-red-500/10 text-red-600 dark:text-red-400"
                       }`}
                     >
-                      {log.success
-                        ? t("settings.cronViewLogSuccess")
-                        : isExpired
-                          ? t("settings.cronViewLogExpired")
-                          : t("settings.cronViewLogFailed")}
+                      {isRunning
+                        ? t("settings.cronViewLogRunning")
+                        : log.success
+                          ? t("settings.cronViewLogSuccess")
+                          : isExpired
+                            ? t("settings.cronViewLogExpired")
+                            : t("settings.cronViewLogFailed")}
                     </span>
                     {/* Duration — right-aligned fixed width */}
                     <span className="ml-auto w-[48px] shrink-0 text-right text-[11px] tabular-nums text-muted-foreground/50">
-                      {formatDuration(log.durationMs)}
+                      {isRunning ? "—" : formatDuration(log.durationMs)}
                     </span>
                     {/* Chevron */}
                     <ChevronDown
@@ -596,6 +656,10 @@ export function CronTaskViewModal({ taskId, onClose }: CronTaskViewModalProps) {
   // scheduler errors show up while the modal is open.
   const { cron } = useAutomation();
   const task = cron.tasks.find((item) => item.id === taskId);
+  const [isRunningNow, setIsRunningNow] = useState(false);
+  const [manualRunStartedAt, setManualRunStartedAt] = useState<number | null>(null);
+  const [runNowError, setRunNowError] = useState<string | null>(null);
+  const runNowLockRef = useRef(false);
 
   useEffect(() => {
     if (!task) {
@@ -603,10 +667,71 @@ export function CronTaskViewModal({ taskId, onClose }: CronTaskViewModalProps) {
     }
   }, [task, requestClose]);
 
+  useEffect(() => {
+    if (manualRunStartedAt == null) return;
+    const startedAt = manualRunStartedAt;
+
+    let cancelled = false;
+    let requestInFlight = false;
+
+    async function reconcileManualRun() {
+      if (requestInFlight) return;
+      requestInFlight = true;
+      try {
+        const runs = await listCronRuns(taskId, 500);
+        if (!cancelled && isManualCronRunFinished(runs, startedAt)) {
+          cancelled = true;
+          runNowLockRef.current = false;
+          setManualRunStartedAt(null);
+          setIsRunningNow(false);
+        }
+      } catch {
+        return;
+      } finally {
+        requestInFlight = false;
+      }
+    }
+
+    void reconcileManualRun();
+    const pollTimer = window.setInterval(
+      () => void reconcileManualRun(),
+      MANUAL_CRON_RUN_POLL_INTERVAL_MS,
+    );
+    const timeoutTimer = window.setTimeout(() => {
+      if (cancelled) return;
+      cancelled = true;
+      runNowLockRef.current = false;
+      setManualRunStartedAt(null);
+      setIsRunningNow(false);
+      setRunNowError(t("settings.cronViewRunNowTimeout"));
+    }, MANUAL_CRON_RUN_TIMEOUT_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(pollTimer);
+      window.clearTimeout(timeoutTimer);
+    };
+  }, [manualRunStartedAt, taskId, t]);
+
   if (!task) {
     return null;
   }
   const cfg = TYPE_CONFIG[task.type];
+
+  async function handleRunNow(selectedTaskId: string) {
+    if (runNowLockRef.current) return;
+    runNowLockRef.current = true;
+    try {
+      setIsRunningNow(true);
+      setRunNowError(null);
+      const response = await runCronNow(selectedTaskId);
+      setManualRunStartedAt(response.startedAt);
+    } catch (error) {
+      runNowLockRef.current = false;
+      setIsRunningNow(false);
+      setRunNowError(error instanceof Error ? error.message : String(error));
+    }
+  }
 
   return createPortal(
     <div
@@ -619,7 +744,16 @@ export function CronTaskViewModal({ taskId, onClose }: CronTaskViewModalProps) {
       <div className="settings-modal-panel settings-cron-view-panel relative z-10 flex h-[80vh] w-full max-w-4xl overflow-hidden rounded-2xl border border-border/60 bg-background shadow-2xl">
         {/* ── Left: task detail ── */}
         <div className="settings-cron-view-left flex w-[380px] shrink-0 flex-col border-r border-border/40 bg-background">
-          <LeftPanel task={task} t={t} cfg={cfg} />
+          <LeftPanel
+            task={task}
+            t={t}
+            cfg={cfg}
+            isRunningNow={isRunningNow}
+            runNowError={runNowError}
+            onRunNow={() => {
+              void handleRunNow(task.id);
+            }}
+          />
         </div>
 
         {/* ── Right: logs ── */}

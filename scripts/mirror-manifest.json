@@ -29,7 +29,9 @@
     "components/project-tools/file-tree/useFileTreeData.ts",
     "components/project-tools/file-tree/Row.tsx",
     "components/project-tools/file-tree/ContextMenu.tsx",
+    "components/chat/promptHistory.ts",
     "components/Markdown.tsx",
+    "lib/normalizeLatexDelimiters.ts",
     "components/workspace-editor/workspaceMarkdownAssets.ts",
     "components/workspace-editor/WorkspaceMarkdownPreview.tsx",
     "lib/chat-scroll/scrollFollowCore.ts",
@@ -37,6 +39,7 @@
     "lib/transcript-virtual/entranceOnce.ts",
     "lib/transcript-virtual/liveRangeExtractor.ts",
     "lib/transcript-virtual/liveScrollAdjustPolicy.ts",
+    "lib/transcript-virtual/measurementsLru.ts",
     "lib/transcript-virtual/rowEstimates.ts",
     "lib/workspace-activity/types.ts",
     "lib/workspace-activity/useWorkspaceInvalidation.ts",
@@ -73,6 +76,7 @@
     "lib/tools/systemToolOptions.ts",
     "lib/tools/builtinToolCatalog.ts",
     "lib/skills/builtin.ts",
+    "lib/shared/id.ts",
     "pages/settings/SystemToolsSection.tsx"
   ]
 }

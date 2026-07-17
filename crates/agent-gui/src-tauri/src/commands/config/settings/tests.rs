@@ -922,11 +922,12 @@ mod tests {
         };
         let loaded = load_system(&conn).expect("load system");
 
-        assert_eq!(row_count, 7);
+        assert_eq!(row_count, 8);
         assert_eq!(
             keys,
             vec![
                 SYSTEM_ACTIVE_WORKSPACE_PROJECT_ID_KEY.to_string(),
+                SYSTEM_ARCHIVED_WORKSPACE_PROJECT_PATHS_KEY.to_string(),
                 SYSTEM_EXECUTION_MODE_KEY.to_string(),
                 SYSTEM_HIDDEN_WORKSPACE_PROJECT_PATHS_KEY.to_string(),
                 SYSTEM_MISSING_WORKSPACE_PROJECT_PATHS_KEY.to_string(),
@@ -942,6 +943,7 @@ mod tests {
                 "executionMode": "tools",
                 "hiddenWorkspaceProjectPaths": [],
                 "missingWorkspaceProjectPaths": [],
+                "archivedWorkspaceProjectPaths": [],
                 "workdir": default_workdir.clone(),
                 "selectedSystemTools": ["http_get_test"],
                 "workspaceProjects": [
@@ -955,6 +957,35 @@ mod tests {
                     }
                 ]
             }))
+        );
+    }
+
+    #[test]
+    fn save_system_round_trips_archived_workspace_project_paths() {
+        let mut conn = open_memory_db();
+        save_system_with_default_workdir(
+            &mut conn,
+            json!({
+                "executionMode": "tools",
+                "workdir": "/tmp/liveagent-default-project",
+                "selectedSystemTools": [],
+                "archivedWorkspaceProjectPaths": [
+                    " /tmp/project-a ",
+                    "/tmp/project-a",
+                    "",
+                    42
+                ]
+            }),
+            "/tmp/liveagent-default-project",
+        )
+        .expect("save system");
+
+        let loaded = load_system(&conn)
+            .expect("load system")
+            .expect("system settings");
+        assert_eq!(
+            loaded.get(SYSTEM_ARCHIVED_WORKSPACE_PROJECT_PATHS_KEY),
+            Some(&json!(["/tmp/project-a"]))
         );
     }
 
@@ -980,6 +1011,7 @@ mod tests {
                 "executionMode": "tools",
                 "hiddenWorkspaceProjectPaths": [],
                 "missingWorkspaceProjectPaths": [],
+                "archivedWorkspaceProjectPaths": [],
                 "workdir": "/tmp/liveagent-default-project",
                 "selectedSystemTools": [],
                 "workspaceProjects": [
@@ -1030,6 +1062,7 @@ mod tests {
                 "executionMode": "tools",
                 "hiddenWorkspaceProjectPaths": [],
                 "missingWorkspaceProjectPaths": [],
+                "archivedWorkspaceProjectPaths": [],
                 "workdir": "/tmp/liveagent-default-project",
                 "selectedSystemTools": [],
                 "workspaceProjects": [
@@ -1061,6 +1094,7 @@ mod tests {
                 "executionMode": "tools",
                 "hiddenWorkspaceProjectPaths": [],
                 "missingWorkspaceProjectPaths": [],
+                "archivedWorkspaceProjectPaths": [],
                 "workdir": "/tmp/liveagent-default-project",
                 "selectedSystemTools": [],
                 "workspaceProjects": [

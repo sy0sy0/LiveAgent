@@ -104,6 +104,10 @@ export type AutomationSnapshot = {
 
 export type CronRunState = "pending" | "leased" | "done" | "expired";
 
+export type CronRunNowResponse = {
+  startedAt: number;
+};
+
 export type CronRunRecord = {
   id: string;
   taskId: string;
@@ -116,6 +120,31 @@ export type CronRunRecord = {
   output: string;
 };
 
+export const MANUAL_CRON_RUN_POLL_INTERVAL_MS = 1_000;
+export const MANUAL_CRON_RUN_TIMEOUT_MS = 6 * 60_000;
+
+const CONCURRENT_RUN_SKIP_PREFIX = "Skipped: previous run is still in progress.";
+
+export function findManualCronRun(
+  runs: CronRunRecord[],
+  startedAt: number,
+): CronRunRecord | undefined {
+  return runs.reduce<CronRunRecord | undefined>((match, run) => {
+    if (run.startedAt < startedAt || run.output.startsWith(CONCURRENT_RUN_SKIP_PREFIX)) {
+      return match;
+    }
+    if (!match || run.startedAt < match.startedAt) {
+      return run;
+    }
+    return match;
+  }, undefined);
+}
+
+export function isManualCronRunFinished(runs: CronRunRecord[], startedAt: number): boolean {
+  const run = findManualCronRun(runs, startedAt);
+  return run?.state === "done" || run?.state === "expired";
+}
+
 export type PromptRunRequest = {
   executionId: string;
   taskId: string;
@@ -125,6 +154,18 @@ export type PromptRunRequest = {
   model: string;
   startedAt: number;
   leaseExpiresAt: number;
+  counted: boolean;
+};
+
+export type CompletePromptRunInput = {
+  executionId: string;
+  success: boolean;
+  durationMs: number;
+  output: string;
+};
+
+export type PromptCompletionResponse = {
+  status: "completed" | "already_finished";
 };
 
 export type AutomationOp =

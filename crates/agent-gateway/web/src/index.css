@@ -1280,11 +1280,11 @@
   @keyframes checkpointExpandIn {
     from {
       opacity: 0;
-      max-height: 0;
+      transform: translateY(-4px);
     }
     to {
       opacity: 1;
-      max-height: 600px;
+      transform: translateY(0);
     }
   }
 
@@ -1327,17 +1327,6 @@
   }
 
   /* Tool card animations & micro-interactions */
-  @keyframes toolCardIn {
-    from {
-      opacity: 0;
-      transform: translateY(6px) scale(0.97);
-    }
-    to {
-      opacity: 1;
-      transform: translateY(0) scale(1);
-    }
-  }
-
   @keyframes toolExpandIn {
     from {
       opacity: 0;
@@ -1349,108 +1338,16 @@
     }
   }
 
-  @keyframes toolArgPillIn {
-    from {
-      opacity: 0;
-      transform: scale(0.92);
-    }
-    to {
-      opacity: 1;
-      transform: scale(1);
-    }
-  }
-
-  .tool-card-enter {
-    animation: toolCardIn 0.28s cubic-bezier(0.16, 1, 0.3, 1);
-  }
-
-  .tool-trace-group {
-    animation: toolCardIn 0.22s cubic-bezier(0.16, 1, 0.3, 1);
-  }
-
-  .tool-trace-group-body {
-    animation: toolExpandIn 0.18s cubic-bezier(0.16, 1, 0.3, 1);
-  }
-
-  .tool-expand {
+  .tool-expand,
+  .lazy-collapse-reveal {
     animation: toolExpandIn 0.22s cubic-bezier(0.16, 1, 0.3, 1);
-  }
-
-  .tool-arg-pill {
-    animation: toolArgPillIn 0.2s cubic-bezier(0.16, 1, 0.3, 1) both;
-  }
-
-  /* Stagger pills */
-  .tool-arg-pill:nth-child(1) {
-    animation-delay: 0ms;
-  }
-  .tool-arg-pill:nth-child(2) {
-    animation-delay: 30ms;
-  }
-  .tool-arg-pill:nth-child(3) {
-    animation-delay: 60ms;
-  }
-  .tool-arg-pill:nth-child(4) {
-    animation-delay: 90ms;
-  }
-  .tool-arg-pill:nth-child(5) {
-    animation-delay: 120ms;
-  }
-  .tool-arg-pill:nth-child(n + 6) {
-    animation-delay: 150ms;
-  }
-
-  /* Click / open spring animation */
-  .tool-card-enter > summary,
-  .tool-card-grouped > summary {
-    transition:
-      transform 250ms cubic-bezier(0.34, 1.56, 0.64, 1),
-      background-color 150ms ease;
-  }
-  .tool-card-enter > summary:active,
-  .tool-card-grouped > summary:active {
-    transform: scale(0.975);
-    transition: transform 100ms cubic-bezier(0.22, 1, 0.36, 1);
-  }
-  /* Spring bounce-back on open */
-  .tool-card-enter[open] > summary {
-    animation: toolSummaryBounce 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
-  }
-  @keyframes toolSummaryBounce {
-    0% {
-      transform: scale(0.975);
-    }
-    50% {
-      transform: scale(1.008);
-    }
-    100% {
-      transform: scale(1);
-    }
-  }
-
-  /* Focus-visible for keyboard nav */
-  .tool-card-enter:focus-within:has(summary:focus-visible),
-  .tool-card-grouped:focus-within:has(summary:focus-visible) {
-    outline: 2px solid hsl(var(--ring));
-    outline-offset: 2px;
-  }
-  .tool-card-enter > summary:focus-visible,
-  .tool-card-grouped > summary:focus-visible {
-    outline: none;
   }
 
   /* Respect reduced motion */
   @media (prefers-reduced-motion: reduce) {
-    .tool-card-enter,
-    .tool-trace-group,
-    .tool-trace-group-body,
     .tool-expand,
-    .tool-arg-pill,
-    .tool-card-enter[open] > summary {
+    .lazy-collapse-reveal {
       animation: none !important;
-    }
-    .tool-card-enter > summary:active {
-      transform: none;
     }
   }
 
@@ -2297,6 +2194,35 @@ body > div:not(#root) [data-streamdown="mermaid"] svg {
 .editor-context-menu {
   animation: editorContextMenuIn 0.15s cubic-bezier(0.16, 1, 0.3, 1);
   transform-origin: top left;
+}
+
+@keyframes sftpPathPopoverIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.sftp-path-popover-enter {
+  animation: sftpPathPopoverIn 0.16s cubic-bezier(0.16, 1, 0.3, 1);
+  transform-origin: top center;
+}
+
+.sftp-path-scroll {
+  scrollbar-width: none;
+}
+.sftp-path-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sftp-path-popover-enter {
+    animation: none;
+  }
 }
 
 .sidebar-project-name-fade {

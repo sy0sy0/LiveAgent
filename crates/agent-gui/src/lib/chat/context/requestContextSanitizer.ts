@@ -1,4 +1,5 @@
 import type { Context, Message, TextContent, ToolResultMessage } from "@earendil-works/pi-ai";
+import { isSubagentCardToolCall } from "../../subagents/card";
 import type { DisplayImageItemDetails, DisplayImageResultDetails } from "../../tools/builtinTypes";
 import { normalizeHostedSearchBlock } from "../messages/hostedSearch";
 import { isOnlyDsmlOrphanCloseTags, stripDsmlToolCallMarkup } from "../runner/deepSeekDsml";
@@ -150,6 +151,11 @@ export function sanitizeMessageForModelContext(message: Message): Message {
     const nextContent: unknown[] = [];
     let changed = false;
     for (const block of nextMessage.content as unknown[]) {
+      if (isSubagentCardToolCall(block)) {
+        changed = true;
+        continue;
+      }
+
       const hostedSearch = normalizeHostedSearchBlock(block);
       if (hostedSearch) {
         changed = true;
@@ -181,8 +187,30 @@ export function sanitizeMessageForModelContext(message: Message): Message {
   };
 }
 
+function collectSubagentCardToolCallIds(messages: Message[]) {
+  const ids = new Set<string>();
+  for (const message of messages) {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+    for (const block of message.content as unknown[]) {
+      if (!isSubagentCardToolCall(block) || !isRecord(block)) continue;
+      if (typeof block.id === "string" && block.id) ids.add(block.id);
+    }
+  }
+  return ids;
+}
+
+function isSubagentCardToolResult(message: Message, toolCallIds: Set<string>) {
+  return (
+    message.role === "toolResult" &&
+    (toolCallIds.has(message.toolCallId) ||
+      (isRecord(message.details) && message.details.kind === "subagent_card"))
+  );
+}
+
 export function sanitizeMessagesForModelContext(messages: Message[]): Message[] {
+  const subagentCardToolCallIds = collectSubagentCardToolCallIds(messages);
   return messages
+    .filter((message) => !isSubagentCardToolResult(message, subagentCardToolCallIds))
     .map(sanitizeMessageForModelContext)
     .filter(
       (message) =>

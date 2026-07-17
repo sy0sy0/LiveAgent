@@ -2,6 +2,7 @@ import { type Dispatch, type MutableRefObject, type SetStateAction, useRef } fro
 import {
   type ConversationViewState,
   createConversationStateFromContext,
+  mergeHydratedConversationState,
   normalizeConversationState,
 } from "../../../lib/chat/conversation/conversationState";
 import {
@@ -214,8 +215,14 @@ export function useConversationHistoryActions(params: UseConversationHistoryActi
     if (conversationLoadSequenceRef.current !== loadSequence) {
       return;
     }
+    // Reuse the phase-1 warm items by identity when the active segment is
+    // unchanged on disk: hydration then only prepends older history and the
+    // already-painted rows never re-render. The persisted-state baseline
+    // stays the disk record so differential persistence keeps its truth.
+    const warmState = conversationRuntimeCacheRef.current.get(id)?.state;
+    const hydratedState = mergeHydratedConversationState(warmState, record.state);
     const nextEntry = createConversationRuntimeEntry({
-      state: record.state,
+      state: hydratedState,
       sessionId: record.sessionId ?? record.id,
       createdAt: record.createdAt,
       workdir: record.cwd,

@@ -18,6 +18,7 @@ import {
   toolResultMessageToText,
 } from "../../../../lib/chat/messages/uiMessages";
 import { cn } from "../../../../lib/shared/utils";
+import { isSubagentCardToolCall } from "../../../../lib/subagents/card";
 import {
   areStableValuesEqual,
   displayString,
@@ -25,10 +26,10 @@ import {
   getSubagentInlineSummary,
   getToolDisplayTitle,
   getToolMeta,
-  isSubagentCardToolCall,
   type MetaTag,
 } from "./assistantBubbleUtils";
 import { FileToolArgsDisplay } from "./FileToolArgs";
+import { LazyCollapse } from "./LazyCollapse";
 import { AssistantStatus } from "./StatusText";
 import { sanitizeTodoItems, TodoListView } from "./TodoListView";
 import {
@@ -281,14 +282,29 @@ function ToolArgsDisplay({ item }: { item: ToolTraceItem }) {
     return <ToolFactGrid tags={display.tags} />;
   }
 
-  // Fallback: raw JSON
+  // Fallback: raw JSON, cached by argument identity — settled tool args are
+  // immutable, so virtualizer remounts reuse the stringified form.
   return (
     <ToolSurface className="overflow-hidden px-0 py-0">
       <ToolScrollablePre className="max-h-44 rounded-none">
-        {safeStringify(toolCallArgsForDisplay(toolCall))}
+        {getRawArgsDisplayText(toolCall)}
       </ToolScrollablePre>
     </ToolSurface>
   );
+}
+
+const rawArgsDisplayCache = new WeakMap<object, string>();
+
+function getRawArgsDisplayText(toolCall: ToolTraceItem["toolCall"]) {
+  const cacheKey = toolCall.arguments;
+  if (!cacheKey || typeof cacheKey !== "object") {
+    return safeStringify(toolCallArgsForDisplay(toolCall));
+  }
+  const cached = rawArgsDisplayCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  const text = safeStringify(toolCallArgsForDisplay(toolCall));
+  rawArgsDisplayCache.set(cacheKey, text);
+  return text;
 }
 
 function ToolCallItem({ item, isRunning }: { item: ToolTraceItem; isRunning?: boolean }) {
@@ -442,16 +458,8 @@ function ToolCallItem({ item, isRunning }: { item: ToolTraceItem; isRunning?: bo
         </div>
       </button>
 
-      <div
-        aria-hidden={!open}
-        className={cn(
-          "grid transition-[grid-template-rows,opacity] duration-200 ease-out",
-          open && canExpand
-            ? "grid-rows-[1fr] opacity-100"
-            : "pointer-events-none grid-rows-[0fr] opacity-0",
-        )}
-      >
-        <div className="min-h-0 overflow-hidden">
+      <LazyCollapse open={open && canExpand}>
+        {() => (
           <div className="space-y-3 pb-2 pl-[22px] pt-1">
             {shouldShowArgs ? (
               <ToolSection
@@ -521,8 +529,8 @@ function ToolCallItem({ item, isRunning }: { item: ToolTraceItem; isRunning?: bo
               </ToolSection>
             ) : null}
           </div>
-        </div>
-      </div>
+        )}
+      </LazyCollapse>
     </div>
   );
 }
@@ -544,7 +552,7 @@ function areToolResultsEqual(
   );
 }
 
-function areToolTraceItemsEqual(previous: ToolTraceItem, next: ToolTraceItem) {
+export function areToolTraceItemsEqual(previous: ToolTraceItem, next: ToolTraceItem) {
   return (
     previous.toolCall.id === next.toolCall.id &&
     previous.toolCall.name === next.toolCall.name &&

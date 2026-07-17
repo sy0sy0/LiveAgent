@@ -16,7 +16,7 @@ use crate::runtime::task_runner::{
 
 use super::db::now_ms;
 use super::store::{AutomationStore, PromptQueueOutcome};
-use super::types::{CompletedRun, CronTask, HttpRequestSpec};
+use super::types::{CompletedRun, CronRunNowResponse, CronTask, HttpRequestSpec};
 
 const CRON_SCRIPT_TIMEOUT_MS: u64 = 60_000;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
@@ -25,6 +25,18 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 struct ScheduledJob {
     job_id: Uuid,
     cron: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunTrigger {
+    Scheduled,
+    Manual,
+}
+
+impl RunTrigger {
+    fn counted(self) -> bool {
+        matches!(self, Self::Scheduled)
+    }
 }
 
 pub struct AutomationScheduler {
@@ -239,54 +251,81 @@ impl AutomationScheduler {
     }
 
     fn fire(self: &Arc<Self>, task: CronTask, workdir: String) {
+        if !self.start_fire(task.clone(), workdir, RunTrigger::Scheduled) {
+            self.record_run_detached(skipped_run(&task.id));
+        }
+    }
+
+    pub fn run_now(self: &Arc<Self>, task_id: &str) -> Result<CronRunNowResponse, String> {
+        let (workdir, task) = self.store.cron_task_for_manual_run(task_id)?;
+        let started_at = now_ms();
+        if !self.start_fire(task, workdir, RunTrigger::Manual) {
+            return Err("Cron task is already running.".to_string());
+        }
+        Ok(CronRunNowResponse { started_at })
+    }
+
+    fn start_fire(
+        self: &Arc<Self>,
+        task: CronTask,
+        workdir: String,
+        trigger: RunTrigger,
+    ) -> bool {
         {
             let mut active = match self.active_runs.lock() {
                 Ok(guard) => guard,
-                Err(_) => return,
+                Err(_) => return false,
             };
             if !active.insert(task.id.clone()) {
-                self.record_run_detached(skipped_run(&task.id));
-                return;
+                return false;
             }
         }
 
         let manager = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
-            manager.execute_fire(task, workdir).await;
+            manager.execute_fire(task, workdir, trigger).await;
         });
+        true
     }
 
-    async fn execute_fire(self: Arc<Self>, task: CronTask, workdir: String) {
+    async fn execute_fire(
+        self: Arc<Self>,
+        task: CronTask,
+        workdir: String,
+        trigger: RunTrigger,
+    ) {
         let task_id = task.id.clone();
 
-        let can_run = {
-            let store = Arc::clone(&self.store);
-            let task_id = task_id.clone();
-            tauri::async_runtime::spawn_blocking(move || store.task_can_run(&task_id)).await
-        };
-        match can_run {
-            Ok(Ok(true)) => {}
-            Ok(Ok(false)) => {
-                self.clear_active(&task_id);
-                return;
-            }
-            Ok(Err(error)) => {
-                self.record_run_detached(failed_run(
-                    &task_id,
-                    format!("Cron task state check failed: {error}"),
-                    false,
-                ));
-                self.clear_active(&task_id);
-                return;
-            }
-            Err(error) => {
-                self.record_run_detached(failed_run(
-                    &task_id,
-                    format!("Cron task state check join failed: {error}"),
-                    false,
-                ));
-                self.clear_active(&task_id);
-                return;
+        if trigger == RunTrigger::Scheduled {
+            let can_run = {
+                let store = Arc::clone(&self.store);
+                let task_id = task_id.clone();
+                tauri::async_runtime::spawn_blocking(move || store.task_can_run(&task_id)).await
+            };
+            match can_run {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => {
+                    self.clear_active(&task_id);
+                    return;
+                }
+                Ok(Err(error)) => {
+                    self.record_run_detached(failed_run(
+                        &task_id,
+                        format!("Cron task state check failed: {error}"),
+                        false,
+                    ));
+                    self.clear_active(&task_id);
+                    return;
+                }
+                Err(error) => {
+                    self.record_run_detached(failed_run(
+                        &task_id,
+                        format!("Cron task state check join failed: {error}"),
+                        false,
+                    ));
+                    self.clear_active(&task_id);
+                    return;
+                }
             }
         }
 
@@ -294,15 +333,17 @@ impl AutomationScheduler {
             let store = Arc::clone(&self.store);
             let queue_task = task.clone();
             let result =
-                tauri::async_runtime::spawn_blocking(move || store.queue_prompt_run(&queue_task))
-                    .await;
+                tauri::async_runtime::spawn_blocking(move || {
+                    store.queue_prompt_run(&queue_task, trigger.counted())
+                })
+                .await;
             match result {
                 Ok(Ok(PromptQueueOutcome::Queued)) => {}
                 Ok(Ok(PromptQueueOutcome::SkippedActiveRun)) => {
                     self.record_run_detached(skipped_run(&task_id));
                 }
                 Ok(Err(error)) => {
-                    self.record_run_detached(failed_run(&task_id, error, true));
+                    self.record_run_detached(failed_run(&task_id, error, trigger.counted()));
                 }
                 Err(error) => {
                     self.record_run_detached(failed_run(
@@ -317,7 +358,11 @@ impl AutomationScheduler {
             return;
         }
 
-        let run = tauri::async_runtime::spawn_blocking(move || execute_blocking(task, workdir))
+        let run = tauri::async_runtime::spawn_blocking(move || {
+            let mut run = execute_blocking(task, workdir);
+            run.counted = trigger.counted();
+            run
+        })
             .await
             .unwrap_or_else(|error| {
                 failed_run(

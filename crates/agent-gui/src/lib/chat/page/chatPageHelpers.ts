@@ -1,6 +1,7 @@
 import type { Context } from "@earendil-works/pi-ai";
 import { type ModelOption, toModelValue } from "../../providers/llm";
 import type { AppSettings } from "../../settings";
+import { createUuid } from "../../shared/id";
 import type { ChatHistorySummary } from "../history/chatHistory";
 import { getMessageText } from "../messages/uiMessages";
 
@@ -9,6 +10,37 @@ const TITLE_LOOKAHEAD_TIMEOUT_MS = 1_200;
 const MODEL_GENERATING_STATUS_PATTERN = /^第\s*\d+\s*轮：模型生成中\.\.\.$/;
 
 export const VIBING_STATUS = "Vibing...";
+
+// Must match BRANCH_DEFAULT_TITLE in src-tauri/src/commands/history/chat_history/branch.rs.
+export const BRANCH_CONVERSATION_DEFAULT_TITLE = "新分支";
+
+export type ModelOptionGroup = {
+  id: string;
+  name: string;
+  providerType: ModelOption["providerType"];
+  opts: ModelOption[];
+};
+
+export function groupModelOptionsByProvider(modelOptions: readonly ModelOption[]) {
+  const groups: ModelOptionGroup[] = [];
+  const groupMap = new Map<string, ModelOptionGroup>();
+  for (const option of modelOptions) {
+    const existing = groupMap.get(option.providerId);
+    if (existing) {
+      existing.opts.push(option);
+      continue;
+    }
+    const group: ModelOptionGroup = {
+      id: option.providerId,
+      name: option.providerName,
+      providerType: option.providerType,
+      opts: [option],
+    };
+    groupMap.set(option.providerId, group);
+    groups.push(group);
+  }
+  return groups;
+}
 
 export function buildModelOptions(
   settings: AppSettings,
@@ -19,6 +51,7 @@ export function buildModelOptions(
     for (const model of provider.activeModels) {
       options.push({
         providerType: provider.type,
+        providerId: provider.id,
         providerName: provider.name,
         model,
         value: toModelValue(provider.id, model),
@@ -131,7 +164,7 @@ export function createPendingHistoryItem(params: {
 }
 
 export function createConversationIdentity() {
-  const conversationId = crypto.randomUUID();
+  const conversationId = createUuid();
   return {
     conversationId,
     sessionId: conversationId,

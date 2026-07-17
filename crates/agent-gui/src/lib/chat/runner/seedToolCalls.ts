@@ -1,4 +1,5 @@
 import type { AssistantMessage, ToolCall } from "@earendil-works/pi-ai";
+import { createUuid } from "../../shared/id";
 import {
   hasDsmlToolCallMarkup,
   isOnlyDsmlOrphanCloseTags,
@@ -134,7 +135,7 @@ function parseSeedToolCallMarkup(markup: string): ToolCall | null {
 
   return {
     type: "toolCall",
-    id: `seed-tool-call-${crypto.randomUUID()}`,
+    id: `seed-tool-call-${createUuid()}`,
     name: toolName,
     arguments: args,
   };

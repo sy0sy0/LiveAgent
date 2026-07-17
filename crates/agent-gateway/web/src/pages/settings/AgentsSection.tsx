@@ -5,6 +5,7 @@ import { BookOpen, Eye, Pencil, Plus, Trash2, X } from "../../components/icons";
 import { Button } from "../../components/ui/button";
 import { useLocale } from "../../i18n";
 import { type AgentPromptTemplate, updateAgents } from "../../lib/settings";
+import { createUuid } from "../../lib/shared/id";
 import { useModalMotion } from "../../lib/shared/modalMotion";
 import { AgentPromptTemplateModal } from "./AgentPromptTemplateModal";
 import { AgentActivationSwitch, ConfirmDeletePopover } from "./shared";
@@ -44,7 +45,7 @@ export function AgentsSection(props: SettingsSectionProps) {
       }
 
       const newTemplate: AgentPromptTemplate = {
-        id: crypto.randomUUID(),
+        id: createUuid(),
         ...data,
         enabled: false,
       };

@@ -8,6 +8,7 @@ import {
   getUserMessageDisplayText,
   type PendingUploadedFile,
 } from "@/lib/chat/uploadedFiles";
+import { createUuid } from "@/lib/shared/id";
 
 import type { ChatCheckpointPayload, ChatEvent, ConversationSummary } from "./gatewayTypes";
 
@@ -133,7 +134,7 @@ const LIVE_UPLOADED_FILE_KINDS = new Set<string>([
 ]);
 
 function randomId(prefix: string) {
-  return `${prefix}-${crypto.randomUUID()}`;
+  return `${prefix}-${createUuid()}`;
 }
 
 export function hashText(value: string) {

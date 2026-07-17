@@ -2272,3 +2272,53 @@ test("chat page helpers keep model options stable and normalize status/title edg
   assert.equal(chatHelpers.isAbortLikeError(new Error("AbortError: aborted")), true);
   assert.equal(chatHelpers.isAbortLikeError("network failed"), false);
 });
+
+test("chat page helpers keep same-name provider instances in separate model groups", () => {
+  const modelOptions = chatHelpers.buildModelOptions({
+    customProviders: [
+      {
+        id: "same-api-a",
+        name: "Shared",
+        type: "codex",
+        activeModels: ["shared-model", "model-a"],
+      },
+      { id: "same-api-b", name: "Shared", type: "codex", activeModels: ["shared-model"] },
+      { id: "different-api", name: "Shared", type: "claude_code", activeModels: ["model-c"] },
+    ],
+    selectedModel: { customProviderId: "same-api-b", model: "shared-model" },
+  });
+
+  const groups = chatHelpers.groupModelOptionsByProvider(modelOptions);
+
+  assert.deepEqual(
+    groups.map((group) => ({
+      id: group.id,
+      name: group.name,
+      type: group.providerType,
+      options: group.opts.map((option) => ({ value: option.value, model: option.model })),
+    })),
+    [
+      {
+        id: "same-api-b",
+        name: "Shared",
+        type: "codex",
+        options: [{ value: "same-api-b::shared-model", model: "shared-model" }],
+      },
+      {
+        id: "same-api-a",
+        name: "Shared",
+        type: "codex",
+        options: [
+          { value: "same-api-a::shared-model", model: "shared-model" },
+          { value: "same-api-a::model-a", model: "model-a" },
+        ],
+      },
+      {
+        id: "different-api",
+        name: "Shared",
+        type: "claude_code",
+        options: [{ value: "different-api::model-c", model: "model-c" }],
+      },
+    ],
+  );
+});

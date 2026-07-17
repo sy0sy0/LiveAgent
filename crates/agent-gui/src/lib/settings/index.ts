@@ -1,7 +1,16 @@
 import type { KnownProvider, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { DEFAULT_LOCALE, type Locale, normalizeLocale } from "../../i18n/config";
+import {
+  ANTHROPIC_LONG_CONTEXT_WINDOW,
+  hasAnthropicLongContextSuffix,
+  isAnthropicAdaptiveModelId,
+  resolveAnthropicContextWindow,
+  resolveAnthropicKnownModelLimits,
+  shouldSendAnthropicLongContextHeader,
+} from "../providers/anthropicModels";
 import { getAvailableThinkingLevelsForModel } from "../providers/runtime/modelFactory";
+import { createUuid } from "../shared/id";
 import { mergeAlwaysEnabledSkillNames } from "../skills/builtin";
 import { SYSTEM_TOOL_OPTIONS, type SystemToolId } from "../tools/systemToolOptions";
 import { normalizeApiKey, normalizeBaseUrl, normalizeModels } from "./normalize";
@@ -140,6 +149,9 @@ export type SystemSettings = {
   activeWorkspaceProjectId?: string;
   hiddenWorkspaceProjectPaths: string[];
   missingWorkspaceProjectPaths: string[];
+  // Archived workspaces (path-keyed, like hidden/missing). Archived rows stay
+  // in the merged list but render disabled and can never be active.
+  archivedWorkspaceProjectPaths: string[];
 };
 
 export type WorkspaceProjectKind = "managed" | "folder" | "history";
@@ -240,8 +252,13 @@ export type CustomProvider = {
 
 export type EffectiveTheme = "light" | "dark";
 export type Theme = EffectiveTheme | "system";
+export type CloseWindowBehavior = "minimize" | "exit";
 
 export const THEME_OPTIONS = ["light", "dark", "system"] as const satisfies readonly Theme[];
+export const CLOSE_WINDOW_BEHAVIOR_OPTIONS = [
+  "minimize",
+  "exit",
+] as const satisfies readonly CloseWindowBehavior[];
 
 const SYSTEM_THEME_MEDIA_QUERY = "(prefers-color-scheme: dark)";
 
@@ -275,6 +292,8 @@ export type AppSettings = {
   selectedModel?: SelectedModel;
   theme: Theme;
   locale: Locale;
+  /** Desktop-only: close title-bar X to hide to tray or exit the application. */
+  closeWindowBehavior: CloseWindowBehavior;
 };
 
 export const CODEX_REQUEST_FORMAT_LABELS: Record<CodexRequestFormat, string> = {
@@ -499,7 +518,7 @@ function normalizeWorkspaceProject(input: unknown): WorkspaceProject | null {
   const obj = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
   const path = normalizeWorkspaceProjectPath(obj.path);
   if (!path) return null;
-  const id = typeof obj.id === "string" && obj.id.trim() ? obj.id.trim() : crypto.randomUUID();
+  const id = typeof obj.id === "string" && obj.id.trim() ? obj.id.trim() : createUuid();
   const name =
     typeof obj.name === "string" && obj.name.trim()
       ? obj.name.trim()
@@ -551,7 +570,7 @@ function normalizeWorkspaceProjects(input: unknown): WorkspaceProject[] {
     seenPaths.add(pathKey);
     let id = project.id;
     if (seenIds.has(id)) {
-      id = crypto.randomUUID();
+      id = createUuid();
     }
     seenIds.add(id);
     out.push({ ...project, id });
@@ -572,6 +591,18 @@ export function normalizeHiddenWorkspaceProjectPaths(input: unknown): string[] {
 }
 
 export function normalizeMissingWorkspaceProjectPaths(input: unknown): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const path of normalizeStringArray(input)) {
+    const key = workspaceProjectPathKey(path);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(path);
+  }
+  return out;
+}
+
+export function normalizeArchivedWorkspaceProjectPaths(input: unknown): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   for (const path of normalizeStringArray(input)) {
@@ -622,7 +653,7 @@ export function resolveWorkspaceProjects(
     seenPaths.add(pathKey);
     let id = project.id;
     if (!id || id === DEFAULT_WORKSPACE_PROJECT_ID || seenIds.has(id)) {
-      id = crypto.randomUUID();
+      id = createUuid();
     }
     seenIds.add(id);
     projects.push({
@@ -648,11 +679,35 @@ export function resolveWorkspaceProjects(
   const missingWorkspaceProjectPaths = normalizeMissingWorkspaceProjectPaths(
     system.missingWorkspaceProjectPaths,
   ).filter((path) => !hiddenWorkspaceProjectPathKeys.has(workspaceProjectPathKey(path)));
-  const activeProjectId = projects.some((project) => project.id === system.activeWorkspaceProjectId)
+  // Hidden means removed — a removed workspace has nothing left to archive.
+  const normalizedArchivedWorkspaceProjectPaths = normalizeArchivedWorkspaceProjectPaths(
+    system.archivedWorkspaceProjectPaths,
+  ).filter((path) => !hiddenWorkspaceProjectPathKeys.has(workspaceProjectPathKey(path)));
+  const normalizedArchivedWorkspaceProjectPathKeys = new Set(
+    normalizedArchivedWorkspaceProjectPaths.map(workspaceProjectPathKey),
+  );
+  const archivedWorkspaceProjectPaths = projects.every((project) =>
+    normalizedArchivedWorkspaceProjectPathKeys.has(workspaceProjectPathKey(project.path)),
+  )
+    ? normalizedArchivedWorkspaceProjectPaths.filter(
+        (path) => workspaceProjectPathKey(path) !== defaultKey,
+      )
+    : normalizedArchivedWorkspaceProjectPaths;
+  const archivedWorkspaceProjectPathKeys = new Set(
+    archivedWorkspaceProjectPaths.map(workspaceProjectPathKey),
+  );
+  const selectableProjects = projects.filter(
+    (project) => !archivedWorkspaceProjectPathKeys.has(workspaceProjectPathKey(project.path)),
+  );
+  const activeProjectId = selectableProjects.some(
+    (project) => project.id === system.activeWorkspaceProjectId,
+  )
     ? system.activeWorkspaceProjectId
-    : DEFAULT_WORKSPACE_PROJECT_ID;
+    : (selectableProjects.find((project) => project.id === DEFAULT_WORKSPACE_PROJECT_ID)?.id ??
+      selectableProjects[0]?.id ??
+      DEFAULT_WORKSPACE_PROJECT_ID);
   const activeProject =
-    projects.find((project) => project.id === activeProjectId) ?? defaultProject;
+    selectableProjects.find((project) => project.id === activeProjectId) ?? defaultProject;
   const workdir = normalizeWorkdir(system.workdir) || defaultPath;
 
   return {
@@ -662,6 +717,7 @@ export function resolveWorkspaceProjects(
     activeWorkspaceProjectId: activeProject.id,
     hiddenWorkspaceProjectPaths,
     missingWorkspaceProjectPaths,
+    archivedWorkspaceProjectPaths,
   };
 }
 
@@ -941,9 +997,15 @@ function toKnownProvider(providerId: ProviderId): KnownProvider {
 function getKnownModelLimits(
   providerId: ProviderId,
   modelId: string | undefined,
+  baseUrl?: string,
 ): Pick<ProviderModelConfig, "contextWindow" | "maxOutputToken"> | undefined {
   const trimmedId = modelId?.trim();
   if (!trimmedId) return undefined;
+  // Anthropic 走规范化目录回查（装饰 id/[1m] 后缀也能继承默认值），并对旧世代
+  // 钳出退役后的有效窗口；contextWindow > 200K 即请求侧启用 1M beta 的开关。
+  if (toKnownProvider(providerId) === "anthropic") {
+    return resolveAnthropicKnownModelLimits(trimmedId, baseUrl);
+  }
   const known = getBuiltinModels(toKnownProvider(providerId)).find(
     (model) => model.id === trimmedId,
   );
@@ -954,8 +1016,9 @@ function getKnownModelLimits(
 export function getProviderModelDefaults(
   providerId: ProviderId,
   modelId?: string,
+  baseUrl?: string,
 ): Pick<ProviderModelConfig, "contextWindow" | "maxOutputToken"> {
-  const known = getKnownModelLimits(providerId, modelId);
+  const known = getKnownModelLimits(providerId, modelId, baseUrl);
   if (known) return known;
 
   if (providerId === "codex") {
@@ -969,6 +1032,18 @@ export function getProviderModelDefaults(
     return {
       contextWindow: DEFAULT_GEMINI_CONTEXT_WINDOW,
       maxOutputToken: DEFAULT_GEMINI_MAX_OUTPUT_TOKEN,
+    };
+  }
+
+  if (modelId && (hasAnthropicLongContextSuffix(modelId) || isAnthropicAdaptiveModelId(modelId))) {
+    return {
+      contextWindow:
+        hasAnthropicLongContextSuffix(modelId) &&
+        baseUrl &&
+        !shouldSendAnthropicLongContextHeader(baseUrl)
+          ? DEFAULT_CLAUDE_CONTEXT_WINDOW
+          : ANTHROPIC_LONG_CONTEXT_WINDOW,
+      maxOutputToken: DEFAULT_CLAUDE_MAX_OUTPUT_TOKEN,
     };
   }
 
@@ -1040,12 +1115,28 @@ export function normalizeProviderModelConfigs(
 }
 
 export function findProviderModelConfig(
-  provider: Pick<CustomProvider, "models" | "type">,
+  provider: Pick<CustomProvider, "models" | "type"> & { baseUrl?: string },
   modelId: string,
 ): ProviderModelConfig {
   const normalizedId = modelId.trim();
   const matched = provider.models.find((item) => item.id === normalizedId);
-  return matched ?? createProviderModelConfig(provider.type, normalizedId);
+  if (!matched) {
+    const defaults = getProviderModelDefaults(provider.type, normalizedId, provider.baseUrl);
+    return {
+      id: normalizedId,
+      contextWindow: defaults.contextWindow,
+      maxOutputToken: defaults.maxOutputToken,
+    };
+  }
+  if (provider.type !== "claude_code") return matched;
+  return {
+    ...matched,
+    contextWindow: resolveAnthropicContextWindow(
+      normalizedId,
+      matched.contextWindow,
+      provider.baseUrl,
+    ),
+  };
 }
 
 function normalizeProviderId(input: unknown): ProviderId {
@@ -1073,7 +1164,7 @@ export function normalizeCustomProvider(input: unknown): CustomProvider {
   const models = normalizeProviderModelConfigs(obj.models, type);
   const validModelIds = new Set(models.map((model) => model.id));
   const apiKey = normalizeApiKey(typeof obj.apiKey === "string" ? obj.apiKey : "");
-  const id = typeof obj.id === "string" && obj.id.trim() ? obj.id.trim() : crypto.randomUUID();
+  const id = typeof obj.id === "string" && obj.id.trim() ? obj.id.trim() : createUuid();
 
   return {
     id,
@@ -1099,7 +1190,7 @@ export function normalizeAgentPromptTemplate(input: unknown): AgentPromptTemplat
   const obj = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
 
   return {
-    id: typeof obj.id === "string" && obj.id.trim() ? obj.id.trim() : crypto.randomUUID(),
+    id: typeof obj.id === "string" && obj.id.trim() ? obj.id.trim() : createUuid(),
     name: typeof obj.name === "string" && obj.name.trim() ? obj.name.trim() : "未命名模板",
     description: normalizeOptionalText(obj.description),
     prompt: normalizeOptionalText(obj.prompt),
@@ -1171,7 +1262,7 @@ export function normalizeSshHostConfig(input: unknown): SshHostConfig {
     (privateKeyPassphrase.length > 0 || obj.privateKeyPassphraseConfigured === true);
 
   return {
-    id: typeof obj.id === "string" && obj.id.trim() ? obj.id.trim() : crypto.randomUUID(),
+    id: typeof obj.id === "string" && obj.id.trim() ? obj.id.trim() : createUuid(),
     name,
     description: normalizeOptionalText(obj.description),
     host,
@@ -1199,7 +1290,7 @@ export function normalizeSshSettings(input: unknown): SshSettings {
       seenIds.add(normalized.id);
       return normalized;
     }
-    const id = crypto.randomUUID();
+    const id = createUuid();
     seenIds.add(id);
     return { ...normalized, id };
   });
@@ -1258,6 +1349,9 @@ export function normalizeSystemSettings(input: unknown): SystemSettings {
     ),
     missingWorkspaceProjectPaths: normalizeMissingWorkspaceProjectPaths(
       obj.missingWorkspaceProjectPaths,
+    ),
+    archivedWorkspaceProjectPaths: normalizeArchivedWorkspaceProjectPaths(
+      obj.archivedWorkspaceProjectPaths,
     ),
   };
 }
@@ -1345,6 +1439,10 @@ export function normalizeTheme(input: unknown): Theme {
   if (input === "dark") return "dark";
   if (input === "system" || input === "auto") return "system";
   return "light";
+}
+
+export function normalizeCloseWindowBehavior(input: unknown): CloseWindowBehavior {
+  return input === "exit" ? "exit" : "minimize";
 }
 
 export function resolveEffectiveTheme(theme: Theme): EffectiveTheme {
@@ -1781,6 +1879,7 @@ export function getDefaultSettings(): AppSettings {
       activeWorkspaceProjectId: undefined,
       hiddenWorkspaceProjectPaths: [],
       missingWorkspaceProjectPaths: [],
+      archivedWorkspaceProjectPaths: [],
     },
     customProviders,
     mcp: {
@@ -1817,6 +1916,7 @@ export function getDefaultSettings(): AppSettings {
     selectedModel: undefined,
     theme: "light",
     locale: DEFAULT_LOCALE,
+    closeWindowBehavior: "minimize",
   };
 }
 
@@ -1851,6 +1951,7 @@ export function normalizeSettings(input?: Partial<AppSettings> | null): AppSetti
     selectedModel,
     theme: normalizeTheme(obj.theme),
     locale: normalizeLocale(obj.locale),
+    closeWindowBehavior: normalizeCloseWindowBehavior(obj.closeWindowBehavior),
   };
 }
 
@@ -1996,11 +2097,7 @@ const RIGHT_DOCK_WRITER_ID_STORAGE_KEY = "liveagent.client-id";
 let cachedRightDockWriterId = "";
 
 function generateRightDockWriterId(): string {
-  const uuid =
-    typeof globalThis.crypto?.randomUUID === "function"
-      ? globalThis.crypto.randomUUID()
-      : `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
-  return uuid.replace(/-/g, "").slice(0, 12);
+  return createUuid().replace(/-/g, "").slice(0, 12);
 }
 
 // Stable per-client id used to break stateVersion ties deterministically in

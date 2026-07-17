@@ -25,6 +25,7 @@ import {
   type StreamdownTranslations,
 } from "streamdown";
 import { useLocale } from "../i18n";
+import { normalizeLatexDelimiters } from "../lib/normalizeLatexDelimiters";
 import { cn } from "../lib/shared/utils";
 import { Check, ChevronDown, ChevronUp, Copy, ExternalLink, X } from "./icons";
 import { Button } from "./ui/button";
@@ -183,7 +184,7 @@ function CodeBlockActions({ code }: { code: string }) {
 
   return (
     <div className="pointer-events-none absolute right-0 top-0 z-20 flex h-8 items-center justify-end">
-      <div className="pointer-events-auto flex shrink-0 items-center gap-2 rounded-md bg-background/80 px-1.5 py-1 backdrop-blur">
+      <div className="pointer-events-auto flex shrink-0 items-center gap-2 rounded-md bg-background/95 px-1.5 py-1">
         <button
           type="button"
           aria-label={copied ? t("chat.markdown.copied") : t("chat.markdown.copyCode")}
@@ -430,6 +431,10 @@ export const Markdown = memo(function Markdown(props: MarkdownProps) {
     preserveRelativeUrls = false,
   } = props;
   const streaming = renderMode === "streaming";
+  const normalizedContent = useMemo(
+    () => normalizeLatexDelimiters(content, streaming && showCaret),
+    [content, showCaret, streaming],
+  );
   const baseComponents = readOnly ? markdownReadOnlyComponents : markdownComponents;
   const components = useMemo(
     () => (componentOverrides ? { ...baseComponents, ...componentOverrides } : baseComponents),
@@ -473,7 +478,7 @@ export const Markdown = memo(function Markdown(props: MarkdownProps) {
         }}
         translations={streamdownTranslations}
       >
-        {content}
+        {normalizedContent}
       </Streamdown>
     </div>
   );

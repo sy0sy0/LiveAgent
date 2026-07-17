@@ -1,5 +1,7 @@
 import type { Message, UserMessage } from "@earendil-works/pi-ai";
 
+import { createUuid } from "../../shared/id";
+
 export type UploadedReadableFileKind =
   | "text"
   | "image"
@@ -23,11 +25,7 @@ const DISPLAY_CONTENT_FIELD = "liveAgentDisplayContent";
 const ATTACHMENTS_FIELD = "liveAgentAttachments";
 
 function createUserMessageId() {
-  const id =
-    typeof globalThis.crypto?.randomUUID === "function"
-      ? globalThis.crypto.randomUUID()
-      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-  return `user-${id}`;
+  return `user-${createUuid()}`;
 }
 
 export type PendingUploadedFile = {

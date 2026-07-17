@@ -1,4 +1,5 @@
 import type { ToolCall } from "@earendil-works/pi-ai";
+import { createUuid } from "../../shared/id";
 
 const FLATTENED_TOOL_REQUEST_LABELS = [
   "Previous assistant tool request:",
@@ -166,7 +167,7 @@ export function parseFlattenedToolRequestAtStart(value: string): ParsedFlattened
   return {
     toolCall: {
       type: "toolCall",
-      id: (match[1] ?? "").trim() || `flattened-context-tool-call-${crypto.randomUUID()}`,
+      id: (match[1] ?? "").trim() || `flattened-context-tool-call-${createUuid()}`,
       name: toolName,
       arguments: parsed,
     },

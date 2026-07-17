@@ -2,6 +2,7 @@ import type { AssistantMessage, UserMessage } from "@earendil-works/pi-ai";
 
 import type { StreamDebugLogger } from "../../debug/agentDebug";
 import type { ProviderId } from "../../settings";
+import { createUuid } from "../../shared/id";
 import {
   applyCompactionCheckpoint,
   type CompactionCheckpointStats,
@@ -24,18 +25,12 @@ export type CompactionOutcome = {
   newSegmentIndex: number;
 };
 
-function randomId() {
-  return typeof globalThis.crypto?.randomUUID === "function"
-    ? globalThis.crypto.randomUUID()
-    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-}
-
 export function createSyntheticContinueUserMessage(
   timestamp = Date.now(),
 ): UserMessage & { id: string } {
   return {
     role: "user",
-    id: `user-${randomId()}`,
+    id: `user-${createUuid()}`,
     // 必须与 conversationState 的常量逐字节一致：normalizeSegment 依赖它过滤持久化。
     content: INTERNAL_RESUME_MESSAGE_TEXT,
     timestamp,
@@ -60,7 +55,7 @@ function buildCheckpointMessage(params: {
     content: [{ type: "text", text: params.summaryText }],
     stopReason: "stop",
     timestamp: params.timestamp,
-    responseId: params.responseId || `liveagent-compaction-${params.timestamp}-${randomId()}`,
+    responseId: params.responseId || `liveagent-compaction-${params.timestamp}-${createUuid()}`,
     // checkpoint 消息自身的 usage 恒为零：summarizer 请求的真实用量走 compactionStats，
     // 绝不冒充会话上下文规模（旧实现的 usage 污染即源于此）。
     usage: {

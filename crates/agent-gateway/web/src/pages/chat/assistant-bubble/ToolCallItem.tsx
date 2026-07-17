@@ -24,6 +24,7 @@ import {
   isBuiltinShareToolName,
   isSubagentCardToolCall,
 } from "./assistantBubbleUtils";
+import { LazyCollapse } from "./LazyCollapse";
 import { AssistantStatus } from "./StatusText";
 import { ToolArgsDisplay, ToolResultDisplay } from "./ToolResultDisplay";
 
@@ -198,16 +199,8 @@ function ToolCallItem({
     </>
   );
   const body = (
-    <div
-      aria-hidden={!effectiveOpen}
-      className={cn(
-        "grid transition-[grid-template-rows,opacity] duration-200 ease-out",
-        effectiveOpen
-          ? "grid-rows-[1fr] opacity-100"
-          : "pointer-events-none grid-rows-[0fr] opacity-0",
-      )}
-    >
-      <div className="min-h-0 overflow-hidden">
+    <LazyCollapse open={effectiveOpen}>
+      {() => (
         <div className="space-y-3 pb-2 pl-[22px] pt-1">
           {shouldShowArgs ? (
             <ToolSection
@@ -277,8 +270,8 @@ function ToolCallItem({
             </ToolSection>
           ) : null}
         </div>
-      </div>
-    </div>
+      )}
+    </LazyCollapse>
   );
   const containerClassName = "group/tool min-w-0 max-w-full";
 
@@ -325,7 +318,7 @@ function areToolResultsEqual(
   );
 }
 
-function areToolTraceItemsEqual(previous: ToolTraceItem, next: ToolTraceItem) {
+export function areToolTraceItemsEqual(previous: ToolTraceItem, next: ToolTraceItem) {
   if (previous === next) {
     return true;
   }

@@ -20,6 +20,7 @@ import {
   mapDeepSeekReasoningEffort,
 } from "../deepSeekProviderAdapter";
 import { resolveMaxTokens } from "./common";
+import { recoverOpenAICompletionsMissingFinishReason } from "./openAICompletionsStream";
 import { withStreamRetry } from "./streamRetry";
 import { normalizeStructuredToolCallHistoryForDeepSeek } from "./textModeToolRecovery";
 import {
@@ -160,7 +161,16 @@ export function streamSimpleByApi(model: Model<any>, context: Context, options: 
           : undefined,
       };
       return withStreamRetry(
-        () => streamOpenAICompletions(model as any, openAICompletionsContext, openAIOptions),
+        () => {
+          const source = streamOpenAICompletions(
+            model as any,
+            openAICompletionsContext,
+            openAIOptions,
+          );
+          return openAICompletionsOptions.recoverMissingFinishReason
+            ? recoverOpenAICompletionsMissingFinishReason(source)
+            : source;
+        },
         { signal: openAICompletionsOptions.signal, ...openAICompletionsOptions.streamRetry },
       );
     }

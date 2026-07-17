@@ -107,9 +107,10 @@ test("growth bookkeeping keeps the next scroll's direction honest (80ae9aa)", ()
   // Content growth widens the gap between scroll events; without recording it
   // the user's next downward arrival would read as "moving away".
   const { state, pin } = run([
-    wheelUp({ now: 1000 }), // detach + latch until 1500
+    wheelUp({ now: 1_000 }),
     growth(200),
-    scroll(150, 1200),
+    wheelDown({ now: 1_100 }),
+    scroll(150, 1_200),
   ]);
   assert.equal(state.following, true);
   assert.equal(pin, true);
@@ -239,6 +240,20 @@ test("wheel-up consumed by a nested scroller never detaches (c4d6471)", () => {
   assert.equal(notConsumed.state.following, false);
 });
 
+test("small Windows wheel-up inside the bottom tolerance stays detached", () => {
+  const detached = run([
+    wheelDown({ gap: 20, now: 900 }),
+    wheelUp({ now: 1_000 }),
+    scroll(BOTTOM_ATTACH_THRESHOLD_PX - 1, 1_001),
+  ]);
+  assert.equal(detached.state.following, false);
+  assert.equal(detached.state.latchUntil, 0);
+
+  const grown = run([growth(40)], { state: detached.state });
+  assert.equal(grown.state.following, false);
+  assert.equal(grown.pin, false);
+});
+
 test("wheel-up without viewport overflow never detaches", () => {
   const { state } = run([wheelUp({ hasOverflow: false })]);
   assert.equal(state.following, true);
@@ -263,8 +278,13 @@ test("wheel-down while clamped at the bottom re-attaches", () => {
 });
 
 test("history keys detach; follow keys only arm the latch", () => {
-  const history = run([{ type: "historyKey", hasOverflow: true, now: 0 }]);
+  const history = run([
+    { type: "followKey", now: 100 },
+    { type: "historyKey", hasOverflow: true, now: 200 },
+    scroll(BOTTOM_ATTACH_THRESHOLD_PX - 1, 201),
+  ]);
   assert.equal(history.state.following, false);
+  assert.equal(history.state.latchUntil, 0);
 
   const noOverflow = run([{ type: "historyKey", hasOverflow: false, now: 0 }]);
   assert.equal(noOverflow.state.following, true);
@@ -280,9 +300,12 @@ test("history keys detach; follow keys only arm the latch", () => {
 
 test("touch drags detach off the clamp; upward finger at the clamp does not", () => {
   const down = run([
-    { type: "touchMove", fingerMovedDown: true, gap: 0, hasOverflow: true, now: 0 },
+    { type: "followKey", now: 100 },
+    { type: "touchMove", fingerMovedDown: true, gap: 0, hasOverflow: true, now: 200 },
+    scroll(BOTTOM_ATTACH_THRESHOLD_PX - 1, 201),
   ]);
   assert.equal(down.state.following, false);
+  assert.equal(down.state.latchUntil, 0);
 
   const atClamp = run([
     { type: "touchMove", fingerMovedDown: false, gap: 5, hasOverflow: true, now: 0 },

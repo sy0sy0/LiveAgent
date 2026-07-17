@@ -15,6 +15,7 @@ import { useLocale } from "../../../i18n";
 import { BOTTOM_REATTACH_ZONE_PX } from "../../../lib/chat-scroll/scrollFollowCore";
 import { useScrollFollow } from "../../../lib/chat-scroll/useScrollFollow";
 import { ChatEmptyState } from "./ChatEmptyState";
+import { RowInteractionProvider, useRowInteractionStore } from "./rowInteraction";
 import { TranscriptList } from "./TranscriptList";
 import { HistorySwitchLoadingOverlay } from "./TranscriptLoadingStates";
 import type { ChatTranscriptProps } from "./transcriptTypes";
@@ -44,6 +45,8 @@ export const ChatTranscript = memo(function ChatTranscript(props: ChatTranscript
     isCompactionRunning,
     bottomReservePx = 0,
     onResendFromEdit,
+    onBranchConversation,
+    branchPendingMessageId,
     onOpenSettings,
     onSuggestionSelect,
     suggestionsDisabled = false,
@@ -78,6 +81,23 @@ export const ChatTranscript = memo(function ChatTranscript(props: ChatTranscript
     trackKeys: true,
     config: { reattachZonePx: BOTTOM_REATTACH_ZONE_PX },
   });
+
+  // Run-scoped state reaches row action bars through this store instead of
+  // row props, so settled rows stay memo-stable across run start/settle.
+  const rowInteractionStore = useRowInteractionStore({
+    isSending,
+    branchPendingMessageId: branchPendingMessageId ?? null,
+  });
+
+  // A freshly opened conversation stays behind the loading overlay until its
+  // first layout settles (TranscriptList reports convergence), then reveals
+  // in one shot — estimate→measure corrections never show as jumps.
+  const [settledConversationId, setSettledConversationId] = useState<string | null>(null);
+  const handleFirstLayoutSettled = useCallback(() => {
+    setSettledConversationId(conversationId);
+  }, [conversationId]);
+  const isTranscriptSettling =
+    shouldReserveTranscriptBottomSpace && settledConversationId !== conversationId;
 
   useLayoutEffect(() => {
     followRef.current = scrollFollowHandle;
@@ -178,7 +198,10 @@ export const ChatTranscript = memo(function ChatTranscript(props: ChatTranscript
         <div className="mx-auto w-full max-w-[768px] px-5 py-4">
           {showNoModelsState || showStartChatState ? (
             <div className="flex min-h-[calc(100vh-220px)] flex-col items-center justify-center">
+              {/* Keyed per conversation so the hero entrance replays when
+                  switching between empty conversations, not just on mount. */}
               <ChatEmptyState
+                key={conversationId ?? "empty"}
                 variant={showNoModelsState ? "no-models" : "start-chat"}
                 onOpenSettings={onOpenSettings}
                 onSuggestionSelect={onSuggestionSelect}
@@ -187,22 +210,33 @@ export const ChatTranscript = memo(function ChatTranscript(props: ChatTranscript
             </div>
           ) : null}
 
-          <div className="select-text">
-            <TranscriptList
-              conversationId={conversationId}
-              historyItems={historyItems}
-              liveTranscriptStore={liveTranscriptStore}
-              scrollViewport={scrollViewport}
-              isViewportFollowing={scrollFollowHandle.isFollowing}
-              isSending={isSending}
-              isAgentMode={isAgentMode}
-              isCompactionRunning={isCompactionRunning}
-              showUsage={showUsage}
-              usageContextWindow={usageContextWindow}
-              workspaceRoot={workspaceRoot}
-              gitClient={gitClient}
-              onResendFromEdit={onResendFromEdit}
-            />
+          <div
+            className={`select-text transition-opacity duration-150 ${isTranscriptSettling ? "opacity-0" : "opacity-100"}`}
+          >
+            <RowInteractionProvider value={rowInteractionStore}>
+              {/* Keyed remount per conversation: per-conversation state
+                  (row model, entrance registry, virtualizer measurements)
+                  initializes fresh, and row keys can never collide across
+                  conversations in the virtualizer's itemSizeCache. */}
+              <TranscriptList
+                key={conversationId}
+                conversationId={conversationId}
+                historyItems={historyItems}
+                liveTranscriptStore={liveTranscriptStore}
+                scrollViewport={scrollViewport}
+                isViewportFollowing={scrollFollowHandle.isFollowing}
+                isSending={isSending}
+                isAgentMode={isAgentMode}
+                isCompactionRunning={isCompactionRunning}
+                showUsage={showUsage}
+                usageContextWindow={usageContextWindow}
+                workspaceRoot={workspaceRoot}
+                gitClient={gitClient}
+                onResendFromEdit={onResendFromEdit}
+                onBranchConversation={onBranchConversation}
+                onFirstLayoutSettled={handleFirstLayoutSettled}
+              />
+            </RowInteractionProvider>
           </div>
 
           <div style={{ height: transcriptBottomReservePx }} />
@@ -250,7 +284,7 @@ export const ChatTranscript = memo(function ChatTranscript(props: ChatTranscript
             document.body,
           )
         : null}
-      {isHistorySwitching ? <HistorySwitchLoadingOverlay /> : null}
+      {isHistorySwitching || isTranscriptSettling ? <HistorySwitchLoadingOverlay /> : null}
     </div>
   );
 });

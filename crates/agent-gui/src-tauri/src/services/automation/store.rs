@@ -114,6 +114,17 @@ impl AutomationStore {
         }
     }
 
+    pub fn run_cron_task_now(&self, task_id: &str) -> Result<CronRunNowResponse, String> {
+        let scheduler = self
+            .notifier
+            .lock()
+            .map_err(|_| "automation notifier lock poisoned".to_string())?
+            .as_ref()
+            .and_then(|notifier| notifier.scheduler.upgrade())
+            .ok_or_else(|| "automation scheduler is unavailable".to_string())?;
+        scheduler.run_now(task_id)
+    }
+
     fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, String> {
         self.conn
             .lock()
@@ -276,7 +287,11 @@ impl AutomationStore {
 
     /// Queue a prompt run for the frontend executor. The run row *is* the
     /// pending queue — it survives restarts and carries the lease deadline.
-    pub fn queue_prompt_run(&self, task: &CronTask) -> Result<PromptQueueOutcome, String> {
+    pub fn queue_prompt_run(
+        &self,
+        task: &CronTask,
+        counted: bool,
+    ) -> Result<PromptQueueOutcome, String> {
         let prompt = task.prompt.as_deref().unwrap_or_default().trim().to_string();
         if prompt.is_empty() {
             return Err("Auto Prompt task has no prompt content.".to_string());
@@ -320,6 +335,7 @@ impl AutomationStore {
                 model,
                 started_at,
                 lease_expires_at: started_at + PROMPT_RUN_TIMEOUT_MS,
+                counted,
             };
             let request_json = serde_json::to_string(&request)
                 .map_err(|e| format!("序列化 prompt run 请求失败：{e}"))?;
@@ -425,17 +441,17 @@ impl AutomationStore {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|e| format!("开启 prompt 完成事务失败：{e}"))?;
 
-            let row: Option<(String, String, i64)> = tx
+            let row: Option<(String, String, i64, Option<String>)> = tx
                 .query_row(
-                    "SELECT task_id, state, started_at FROM automation_cron_runs
+                    "SELECT task_id, state, started_at, request_json FROM automation_cron_runs
                      WHERE execution_id = ?1",
                     params![execution_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()
                 .map_err(|e| format!("读取 prompt run 失败：{e}"))?;
 
-            let Some((task_id, state, started_at)) = row else {
+            let Some((task_id, state, started_at, request_json)) = row else {
                 return Ok(PromptCompletionResponse {
                     status: PromptCompletionStatus::AlreadyFinished,
                 });
@@ -477,7 +493,11 @@ impl AutomationStore {
             )
             .map_err(|e| format!("写入 prompt 完成结果失败：{e}"))?;
 
-            let effect = decrement_remaining(&tx, &task_id)?;
+            let effect = if prompt_run_is_counted(request_json.as_deref()) {
+                decrement_remaining(&tx, &task_id)?
+            } else {
+                CronMutationEffect::None
+            };
             db::prune_runs(&tx, &task_id)?;
             let snapshot = match effect {
                 CronMutationEffect::Changed => {
@@ -537,7 +557,7 @@ impl AutomationStore {
             {
                 let mut stmt = tx
                     .prepare(&format!(
-                        "SELECT execution_id, task_id, started_at FROM automation_cron_runs
+                        "SELECT execution_id, task_id, started_at, request_json FROM automation_cron_runs
                          WHERE {predicate}"
                     ))
                     .map_err(|e| format!("准备读取过期 prompt runs 失败：{e}"))?;
@@ -547,6 +567,7 @@ impl AutomationStore {
                             row.get::<_, String>(0)?,
                             row.get::<_, String>(1)?,
                             row.get::<_, i64>(2)?,
+                            row.get::<_, Option<String>>(3)?,
                         ))
                     })
                     .map_err(|e| format!("读取过期 prompt runs 失败：{e}"))?;
@@ -561,7 +582,7 @@ impl AutomationStore {
             let now = db::now_ms();
             let mut changed = false;
             let mut events = Vec::with_capacity(rows.len());
-            for (execution_id, task_id, started_at) in rows {
+            for (execution_id, task_id, started_at, request_json) in rows {
                 tx.execute(
                     "UPDATE automation_cron_runs
                      SET state = 'expired', success = 0, finished_at = ?2, duration_ms = ?3,
@@ -570,10 +591,12 @@ impl AutomationStore {
                     params![execution_id, now, (now - started_at).max(0), message],
                 )
                 .map_err(|e| format!("标记 prompt run 过期失败：{e}"))?;
-                if matches!(
-                    decrement_remaining(&tx, &task_id)?,
-                    CronMutationEffect::Changed
-                ) {
+                if prompt_run_is_counted(request_json.as_deref())
+                    && matches!(
+                        decrement_remaining(&tx, &task_id)?,
+                        CronMutationEffect::Changed
+                    )
+                {
                     changed = true;
                 }
                 db::prune_runs(&tx, &task_id)?;
@@ -630,6 +653,38 @@ impl AutomationStore {
             .collect();
         Ok((workdir, tasks))
     }
+
+    pub fn cron_task_for_manual_run(&self, task_id: &str) -> Result<(String, CronTask), String> {
+        let task_id = task_id.trim();
+        if task_id.is_empty() {
+            return Err("cron task id cannot be empty".to_string());
+        }
+        let conn = self.lock_conn()?;
+        let task = db::read_cron_task(&conn, task_id)?
+            .ok_or_else(|| format!("cron task 不存在：{task_id}"))?;
+        if task.kind == "prompt" {
+            let active: Option<String> = conn
+                .query_row(
+                    "SELECT execution_id FROM automation_cron_runs
+                     WHERE task_id = ?1 AND state IN ('pending', 'leased') LIMIT 1",
+                    params![task_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("检查 prompt 活动运行失败：{e}"))?;
+            if active.is_some() {
+                return Err("Cron task is already running.".to_string());
+            }
+        }
+        Ok((read_system_workdir(&conn)?, task))
+    }
+}
+
+fn prompt_run_is_counted(request_json: Option<&str>) -> bool {
+    request_json
+        .and_then(|raw| serde_json::from_str::<PromptRunRequest>(raw).ok())
+        .map(|request| request.counted)
+        .unwrap_or(true)
 }
 
 fn apply_cron_op(conn: &Connection, op: AutomationOp) -> Result<(), String> {

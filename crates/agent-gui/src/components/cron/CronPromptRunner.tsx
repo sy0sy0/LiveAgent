@@ -1,8 +1,8 @@
 import type { Context } from "@earendil-works/pi-ai";
-import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useRef } from "react";
-import type { PromptRunRequest } from "../../lib/automation";
+import type { CompletePromptRunInput, PromptRunRequest } from "../../lib/automation";
+import { backend } from "../../lib/automation/backend";
 import { runAssistantWithTools } from "../../lib/chat/runner/agentRunner";
 import { createStreamDebugLogger } from "../../lib/debug/agentDebug";
 import { assistantMessageToText } from "../../lib/providers/llm";
@@ -24,6 +24,10 @@ import { buildBuiltinToolRegistry } from "../../lib/tools/builtinRegistry";
 import { createFileToolState } from "../../lib/tools/fileToolState";
 import type { SkillAccessPolicy } from "../../lib/tools/skillAccessPolicy";
 import { appendSystemPrompt } from "../../pages/chat";
+import {
+  createCompletePromptRunInput,
+  PROMPT_RUN_RECONCILE_INTERVAL_MS,
+} from "./promptRunProtocol";
 
 const PROMPT_PENDING_EVENT = "automation:prompt-pending";
 const PROMPT_EXPIRED_EVENT = "automation:prompt-expired";
@@ -207,15 +211,10 @@ async function executeCronPromptRun(
   return conclusion;
 }
 
-async function completeWithRetry(input: {
-  execution_id: string;
-  success: boolean;
-  duration_ms: number;
-  output: string;
-}) {
+async function completeWithRetry(input: CompletePromptRunInput) {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      await invoke("automation_complete_prompt_run", { input });
+      await backend.completePromptRun(input);
       return;
     } catch (error) {
       if (attempt >= COMPLETION_RETRY_DELAYS_MS.length) {
@@ -272,18 +271,20 @@ export function CronPromptRunner({ settings }: CronPromptRunnerProps) {
         // completion would be answered with AlreadyFinished anyway.
         return;
       }
-      await completeWithRetry({
-        execution_id: request.executionId,
-        success,
-        duration_ms: Math.max(0, Date.now() - startedAt),
-        output: output.trim(),
-      });
+      await completeWithRetry(
+        createCompletePromptRunInput(
+          request.executionId,
+          success,
+          Math.max(0, Date.now() - startedAt),
+          output.trim(),
+        ),
+      );
     }
 
     async function claimAndRun() {
       let claimed: PromptRunRequest[] = [];
       try {
-        claimed = await invoke<PromptRunRequest[]>("automation_claim_prompt_runs");
+        claimed = await backend.claimPromptRuns();
       } catch (error) {
         console.warn("Cron Auto Prompt claim failed", error);
         return;
@@ -292,9 +293,7 @@ export function CronPromptRunner({ settings }: CronPromptRunnerProps) {
         // Claimed after unmount (StrictMode remount window): hand the runs
         // back so the surviving runner instance picks them up.
         for (const request of claimed) {
-          void invoke("automation_release_prompt_run", {
-            execution_id: request.executionId,
-          }).catch(() => undefined);
+          void backend.releasePromptRun(request.executionId).catch(() => undefined);
         }
         return;
       }
@@ -303,16 +302,26 @@ export function CronPromptRunner({ settings }: CronPromptRunnerProps) {
       }
     }
 
-    void claimAndRun();
+    let claimInFlight: Promise<void> | null = null;
+    function requestClaim() {
+      if (disposed || claimInFlight) return;
+      claimInFlight = claimAndRun().finally(() => {
+        claimInFlight = null;
+      });
+    }
+
     const unlistenPending = listen(PROMPT_PENDING_EVENT, () => {
-      if (!disposed) void claimAndRun();
+      requestClaim();
     });
     const unlistenExpired = listen<{ executionId: string }>(PROMPT_EXPIRED_EVENT, (event) => {
       abortControllers.get(event.payload?.executionId ?? "")?.abort();
     });
+    const reconcileTimer = window.setInterval(requestClaim, PROMPT_RUN_RECONCILE_INTERVAL_MS);
+    requestClaim();
 
     return () => {
       disposed = true;
+      window.clearInterval(reconcileTimer);
       void unlistenPending.then((unlisten) => unlisten());
       void unlistenExpired.then((unlisten) => unlisten());
       for (const controller of abortControllers.values()) {

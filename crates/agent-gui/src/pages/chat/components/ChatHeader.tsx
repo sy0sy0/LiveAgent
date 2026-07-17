@@ -23,6 +23,7 @@ import {
   DropdownMenuTrigger,
 } from "../../../components/ui/dropdown-menu";
 import { useLocale } from "../../../i18n";
+import { groupModelOptionsByProvider } from "../../../lib/chat/page/chatPageHelpers";
 import { type ModelOption, parseModelValue } from "../../../lib/providers/llm";
 import {
   type AppSettings,
@@ -98,38 +99,19 @@ export const ChatHeader = memo(function ChatHeader(props: {
   }, [isModelMenuOpen]);
 
   const normalizedSearch = modelSearch.trim().toLowerCase();
-  const groups: {
-    name: string;
-    providerType: ProviderId;
-    opts: ModelOption[];
-  }[] = [];
-  const groupMap = new Map<string, ModelOption[]>();
-  for (const option of modelOptions) {
-    const existing = groupMap.get(option.providerName);
-    if (existing) {
-      existing.push(option);
-      continue;
-    }
-    const nextGroup: ModelOption[] = [option];
-    groupMap.set(option.providerName, nextGroup);
-    groups.push({
-      name: option.providerName,
-      providerType: option.providerType,
-      opts: nextGroup,
-    });
-  }
+  const groups = groupModelOptionsByProvider(modelOptions);
 
   const selectedOption = modelOptions.find((o) => o.value === selectedValue);
-  const selectedGroupName = selectedOption?.providerName;
+  const selectedGroupId = selectedOption?.providerId;
   // 默认全部折叠，仅当前选中模型所在分组展开；搜索时强制展开所有匹配分组
-  const isGroupExpanded = (name: string) =>
-    normalizedSearch.length > 0 || (expandedGroups[name] ?? name === selectedGroupName);
+  const isGroupExpanded = (id: string) =>
+    normalizedSearch.length > 0 || (expandedGroups[id] ?? id === selectedGroupId);
   // 基于存储态取反（而非 isGroupExpanded）：搜索强制展开是只读覆盖，
   // 不应让搜索期间的点击把折叠态写坏
-  const toggleGroup = (name: string) =>
+  const toggleGroup = (id: string) =>
     setExpandedGroups((prev) => ({
       ...prev,
-      [name]: !(prev[name] ?? name === selectedGroupName),
+      [id]: !(prev[id] ?? id === selectedGroupId),
     }));
 
   return (
@@ -223,13 +205,13 @@ export const ChatHeader = memo(function ChatHeader(props: {
                 }
 
                 return filteredGroups.map((group, groupIndex) => {
-                  const expanded = isGroupExpanded(group.name);
+                  const expanded = isGroupExpanded(group.id);
                   return (
-                    <div key={group.name} className="flex flex-col gap-0.5">
+                    <div key={group.id} className="flex flex-col gap-0.5">
                       {groupIndex > 0 ? <DropdownMenuSeparator className="bg-border/30" /> : null}
                       <DropdownMenuItem
                         closeOnClick={false}
-                        onSelect={() => toggleGroup(group.name)}
+                        onSelect={() => toggleGroup(group.id)}
                         aria-expanded={expanded}
                         title={expanded ? t("chat.collapseProvider") : t("chat.expandProvider")}
                         className="model-selector-group-label sticky top-0 z-10 flex h-[30px] shrink-0 cursor-pointer items-center gap-1.5 rounded-md bg-popover/60 px-2 py-0 text-xs font-medium uppercase tracking-wider text-muted-foreground/80 backdrop-blur-xl transition-colors data-[highlighted]:bg-muted/40 supports-[backdrop-filter]:bg-popover/40 dark:text-white/80"

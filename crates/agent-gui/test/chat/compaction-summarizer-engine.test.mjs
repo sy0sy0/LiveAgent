@@ -143,6 +143,25 @@ test("invalid first output triggers exactly one self-repair round-trip", async (
   assert.equal(repairMessages.length, 3);
   assert.equal(repairMessages[1].role, "assistant");
   assert.match(repairMessages[2].content, /previous compaction summary was invalid/);
+  assert.match(repairMessages[2].content, /src\/app\.ts/);
+  assert.equal(outcome.state.segments.length, 2);
+});
+
+test("verification repair identifies the exact recent technical references", async () => {
+  const calls = [];
+  const outcome = await runCompaction(
+    runParams(async (params) => {
+      calls.push(params);
+      if (calls.length === 1) {
+        return summaryResponse(VALID_SUMMARY_XML.replaceAll("src/app.ts", "src/other.ts"));
+      }
+      return summaryResponse();
+    }),
+  );
+
+  assert.equal(calls.length, 2);
+  assert.match(calls[1].context.messages[2].content, /at least one.*recent technical references/);
+  assert.match(calls[1].context.messages[2].content, /"src\/app\.ts"/);
   assert.equal(outcome.state.segments.length, 2);
 });
 

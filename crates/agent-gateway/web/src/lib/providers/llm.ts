@@ -5,6 +5,7 @@ import type { ProviderId } from "../settings";
 export type ModelOption = {
   value: string;
   label: string;
+  providerId: string;
   providerName: string;
   providerType: ProviderId;
   model: string;

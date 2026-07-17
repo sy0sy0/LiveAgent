@@ -95,6 +95,7 @@ import {
   type WorkspaceProject,
   workspaceProjectPathKey,
 } from "@/lib/settings";
+import { createUuid } from "@/lib/shared/id";
 import { mergeAlwaysEnabledSkillNames } from "@/lib/skills";
 import { terminalSessionBelongsToProject } from "@/lib/terminal/sessionStore";
 import type { TerminalSession } from "@/lib/terminal/types";
@@ -110,7 +111,7 @@ import { SkillsHubPage } from "@/pages/skills-hub/SkillsHubPage";
 
 const LOCAL_DRAFT_PREFIX = "__local_draft__:";
 function createLocalDraftConversationId() {
-  return `${LOCAL_DRAFT_PREFIX}${crypto.randomUUID()}`;
+  return `${LOCAL_DRAFT_PREFIX}${createUuid()}`;
 }
 function isLocalDraftConversationId(id: string) {
   return id.trim().startsWith(LOCAL_DRAFT_PREFIX);
@@ -309,6 +310,7 @@ export default function GatewayApp() {
   });
   const composerRef = useRef<MentionComposerHandle | null>(null);
   const composerDraftCacheRef = useRef<Map<string, MentionComposerDraft>>(new Map());
+  const composerDraftOwnerRef = useRef("");
   const conversationIdRef = useRef(conversationId);
   const selectedHistoryIdRef = useRef(selectedHistoryId);
   const statusRef = useRef<AgentStatus | null>(status);
@@ -442,9 +444,21 @@ export default function GatewayApp() {
     () => mergeWorkspaceProjectsWithHistory(settings.system, sidebarWorkdirs),
     [settings.system, sidebarWorkdirs],
   );
+  const archivedWorkspaceProjectPathKeys = useMemo(
+    () => new Set(settings.system.archivedWorkspaceProjectPaths.map(workspaceProjectPathKey)),
+    [settings.system.archivedWorkspaceProjectPaths],
+  );
+  // Archived workspaces can never be active. Falling back to the full list
+  // only guards a transient synced state where everything is archived.
+  const selectableWorkspaceProjects = useMemo(() => {
+    const active = workspaceProjects.filter(
+      (project) => !archivedWorkspaceProjectPathKeys.has(workspaceProjectPathKey(project.path)),
+    );
+    return active.length > 0 ? active : workspaceProjects;
+  }, [archivedWorkspaceProjectPathKeys, workspaceProjects]);
   const activeWorkspaceProject = useMemo(
-    () => findWorkspaceProject(workspaceProjects, activeWorkspaceProjectId),
-    [activeWorkspaceProjectId, workspaceProjects],
+    () => findWorkspaceProject(selectableWorkspaceProjects, activeWorkspaceProjectId),
+    [activeWorkspaceProjectId, selectableWorkspaceProjects],
   );
   useEffect(() => {
     if (activeWorkspaceProject?.id && activeWorkspaceProject.id !== activeWorkspaceProjectId) {
@@ -549,10 +563,14 @@ export default function GatewayApp() {
     return resolveVisibleConversationId(selectedHistoryIdRef.current, conversationIdRef.current);
   }
 
-  function cacheVisibleComposerDraft(conversationId = getVisibleComposerConversationId()) {
+  function cacheVisibleComposerDraft(conversationId = composerDraftOwnerRef.current) {
     const targetConversationId = conversationId.trim();
     const composer = composerRef.current;
-    if (!targetConversationId || !composer) {
+    if (
+      !targetConversationId ||
+      composerDraftOwnerRef.current !== targetConversationId ||
+      !composer
+    ) {
       return;
     }
 
@@ -563,6 +581,27 @@ export default function GatewayApp() {
     }
 
     composerDraftCacheRef.current.set(targetConversationId, draft);
+  }
+
+  function prepareComposerForConversationChange() {
+    cacheVisibleComposerDraft();
+    composerDraftOwnerRef.current = "";
+  }
+
+  function restoreCachedComposerDraft(conversationId: string) {
+    const targetConversationId = conversationId.trim();
+    const composer = composerRef.current;
+    if (!targetConversationId || !composer) {
+      return;
+    }
+
+    const cachedDraft = composerDraftCacheRef.current.get(targetConversationId);
+    if (cachedDraft) {
+      composer.setDraft(cachedDraft);
+    } else {
+      composer.clear();
+    }
+    composerDraftOwnerRef.current = targetConversationId;
   }
 
   function clearCachedComposerDraft(conversationId = getVisibleComposerConversationId()) {
@@ -600,6 +639,19 @@ export default function GatewayApp() {
     const conversationIdValue = targetConversationId.trim();
     return conversationIdValue !== "" && getDisplayedConversationId() === conversationIdValue;
   }
+
+  // Sent-prompt history for the composer's ↑/↓ recall. Read lazily from the
+  // displayed conversation's transcript snapshot at the moment recall starts,
+  // so transcript growth never re-renders the memoized composer bar.
+  const loadComposerHistoryPrompts = useCallback(() => {
+    const store = transcriptStoreRegistry.peek(getDisplayedConversationId());
+    if (!store) return [];
+    const prompts: string[] = [];
+    for (const row of store.getSnapshot().rows) {
+      if (row.kind === "user" && row.text.trim()) prompts.push(row.text);
+    }
+    return prompts;
+  }, [transcriptStoreRegistry]);
 
   const applyLiveConversationTitle = useCallback(
     (targetConversationId: string, nextTitle: string) => {
@@ -785,6 +837,9 @@ export default function GatewayApp() {
         composerDraftCacheRef.current.delete(previousId);
         composerDraftCacheRef.current.set(nextId, cachedComposerDraft);
       }
+      if (composerDraftOwnerRef.current === previousId) {
+        composerDraftOwnerRef.current = nextId;
+      }
       moveConversationUploads(previousId, nextId);
       if (chatQueueConversationIdRef.current === previousId) {
         chatQueueConversationIdRef.current = nextId;
@@ -966,6 +1021,10 @@ export default function GatewayApp() {
             missingWorkspaceProjectPaths: prev.system.missingWorkspaceProjectPaths.filter(
               (path) => workspaceProjectPathKey(path) !== normalizedPathKey,
             ),
+            // Activating a workspace always brings it back from the archive.
+            archivedWorkspaceProjectPaths: prev.system.archivedWorkspaceProjectPaths.filter(
+              (path) => workspaceProjectPathKey(path) !== normalizedPathKey,
+            ),
           },
           getDefaultWorkspaceProjectPath(prev.system),
         );
@@ -976,7 +1035,10 @@ export default function GatewayApp() {
       });
       if (options?.startConversation) {
         setActiveView("chat");
-        startNewConversation({ workdir: targetProject.path });
+        startNewConversation({
+          workdir: targetProject.path,
+          preserveCurrentComposerDraft: true,
+        });
       }
     },
     [setSettings, workspaceProjects],
@@ -1806,7 +1868,7 @@ export default function GatewayApp() {
     }
     clearCachedComposerDraft(activeConversationId);
 
-    const clientRequestId = options?.clientRequestId?.trim() || crypto.randomUUID();
+    const clientRequestId = options?.clientRequestId?.trim() || createUuid();
     const startedAt = Date.now();
     const persistedConversationWorkdir = sidebarStore.peek(activeConversationId)?.cwd?.trim() || "";
     const runtimeConversationWorkdir =
@@ -2023,7 +2085,7 @@ export default function GatewayApp() {
           ),
           systemSettings: buildGatewaySystemSettings(settings, workdirForTurn),
           uploadedFiles: materialized.uploadedFiles,
-          clientRequestId: crypto.randomUUID(),
+          clientRequestId: createUuid(),
           runtimeControls: chatRuntimeControlsForCurrentProvider,
           queuePolicy,
         });
@@ -2216,11 +2278,18 @@ export default function GatewayApp() {
       });
   }
 
-  function startNewConversation(options?: { workdir?: string }) {
-    const currentConversationId = conversationIdRef.current.trim();
+  function startNewConversation(options?: {
+    workdir?: string;
+    preserveCurrentComposerDraft?: boolean;
+  }) {
+    const currentConversationId = getVisibleComposerConversationId().trim();
     if (currentConversationId) {
       transcriptStoreRegistry.peek(currentConversationId)?.foldSettledTurns();
-      clearCachedComposerDraft(currentConversationId);
+      if (options?.preserveCurrentComposerDraft) {
+        cacheVisibleComposerDraft(currentConversationId);
+      } else {
+        clearCachedComposerDraft(currentConversationId);
+      }
     }
     invalidateHistoryLoad();
     markVisibleConversationRevision();
@@ -2228,6 +2297,7 @@ export default function GatewayApp() {
     const nextConversationId = createLocalDraftConversationId();
     protectedConversationRef.current = PROTECTED_DRAFT_CONVERSATION;
     submitInFlightRef.current = false;
+    composerDraftOwnerRef.current = "";
     composerRef.current?.clear();
     const nextWorkdir = options?.workdir?.trim() || "";
     if (nextWorkdir) {
@@ -2247,6 +2317,15 @@ export default function GatewayApp() {
       if (project.id === DEFAULT_WORKSPACE_PROJECT_ID) return;
       const path = project.path.trim();
       const pathKey = workspaceProjectPathKey(path);
+      // Removing the last non-archived workspace would leave nothing usable;
+      // the default project is unarchived alongside in that case. The merged
+      // list (settings + history workdirs) is the authority on what remains.
+      const hasOtherActiveProjects = workspaceProjects.some(
+        (item) =>
+          item.id !== project.id &&
+          workspaceProjectPathKey(item.path) !== pathKey &&
+          !archivedWorkspaceProjectPathKeys.has(workspaceProjectPathKey(item.path)),
+      );
       setActiveWorkspaceProjectId((current) => {
         const currentProject = workspaceProjects.find((item) => item.id === current);
         if (
@@ -2279,6 +2358,16 @@ export default function GatewayApp() {
               missingWorkspaceProjectPaths: prev.system.missingWorkspaceProjectPaths.filter(
                 (item) => workspaceProjectPathKey(item) !== pathKey,
               ),
+              archivedWorkspaceProjectPaths: prev.system.archivedWorkspaceProjectPaths.filter(
+                (item) => {
+                  const itemKey = workspaceProjectPathKey(item);
+                  if (itemKey === pathKey) return false;
+                  return (
+                    hasOtherActiveProjects ||
+                    itemKey !== workspaceProjectPathKey(getDefaultWorkspaceProjectPath(prev.system))
+                  );
+                },
+              ),
             },
             getDefaultWorkspaceProjectPath(prev.system),
           ),
@@ -2288,7 +2377,7 @@ export default function GatewayApp() {
       setProjectRenamingId((current) => (current === project.id ? null : current));
       setProjectRenameDraft("");
     },
-    [setSettings, workspaceProjects],
+    [archivedWorkspaceProjectPathKeys, setSettings, workspaceProjects],
   );
 
   const handleRemoveWorkspaceProject = useCallback(
@@ -2508,6 +2597,74 @@ export default function GatewayApp() {
     ],
   );
 
+  const handleArchiveWorkspaceProject = useCallback(
+    (project: WorkspaceProject) => {
+      const pathKey = workspaceProjectPathKey(project.path);
+      if (!pathKey || archivedWorkspaceProjectPathKeys.has(pathKey)) return;
+      const fallbackProject = workspaceProjects.find(
+        (item) =>
+          item.id !== project.id &&
+          workspaceProjectPathKey(item.path) !== pathKey &&
+          !archivedWorkspaceProjectPathKeys.has(workspaceProjectPathKey(item.path)),
+      );
+      // Archiving is only offered while another active workspace remains.
+      if (!fallbackProject) return;
+      if (
+        activeWorkspaceProject &&
+        (activeWorkspaceProject.id === project.id ||
+          workspaceProjectPathKey(activeWorkspaceProject.path) === pathKey)
+      ) {
+        activateWorkspaceProject(fallbackProject);
+      }
+      setSettings((prev) =>
+        prev.system.archivedWorkspaceProjectPaths.some(
+          (path) => workspaceProjectPathKey(path) === pathKey,
+        )
+          ? prev
+          : {
+              ...prev,
+              system: {
+                ...prev.system,
+                archivedWorkspaceProjectPaths: [
+                  ...prev.system.archivedWorkspaceProjectPaths,
+                  project.path.trim(),
+                ],
+              },
+            },
+      );
+    },
+    [
+      activateWorkspaceProject,
+      activeWorkspaceProject,
+      archivedWorkspaceProjectPathKeys,
+      setSettings,
+      workspaceProjects,
+    ],
+  );
+
+  const handleUnarchiveWorkspaceProject = useCallback(
+    (project: WorkspaceProject) => {
+      const pathKey = workspaceProjectPathKey(project.path);
+      if (!pathKey) return;
+      setSettings((prev) => {
+        const next = prev.system.archivedWorkspaceProjectPaths.filter(
+          (path) => workspaceProjectPathKey(path) !== pathKey,
+        );
+        if (next.length === prev.system.archivedWorkspaceProjectPaths.length) {
+          return prev;
+        }
+        return {
+          ...prev,
+          system: {
+            ...prev.system,
+            archivedWorkspaceProjectPaths: next,
+          },
+        };
+      });
+    },
+    [setSettings],
+  );
+
   function handleSidebarNewConversation() {
     if (isMobileSidebarLayout()) {
       setSidebarOpen(false);
@@ -2522,6 +2679,7 @@ export default function GatewayApp() {
     }
     startNewConversation({
       workdir: isAgentMode ? activeWorkspaceProjectPath || undefined : undefined,
+      preserveCurrentComposerDraft: true,
     });
   }
 
@@ -2536,9 +2694,9 @@ export default function GatewayApp() {
       return;
     }
 
-    const currentConversationId = conversationIdRef.current.trim();
-    if (currentConversationId && currentConversationId !== targetConversationId) {
-      cacheVisibleComposerDraft(currentConversationId);
+    const currentConversationId = getVisibleComposerConversationId().trim();
+    if (currentConversationId !== targetConversationId) {
+      prepareComposerForConversationChange();
     }
 
     pendingDisplayedConversationAutoBottomRef.current = targetConversationId;
@@ -2559,12 +2717,14 @@ export default function GatewayApp() {
       setSelectedHistoryId(targetConversationId);
       setChatError(null);
       setSelectedHistory(null);
+      restoreCachedComposerDraft(targetConversationId);
       return;
     }
 
     // Two-phase open: initial tail paint now, quiet full hydration at idle;
     // the overlay appears only after ~150ms of still-loading.
     openController.open(targetConversationId);
+    restoreCachedComposerDraft(targetConversationId);
   }
 
   // Conversations that left the authoritative sidebar index (remote deletes,
@@ -3015,6 +3175,45 @@ export default function GatewayApp() {
     [api, isConversationBusy, setPendingUploadsForConversation],
   );
 
+  // handleSidebarSelectConversation is a plain per-render function; route the
+  // branch handler through a ref (same pattern as sendChatRef) so the callback
+  // stays stable for the memoized transcript region.
+  const selectConversationRef = useRef(handleSidebarSelectConversation);
+  selectConversationRef.current = handleSidebarSelectConversation;
+  // The button stays clickable during the WS round-trip; a ref (not state)
+  // blocks duplicate confirms without changing the callback identity, while
+  // the pending-anchor state drives the clicked row's spinner.
+  const branchInFlightRef = useRef(false);
+  const [branchPendingMessageId, setBranchPendingMessageId] = useState<string | null>(null);
+
+  const handleBranchConversation = useCallback(
+    async (messageRef: HistoryMessageRef) => {
+      if (!api) return;
+      const activeConversationId = conversationIdRef.current.trim();
+      if (
+        !activeConversationId ||
+        isLocalDraftConversationId(activeConversationId) ||
+        isConversationBusy(activeConversationId)
+      ) {
+        return;
+      }
+      if (branchInFlightRef.current) return;
+      branchInFlightRef.current = true;
+      setBranchPendingMessageId(messageRef.messageId);
+      try {
+        const summary = await api.branchHistory(activeConversationId, messageRef);
+        sidebarStore.upsertLocal(normalizeGatewayConversationSummary(summary));
+        selectConversationRef.current(summary.id);
+      } catch (error) {
+        setChatError(asErrorMessage(error, translate("chat.branchFailed", settings.locale)));
+      } finally {
+        branchInFlightRef.current = false;
+        setBranchPendingMessageId(null);
+      }
+    },
+    [api, isConversationBusy, sidebarStore, settings.locale],
+  );
+
   const handleLoadUploadedImagePreview = useCallback(
     async (workspaceRoot: string, absolutePath: string) => {
       if (!api) {
@@ -3061,6 +3260,7 @@ export default function GatewayApp() {
     draftClientRequestsRef.current.clear();
     conversationWorkdirsRef.current.clear();
     composerDraftCacheRef.current.clear();
+    composerDraftOwnerRef.current = "";
     composerRef.current?.clear();
     conversationIdRef.current = "";
     selectedHistoryIdRef.current = "";
@@ -3522,12 +3722,14 @@ export default function GatewayApp() {
     }
 
     const frameId = window.requestAnimationFrame(() => {
-      const cachedDraft = composerDraftCacheRef.current.get(targetConversationId);
       const composer = composerRef.current;
-      if (!cachedDraft || !composer || composer.hasContent()) {
+      if (
+        !composer ||
+        (composerDraftOwnerRef.current === targetConversationId && composer.hasContent())
+      ) {
         return;
       }
-      composer.setDraft(cachedDraft);
+      restoreCachedComposerDraft(targetConversationId);
     });
 
     return () => {
@@ -3802,6 +4004,9 @@ export default function GatewayApp() {
               onCancelProjectRename={handleCancelWorkspaceProjectRename}
               onSetProjectPinned={handleSetWorkspaceProjectPinned}
               onRemoveProject={handleRemoveWorkspaceProject}
+              onArchiveProject={handleArchiveWorkspaceProject}
+              onUnarchiveProject={handleUnarchiveWorkspaceProject}
+              archivedProjectPathKeys={archivedWorkspaceProjectPathKeys}
               onNewConversation={handleSidebarNewConversation}
               onSelectConversation={handleSidebarSelectConversation}
               onShareConversation={handleOpenShareModal}
@@ -3991,6 +4196,8 @@ export default function GatewayApp() {
                           gitClient={gitClient}
                           onLoadUploadedImagePreview={handleLoadUploadedImagePreview}
                           onResendFromEdit={handleResendFromEdit}
+                          onBranchConversation={handleBranchConversation}
+                          branchPendingMessageId={branchPendingMessageId}
                           onSuggestionSelect={handleEmptyStateSuggestion}
                           suggestionsDisabled={isSuggestionTyping}
                         />
@@ -4124,6 +4331,7 @@ export default function GatewayApp() {
                       onChatRuntimeControlsChange={handleChatRuntimeControlsChange}
                       onPickReadableFiles={() => fileInputRef.current?.click()}
                       onPasteFiles={handleImportReadableFiles}
+                      loadHistoryPrompts={loadComposerHistoryPrompts}
                       pendingUploadedFiles={pendingUploadedFiles}
                       onRemovePendingUpload={(relativePath) => {
                         updatePendingUploadsForConversation(

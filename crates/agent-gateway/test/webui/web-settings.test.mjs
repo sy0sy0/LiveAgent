@@ -6,7 +6,58 @@ const loader = createWebModuleLoader();
 const webSettings = loader.loadModule("src/lib/webSettings.ts");
 const settings = loader.loadModule("@/lib/settings/index.ts");
 const settingsSync = loader.loadModule("@/lib/settings/sync.ts");
+const chatHelpers = loader.loadModule("@/lib/chat/chatPageHelpers.ts");
 const RIGHT_DOCK_TAB_IDS = settings.RIGHT_DOCK_SINGLETON_TAB_IDS;
+
+test("gateway model picker keeps same-name provider instances in separate groups", () => {
+  const modelOptions = chatHelpers.buildModelOptions({
+    customProviders: [
+      {
+        id: "same-api-a",
+        name: "Shared",
+        type: "codex",
+        activeModels: ["shared-model", "model-a"],
+      },
+      { id: "same-api-b", name: "Shared", type: "codex", activeModels: ["shared-model"] },
+      { id: "different-api", name: "Shared", type: "claude_code", activeModels: ["model-c"] },
+    ],
+    selectedModel: { customProviderId: "same-api-b", model: "shared-model" },
+  });
+
+  const groups = chatHelpers.groupModelOptionsByProvider(modelOptions);
+
+  assert.deepEqual(
+    groups.map((group) => ({
+      id: group.id,
+      name: group.name,
+      type: group.providerType,
+      options: group.opts.map((option) => ({ value: option.value, model: option.model })),
+    })),
+    [
+      {
+        id: "same-api-b",
+        name: "Shared",
+        type: "codex",
+        options: [{ value: "same-api-b::shared-model", model: "shared-model" }],
+      },
+      {
+        id: "same-api-a",
+        name: "Shared",
+        type: "codex",
+        options: [
+          { value: "same-api-a::shared-model", model: "shared-model" },
+          { value: "same-api-a::model-a", model: "model-a" },
+        ],
+      },
+      {
+        id: "different-api",
+        name: "Shared",
+        type: "claude_code",
+        options: [{ value: "different-api::model-c", model: "model-c" }],
+      },
+    ],
+  );
+});
 
 function installWindow(origin = "https://gateway.example") {
   const store = new Map();
@@ -349,6 +400,39 @@ test("web chat runtime controls default and follow model-aware reasoning support
       modelId: "not-a-real-model",
     }).reasoning,
     "high",
+  );
+});
+
+test("Anthropic settings keep 1M context parity for adaptive and explicit relay suffix models", () => {
+  assert.equal(
+    settings.getProviderModelDefaults("claude_code", "claude-sonnet-4-6").contextWindow,
+    1_000_000,
+  );
+  assert.equal(
+    settings.getProviderModelDefaults("claude_code", "claude-sonnet-4-5").contextWindow,
+    200_000,
+  );
+  assert.equal(
+    settings.getProviderModelDefaults("claude_code", "claude-sonnet-4-5[1m]").contextWindow,
+    1_000_000,
+  );
+  assert.equal(
+    settings.getProviderModelDefaults("claude_code", "claude-4.6-sonnet").contextWindow,
+    1_000_000,
+  );
+  assert.equal(
+    settings.findProviderModelConfig(
+      { models: [], type: "claude_code", baseUrl: "https://relay.example.com/v1" },
+      "claude-sonnet-4-5[1m]",
+    ).contextWindow,
+    1_000_000,
+  );
+  assert.equal(
+    settings.findProviderModelConfig(
+      { models: [], type: "claude_code", baseUrl: "https://api.anthropic.com/v1" },
+      "claude-sonnet-4-5[1m]",
+    ).contextWindow,
+    200_000,
   );
 });
 

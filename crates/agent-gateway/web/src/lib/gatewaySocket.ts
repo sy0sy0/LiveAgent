@@ -21,6 +21,7 @@ import type {
   SftpTransferEvent,
   SftpTransferResponse,
 } from "@/lib/sftp/types";
+import { createUuid } from "@/lib/shared/id";
 import { BrowserGatewayTerminalStreamClient } from "@/lib/terminal/gatewayTerminalStreamClient";
 import type {
   SshTerminalTab,
@@ -553,14 +554,10 @@ function buildWebSocketUrl() {
 function createChatClientRequestId(input: GatewayChatCommandInput) {
   const commandType = input.type.trim() || "chat.command";
   const conversationId = input.conversationId?.trim() || "new";
-  const randomPart =
-    typeof globalThis.crypto?.randomUUID === "function"
-      ? globalThis.crypto.randomUUID()
-      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   return `webui-${commandType.replace(/[^a-z0-9._-]/gi, "_")}-${conversationId.replace(
     /[^a-z0-9._-]/gi,
     "_",
-  )}-${randomPart}`;
+  )}-${createUuid()}`;
 }
 
 function buildChatCommandPayload(input: GatewayChatCommandInput) {
@@ -2172,6 +2169,16 @@ export class GatewayWebSocketClient {
     });
   }
 
+  async branchHistory(
+    conversationId: string,
+    baseMessageRef: HistoryMessageRef,
+  ): Promise<ConversationSummary> {
+    return this.request<ConversationSummary>("history.branch", {
+      conversation_id: conversationId,
+      base_message_ref: buildHistoryMessageRefPayload(baseMessageRef),
+    });
+  }
+
   async pinHistory(conversationId: string, isPinned: boolean): Promise<ConversationSummary> {
     return this.request<ConversationSummary>("history.pin", {
       conversation_id: conversationId,
@@ -3347,6 +3354,10 @@ export type GatewayWebSocketClientLike = {
     options?: HistoryGetOptions,
   ): Promise<HistoryDetail>;
   renameHistory(conversationId: string, title: string): Promise<ConversationSummary>;
+  branchHistory(
+    conversationId: string,
+    baseMessageRef: HistoryMessageRef,
+  ): Promise<ConversationSummary>;
   pinHistory(conversationId: string, isPinned: boolean): Promise<ConversationSummary>;
   getHistoryShare(conversationId: string): Promise<HistoryShareStatus>;
   setHistoryShare(

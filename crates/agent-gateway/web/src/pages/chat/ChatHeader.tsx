@@ -21,6 +21,7 @@ import {
   DropdownMenuTrigger,
 } from "../../components/ui/dropdown-menu";
 import { useLocale } from "../../i18n";
+import { groupModelOptionsByProvider } from "../../lib/chat/chatPageHelpers";
 import { type ModelOption, parseModelValue } from "../../lib/providers/llm";
 import {
   type AppSettings,
@@ -90,33 +91,15 @@ export const ChatHeader = memo(function ChatHeader(props: {
     }
   }, [isModelMenuOpen]);
 
-  const groups = useMemo(() => {
-    const nextGroups: { name: string; providerType: ProviderId; opts: ModelOption[] }[] = [];
-    const groupMap = new Map<string, ModelOption[]>();
-    for (const option of modelOptions) {
-      const existing = groupMap.get(option.providerName);
-      if (existing) {
-        existing.push(option);
-        continue;
-      }
-      const nextGroup: ModelOption[] = [option];
-      groupMap.set(option.providerName, nextGroup);
-      nextGroups.push({
-        name: option.providerName,
-        providerType: option.providerType,
-        opts: nextGroup,
-      });
-    }
-    return nextGroups;
-  }, [modelOptions]);
+  const groups = useMemo(() => groupModelOptionsByProvider(modelOptions), [modelOptions]);
   const selectedOption = modelOptions.find((option) => option.value === selectedValue);
-  const selectedGroupName = selectedOption?.providerName;
+  const selectedGroupId = selectedOption?.providerId;
   // 默认全部折叠，仅当前选中模型所在分组展开
-  const isGroupExpanded = (name: string) => expandedGroups[name] ?? name === selectedGroupName;
-  const toggleGroup = (name: string) =>
+  const isGroupExpanded = (id: string) => expandedGroups[id] ?? id === selectedGroupId;
+  const toggleGroup = (id: string) =>
     setExpandedGroups((prev) => ({
       ...prev,
-      [name]: !(prev[name] ?? name === selectedGroupName),
+      [id]: !(prev[id] ?? id === selectedGroupId),
     }));
 
   return (
@@ -168,15 +151,15 @@ export const ChatHeader = memo(function ChatHeader(props: {
               {(() => {
                 let animationIndex = 0;
                 return groups.map((group, groupIndex) => {
-                  const expanded = isGroupExpanded(group.name);
+                  const expanded = isGroupExpanded(group.id);
                   return (
-                    <div key={group.name} className="flex flex-col gap-0.5">
+                    <div key={group.id} className="flex flex-col gap-0.5">
                       {groupIndex > 0 ? <DropdownMenuSeparator /> : null}
                       <DropdownMenuItem
                         onSelect={(event) => {
                           // 阻止 Radix 默认的选中即关闭：分组头只负责展开/收起
                           event.preventDefault();
-                          toggleGroup(group.name);
+                          toggleGroup(group.id);
                         }}
                         aria-expanded={expanded}
                         title={expanded ? t("chat.collapseProvider") : t("chat.expandProvider")}

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 
 import { ChevronRight, Terminal } from "../../../../components/icons";
 import { useLocale } from "../../../../i18n";
@@ -11,10 +11,11 @@ import {
   getToolMeta,
   getToolTraceKey,
 } from "./assistantBubbleUtils";
+import { LazyCollapse } from "./LazyCollapse";
 import { AssistantStatus } from "./StatusText";
-import { MemoToolCallItem } from "./ToolCallItem";
+import { areToolTraceItemsEqual, MemoToolCallItem } from "./ToolCallItem";
 
-export function ToolTraceGroup(props: { items: ToolTraceItem[]; runningToolCallIds?: string[] }) {
+function ToolTraceGroupInner(props: { items: ToolTraceItem[]; runningToolCallIds?: string[] }) {
   const { items, runningToolCallIds = [] } = props;
   const { t } = useLocale();
   const counts = useMemo(
@@ -87,14 +88,8 @@ export function ToolTraceGroup(props: { items: ToolTraceItem[]; runningToolCallI
         </div>
       </button>
 
-      <div
-        aria-hidden={!open}
-        className={cn(
-          "grid transition-[grid-template-rows,opacity] duration-200 ease-out",
-          open ? "grid-rows-[1fr] opacity-100" : "pointer-events-none grid-rows-[0fr] opacity-0",
-        )}
-      >
-        <div className="min-h-0 overflow-hidden">
+      <LazyCollapse open={open}>
+        {() => (
           <div className="space-y-0.5 pb-2 pl-[22px] pt-1">
             {items.map((item, index) => (
               <MemoToolCallItem
@@ -106,8 +101,28 @@ export function ToolTraceGroup(props: { items: ToolTraceItem[]; runningToolCallI
               />
             ))}
           </div>
-        </div>
-      </div>
+        )}
+      </LazyCollapse>
     </div>
   );
 }
+
+function areRunningIdsEqual(previous?: string[], next?: string[]) {
+  if (previous === next) return true;
+  if (!previous || !next || previous.length !== next.length) return false;
+  return previous.every((id, index) => id === next[index]);
+}
+
+// A streaming text delta rebuilds the round's grouped-block structure with
+// fresh arrays but unchanged tool items — compare element-wise so the whole
+// group (every child card) bails unless a tool actually changed.
+export const ToolTraceGroup = memo(
+  ToolTraceGroupInner,
+  (previous, next) =>
+    previous.items.length === next.items.length &&
+    previous.items.every(
+      (item, index) =>
+        item === next.items[index] || areToolTraceItemsEqual(item, next.items[index]),
+    ) &&
+    areRunningIdsEqual(previous.runningToolCallIds, next.runningToolCallIds),
+);

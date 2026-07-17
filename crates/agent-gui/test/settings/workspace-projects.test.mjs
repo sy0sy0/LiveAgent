@@ -233,6 +233,65 @@ test("history merge stores conversation activity on configured and discovered pr
   );
 });
 
+test("archived paths survive resolveWorkspaceProjects normalization", () => {
+  const resolved = settings.resolveWorkspaceProjects(
+    {
+      ...settings.getDefaultSettings().system,
+      workspaceProjects: [
+        project(settings.DEFAULT_WORKSPACE_PROJECT_ID, "/tmp/default-project", 1),
+        project("project-a", "/tmp/project-a", 2),
+        project("project-b", "/tmp/project-b", 3),
+      ],
+      archivedWorkspaceProjectPaths: [
+        "/tmp/project-a",
+        "/tmp/project-a/",
+        " /tmp/default-project ",
+      ],
+    },
+    "/tmp/default-project",
+  );
+
+  assert.deepEqual(resolved.archivedWorkspaceProjectPaths, [
+    "/tmp/project-a",
+    "/tmp/default-project",
+  ]);
+  assert.equal(resolved.activeWorkspaceProjectId, "project-b");
+});
+
+test("resolveWorkspaceProjects keeps one workspace selectable when every path is archived", () => {
+  const resolved = settings.resolveWorkspaceProjects(
+    {
+      ...settings.getDefaultSettings().system,
+      workspaceProjects: [
+        project(settings.DEFAULT_WORKSPACE_PROJECT_ID, "/tmp/default-project", 1),
+        project("project-a", "/tmp/project-a", 2),
+      ],
+      activeWorkspaceProjectId: "project-a",
+      archivedWorkspaceProjectPaths: ["/tmp/default-project", "/tmp/project-a"],
+    },
+    "/tmp/default-project",
+  );
+
+  assert.equal(resolved.activeWorkspaceProjectId, settings.DEFAULT_WORKSPACE_PROJECT_ID);
+  assert.deepEqual(resolved.archivedWorkspaceProjectPaths, ["/tmp/project-a"]);
+});
+
+test("removed (hidden) paths are dropped from the archived list", () => {
+  const resolved = settings.resolveWorkspaceProjects(
+    {
+      ...settings.getDefaultSettings().system,
+      workspaceProjects: [
+        project(settings.DEFAULT_WORKSPACE_PROJECT_ID, "/tmp/default-project", 1),
+      ],
+      hiddenWorkspaceProjectPaths: ["/tmp/project-a"],
+      archivedWorkspaceProjectPaths: ["/tmp/project-a", "/tmp/project-b"],
+    },
+    "/tmp/default-project",
+  );
+
+  assert.deepEqual(resolved.archivedWorkspaceProjectPaths, ["/tmp/project-b"]);
+});
+
 test("conversation activity persistence does not rewrite project metadata ordering", () => {
   const projects = [
     project(settings.DEFAULT_WORKSPACE_PROJECT_ID, "/tmp/default-project", 1),

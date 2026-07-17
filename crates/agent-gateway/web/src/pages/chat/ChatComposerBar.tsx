@@ -129,6 +129,8 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: {
   onChatRuntimeControlsChange: (patch: Partial<ChatRuntimeControls>) => void;
   onPickReadableFiles: () => void;
   onPasteFiles: (files: File[]) => void;
+  /** Prompts previously sent in this conversation for ↑/↓ recall. */
+  loadHistoryPrompts?: () => readonly string[];
   pendingUploadedFiles: PendingUploadedFile[];
   onRemovePendingUpload: (relativePath: string) => void;
   queuedTurns: ChatQueueTurnPreview[];
@@ -160,6 +162,7 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: {
     onChatRuntimeControlsChange,
     onPickReadableFiles,
     onPasteFiles,
+    loadHistoryPrompts,
     pendingUploadedFiles,
     onRemovePendingUpload,
     queuedTurns,
@@ -606,6 +609,7 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: {
               onEmptyChange={setComposerIsEmpty}
               onBusyChange={onComposerBusyChange}
               onPasteFiles={onPasteFiles}
+              loadHistoryPrompts={loadHistoryPrompts}
               placeholder={inputPlaceholder}
               disabled={isInputDisabled}
               workdir={workdir}

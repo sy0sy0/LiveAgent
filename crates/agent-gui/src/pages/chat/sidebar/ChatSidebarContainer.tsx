@@ -50,6 +50,9 @@ type ChatSidebarContainerProps = {
   onCancelProjectRename: () => void;
   onSetProjectPinned: (project: WorkspaceProject, isPinned: boolean) => void;
   onRemoveProject: (project: WorkspaceProject) => void;
+  onArchiveProject: (project: WorkspaceProject) => void;
+  onUnarchiveProject: (project: WorkspaceProject) => void;
+  archivedProjectPathKeys?: ReadonlySet<string>;
   onNewConversation: () => void;
   onSelectConversation: (id: string) => void;
   // Invoked after the store confirmed a deletion; ChatPage cleans artifacts
@@ -211,6 +214,9 @@ export function ChatSidebarContainer(props: ChatSidebarContainerProps) {
       onCancelProjectRename={props.onCancelProjectRename}
       onSetProjectPinned={props.onSetProjectPinned}
       onRemoveProject={props.onRemoveProject}
+      onArchiveProject={props.onArchiveProject}
+      onUnarchiveProject={props.onUnarchiveProject}
+      archivedProjectPathKeys={props.archivedProjectPathKeys}
       onNewConversation={props.onNewConversation}
       onSelectConversation={props.onSelectConversation}
       onStartRenaming={handleStartRenaming}

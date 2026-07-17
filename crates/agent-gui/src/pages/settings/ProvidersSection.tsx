@@ -17,6 +17,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  Search,
   Settings,
   Settings2,
   Trash2,
@@ -53,6 +54,7 @@ import {
   updateCustomProviders,
   updateCustomSettings,
 } from "../../lib/settings";
+import { createUuid } from "../../lib/shared/id";
 import { cn } from "../../lib/shared/utils";
 import {
   type CherryProviderImportItem,
@@ -256,6 +258,7 @@ function ProviderModal({ providerType, initialData, onSave, onClose }: ModalProp
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [addingModel, setAddingModel] = useState(false);
   const [newModelName, setNewModelName] = useState("");
+  const [modelSearch, setModelSearch] = useState("");
   const [editingModel, setEditingModel] = useState<ProviderModelConfig | null>(null);
   const [showApiKey, setShowApiKey] = useState(false);
 
@@ -318,10 +321,10 @@ function ProviderModal({ providerType, initialData, onSave, onClose }: ModalProp
 
   function setVisibleModelsSelected(selected: boolean) {
     setActiveModels((prev) => {
-      const visibleModels = new Set(models.map((model) => model.id));
-      const next = new Set(Array.from(prev).filter((model) => !visibleModels.has(model)));
+      const visibleModelIds = new Set(visibleModels.map((model) => model.id));
+      const next = new Set(Array.from(prev).filter((model) => !visibleModelIds.has(model)));
       if (selected) {
-        for (const model of models) next.add(model.id);
+        for (const model of visibleModels) next.add(model.id);
       }
       return next;
     });
@@ -385,12 +388,20 @@ function ProviderModal({ providerType, initialData, onSave, onClose }: ModalProp
 
   const isEditing = Boolean(initialData);
   const typeLabel = getProviderLabel(providerType);
-  const allVisibleModelsSelected =
-    models.length > 0 && models.every((model) => activeModels.has(model.id));
   const orderedModels = useMemo(
     () => sortModelsBySelection(models, activeModels),
     [models, activeModels],
   );
+  const modelSearchQuery = modelSearch.trim().toLowerCase();
+  const visibleModels = useMemo(
+    () =>
+      modelSearchQuery
+        ? orderedModels.filter((model) => model.id.toLowerCase().includes(modelSearchQuery))
+        : orderedModels,
+    [orderedModels, modelSearchQuery],
+  );
+  const allVisibleModelsSelected =
+    visibleModels.length > 0 && visibleModels.every((model) => activeModels.has(model.id));
 
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
@@ -488,7 +499,7 @@ function ProviderModal({ providerType, initialData, onSave, onClose }: ModalProp
                   size="sm"
                   className="h-7 px-2 text-xs"
                   onClick={() => setVisibleModelsSelected(!allVisibleModelsSelected)}
-                  disabled={models.length === 0}
+                  disabled={visibleModels.length === 0}
                 >
                   {allVisibleModelsSelected ? t("settings.deselectAll") : t("settings.selectAll")}
                 </Button>
@@ -546,15 +557,46 @@ function ProviderModal({ providerType, initialData, onSave, onClose }: ModalProp
               </div>
             ) : null}
 
+            {models.length > 0 ? (
+              <div className="relative">
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={modelSearch}
+                  className="h-8 pl-8 pr-8 text-sm"
+                  placeholder={t("settings.searchModels")}
+                  aria-label={t("settings.searchModels")}
+                  autoComplete="off"
+                  spellCheck={false}
+                  onChange={(event) => setModelSearch(event.currentTarget.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") setModelSearch("");
+                  }}
+                />
+                {modelSearch ? (
+                  <button
+                    type="button"
+                    className="absolute right-1 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+                    onClick={() => setModelSearch("")}
+                    title={t("settings.clearModelSearch")}
+                    aria-label={t("settings.clearModelSearch")}
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
+
             <div className="max-h-[220px] divide-y overflow-y-auto rounded-lg border">
-              {orderedModels.length === 0 ? (
+              {visibleModels.length === 0 ? (
                 <div className="px-3 py-4 text-center text-xs text-muted-foreground">
-                  {baseUrl.trim() && apiKeyForRequest
-                    ? t("settings.fetchFailed")
-                    : t("settings.fetchHint")}
+                  {models.length > 0 && modelSearchQuery
+                    ? t("settings.noMatchingModels")
+                    : baseUrl.trim() && apiKeyForRequest
+                      ? t("settings.fetchFailed")
+                      : t("settings.fetchHint")}
                 </div>
               ) : (
-                orderedModels.map((model) => {
+                visibleModels.map((model) => {
                   const checkboxId = `model-${providerType}-${normalizeModelDomId(model.id)}`;
                   return (
                     <div
@@ -1811,7 +1853,7 @@ export function ProvidersSection(props: SettingsSectionProps) {
       }
 
       const newProvider: CustomProvider = {
-        id: crypto.randomUUID(),
+        id: createUuid(),
         ...data,
       };
       return updateCustomProviders(prev, [...prev.customProviders, newProvider]);

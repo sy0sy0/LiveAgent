@@ -60,9 +60,9 @@ export const DIRECTION_SLOP_PX = 1;
 // can never read as "dragged away from the bottom".
 export const POINTER_DRAG_SLOP_PX = 4;
 
-// Attach-side gesture latch. Refreshed by wheel/touch/key input and extended
-// by chained downward scroll events (touchscreen momentum carries no input
-// events); it can extend an active latch but never create one.
+// Attach-side gesture latch. Armed only by toward-bottom wheel/touch/key input
+// and extended by chained downward scroll events (touchscreen momentum carries
+// no input events); it can extend an active latch but never create one.
 export const GESTURE_LATCH_MS = 500;
 
 export type FollowConfig = {
@@ -157,11 +157,11 @@ export function reduceFollowEvent(
 ): FollowStep {
   switch (event.type) {
     case "wheel": {
-      const next = { ...state, latchUntil: event.now + config.latchMs };
       if (!isDominantVerticalWheel(event.deltaX, event.deltaY)) {
-        return { state: next, pin: false };
+        return { state, pin: false };
       }
       if (event.deltaY < 0) {
+        const next = { ...state, latchUntil: 0 };
         // Wheel-up consumed by a nested scroller (thinking <pre>, tool output)
         // never moves the viewport; detaching there would strand follow "off"
         // while visually pinned at the bottom.
@@ -170,6 +170,7 @@ export function reduceFollowEvent(
         }
         return { state: next, pin: false };
       }
+      const next = { ...state, latchUntil: event.now + config.latchMs };
       // Wheeling down while already clamped at the bottom produces no scroll
       // event (scrollTop can't change), so a detached-at-bottom state must
       // re-engage here explicitly.
@@ -181,13 +182,14 @@ export function reduceFollowEvent(
     }
 
     case "touchMove": {
-      const next = { ...state, latchUntil: event.now + config.latchMs };
+      const movedAway = event.fingerMovedDown !== false;
+      const next = {
+        ...state,
+        latchUntil: movedAway ? 0 : event.now + config.latchMs,
+      };
       // Any touch drag off the clamp detaches; downward re-engagement flows
       // through the scroll/zone/release paths.
-      if (
-        event.hasOverflow &&
-        (event.fingerMovedDown !== false || event.gap > config.attachThresholdPx)
-      ) {
+      if (event.hasOverflow && (movedAway || event.gap > config.attachThresholdPx)) {
         next.following = false;
       }
       return { state: next, pin: false };
@@ -282,7 +284,7 @@ export function reduceFollowEvent(
     }
 
     case "historyKey": {
-      const next = { ...state, latchUntil: event.now + config.latchMs };
+      const next = { ...state, latchUntil: 0 };
       if (event.hasOverflow) {
         next.following = false;
       }

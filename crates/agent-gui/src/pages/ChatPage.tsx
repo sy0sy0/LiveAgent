@@ -42,7 +42,10 @@ import type { AppUpdateController } from "../lib/appUpdates";
 import { getAutomationState } from "../lib/automation";
 import { createHookRunScope } from "../lib/automation/hookRunner";
 import type { CompactionStatus } from "../lib/chat/compaction/types";
-import { buildPersistableMessagesFromSnapshot } from "../lib/chat/conversation/chatAbort";
+import {
+  buildPersistableMessagesFromSnapshot,
+  type SuppressedToolTraceSnapshot,
+} from "../lib/chat/conversation/chatAbort";
 import {
   appendMessagesToConversation,
   buildRequestContext,
@@ -59,6 +62,7 @@ import {
 } from "../lib/chat/conversation/run";
 import { createTurnCancellation } from "../lib/chat/conversation/turnCancellation";
 import {
+  branchChatHistory,
   type ChatHistoryShareStatus,
   type ChatHistorySummary,
   deleteChatHistory,
@@ -83,6 +87,7 @@ import {
   withPastedTextDisplayMetadata,
 } from "../lib/chat/messages/uploadedFiles";
 import {
+  BRANCH_CONVERSATION_DEFAULT_TITLE,
   buildFallbackConversationTitle,
   buildModelOptions,
   createConversationIdentity,
@@ -146,6 +151,7 @@ import {
   workspaceProjectPathKey,
 } from "../lib/settings";
 import { tauriSftpClient } from "../lib/sftp/tauriSftpClient";
+import { createUuid } from "../lib/shared/id";
 import { cn } from "../lib/shared/utils";
 import { createGuiSidebarBackend } from "../lib/sidebar/guiSidebarBackend";
 import {
@@ -277,11 +283,7 @@ const WorkspaceSshTerminalOverlay = lazy(async () => {
 });
 
 function createLocalGatewayChatRunId(conversationId: string) {
-  const suffix =
-    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-      ? crypto.randomUUID()
-      : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  return `conversation-live-${conversationId}-${suffix}`;
+  return `conversation-live-${conversationId}-${createUuid()}`;
 }
 
 type ChatPageProps = {
@@ -693,9 +695,21 @@ export function ChatPage(props: ChatPageProps) {
     () => new Set(settings.system.missingWorkspaceProjectPaths.map(workspaceProjectPathKey)),
     [settings.system.missingWorkspaceProjectPaths],
   );
+  const archivedWorkspaceProjectPathKeys = useMemo(
+    () => new Set(settings.system.archivedWorkspaceProjectPaths.map(workspaceProjectPathKey)),
+    [settings.system.archivedWorkspaceProjectPaths],
+  );
+  // Archived workspaces can never be active. Falling back to the full list
+  // only guards a transient synced state where everything is archived.
+  const selectableWorkspaceProjects = useMemo(() => {
+    const active = workspaceProjects.filter(
+      (project) => !archivedWorkspaceProjectPathKeys.has(workspaceProjectPathKey(project.path)),
+    );
+    return active.length > 0 ? active : workspaceProjects;
+  }, [archivedWorkspaceProjectPathKeys, workspaceProjects]);
   const activeWorkspaceProject = useMemo(
-    () => findWorkspaceProject(workspaceProjects, activeWorkspaceProjectId),
-    [activeWorkspaceProjectId, workspaceProjects],
+    () => findWorkspaceProject(selectableWorkspaceProjects, activeWorkspaceProjectId),
+    [activeWorkspaceProjectId, selectableWorkspaceProjects],
   );
   useEffect(() => {
     if (activeWorkspaceProject?.id && activeWorkspaceProject.id !== activeWorkspaceProjectId) {
@@ -904,6 +918,9 @@ export function ChatPage(props: ChatPageProps) {
         ) &&
         !settings.system.missingWorkspaceProjectPaths.some(
           (path) => workspaceProjectPathKey(path) === normalizedPathKey,
+        ) &&
+        !settings.system.archivedWorkspaceProjectPaths.some(
+          (path) => workspaceProjectPathKey(path) === normalizedPathKey,
         )
       ) {
         return;
@@ -947,6 +964,10 @@ export function ChatPage(props: ChatPageProps) {
             missingWorkspaceProjectPaths: prev.system.missingWorkspaceProjectPaths.filter(
               (path) => workspaceProjectPathKey(path) !== normalizedPathKey,
             ),
+            // Activating a workspace always brings it back from the archive.
+            archivedWorkspaceProjectPaths: prev.system.archivedWorkspaceProjectPaths.filter(
+              (path) => workspaceProjectPathKey(path) !== normalizedPathKey,
+            ),
           },
           getDefaultWorkspaceProjectPath(prev.system),
         );
@@ -956,6 +977,7 @@ export function ChatPage(props: ChatPageProps) {
         };
       });
       if (options?.startConversation) {
+        prepareComposerForConversationChangeActionRef.current();
         startNewConversationActionRef.current({ workdir: targetProject.path });
       }
     },
@@ -1290,6 +1312,19 @@ export function ChatPage(props: ChatPageProps) {
     () => conversationState.historyRenderItems,
     [conversationState],
   );
+  // Sent-prompt history for the composer's ↑/↓ recall. Read lazily through a
+  // ref so the memoized composer bar never re-renders on transcript growth.
+  const historyRenderItemsRef = useRef<RenderTimelineItem[]>(historyRenderItems);
+  useEffect(() => {
+    historyRenderItemsRef.current = historyRenderItems;
+  }, [historyRenderItems]);
+  const loadComposerHistoryPrompts = useCallback(() => {
+    const prompts: string[] = [];
+    for (const item of historyRenderItemsRef.current) {
+      if (item.kind === "user" && item.text.trim()) prompts.push(item.text);
+    }
+    return prompts;
+  }, []);
   const currentRequestContext = useMemo(
     () => buildRequestContext(conversationState),
     [conversationState],
@@ -1300,6 +1335,7 @@ export function ChatPage(props: ChatPageProps) {
   const composerBusyRef = useRef(false);
   const composerRef = useRef<MentionComposerHandle | null>(null);
   const composerDraftCacheRef = useRef<Map<string, MentionComposerDraft>>(new Map());
+  const composerDraftOwnerRef = useRef(currentConversationId);
   const conversationLoadSequenceRef = useRef(0);
   const subagentStoresRef = useRef(createSubagentStoreManager());
   const previousSubagentRuntimeConversationRef = useRef(currentConversationId);
@@ -1316,6 +1352,7 @@ export function ChatPage(props: ChatPageProps) {
   const startNewConversationActionRef = useRef<(options?: { workdir?: string }) => void>(
     () => undefined,
   );
+  const prepareComposerForConversationChangeActionRef = useRef<() => void>(() => undefined);
   const openInitialActionRef = useRef<(id: string) => Promise<"cache-hit" | "painted">>(
     async () => "painted",
   );
@@ -1362,7 +1399,6 @@ export function ChatPage(props: ChatPageProps) {
     captureAbortSnapshot,
     getAbortSnapshot,
     resetLiveTranscript,
-    updateLiveRounds,
     appendDraftAssistantText,
     batchLiveRoundsUpdate,
     updateToolStatus,
@@ -1951,6 +1987,9 @@ export function ChatPage(props: ChatPageProps) {
       const key = conversationId.trim();
       if (!key) return;
       composerDraftCacheRef.current.delete(key);
+      if (composerDraftOwnerRef.current === key) {
+        composerDraftOwnerRef.current = "";
+      }
       locallySyncedHistoryUpdatedAtRef.current.delete(key);
       gatewayBridgeHistorySummaryRef.current.delete(key);
       setPendingUploadsForConversation(key, []);
@@ -1972,10 +2011,14 @@ export function ChatPage(props: ChatPageProps) {
     scrollFollowRef.current?.stickToBottom();
   }
 
-  function cacheActiveComposerDraft(conversationId = currentConversationIdRef.current) {
+  function cacheActiveComposerDraft(conversationId = composerDraftOwnerRef.current) {
     const targetConversationId = conversationId.trim();
     const composer = composerRef.current;
-    if (!targetConversationId || !composer) {
+    if (
+      !targetConversationId ||
+      composerDraftOwnerRef.current !== targetConversationId ||
+      !composer
+    ) {
       return;
     }
 
@@ -1987,6 +2030,29 @@ export function ChatPage(props: ChatPageProps) {
 
     composerDraftCacheRef.current.set(targetConversationId, draft);
   }
+
+  function prepareComposerForConversationChange() {
+    cacheActiveComposerDraft();
+    composerDraftOwnerRef.current = "";
+  }
+
+  function restoreCachedComposerDraft(conversationId: string) {
+    const targetConversationId = conversationId.trim();
+    const composer = composerRef.current;
+    if (!targetConversationId || !composer) {
+      return;
+    }
+
+    const cachedDraft = composerDraftCacheRef.current.get(targetConversationId);
+    if (cachedDraft) {
+      composer.setDraft(cachedDraft);
+    } else {
+      composer.clear();
+    }
+    composerDraftOwnerRef.current = targetConversationId;
+  }
+
+  prepareComposerForConversationChangeActionRef.current = prepareComposerForConversationChange;
 
   function clearCachedComposerDraft(conversationId = currentConversationIdRef.current) {
     const targetConversationId = conversationId.trim();
@@ -2007,12 +2073,14 @@ export function ChatPage(props: ChatPageProps) {
     }
 
     const frameId = window.requestAnimationFrame(() => {
-      const cachedDraft = composerDraftCacheRef.current.get(targetConversationId);
       const composer = composerRef.current;
-      if (!cachedDraft || !composer || composer.hasContent()) {
+      if (
+        !composer ||
+        (composerDraftOwnerRef.current === targetConversationId && composer.hasContent())
+      ) {
         return;
       }
-      composer.setDraft(cachedDraft);
+      restoreCachedComposerDraft(targetConversationId);
     });
 
     return () => {
@@ -2737,6 +2805,15 @@ export function ChatPage(props: ChatPageProps) {
       if (project.id === DEFAULT_WORKSPACE_PROJECT_ID) return;
       const path = project.path.trim();
       const pathKey = workspaceProjectPathKey(path);
+      // Removing the last non-archived workspace would leave nothing usable;
+      // the default project is unarchived alongside in that case. The merged
+      // list (settings + history workdirs) is the authority on what remains.
+      const hasOtherActiveProjects = workspaceProjects.some(
+        (item) =>
+          item.id !== project.id &&
+          workspaceProjectPathKey(item.path) !== pathKey &&
+          !archivedWorkspaceProjectPathKeys.has(workspaceProjectPathKey(item.path)),
+      );
       setActiveWorkspaceProjectId((current) => {
         const currentProject = workspaceProjects.find((item) => item.id === current);
         if (
@@ -2769,6 +2846,16 @@ export function ChatPage(props: ChatPageProps) {
               missingWorkspaceProjectPaths: prev.system.missingWorkspaceProjectPaths.filter(
                 (item) => workspaceProjectPathKey(item) !== pathKey,
               ),
+              archivedWorkspaceProjectPaths: prev.system.archivedWorkspaceProjectPaths.filter(
+                (item) => {
+                  const itemKey = workspaceProjectPathKey(item);
+                  if (itemKey === pathKey) return false;
+                  return (
+                    hasOtherActiveProjects ||
+                    itemKey !== workspaceProjectPathKey(getDefaultWorkspaceProjectPath(prev.system))
+                  );
+                },
+              ),
             },
             getDefaultWorkspaceProjectPath(prev.system),
           ),
@@ -2778,7 +2865,7 @@ export function ChatPage(props: ChatPageProps) {
       setProjectRenamingId((current) => (current === project.id ? null : current));
       setProjectRenameDraft("");
     },
-    [setSettings, workspaceProjects],
+    [archivedWorkspaceProjectPathKeys, setSettings, workspaceProjects],
   );
 
   const handleRemoveWorkspaceProject = useCallback(
@@ -2909,6 +2996,74 @@ export function ChatPage(props: ChatPageProps) {
       sidebarStore,
       terminalProjectPathKey,
     ],
+  );
+
+  const handleArchiveWorkspaceProject = useCallback(
+    (project: WorkspaceProject) => {
+      const pathKey = workspaceProjectPathKey(project.path);
+      if (!pathKey || archivedWorkspaceProjectPathKeys.has(pathKey)) return;
+      const fallbackProject = workspaceProjects.find(
+        (item) =>
+          item.id !== project.id &&
+          workspaceProjectPathKey(item.path) !== pathKey &&
+          !archivedWorkspaceProjectPathKeys.has(workspaceProjectPathKey(item.path)),
+      );
+      // Archiving is only offered while another active workspace remains.
+      if (!fallbackProject) return;
+      if (
+        activeWorkspaceProject &&
+        (activeWorkspaceProject.id === project.id ||
+          workspaceProjectPathKey(activeWorkspaceProject.path) === pathKey)
+      ) {
+        activateWorkspaceProject(fallbackProject);
+      }
+      setSettings((prev) =>
+        prev.system.archivedWorkspaceProjectPaths.some(
+          (path) => workspaceProjectPathKey(path) === pathKey,
+        )
+          ? prev
+          : {
+              ...prev,
+              system: {
+                ...prev.system,
+                archivedWorkspaceProjectPaths: [
+                  ...prev.system.archivedWorkspaceProjectPaths,
+                  project.path.trim(),
+                ],
+              },
+            },
+      );
+    },
+    [
+      activateWorkspaceProject,
+      activeWorkspaceProject,
+      archivedWorkspaceProjectPathKeys,
+      setSettings,
+      workspaceProjects,
+    ],
+  );
+
+  const handleUnarchiveWorkspaceProject = useCallback(
+    (project: WorkspaceProject) => {
+      const pathKey = workspaceProjectPathKey(project.path);
+      if (!pathKey) return;
+      setSettings((prev) => {
+        const next = prev.system.archivedWorkspaceProjectPaths.filter(
+          (path) => workspaceProjectPathKey(path) !== pathKey,
+        );
+        if (next.length === prev.system.archivedWorkspaceProjectPaths.length) {
+          return prev;
+        }
+        return {
+          ...prev,
+          system: {
+            ...prev.system,
+            archivedWorkspaceProjectPaths: next,
+          },
+        };
+      });
+    },
+    [setSettings],
   );
 
   useEffect(() => {
@@ -3765,6 +3920,12 @@ export function ChatPage(props: ChatPageProps) {
     const existingHistoryItem =
       sidebarStore.peek(conversationId) ??
       gatewayBridgeHistorySummaryRef.current.get(conversationId);
+    // Branched conversations start with the placeholder title; the first
+    // prompt sent inside the branch regenerates it like a first turn would.
+    const isBranchDefaultTitle =
+      !!existingHistoryItem &&
+      !existingHistoryItem.isPending &&
+      existingHistoryItem.title.trim() === BRANCH_CONVERSATION_DEFAULT_TITLE;
     const shouldCreatePendingHistoryItem = isFirstTurn && !existingHistoryItem;
     const pendingConversationTitle = t("chat.pendingTitle");
     const fallbackTitle =
@@ -3776,7 +3937,7 @@ export function ChatPage(props: ChatPageProps) {
           );
 
     let titlePromise: Promise<string | null> | null = null;
-    if (isFirstTurn) {
+    if (isFirstTurn || isBranchDefaultTitle) {
       const titleModelSelection = resolveConversationTitleModelSelection(
         settings,
         effectiveSelectedModel,
@@ -4229,6 +4390,13 @@ export function ChatPage(props: ChatPageProps) {
     });
 
     let abortedConversationCommitted = false;
+    let persistableAgentProgress: {
+      completedThroughRound: number;
+      suppressedToolTrace: SuppressedToolTraceSnapshot[];
+    } = {
+      completedThroughRound: 0,
+      suppressedToolTrace: [],
+    };
     const commitVisibleAbortedConversation = () => {
       if (abortedConversationCommitted) return true;
 
@@ -4238,6 +4406,8 @@ export function ChatPage(props: ChatPageProps) {
         model: runtimeModel,
         draftAssistantText: snapshot.draftAssistantText,
         liveRounds: snapshot.liveRounds,
+        completedThroughRound: persistableAgentProgress.completedThroughRound,
+        suppressedToolTrace: persistableAgentProgress.suppressedToolTrace,
       });
 
       if (partialMessages.length === 0) return false;
@@ -4271,6 +4441,8 @@ export function ChatPage(props: ChatPageProps) {
         model: runtimeModel,
         draftAssistantText: snapshot.draftAssistantText,
         liveRounds: snapshot.liveRounds,
+        completedThroughRound: persistableAgentProgress.completedThroughRound,
+        suppressedToolTrace: persistableAgentProgress.suppressedToolTrace,
       });
       const errorAssistant = buildErrorAssistantMessage({
         model: runtimeModel,
@@ -4386,9 +4558,11 @@ export function ChatPage(props: ChatPageProps) {
             compaction,
             cancellation,
             resetLiveTranscript,
-            updateLiveRounds,
             batchLiveRoundsUpdate,
             updateToolStatus,
+            updatePersistableAgentProgress: (progress) => {
+              persistableAgentProgress = progress;
+            },
             commitVisibleAbortedConversation,
             updateConversationRuntimeEntry,
             persistConversationWithHistorySync,
@@ -4493,7 +4667,7 @@ export function ChatPage(props: ChatPageProps) {
 
   const handleNewConversation = useCallback(() => {
     openController.cancel();
-    clearCachedComposerDraft();
+    prepareComposerForConversationChange();
     startNewConversationActionRef.current({
       workdir: isAgentMode ? activeWorkspaceProjectPath || undefined : undefined,
     });
@@ -4505,7 +4679,9 @@ export function ChatPage(props: ChatPageProps) {
       if (!targetConversationId) {
         return;
       }
+      prepareComposerForConversationChange();
       openController.open(targetConversationId);
+      restoreCachedComposerDraft(targetConversationId);
     },
     [openController],
   );
@@ -5120,6 +5296,45 @@ export function ChatPage(props: ChatPageProps) {
     sendActionRef,
   });
 
+  // Copies the conversation prefix up to (and including) the picked assistant
+  // reply into a fresh "新分支" conversation, then switches to it. Defined
+  // after the hydration flags above so the guard reads the same sources as
+  // useEditResend.
+  const branchInFlightRef = useRef(false);
+  // 驱动被点行的转圈与全行禁用；ref 仍是同步防重入的真源。
+  const [branchPendingMessageId, setBranchPendingMessageId] = useState<string | null>(null);
+  const handleBranchConversation = useCallback(
+    async (messageRef: HistoryMessageRef) => {
+      const conversationId = currentConversationIdRef.current.trim();
+      if (!conversationId) return;
+      if (isSending || isConversationHydrating || isConversationHydrationFailed) return;
+      // 分支 invoke 会排在同会话 persist 写锁后面，期间按钮仍可点：
+      // 用 ref 挡掉重复确认，避免一次点击风暴造出多份"新分支"。
+      if (branchInFlightRef.current) return;
+      branchInFlightRef.current = true;
+      setBranchPendingMessageId(messageRef.messageId);
+      try {
+        const summary = await branchChatHistory(conversationId, messageRef);
+        sidebarStore.upsertLocal({ ...summary, isPending: undefined });
+        handleSelectConversation(summary.id);
+      } catch (error) {
+        setErrorMessage(asErrorMessage(error, t("chat.branchFailed")));
+      } finally {
+        branchInFlightRef.current = false;
+        setBranchPendingMessageId(null);
+      }
+    },
+    [
+      currentConversationIdRef,
+      handleSelectConversation,
+      isConversationHydrating,
+      isConversationHydrationFailed,
+      isSending,
+      sidebarStore,
+      t,
+    ],
+  );
+
   return (
     <div className="flex h-full min-h-0 w-full overflow-hidden">
       <div className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
@@ -5157,6 +5372,9 @@ export function ChatPage(props: ChatPageProps) {
           onCancelProjectRename={handleCancelWorkspaceProjectRename}
           onSetProjectPinned={handleSetWorkspaceProjectPinned}
           onRemoveProject={handleRemoveWorkspaceProject}
+          onArchiveProject={handleArchiveWorkspaceProject}
+          onUnarchiveProject={handleUnarchiveWorkspaceProject}
+          archivedProjectPathKeys={archivedWorkspaceProjectPathKeys}
           onNewConversation={() => {
             setActiveView("chat");
             if (activeView !== "chat" && isDraftConversation) {
@@ -5318,6 +5536,14 @@ export function ChatPage(props: ChatPageProps) {
                 isCompactionRunning={isCompactionRunning}
                 bottomReservePx={composerOverlayHeight}
                 onResendFromEdit={handleResendFromEdit}
+                onBranchConversation={
+                  // 水合中/水合失败时 handler 只会静默 return——直接不传，
+                  // 让 AssistantRow 的 disabled 分支给出可见的禁用态。
+                  isConversationHydrating || isConversationHydrationFailed
+                    ? undefined
+                    : handleBranchConversation
+                }
+                branchPendingMessageId={branchPendingMessageId}
                 onOpenSettings={onOpenSettings}
                 onSuggestionSelect={handleEmptyStateSuggestion}
                 suggestionsDisabled={isSuggestionTyping}
@@ -5343,6 +5569,7 @@ export function ChatPage(props: ChatPageProps) {
                 onChatRuntimeControlsChange={handleChatRuntimeControlsChange}
                 onPickReadableFiles={pickReadableFiles}
                 onPasteFiles={importReadableFiles}
+                loadHistoryPrompts={loadComposerHistoryPrompts}
                 pendingUploadedFiles={pendingUploadedFiles}
                 onRemovePendingUpload={removePendingUpload}
                 queuedTurns={queuedChatTurnsForCurrentConversation}

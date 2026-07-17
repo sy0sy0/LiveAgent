@@ -932,6 +932,60 @@ test("GatewayWebSocketClient sends history share requests", async () => {
   resetGatewayWebSocketClient();
 });
 
+test("GatewayWebSocketClient sends history branch requests with a snake_case base message ref", async () => {
+  installBrowser();
+  const loader = createWebModuleLoader();
+  const { getGatewayWebSocketClient, resetGatewayWebSocketClient } = loader.loadModule("src/lib/gatewaySocket.ts");
+  resetGatewayWebSocketClient();
+
+  const client = getGatewayWebSocketClient("token");
+  const branchPromise = client.branchHistory("conversation-1", {
+    segmentIndex: 2,
+    messageIndex: 5,
+    segmentId: "segment-2",
+    messageId: "message-5",
+    role: "user",
+    contentHash: "hash-abc",
+  });
+  const socket = await connectAndAuth();
+  await waitFor(
+    () => socket.sent.some((item) => item.type === "history.branch"),
+    "history branch envelope",
+  );
+  const request = socket.sent.find((item) => item.type === "history.branch");
+  assert.deepEqual(request.payload, {
+    conversation_id: "conversation-1",
+    base_message_ref: {
+      segment_index: 2,
+      message_index: 5,
+      segment_id: "segment-2",
+      message_id: "message-5",
+      role: "user",
+      content_hash: "hash-abc",
+    },
+  });
+  socket.receive({
+    id: request.id,
+    type: "response",
+    payload: {
+      id: "conversation-branch",
+      title: "新分支",
+      message_count: 6,
+      created_at: 1700000000100,
+      updated_at: 1700000000200,
+    },
+  });
+  assert.deepEqual(await branchPromise, {
+    id: "conversation-branch",
+    title: "新分支",
+    message_count: 6,
+    created_at: 1700000000100,
+    updated_at: 1700000000200,
+  });
+
+  resetGatewayWebSocketClient();
+});
+
 test("GatewayWebSocketClient reconnects before read requests when an authenticated socket goes stale", async () => {
   installBrowser();
   const loader = createWebModuleLoader();
