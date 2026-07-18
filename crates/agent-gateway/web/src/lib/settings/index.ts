@@ -129,6 +129,20 @@ export type CustomSettings = {
   fontScale: FontScaleSettings;
 };
 
+export type SystemProxyType = "socks5" | "http";
+
+// 系统级出站代理：注入本地 shell 命令 env，并供勾选了 useSystemProxy 的
+// 供应商模型请求走代理（代理连接由桌面 Rust 侧完成，凭据不进前端请求）。
+export type SystemProxyConfig = {
+  enabled: boolean;
+  type: SystemProxyType;
+  host: string;
+  port: number;
+  username: string;
+  password: string;
+  passwordConfigured?: boolean;
+};
+
 export type SystemSettings = {
   executionMode: ExecutionMode;
   workdir: string;
@@ -140,6 +154,7 @@ export type SystemSettings = {
   // Archived workspaces (path-keyed, like hidden/missing). Archived rows stay
   // in the merged list but render disabled and can never be active.
   archivedWorkspaceProjectPaths: string[];
+  systemProxy: SystemProxyConfig;
 };
 
 export type WorkspaceProjectKind = "managed" | "folder" | "history";
@@ -236,6 +251,7 @@ export type CustomProvider = {
   reasoning: ReasoningLevel;
   promptCachingEnabled: boolean;
   nativeWebSearchEnabled: boolean;
+  useSystemProxy: boolean;
 };
 
 export type EffectiveTheme = "light" | "dark";
@@ -357,6 +373,7 @@ export function getBuiltinCustomProviders(): CustomProvider[] {
       reasoning: "off",
       promptCachingEnabled: true,
       nativeWebSearchEnabled: true,
+      useSystemProxy: false,
     },
     {
       id: "builtin-codex",
@@ -370,6 +387,7 @@ export function getBuiltinCustomProviders(): CustomProvider[] {
       reasoning: "off",
       promptCachingEnabled: false,
       nativeWebSearchEnabled: true,
+      useSystemProxy: false,
     },
     {
       id: "builtin-gemini",
@@ -382,6 +400,7 @@ export function getBuiltinCustomProviders(): CustomProvider[] {
       reasoning: "off",
       promptCachingEnabled: false,
       nativeWebSearchEnabled: true,
+      useSystemProxy: false,
     },
   ];
 }
@@ -1318,6 +1337,7 @@ export function normalizeCustomProvider(input: unknown): CustomProvider {
     reasoning: normalizeReasoningLevel(obj.reasoning),
     promptCachingEnabled: type === "claude_code" ? obj.promptCachingEnabled !== false : false,
     nativeWebSearchEnabled: obj.nativeWebSearchEnabled !== false,
+    useSystemProxy: obj.useSystemProxy === true,
   };
 }
 
@@ -1468,6 +1488,45 @@ function normalizeSshProjectHostAssociations(
   return associations;
 }
 
+export function getDefaultSystemProxyConfig(): SystemProxyConfig {
+  return {
+    enabled: false,
+    type: "http",
+    host: "",
+    port: 0,
+    username: "",
+    password: "",
+  };
+}
+
+export function isValidSystemProxyHost(input: string): boolean {
+  const host = input.trim();
+  if (!host || /[\s/\\@#?%]/.test(host)) return false;
+  const bracketed = host.startsWith("[") && host.endsWith("]");
+  const hostForUrl = host.includes(":") && !bracketed ? `[${host}]` : host;
+  try {
+    const parsed = new URL(`http://${hostForUrl}`);
+    return parsed.hostname.length > 0 && parsed.port === "";
+  } catch {
+    return false;
+  }
+}
+
+export function normalizeSystemProxyConfig(input: unknown): SystemProxyConfig {
+  const obj = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
+  const port = Number(obj.port);
+  const password = typeof obj.password === "string" ? obj.password : "";
+  return {
+    enabled: obj.enabled === true,
+    type: obj.type === "socks5" ? "socks5" : "http",
+    host: typeof obj.host === "string" ? obj.host.trim() : "",
+    port: Number.isInteger(port) && port > 0 && port <= 65535 ? port : 0,
+    username: typeof obj.username === "string" ? obj.username.trim() : "",
+    password,
+    passwordConfigured: password.trim().length > 0 || obj.passwordConfigured === true,
+  };
+}
+
 export function normalizeSystemSettings(input: unknown): SystemSettings {
   const obj = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
   return {
@@ -1488,6 +1547,7 @@ export function normalizeSystemSettings(input: unknown): SystemSettings {
     archivedWorkspaceProjectPaths: normalizeArchivedWorkspaceProjectPaths(
       obj.archivedWorkspaceProjectPaths,
     ),
+    systemProxy: normalizeSystemProxyConfig(obj.systemProxy),
   };
 }
 
@@ -2004,6 +2064,7 @@ export function getDefaultSettings(): AppSettings {
       hiddenWorkspaceProjectPaths: [],
       missingWorkspaceProjectPaths: [],
       archivedWorkspaceProjectPaths: [],
+      systemProxy: getDefaultSystemProxyConfig(),
     },
     customProviders,
     mcp: {

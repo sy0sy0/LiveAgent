@@ -12,6 +12,7 @@ type RuntimeDebugInput = {
   reasoning?: ReasoningLevel;
   promptCachingEnabled?: boolean;
   nativeWebSearchEnabled?: boolean;
+  useSystemProxy?: boolean;
 };
 
 export type StreamDebugLogger = {
@@ -181,6 +182,7 @@ export function buildRuntimeDebugInfo(runtime: RuntimeDebugInput) {
     reasoning: runtime.reasoning,
     promptCachingEnabled: runtime.promptCachingEnabled,
     nativeWebSearchEnabled: runtime.nativeWebSearchEnabled,
+    useSystemProxy: runtime.useSystemProxy,
     hasApiKey: runtime.apiKey.trim().length > 0,
   };
 }

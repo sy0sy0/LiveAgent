@@ -37,7 +37,8 @@ const TRAILER: &str = "trailer";
 const TRANSFER_ENCODING: &str = "transfer-encoding";
 const UPGRADE: &str = "upgrade";
 const UPSTREAM_ORIGIN_HEADER: &str = "x-liveagent-upstream-origin";
-const DEFAULT_ALLOW_HEADERS: &str = "authorization,content-type,x-api-key,x-goog-api-key,anthropic-version,x-liveagent-upstream-origin,x-liveagent-proxy-token";
+const USE_SYSTEM_PROXY_HEADER: &str = "x-liveagent-use-system-proxy";
+const DEFAULT_ALLOW_HEADERS: &str = "authorization,content-type,x-api-key,x-goog-api-key,anthropic-version,x-liveagent-upstream-origin,x-liveagent-proxy-token,x-liveagent-use-system-proxy";
 const ALLOW_METHODS_VALUE: &str = "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD";
 const VARY_VALUE: &str = "Origin, Access-Control-Request-Method, Access-Control-Request-Headers";
 const IMAGE_PROXY_MAX_BYTES: usize = 25 * 1024 * 1024;
@@ -91,6 +92,7 @@ pub fn start_proxy_server() -> Result<Arc<ProxyServerState>, String> {
             token: Uuid::new_v4().to_string(),
         },
         client: reqwest::Client::builder()
+            .no_proxy()
             .build()
             .map_err(|err| format!("创建本地代理 HTTP 客户端失败：{err}"))?,
     });
@@ -351,7 +353,27 @@ async fn handle_proxy(
         }
     };
 
-    let mut request = state.client.request(method, target_url);
+    let use_system_proxy = headers
+        .get(USE_SYSTEM_PROXY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == "1");
+    // 系统代理未启用时 cached_client 返回直连 client（勾选但全局关闭 = 直连）；
+    // 代理配置异常则 fail fast，绝不静默降级为直连。
+    let client = if use_system_proxy {
+        match crate::services::system_proxy::cached_client() {
+            Ok(client) => client,
+            Err(error) => {
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("App proxy unavailable: {error}"),
+                    &headers,
+                );
+            }
+        }
+    } else {
+        state.client.clone()
+    };
+    let mut request = client.request(method, target_url);
     for (name, value) in &headers {
         if should_forward_request_header(name) {
             request = request.header(name, value);

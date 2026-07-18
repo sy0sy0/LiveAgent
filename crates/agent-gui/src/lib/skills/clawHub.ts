@@ -4,6 +4,8 @@ export type ClawHubSkillCard = {
   slug: string;
   displayName: string;
   summary: string;
+  /** ClawHub 上的自由标签，用于本地分类与卡片标签展示。 */
+  topics: string[];
   latestVersion: string | null;
   downloads: number;
   stars: number;
@@ -78,6 +80,7 @@ export function normalizeClawHubSkillCard(raw: unknown): ClawHubSkillCard | null
     slug,
     displayName: asString(item.displayName) ?? slug,
     summary: asString(item.summary) ?? "",
+    topics: asStringArray(item.topics),
     latestVersion:
       asString(latestVersion.version) ?? asString(tags.latest) ?? asString(item.version),
     downloads: asNullableNumber(item.downloads) ?? asNullableNumber(stats.downloads) ?? 0,

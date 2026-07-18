@@ -358,6 +358,19 @@ pub async fn handle_provider_list() -> Result<proto::ProviderListResponse, Strin
     Ok(proto::ProviderListResponse { providers_json })
 }
 
+pub async fn handle_provider_models(
+    request: proto::ProviderModelsRequest,
+) -> Result<proto::ProviderModelsResponse, String> {
+    let models_json = crate::services::provider_models::fetch_provider_models(
+        request.provider_type.trim(),
+        request.base_url.trim(),
+        request.api_key.trim(),
+        request.use_system_proxy,
+    )
+    .await?;
+    Ok(proto::ProviderModelsResponse { models_json })
+}
+
 pub async fn handle_skill_files_list() -> Result<proto::SkillFilesListResponse, String> {
     tauri::async_runtime::spawn_blocking(system_list_skill_files_sync)
         .await

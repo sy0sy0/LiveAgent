@@ -12,6 +12,7 @@ export type ProviderRuntimeConfig = {
   reasoning?: ReasoningLevel;
   promptCachingEnabled?: boolean;
   nativeWebSearchEnabled?: boolean;
+  useSystemProxy?: boolean;
   modelConfig?: ProviderModelConfig;
 };
 

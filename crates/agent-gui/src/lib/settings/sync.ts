@@ -1,5 +1,6 @@
 import {
   type AppSettings,
+  getDefaultSystemProxyConfig,
   normalizeChatRuntimeControls,
   normalizeRightDockSettings,
   normalizeSettings,
@@ -57,6 +58,9 @@ export type GatewaySettingsSyncPayload = {
   sshPatch?: GatewaySshSyncPatch;
   providerApiKeyUpdates?: GatewayProviderApiKeyUpdates;
   sshSecretUpdates?: GatewaySshSecretUpdates;
+  // systemProxy 密码回传 sidecar（仿 providerApiKeyUpdates 的简化范式）：
+  // system 字段本身出口必被脱敏，明文密码只经此通道回到桌面端落库。
+  systemProxyPasswordUpdate?: string;
 };
 export type GatewaySettingsSyncUpdatePayload = Partial<GatewaySettingsSyncPayload>;
 
@@ -111,9 +115,23 @@ export function redactCustomProvidersForWebStorage(
 export function redactSettingsForWebStorage(settings: AppSettings): AppSettings {
   return normalizeSettings({
     ...settings,
+    system: {
+      ...settings.system,
+      systemProxy: redactSystemProxyConfig(settings.system.systemProxy),
+    },
     customProviders: redactCustomProvidersForWebStorage(settings.customProviders),
     ssh: redactSshSettingsForWebStorage(settings.ssh),
   });
+}
+
+function redactSystemProxyConfig(
+  proxy: AppSettings["system"]["systemProxy"],
+): AppSettings["system"]["systemProxy"] {
+  return {
+    ...proxy,
+    password: "",
+    passwordConfigured: proxy.password.trim().length > 0 || proxy.passwordConfigured === true,
+  };
 }
 
 function redactSshSettingsForWebStorage(ssh: AppSettings["ssh"]): AppSettings["ssh"] {
@@ -338,7 +356,11 @@ function syncableCustomSettings(
 }
 
 function syncableSystemSettings(system: AppSettings["system"]): AppSettings["system"] {
-  const syncableSystem = { ...system };
+  const syncableSystem = {
+    ...system,
+    // systemProxy 密码不随 system 字段出站（明文只走 systemProxyPasswordUpdate sidecar）。
+    systemProxy: redactSystemProxyConfig(system.systemProxy),
+  };
   delete syncableSystem.activeWorkspaceProjectId;
   return syncableSystem as AppSettings["system"];
 }
@@ -395,9 +417,40 @@ function resolveSyncedActiveWorkspaceProjectId(
   return explicitActiveProjectId || currentActiveProjectId;
 }
 
+/// 镜像 SSH 代理密码的同步规则：sidecar 优先；脱敏值（空密码 + passwordConfigured=true）
+/// 不清空既有密码；passwordConfigured === false 是显式清除信号。
+function mergeSyncedSystemProxy(
+  current: AppSettings["system"]["systemProxy"] | undefined,
+  incoming: AppSettings["system"]["systemProxy"] | undefined,
+  passwordUpdate: string | undefined,
+): AppSettings["system"]["systemProxy"] {
+  const currentProxy = current ?? getDefaultSystemProxyConfig();
+  if (!incoming || typeof incoming !== "object") {
+    return currentProxy;
+  }
+  const cleared = incoming.passwordConfigured === false;
+  const incomingPassword = typeof incoming.password === "string" ? incoming.password : "";
+  const currentPassword = typeof currentProxy.password === "string" ? currentProxy.password : "";
+  const password =
+    passwordUpdate !== undefined
+      ? passwordUpdate
+      : incomingPassword.trim()
+        ? incomingPassword
+        : cleared
+          ? ""
+          : currentPassword;
+  return {
+    ...incoming,
+    password,
+    passwordConfigured:
+      password.trim().length > 0 || (!cleared && incoming.passwordConfigured === true),
+  };
+}
+
 function mergeSyncedSystemSettings(
   current: AppSettings["system"],
   incoming: unknown,
+  systemProxyPasswordUpdate?: string,
 ): AppSettings["system"] {
   if (!incoming || typeof incoming !== "object" || Array.isArray(incoming)) {
     return current;
@@ -405,10 +458,16 @@ function mergeSyncedSystemSettings(
 
   const incomingSystem = incoming as AppSettings["system"];
   const activeWorkspaceProjectId = resolveSyncedActiveWorkspaceProjectId(current, incomingSystem);
+  const systemProxy = mergeSyncedSystemProxy(
+    current.systemProxy,
+    incomingSystem.systemProxy,
+    systemProxyPasswordUpdate,
+  );
   if (!Array.isArray(incomingSystem.workspaceProjects)) {
     return {
       ...incomingSystem,
       activeWorkspaceProjectId,
+      systemProxy,
     };
   }
 
@@ -424,6 +483,7 @@ function mergeSyncedSystemSettings(
   return {
     ...incomingSystem,
     activeWorkspaceProjectId,
+    systemProxy,
     workspaceProjects: incomingSystem.workspaceProjects.map((project) => {
       const lastConversationAt = Math.max(
         readWorkspaceProjectLastConversationAt(project),
@@ -780,6 +840,11 @@ function mergeSyncedRightDockSettings(
   });
 }
 
+function collectSystemProxyPasswordUpdate(system: AppSettings["system"]): string | undefined {
+  const password = system.systemProxy.password;
+  return typeof password === "string" && password.trim() ? password : undefined;
+}
+
 export function buildGatewaySettingsSyncPayload(
   settings: AppSettings,
   options: { includeProviderApiKeyUpdates?: boolean } = {},
@@ -815,6 +880,12 @@ export function buildGatewaySettingsSyncPayload(
     : undefined;
   if (sshSecretUpdates) {
     payload.sshSecretUpdates = sshSecretUpdates;
+  }
+  const systemProxyPasswordUpdate = options.includeProviderApiKeyUpdates
+    ? collectSystemProxyPasswordUpdate(settings.system)
+    : undefined;
+  if (systemProxyPasswordUpdate !== undefined) {
+    payload.systemProxyPasswordUpdate = systemProxyPasswordUpdate;
   }
   return payload;
 }
@@ -855,6 +926,14 @@ export function buildGatewaySettingsSyncUpdatePayload(
     update.sshPatch ??= sshPatch ?? {};
     update.sshSecretUpdates = sshSecretUpdates;
   }
+  const systemProxyPasswordUpdate = options.includeProviderApiKeyUpdates
+    ? collectSystemProxyPasswordUpdate(next.system)
+    : undefined;
+  if (systemProxyPasswordUpdate !== undefined) {
+    // sidecar 必须与（脱敏后的）system 字段成对出现，接收端才能定位回填目标。
+    update.system ??= nextPayload.system;
+    update.systemProxyPasswordUpdate = systemProxyPasswordUpdate;
+  }
 
   return update;
 }
@@ -866,6 +945,10 @@ export function applyGatewaySettingsSyncPayload(
   const source = asObject(payload);
   const providerApiKeyUpdates = normalizeProviderApiKeyUpdates(source.providerApiKeyUpdates);
   const sshSecretUpdates = normalizeSshSecretUpdates(source.sshSecretUpdates);
+  const systemProxyPasswordUpdate =
+    typeof source.systemProxyPasswordUpdate === "string" && source.systemProxyPasswordUpdate.trim()
+      ? source.systemProxyPasswordUpdate
+      : undefined;
   const selectedModel =
     source.selectedModel === null
       ? undefined
@@ -882,7 +965,7 @@ export function applyGatewaySettingsSyncPayload(
   return normalizeSettings({
     ...current,
     system: Object.hasOwn(source, "system")
-      ? mergeSyncedSystemSettings(current.system, source.system)
+      ? mergeSyncedSystemSettings(current.system, source.system, systemProxyPasswordUpdate)
       : current.system,
     customProviders: mergeSyncedCustomProviders(
       current.customProviders,

@@ -493,12 +493,17 @@ where
     F: FnMut() -> io::Result<(Stdio, Stdio)>,
 {
     let mut errors: Vec<String> = Vec::new();
+    let system_proxy_envs = crate::services::system_proxy::shell_proxy_envs()?;
 
     for candidate in platform_shell_candidates(command) {
         let (stdout, stderr) =
             stdio_factory().map_err(|err| format!("Failed to prepare shell stdio: {err}"))?;
         let mut c = Command::new(&candidate.program);
         c.args(&candidate.args);
+        // 系统代理 env 先注入，调用方 envs（如 LIVEAGENT_HOOK_*）后写保持更高优先级。
+        for (key, value) in &system_proxy_envs {
+            c.env(key, value);
+        }
         c.envs(envs.iter().map(|(key, value)| (key.as_str(), value.as_str())));
         if candidate.augment_macos_path {
             maybe_augment_macos_path(&mut c);

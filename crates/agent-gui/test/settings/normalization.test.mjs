@@ -2086,3 +2086,155 @@ test("close window behavior defaults to minimize and only accepts exit", () => {
     "minimize",
   );
 });
+
+test("system proxy config normalizes defaults, ports, and password flags", () => {
+  const defaults = settings.getDefaultSettings().system.systemProxy;
+  assert.deepEqual(defaults, {
+    enabled: false,
+    type: "http",
+    host: "",
+    port: 0,
+    username: "",
+    password: "",
+  });
+
+  const missing = settings.normalizeSystemSettings({}).systemProxy;
+  assert.equal(missing.enabled, false);
+  assert.equal(missing.type, "http");
+  assert.equal(missing.port, 0);
+  assert.equal(missing.passwordConfigured, false);
+
+  const normalized = settings.normalizeSystemProxyConfig({
+    enabled: true,
+    type: "socks5",
+    host: " 10.0.0.1 ",
+    port: 1080,
+    username: " user ",
+    password: "secret",
+  });
+  assert.deepEqual(normalized, {
+    enabled: true,
+    type: "socks5",
+    host: "10.0.0.1",
+    port: 1080,
+    username: "user",
+    password: "secret",
+    passwordConfigured: true,
+  });
+
+  assert.equal(settings.normalizeSystemProxyConfig({ port: 0 }).port, 0);
+  assert.equal(settings.normalizeSystemProxyConfig({ port: 65536 }).port, 0);
+  assert.equal(settings.normalizeSystemProxyConfig({ port: "abc" }).port, 0);
+  assert.equal(settings.normalizeSystemProxyConfig({ port: "8080" }).port, 8080);
+  assert.equal(settings.normalizeSystemProxyConfig({ type: "https" }).type, "http");
+  assert.equal(
+    settings.normalizeSystemProxyConfig({ password: "", passwordConfigured: true })
+      .passwordConfigured,
+    true,
+  );
+  assert.equal(settings.isValidSystemProxyHost("proxy.local"), true);
+  assert.equal(settings.isValidSystemProxyHost("127.0.0.1"), true);
+  assert.equal(settings.isValidSystemProxyHost("::1"), true);
+  assert.equal(settings.isValidSystemProxyHost("[::1]"), true);
+  assert.equal(settings.isValidSystemProxyHost("bad host/@"), false);
+  assert.equal(settings.isValidSystemProxyHost("proxy.local:7890"), false);
+});
+
+test("custom provider useSystemProxy defaults to false and keeps explicit true", () => {
+  assert.equal(settings.normalizeCustomProvider({ id: "p-1" }).useSystemProxy, false);
+  assert.equal(
+    settings.normalizeCustomProvider({ id: "p-1", useSystemProxy: "yes" }).useSystemProxy,
+    false,
+  );
+  assert.equal(
+    settings.normalizeCustomProvider({ id: "p-1", useSystemProxy: true }).useSystemProxy,
+    true,
+  );
+  for (const provider of settings.getBuiltinCustomProviders()) {
+    assert.equal(provider.useSystemProxy, false);
+  }
+});
+
+test("system proxy password is redacted for web storage and gateway sync", () => {
+  const base = settings.normalizeSettings({
+    system: {
+      systemProxy: {
+        enabled: true,
+        type: "socks5",
+        host: "10.0.0.1",
+        port: 1080,
+        username: "user",
+        password: "secret",
+      },
+    },
+  });
+
+  const webStored = sync.redactSettingsForWebStorage(base);
+  assert.equal(webStored.system.systemProxy.password, "");
+  assert.equal(webStored.system.systemProxy.passwordConfigured, true);
+
+  const payload = sync.buildGatewaySettingsSyncPayload(base);
+  assert.equal(payload.system.systemProxy.password, "");
+  assert.equal(payload.system.systemProxy.passwordConfigured, true);
+  assert.equal(payload.systemProxyPasswordUpdate, undefined);
+
+  const webuiPayload = sync.buildGatewaySettingsSyncPayload(base, {
+    includeProviderApiKeyUpdates: true,
+  });
+  assert.equal(webuiPayload.system.systemProxy.password, "");
+  assert.equal(webuiPayload.systemProxyPasswordUpdate, "secret");
+});
+
+test("gateway sync merge keeps system proxy password against redacted payloads", () => {
+  const current = settings.normalizeSettings({
+    system: {
+      systemProxy: {
+        enabled: true,
+        type: "http",
+        host: "proxy.local",
+        port: 7890,
+        username: "user",
+        password: "secret",
+      },
+    },
+  });
+
+  // 脱敏 system（password 空 + passwordConfigured=true）不得冲掉本地密码。
+  const redactedIncoming = sync.buildGatewaySettingsSyncPayload(current);
+  const merged = sync.applyGatewaySettingsSyncPayload(current, redactedIncoming);
+  assert.equal(merged.system.systemProxy.password, "secret");
+  assert.equal(merged.system.systemProxy.passwordConfigured, true);
+
+  // sidecar 回填新密码。
+  const withUpdate = sync.applyGatewaySettingsSyncPayload(current, {
+    ...redactedIncoming,
+    systemProxyPasswordUpdate: "next-secret",
+  });
+  assert.equal(withUpdate.system.systemProxy.password, "next-secret");
+  assert.equal(withUpdate.system.systemProxy.passwordConfigured, true);
+
+  // passwordConfigured === false 是显式清除信号。
+  const clearedIncoming = sync.buildGatewaySettingsSyncPayload(current);
+  clearedIncoming.system = {
+    ...clearedIncoming.system,
+    systemProxy: {
+      ...clearedIncoming.system.systemProxy,
+      password: "",
+      passwordConfigured: false,
+    },
+  };
+  const cleared = sync.applyGatewaySettingsSyncPayload(current, clearedIncoming);
+  assert.equal(cleared.system.systemProxy.password, "");
+  assert.equal(cleared.system.systemProxy.passwordConfigured, false);
+
+  // 其余 systemProxy 字段随 incoming 收敛（host/port 变化生效）。
+  const hostChanged = sync.buildGatewaySettingsSyncPayload(current);
+  hostChanged.system = {
+    ...hostChanged.system,
+    systemProxy: { ...hostChanged.system.systemProxy, host: "proxy2.local", port: 1080 },
+  };
+  const mergedHost = sync.applyGatewaySettingsSyncPayload(current, hostChanged);
+  assert.equal(mergedHost.system.systemProxy.host, "proxy2.local");
+  assert.equal(mergedHost.system.systemProxy.port, 1080);
+  assert.equal(mergedHost.system.systemProxy.password, "secret");
+});

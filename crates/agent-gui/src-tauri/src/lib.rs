@@ -448,6 +448,9 @@ pub fn run() {
                 )?;
                 #[cfg(target_os = "windows")]
                 configure_windows_window_chrome(app)?;
+                if let Err(error) = commands::settings::initialize_system_proxy_from_db() {
+                    eprintln!("failed to initialize system proxy state: {error}");
+                }
                 app.manage(services::proxy::start_proxy_server()?);
                 if let Err(error) = services::skills::ensure_builtin_agent_skills_sync() {
                     eprintln!("failed to seed builtin skills: {error}");

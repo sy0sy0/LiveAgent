@@ -138,6 +138,7 @@ export async function streamAssistantMessage(params: {
     params.providerId,
     params.runtime.baseUrl.trim(),
     buildProviderAuthHeaders(params.providerId, params.runtime.apiKey),
+    { useSystemProxy: params.runtime.useSystemProxy === true },
   );
 
   const m = createModelFromConfig(
@@ -327,6 +328,7 @@ export async function completeAssistantMessage(params: {
     params.providerId,
     params.runtime.baseUrl.trim(),
     buildProviderAuthHeaders(params.providerId, params.runtime.apiKey),
+    { useSystemProxy: params.runtime.useSystemProxy === true },
   );
 
   const m = createModelFromConfig(

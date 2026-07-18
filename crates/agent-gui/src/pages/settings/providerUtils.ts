@@ -199,6 +199,7 @@ async function fetchModelsThroughGateway(
   type: ProviderId,
   baseUrl: string,
   apiKey: string,
+  useSystemProxy: boolean,
 ): Promise<ProviderModelConfig[]> {
   const token =
     typeof window !== "undefined"
@@ -212,7 +213,8 @@ async function fetchModelsThroughGateway(
     type,
     base_url: baseUrl,
     api_key: apiKey,
-  } as any);
+    use_system_proxy: useSystemProxy,
+  });
 
   const items = extractModelListItems(data);
   if (items !== null) {
@@ -327,15 +329,29 @@ export function createDraftModelConfig(
   return createProviderModelConfig(providerType, modelId);
 }
 
+export function buildProviderModelsFetchKey(
+  baseUrl: string,
+  apiKey: string,
+  useSystemProxy: boolean,
+): string {
+  return `${baseUrl.trim()}||${apiKey.trim()}||${useSystemProxy ? "proxy" : "direct"}`;
+}
+
 export async function fetchModelsFromApi(
   type: ProviderId,
   baseUrl: string,
   apiKey: string,
+  options?: { useSystemProxy?: boolean },
 ): Promise<ProviderModelConfig[]> {
   const normalizedUrl = normalizeModelBaseUrl(type, baseUrl);
   const normalizedApiKey = apiKey.trim();
   if (isGatewayWebuiRuntime()) {
-    return fetchModelsThroughGateway(type, normalizedUrl, normalizedApiKey);
+    return fetchModelsThroughGateway(
+      type,
+      normalizedUrl,
+      normalizedApiKey,
+      options?.useSystemProxy === true,
+    );
   }
 
   const attempts = buildProviderModelsAttempts(type, normalizedUrl, normalizedApiKey);
@@ -343,7 +359,9 @@ export async function fetchModelsFromApi(
   let emptyResult: ProviderModelConfig[] | null = null;
 
   for (const attempt of attempts) {
-    const proxyRequest = await prepareProxyRequest(type, normalizedUrl, attempt.headers);
+    const proxyRequest = await prepareProxyRequest(type, normalizedUrl, attempt.headers, {
+      useSystemProxy: options?.useSystemProxy === true,
+    });
     const modelsUrl = buildProviderModelsUrl(type, proxyRequest.baseUrl, attempt.kind);
 
     let response: Response;

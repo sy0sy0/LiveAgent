@@ -292,7 +292,8 @@ fn selected_release_candidates_from_entries(
 }
 
 fn github_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+    // 系统代理启用时更新检查随之走代理（GitHub 直连常不可达）。
+    crate::services::system_proxy::client_builder()?
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|error| format!("failed to create GitHub client: {error}"))

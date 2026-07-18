@@ -189,6 +189,7 @@ async function executeCronPromptRun(
       reasoning: DEFAULT_CHAT_RUNTIME_CONTROLS.reasoning,
       promptCachingEnabled: true,
       nativeWebSearchEnabled: DEFAULT_CHAT_RUNTIME_CONTROLS.nativeWebSearchEnabled,
+      useSystemProxy: provider.useSystemProxy,
       modelConfig: findProviderModelConfig(provider, request.model),
     },
     runtimePlatform,

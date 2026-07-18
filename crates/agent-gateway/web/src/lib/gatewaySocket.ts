@@ -2371,11 +2371,17 @@ export class GatewayWebSocketClient {
     });
   }
 
-  async getProviderModels(type: string, baseUrl: string, apiKey: string): Promise<unknown> {
+  async getProviderModels(
+    type: string,
+    baseUrl: string,
+    apiKey: string,
+    useSystemProxy = false,
+  ): Promise<unknown> {
     return this.requestWithRecovery("provider.models", {
       type,
       base_url: baseUrl,
       api_key: apiKey,
+      use_system_proxy: useSystemProxy,
     });
   }
 
@@ -3408,7 +3414,12 @@ export type GatewayWebSocketClientLike = {
   ): Promise<UploadedImagePreviewResponse>;
   readSkillMetadata(path: string): Promise<SkillMetadataResponse>;
   readSkillText(path: string, offset?: number, length?: number): Promise<SkillTextResponse>;
-  getProviderModels(type: string, baseUrl: string, apiKey: string): Promise<unknown>;
+  getProviderModels(
+    type: string,
+    baseUrl: string,
+    apiKey: string,
+    useSystemProxy?: boolean,
+  ): Promise<unknown>;
   dispose(): void;
 };
 

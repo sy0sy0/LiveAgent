@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import ccswitchLogoUrl from "../../../src-tauri/icons/custom/ccswitch.png";
 import cherryStudioLogoUrl from "../../../src-tauri/icons/custom/cherrystudio.png";
@@ -21,6 +21,7 @@ import {
   Settings,
   Settings2,
   Trash2,
+  Waypoints,
   X,
 } from "../../components/icons";
 
@@ -62,6 +63,7 @@ import {
   CherryStudioImportModal,
 } from "./CherryStudioImportModal";
 import {
+  buildProviderModelsFetchKey,
   createDraftModelConfig,
   fetchModelsFromApi,
   isGatewayWebuiRuntime,
@@ -254,6 +256,7 @@ function ProviderModal({ providerType, initialData, onSave, onClose }: ModalProp
   const [requestFormat, setRequestFormat] = useState<CodexRequestFormat>(
     initialData?.requestFormat ?? "openai-responses",
   );
+  const [useSystemProxy, setUseSystemProxy] = useState(initialData?.useSystemProxy ?? false);
   const [fetchingModels, setFetchingModels] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [addingModel, setAddingModel] = useState(false);
@@ -268,10 +271,26 @@ function ProviderModal({ providerType, initialData, onSave, onClose }: ModalProp
   const apiKeyForRequest = apiKeyIsRedactedDisplay ? "" : apiKey.trim();
   const canFetchModels = baseUrl.trim().length > 0 && apiKeyForRequest.length > 0;
 
+  const doFetch = useCallback(
+    async (url: string, key: string) => {
+      setFetchingModels(true);
+      setFetchError(null);
+      try {
+        const list = await fetchModelsFromApi(providerType, url, key, { useSystemProxy });
+        setModels((prev) => mergeFetchedModels(list, prev));
+      } catch (err) {
+        setFetchError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setFetchingModels(false);
+      }
+    },
+    [providerType, useSystemProxy],
+  );
+
   useEffect(() => {
     const trimUrl = baseUrl.trim();
     const trimKey = apiKeyForRequest;
-    const key = `${trimUrl}||${trimKey}`;
+    const key = buildProviderModelsFetchKey(trimUrl, trimKey, useSystemProxy);
     if (!trimUrl || !trimKey) return;
     if (key === prevFetchKey.current) return;
 
@@ -284,20 +303,7 @@ function ProviderModal({ providerType, initialData, onSave, onClose }: ModalProp
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [baseUrl, apiKeyForRequest]);
-
-  async function doFetch(url: string, key: string) {
-    setFetchingModels(true);
-    setFetchError(null);
-    try {
-      const list = await fetchModelsFromApi(providerType, url, key);
-      setModels((prev) => mergeFetchedModels(list, prev));
-    } catch (err) {
-      setFetchError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setFetchingModels(false);
-    }
-  }
+  }, [apiKeyForRequest, baseUrl, doFetch, useSystemProxy]);
 
   function handleRefresh() {
     const trimUrl = baseUrl.trim();
@@ -383,6 +389,7 @@ function ProviderModal({ providerType, initialData, onSave, onClose }: ModalProp
           : (initialData?.reasoning ?? "off"),
       promptCachingEnabled: initialData?.promptCachingEnabled ?? providerType === "claude_code",
       nativeWebSearchEnabled: initialData?.nativeWebSearchEnabled ?? true,
+      useSystemProxy,
     });
   }
 
@@ -484,6 +491,16 @@ function ProviderModal({ providerType, initialData, onSave, onClose }: ModalProp
               </Select>
             </div>
           ) : null}
+
+          <label className="flex cursor-pointer items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              className="h-4 w-4 shrink-0 cursor-pointer accent-primary"
+              checked={useSystemProxy}
+              onChange={(event) => setUseSystemProxy(event.currentTarget.checked)}
+            />
+            {t("settings.providerUseSystemProxy")}
+          </label>
 
           <div className="space-y-2">
             <div className="flex items-center justify-between">
@@ -838,6 +855,7 @@ function providerFromCcs(item: CcsProviderImportItem, existingIds: Set<string>):
     reasoning: "off",
     promptCachingEnabled: providerType === "claude_code",
     nativeWebSearchEnabled: true,
+    useSystemProxy: false,
   };
 }
 
@@ -903,6 +921,7 @@ function providerFromCherry(
     reasoning: existing?.reasoning ?? "off",
     promptCachingEnabled: existing?.promptCachingEnabled ?? providerType === "claude_code",
     nativeWebSearchEnabled: existing?.nativeWebSearchEnabled ?? true,
+    useSystemProxy: existing?.useSystemProxy ?? false,
   };
 }
 
@@ -1447,7 +1466,17 @@ function ProviderList(props: {
                   <ProviderBrandIcon type={type} />
                 </div>
                 <div className="min-w-0 flex-1">
-                  <div className="text-sm font-medium">{provider.name}</div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="truncate text-sm font-medium">{provider.name}</span>
+                    {provider.useSystemProxy ? (
+                      <span
+                        className="shrink-0 text-blue-500 dark:text-blue-400"
+                        title={t("settings.providerUseSystemProxy")}
+                      >
+                        <Waypoints className="h-3 w-3" />
+                      </span>
+                    ) : null}
+                  </div>
                   <div className="truncate text-xs text-muted-foreground">
                     {provider.baseUrl || t("settings.noBaseUrl")} {" · "}
                     {provider.activeModels.length} {t("settings.activeModels")}

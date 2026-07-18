@@ -2,12 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createTsModuleLoader } from "../helpers/load-ts-module.mjs";
 
+const gatewayInvokeCalls = [];
 const loader = createTsModuleLoader({
   mocks: {
     "@tauri-apps/api/core": {
-      invoke(command) {
+      invoke(command, args) {
         if (command === "proxy_get_server_info") {
           return Promise.resolve({ baseUrl: "http://proxy.local:9999", token: "proxy-token" });
+        }
+        if (command === "gateway_provider_models") {
+          gatewayInvokeCalls.push(args);
+          return Promise.resolve({ data: [{ id: "gpt-proxied" }] });
         }
         throw new Error(`unexpected invoke(${command})`);
       },
@@ -109,6 +114,23 @@ test("buildProviderModelsAttempts orders default before official with provider h
   assert.equal(codex[0].headers["x-api-key"], "test-key");
   assert.equal(codex[1].headers["x-api-key"], undefined);
   assert.equal(codex[1].headers.Authorization, "Bearer test-key");
+});
+
+test("provider model fetch identity changes when system proxy routing changes", () => {
+  const direct = providerUtils.buildProviderModelsFetchKey(
+    " https://relay.example.com/v1 ",
+    " test-key ",
+    false,
+  );
+  const proxied = providerUtils.buildProviderModelsFetchKey(
+    "https://relay.example.com/v1",
+    "test-key",
+    true,
+  );
+
+  assert.equal(direct, "https://relay.example.com/v1||test-key||direct");
+  assert.equal(proxied, "https://relay.example.com/v1||test-key||proxy");
+  assert.notEqual(direct, proxied);
 });
 
 test("pickProviderModelsFailure prefers informative errors over missing-endpoint noise", () => {
@@ -237,4 +259,43 @@ test("fetchModelsFromApi retries claude_code with official anthropic headers", a
       );
     },
   );
+});
+
+test("gateway WebUI forwards the system proxy choice to desktop model fetching", async () => {
+  const previousDocument = globalThis.document;
+  const previousWindow = globalThis.window;
+  globalThis.document = { documentElement: { dataset: { liveagentWebui: "gateway" } } };
+  globalThis.window = {
+    localStorage: {
+      getItem(key) {
+        return key === "liveagent.gateway.token" ? "gateway-token" : null;
+      },
+    },
+  };
+  gatewayInvokeCalls.length = 0;
+  try {
+    const models = await providerUtils.fetchModelsFromApi(
+      "codex",
+      "https://relay.example.com/v1",
+      "test-key",
+      { useSystemProxy: true },
+    );
+    assert.deepEqual(
+      models.map((model) => model.id),
+      ["gpt-proxied"],
+    );
+    assert.deepEqual(gatewayInvokeCalls, [
+      {
+        type: "codex",
+        base_url: "https://relay.example.com/v1",
+        api_key: "test-key",
+        use_system_proxy: true,
+      },
+    ]);
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+  }
 });

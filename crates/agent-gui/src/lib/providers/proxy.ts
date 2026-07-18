@@ -4,6 +4,9 @@ import type { ProviderId } from "../settings";
 
 export const LIVEAGENT_PROXY_TOKEN_HEADER = "x-liveagent-proxy-token";
 export const LIVEAGENT_UPSTREAM_ORIGIN_HEADER = "x-liveagent-upstream-origin";
+// 布尔标记头：声明该请求经系统代理出网。代理地址/凭据只存于桌面 Rust 侧，
+// 由本地反代按此头选择带代理的 client（x-liveagent-* 头不会转发给上游）。
+export const LIVEAGENT_USE_SYSTEM_PROXY_HEADER = "x-liveagent-use-system-proxy";
 
 type ProxyServerInfo = {
   baseUrl: string;
@@ -124,6 +127,7 @@ export async function prepareProxyRequest(
   providerId: ProviderId,
   upstreamBaseUrl: string,
   headers: Record<string, string>,
+  options?: { useSystemProxy?: boolean },
 ): Promise<PreparedProxyRequest> {
   const proxyServerInfo = await getProxyServerInfo();
   const { baseUrl, upstreamOrigin } = buildProxyBaseUrl(
@@ -138,6 +142,7 @@ export async function prepareProxyRequest(
       ...headers,
       [LIVEAGENT_UPSTREAM_ORIGIN_HEADER]: upstreamOrigin,
       [LIVEAGENT_PROXY_TOKEN_HEADER]: proxyServerInfo.token,
+      ...(options?.useSystemProxy ? { [LIVEAGENT_USE_SYSTEM_PROXY_HEADER]: "1" } : {}),
     },
   };
 }

@@ -64,6 +64,7 @@ message GatewayEnvelope {
     FsReadEditableTextRequest fs_read_editable_text = 62;
     FsReadWorkspaceImageRequest fs_read_workspace_image = 63;
     SftpRequest sftp_request = 64;
+    ProviderModelsRequest provider_models = 65;
     SettingsResetSshKnownHostRequest settings_reset_ssh_known_host = 72;
     ChatQueueRequest chat_queue = 73;
     TunnelStateSnapshot tunnel_state = 80;
@@ -131,6 +132,7 @@ message AgentEnvelope {
     RuntimeStatusEvent runtime_status = 71;
     SettingsResetSshKnownHostResponse settings_reset_ssh_known_host_resp = 72;
     ChatRuntimeSnapshot chat_runtime_snapshot = 77;
+    ProviderModelsResponse provider_models_resp = 79;
     TunnelDesiredState tunnel_desired = 80;
     TunnelMutationResult tunnel_mutation_result = 81;
     TunnelFrame tunnel_frame = 82;
@@ -1098,4 +1100,15 @@ message PongResponse {
 message ErrorResponse {
   int32 code = 1;
   string message = 2;
+}
+
+message ProviderModelsRequest {
+  string provider_type = 1;
+  string base_url = 2;
+  string api_key = 3;
+  bool use_system_proxy = 4;
+}
+
+message ProviderModelsResponse {
+  string models_json = 1;
 }

@@ -183,6 +183,47 @@ fn normalize_archived_workspace_project_paths(raw: Option<&Value>) -> Value {
     Value::Array(out)
 }
 
+fn normalize_system_proxy_value(raw: Option<&Value>) -> Value {
+    let obj = match raw {
+        Some(Value::Object(map)) => map.clone(),
+        _ => Map::new(),
+    };
+    let proxy_type = match obj.get("type").and_then(Value::as_str) {
+        Some("socks5") => "socks5",
+        _ => "http",
+    };
+    let host = obj
+        .get("host")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let port = obj
+        .get("port")
+        .and_then(Value::as_u64)
+        .filter(|port| (1..=65535).contains(port))
+        .unwrap_or(0);
+    let username = obj
+        .get("username")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let password = obj.get("password").and_then(Value::as_str).unwrap_or_default();
+    let password_configured = !password.trim().is_empty()
+        || obj
+            .get("passwordConfigured")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    json!({
+        "enabled": obj.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+        "type": proxy_type,
+        "host": host,
+        "port": port,
+        "username": username,
+        "password": password,
+        "passwordConfigured": password_configured,
+    })
+}
+
 fn system_value_with_defaults(raw: Option<Value>, default_workdir: &str) -> Value {
     let mut system = match raw {
         Some(Value::Object(system)) => system,
@@ -302,6 +343,10 @@ fn system_value_with_defaults(raw: Option<Value>, default_workdir: &str) -> Valu
             system.get(SYSTEM_ARCHIVED_WORKSPACE_PROJECT_PATHS_KEY),
         ),
     );
+    system.insert(
+        SYSTEM_SYSTEM_PROXY_KEY.to_string(),
+        normalize_system_proxy_value(system.get(SYSTEM_SYSTEM_PROXY_KEY)),
+    );
 
     Value::Object(system)
 }
@@ -348,6 +393,7 @@ fn save_system_with_default_workdir(
         SYSTEM_HIDDEN_WORKSPACE_PROJECT_PATHS_KEY,
         SYSTEM_MISSING_WORKSPACE_PROJECT_PATHS_KEY,
         SYSTEM_ARCHIVED_WORKSPACE_PROJECT_PATHS_KEY,
+        SYSTEM_SYSTEM_PROXY_KEY,
     ] {
         let value = system.get(key).cloned().unwrap_or(Value::Null);
         tx.execute(
@@ -364,4 +410,21 @@ fn save_system_with_default_workdir(
     tx.commit()
         .map_err(|e| format!("提交 {SYSTEM_SETTINGS_TABLE} 事务失败：{e}"))?;
     Ok(())
+}
+
+/// 把 DB 中的 systemProxy 配置刷进全局代理状态（shell env 注入与 reqwest 出网共用）。
+fn refresh_system_proxy_state(conn: &Connection) -> Result<(), String> {
+    let system = load_system(conn)?;
+    crate::services::system_proxy::set_config(
+        system
+            .as_ref()
+            .and_then(|value| value.get(SYSTEM_SYSTEM_PROXY_KEY)),
+    );
+    Ok(())
+}
+
+/// 启动时初始化系统代理状态；失败不阻断启动（调用方仅记录日志）。
+pub fn initialize_system_proxy_from_db() -> Result<(), String> {
+    let conn = open_db()?;
+    refresh_system_proxy_state(&conn)
 }

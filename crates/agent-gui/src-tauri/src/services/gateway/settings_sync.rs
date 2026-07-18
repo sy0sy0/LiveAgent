@@ -4,6 +4,7 @@ use uuid::Uuid;
 use crate::commands::settings::{
     load_gateway_settings_sync_snapshot, open_db, redact_gateway_settings_sync_payload,
     PROVIDER_API_KEY_UPDATES_FIELD, SSH_PATCH_FIELD, SSH_SECRET_UPDATES_FIELD,
+    SYSTEM_PROXY_PASSWORD_UPDATE_FIELD,
 };
 
 use super::*;
@@ -118,6 +119,7 @@ pub(crate) fn build_local_settings_update_event_payload(payload: Value) -> Resul
     };
     let provider_api_key_updates = event.remove(PROVIDER_API_KEY_UPDATES_FIELD);
     let ssh_secret_updates = event.remove(SSH_SECRET_UPDATES_FIELD);
+    let system_proxy_password_update = event.remove(SYSTEM_PROXY_PASSWORD_UPDATE_FIELD);
     event.remove("remote");
     let mut public_event = match redact_gateway_settings_sync_payload(Value::Object(event))? {
         Value::Object(map) => map,
@@ -128,6 +130,9 @@ pub(crate) fn build_local_settings_update_event_payload(payload: Value) -> Resul
     }
     if let Some(updates) = ssh_secret_updates {
         public_event.insert(SSH_SECRET_UPDATES_FIELD.to_string(), updates);
+    }
+    if let Some(update) = system_proxy_password_update {
+        public_event.insert(SYSTEM_PROXY_PASSWORD_UPDATE_FIELD.to_string(), update);
     }
     Ok(Value::Object(public_event))
 }
@@ -142,6 +147,7 @@ pub(crate) fn build_local_settings_update_event_payload_with_ssh(
     };
     let provider_api_key_updates = event.remove(PROVIDER_API_KEY_UPDATES_FIELD);
     let ssh_secret_updates = event.remove(SSH_SECRET_UPDATES_FIELD);
+    let system_proxy_password_update = event.remove(SYSTEM_PROXY_PASSWORD_UPDATE_FIELD);
     event.remove("remote");
     event.remove(SSH_PATCH_FIELD);
     event.insert("ssh".to_string(), ssh);
@@ -154,6 +160,9 @@ pub(crate) fn build_local_settings_update_event_payload_with_ssh(
     }
     if let Some(updates) = ssh_secret_updates {
         public_event.insert(SSH_SECRET_UPDATES_FIELD.to_string(), updates);
+    }
+    if let Some(update) = system_proxy_password_update {
+        public_event.insert(SYSTEM_PROXY_PASSWORD_UPDATE_FIELD.to_string(), update);
     }
     Ok(Value::Object(public_event))
 }

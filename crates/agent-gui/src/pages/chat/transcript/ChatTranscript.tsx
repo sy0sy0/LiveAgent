@@ -14,6 +14,8 @@ import { ScrollArea } from "../../../components/ui/scroll-area";
 import { useLocale } from "../../../i18n";
 import { BOTTOM_REATTACH_ZONE_PX } from "../../../lib/chat-scroll/scrollFollowCore";
 import { useScrollFollow } from "../../../lib/chat-scroll/useScrollFollow";
+import { useMenuExitPresence } from "../../../lib/shared/menuMotion";
+import { cn } from "../../../lib/shared/utils";
 import { ChatEmptyState } from "./ChatEmptyState";
 import { RowInteractionProvider, useRowInteractionStore } from "./rowInteraction";
 import { TranscriptList } from "./TranscriptList";
@@ -182,8 +184,12 @@ export const ChatTranscript = memo(function ChatTranscript(props: ChatTranscript
     [closeTranscriptContextMenu],
   );
 
-  const transcriptContextMenuPosition = transcriptContextMenu
-    ? clampTranscriptContextMenuPosition(transcriptContextMenu.x, transcriptContextMenu.y)
+  // Closing keeps the last snapshot mounted (inert) while the exit animation
+  // plays; only the live snapshot drives the dismiss listeners above.
+  const { rendered: renderedContextMenu, isExiting: isContextMenuExiting } =
+    useMenuExitPresence(transcriptContextMenu);
+  const transcriptContextMenuPosition = renderedContextMenu
+    ? clampTranscriptContextMenuPosition(renderedContextMenu.x, renderedContextMenu.y)
     : null;
   const copySelectedTextLabel = locale === "en-US" ? "Copy selected text" : "复制选中文本";
   const jumpToBottomLabel = locale === "en-US" ? "Scroll to bottom" : "回到底部";
@@ -254,12 +260,15 @@ export const ChatTranscript = memo(function ChatTranscript(props: ChatTranscript
           <ChevronDown className="h-4 w-4" />
         </button>
       ) : null}
-      {transcriptContextMenu && transcriptContextMenuPosition
+      {renderedContextMenu && transcriptContextMenuPosition
         ? createPortal(
             <div
               ref={transcriptContextMenuRef}
               role="menu"
-              className="fixed z-[120] w-max min-w-[9.5rem] max-w-[calc(100vw-1.5rem)] overflow-hidden rounded-lg border border-border/70 bg-popover p-1.5 text-popover-foreground shadow-[0_20px_60px_-20px_rgba(15,23,42,0.35)]"
+              className={cn(
+                "editor-context-menu fixed z-[120] w-max min-w-[9.5rem] max-w-[calc(100vw-1.5rem)] select-none overflow-hidden rounded-lg border border-border/70 bg-popover p-1.5 text-popover-foreground shadow-[0_20px_60px_-20px_rgba(15,23,42,0.35)]",
+                isContextMenuExiting && "editor-context-menu-exit",
+              )}
               style={{
                 left: transcriptContextMenuPosition.left,
                 top: transcriptContextMenuPosition.top,
@@ -273,7 +282,7 @@ export const ChatTranscript = memo(function ChatTranscript(props: ChatTranscript
                 role="menuitem"
                 className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-[calc(13px*var(--zone-font-scale,1))] text-foreground/90 transition-colors hover:bg-accent hover:text-accent-foreground"
                 onClick={() => {
-                  writeTextToClipboard(transcriptContextMenu.selectedText);
+                  writeTextToClipboard(renderedContextMenu.selectedText);
                   closeTranscriptContextMenu();
                 }}
               >

@@ -3,7 +3,7 @@ pub(crate) fn load_gateway_settings_sync_snapshot(conn: &Connection) -> Result<V
     let mut snapshot = Map::new();
     snapshot.insert(
         "system".to_string(),
-        load_system_with_defaults(conn, &default_workdir)?,
+        redact_system_settings(load_system_with_defaults(conn, &default_workdir)?)?,
     );
     snapshot.insert(
         "customProviders".to_string(),
@@ -80,11 +80,15 @@ pub(crate) fn redact_gateway_settings_sync_payload(payload: Value) -> Result<Val
     let mut snapshot = expect_object(payload, "gateway settings sync payload")?;
     snapshot.remove(PROVIDER_API_KEY_UPDATES_FIELD);
     snapshot.remove(SSH_SECRET_UPDATES_FIELD);
+    snapshot.remove(SYSTEM_PROXY_PASSWORD_UPDATE_FIELD);
     if let Some(providers) = snapshot.remove("customProviders") {
         snapshot.insert(
             "customProviders".to_string(),
             redact_provider_credentials(providers)?,
         );
+    }
+    if let Some(system) = snapshot.remove("system") {
+        snapshot.insert("system".to_string(), redact_system_settings(system)?);
     }
     if let Some(ssh) = snapshot.remove("ssh") {
         snapshot.insert("ssh".to_string(), redact_ssh_settings(ssh)?);
@@ -179,6 +183,36 @@ fn redact_ssh_proxy_secret(proxy: Value) -> Result<Value, String> {
             Some(Value::Null) | None => false,
             Some(_) => return Err("ssh settings proxy.password must be a string".to_string()),
         } || matches!(payload.get("passwordConfigured"), Some(Value::Bool(true)));
+    payload.insert(
+        "passwordConfigured".to_string(),
+        Value::Bool(password_configured),
+    );
+    Ok(Value::Object(payload))
+}
+
+/// system 快照出口脱敏：systemProxy.password 摘除并写 passwordConfigured 标记。
+fn redact_system_settings(system: Value) -> Result<Value, String> {
+    let mut payload = expect_object(system, "system settings payload")?;
+    if let Some(proxy) = payload.remove(SYSTEM_SYSTEM_PROXY_KEY) {
+        if !matches!(proxy, Value::Null) {
+            payload.insert(
+                SYSTEM_SYSTEM_PROXY_KEY.to_string(),
+                redact_system_proxy_secret(proxy)?,
+            );
+        }
+    }
+    Ok(Value::Object(payload))
+}
+
+fn redact_system_proxy_secret(proxy: Value) -> Result<Value, String> {
+    let mut payload = expect_object(proxy, "system settings systemProxy")?;
+    let password_configured = match payload.remove("password") {
+        Some(Value::String(value)) => !value.trim().is_empty(),
+        Some(Value::Null) | None => false,
+        Some(_) => {
+            return Err("system settings systemProxy.password must be a string".to_string())
+        }
+    } || matches!(payload.get("passwordConfigured"), Some(Value::Bool(true)));
     payload.insert(
         "passwordConfigured".to_string(),
         Value::Bool(password_configured),

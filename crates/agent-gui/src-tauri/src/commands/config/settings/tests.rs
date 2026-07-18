@@ -890,6 +890,19 @@ mod tests {
         );
     }
 
+    /// 归一后的 systemProxy 默认值（save/load 全量断言共用）。
+    fn default_system_proxy_json() -> Value {
+        json!({
+            "enabled": false,
+            "type": "http",
+            "host": "",
+            "port": 0,
+            "username": "",
+            "password": "",
+            "passwordConfigured": false
+        })
+    }
+
     #[test]
     fn save_system_persists_project_setting_rows() {
         let mut conn = open_memory_db();
@@ -922,7 +935,7 @@ mod tests {
         };
         let loaded = load_system(&conn).expect("load system");
 
-        assert_eq!(row_count, 8);
+        assert_eq!(row_count, 9);
         assert_eq!(
             keys,
             vec![
@@ -932,6 +945,7 @@ mod tests {
                 SYSTEM_HIDDEN_WORKSPACE_PROJECT_PATHS_KEY.to_string(),
                 SYSTEM_MISSING_WORKSPACE_PROJECT_PATHS_KEY.to_string(),
                 SYSTEM_SELECTED_TOOLS_KEY.to_string(),
+                SYSTEM_SYSTEM_PROXY_KEY.to_string(),
                 SYSTEM_WORKDIR_KEY.to_string(),
                 SYSTEM_WORKSPACE_PROJECTS_KEY.to_string(),
             ]
@@ -944,6 +958,7 @@ mod tests {
                 "hiddenWorkspaceProjectPaths": [],
                 "missingWorkspaceProjectPaths": [],
                 "archivedWorkspaceProjectPaths": [],
+                "systemProxy": default_system_proxy_json(),
                 "workdir": default_workdir.clone(),
                 "selectedSystemTools": ["http_get_test"],
                 "workspaceProjects": [
@@ -1012,6 +1027,7 @@ mod tests {
                 "hiddenWorkspaceProjectPaths": [],
                 "missingWorkspaceProjectPaths": [],
                 "archivedWorkspaceProjectPaths": [],
+                "systemProxy": default_system_proxy_json(),
                 "workdir": "/tmp/liveagent-default-project",
                 "selectedSystemTools": [],
                 "workspaceProjects": [
@@ -1063,6 +1079,7 @@ mod tests {
                 "hiddenWorkspaceProjectPaths": [],
                 "missingWorkspaceProjectPaths": [],
                 "archivedWorkspaceProjectPaths": [],
+                "systemProxy": default_system_proxy_json(),
                 "workdir": "/tmp/liveagent-default-project",
                 "selectedSystemTools": [],
                 "workspaceProjects": [
@@ -1095,6 +1112,7 @@ mod tests {
                 "hiddenWorkspaceProjectPaths": [],
                 "missingWorkspaceProjectPaths": [],
                 "archivedWorkspaceProjectPaths": [],
+                "systemProxy": default_system_proxy_json(),
                 "workdir": "/tmp/liveagent-default-project",
                 "selectedSystemTools": [],
                 "workspaceProjects": [

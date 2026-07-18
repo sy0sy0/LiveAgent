@@ -183,6 +183,21 @@ docker run -d \
   ghcr.io/stack-cairn/liveagent-gateway:latest
 ```
 
+**一键升级到最新版** — 拉取新镜像 → 删除旧容器 → 以相同参数重建(若你修改过端口映射或 token,请同步替换下方参数):
+
+```bash
+docker pull ghcr.io/stack-cairn/liveagent-gateway:latest \
+  && docker rm -f liveagent-gateway \
+  && docker run -d \
+    --name liveagent-gateway \
+    --restart unless-stopped \
+    -p 50051:50051 \
+    -p 50052:8080 \
+    -e LIVEAGENT_GATEWAY_TOKEN=your-token \
+    ghcr.io/stack-cairn/liveagent-gateway:latest \
+  && docker image prune -f
+```
+
 <details>
 <summary><b>Nginx 反向代理配置</b> — 自建域名 / TLS 时参考</summary>
 

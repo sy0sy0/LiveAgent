@@ -182,6 +182,21 @@ docker run -d \
   ghcr.io/stack-cairn/liveagent-gateway:latest
 ```
 
+**One-command upgrade to the latest version** — pull the new image → remove the old container → recreate it with the same arguments (if you changed the port mappings or token, adjust the arguments below accordingly):
+
+```bash
+docker pull ghcr.io/stack-cairn/liveagent-gateway:latest \
+  && docker rm -f liveagent-gateway \
+  && docker run -d \
+    --name liveagent-gateway \
+    --restart unless-stopped \
+    -p 50051:50051 \
+    -p 50052:8080 \
+    -e LIVEAGENT_GATEWAY_TOKEN=your-token \
+    ghcr.io/stack-cairn/liveagent-gateway:latest \
+  && docker image prune -f
+```
+
 <details>
 <summary><b>Nginx reverse proxy configuration</b> — reference for custom domains / TLS</summary>
 

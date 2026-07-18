@@ -649,6 +649,7 @@ export async function runAssistantWithTools(params: {
     reasoning?: ReasoningLevel;
     promptCachingEnabled?: boolean;
     nativeWebSearchEnabled?: boolean;
+    useSystemProxy?: boolean;
     modelConfig?: ProviderModelConfig;
   };
   runtimePlatform?: RuntimePlatform;
@@ -704,6 +705,7 @@ export async function runAssistantWithTools(params: {
       params.providerId,
       params.runtime.baseUrl.trim(),
       buildProviderAuthHeaders(params.providerId, params.runtime.apiKey),
+      { useSystemProxy: params.runtime.useSystemProxy === true },
     );
 
     const model = createModelFromConfig(

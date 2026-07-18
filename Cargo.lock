@@ -3189,6 +3189,7 @@ dependencies = [
  "lopdf",
  "notify",
  "objc2-app-kit 0.3.2",
+ "percent-encoding",
  "portable-pty",
  "prost",
  "quick-xml 0.41.0",

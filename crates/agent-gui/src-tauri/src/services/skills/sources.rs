@@ -1,6 +1,5 @@
 //! 安装源准备：GitHub / HTTP / 本地目录 / 压缩包，含下载与安全解压。
 
-use reqwest::blocking::Client as HttpClient;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -100,7 +99,8 @@ pub(crate) fn write_download_to_path_with_progress<F>(
 where
     F: FnMut(u64, Option<u64>),
 {
-    let client = HttpClient::builder()
+    let client = crate::services::system_proxy::blocking_client_builder()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?
         .timeout(Duration::from_secs(30))
         .user_agent("liveagent-skill-installer")
         .build()
@@ -244,6 +244,9 @@ pub(crate) fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<(), String> {
     let mut command = Command::new("git");
     crate::runtime::process::configure_child_process_group(&mut command);
     command.args(args);
+    for (key, value) in crate::services::system_proxy::shell_proxy_envs()? {
+        command.env(key, value);
+    }
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }

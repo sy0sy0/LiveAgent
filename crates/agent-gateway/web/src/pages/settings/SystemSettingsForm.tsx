@@ -1,6 +1,8 @@
+import { useState } from "react";
 import {
   CheckCircle2,
   Cpu,
+  Globe,
   MessageSquare,
   MonitorSmartphone,
   Moon,
@@ -9,16 +11,28 @@ import {
   Terminal,
   Wrench,
 } from "../../components/icons";
-
+import { Input } from "../../components/ui/input";
+import { Label } from "../../components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "../../components/ui/select";
 import { SUPPORTED_LOCALES, useLocale } from "../../i18n";
 import {
   type ExecutionMode,
   type FontScaleSettings,
+  isValidSystemProxyHost,
+  type SystemProxyConfig,
+  type SystemProxyType,
   THEME_OPTIONS,
   type Theme,
   updateCustomSettings,
   updateSystem,
 } from "../../lib/settings";
+import { AgentActivationSwitch } from "./shared";
 import type { SettingsSectionProps } from "./types";
 
 const FONT_SCALE_OPTIONS = [0.9, 1, 1.1, 1.2] as const;
@@ -73,6 +87,65 @@ export function SystemSettingsForm(props: SettingsSectionProps) {
     );
   }
 
+  const systemProxy = settings.system.systemProxy;
+  // host/port/username/password 走"本地草稿 + blur 提交"：失焦才写入 settings，
+  // 避免逐字符触发同步；且 WebUI 设置 state 持久前会脱敏密码，草稿避免输入即被清空。
+  const [proxyHostDraft, setProxyHostDraft] = useState<string | null>(null);
+  const [proxyPortDraft, setProxyPortDraft] = useState<string | null>(null);
+  const [proxyUsernameDraft, setProxyUsernameDraft] = useState<string | null>(null);
+  const [proxyPasswordDraft, setProxyPasswordDraft] = useState<string | null>(null);
+  // 护栏 A：host + port 有效才算配置可用（端口在启用时必填有效）。
+  // 用"草稿优先"的生效值计算：blur 提交前开关若仍禁用，点击开关触发的 blur
+  // 会先把按钮变回可用，但落在禁用按钮上的这次 click 已被浏览器吞掉，需点两次。
+  const effectiveProxyHost = (proxyHostDraft ?? systemProxy.host).trim();
+  const effectiveProxyPort =
+    proxyPortDraft !== null ? Number.parseInt(proxyPortDraft, 10) : systemProxy.port;
+  const proxyConfigValid =
+    isValidSystemProxyHost(effectiveProxyHost) &&
+    Number.isInteger(effectiveProxyPort) &&
+    effectiveProxyPort >= 1 &&
+    effectiveProxyPort <= 65535;
+  const systemProxyInvalid = systemProxy.enabled && !proxyConfigValid;
+  // 配置无效且当前未启用时禁止开启开关（护栏 A）；已启用时始终允许关闭。
+  const proxyToggleDisabled = !systemProxy.enabled && !proxyConfigValid;
+
+  function patchSystemProxy(patch: Partial<SystemProxyConfig>) {
+    setSettings((prev) =>
+      updateSystem(prev, {
+        systemProxy: { ...prev.system.systemProxy, ...patch },
+      }),
+    );
+  }
+
+  function commitProxyHostDraft() {
+    if (proxyHostDraft !== null) {
+      patchSystemProxy({ host: proxyHostDraft.trim() });
+      setProxyHostDraft(null);
+    }
+  }
+
+  function commitProxyPortDraft() {
+    if (proxyPortDraft !== null) {
+      const parsed = Number.parseInt(proxyPortDraft, 10);
+      patchSystemProxy({ port: Number.isNaN(parsed) ? 0 : parsed });
+      setProxyPortDraft(null);
+    }
+  }
+
+  function commitProxyUsernameDraft() {
+    if (proxyUsernameDraft !== null) {
+      patchSystemProxy({ username: proxyUsernameDraft.trim() });
+      setProxyUsernameDraft(null);
+    }
+  }
+
+  function commitProxyPasswordDraft() {
+    if (proxyPasswordDraft !== null) {
+      patchSystemProxy({ password: proxyPasswordDraft });
+      setProxyPasswordDraft(null);
+    }
+  }
+
   return (
     <div className="settings-system-section space-y-6">
       <div className="space-y-3">
@@ -80,9 +153,6 @@ export function SystemSettingsForm(props: SettingsSectionProps) {
           <Terminal className="h-4 w-4 text-muted-foreground" />
           {t("settings.executionMode")}
         </div>
-        <p className="text-xs leading-relaxed text-muted-foreground">
-          {t("settings.executionModeDesc")}
-        </p>
 
         <div className="settings-choice-grid grid grid-cols-1 gap-3 md:grid-cols-3">
           <button
@@ -288,27 +358,127 @@ export function SystemSettingsForm(props: SettingsSectionProps) {
       </div>
 
       <section className="space-y-3 rounded-2xl border border-border/60 bg-card p-4">
-        <div className="flex items-start justify-between gap-3">
-          <div className="space-y-1">
-            <div className="flex items-center gap-2 text-sm font-medium text-foreground">
-              <ScanText className="h-4 w-4 text-muted-foreground" />
-              {t("settings.fontSize")}
-            </div>
-            <p className="text-xs leading-relaxed text-muted-foreground">
-              {t("settings.fontSizeDesc")}
-            </p>
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+            <Globe className="h-4 w-4 text-muted-foreground" />
+            {t("settings.systemProxy")}
           </div>
-          <button
-            type="button"
-            onClick={() =>
-              setSettings((prev) =>
-                updateCustomSettings(prev, { fontScale: { sidebar: 1, chat: 1, rightDock: 1 } }),
-              )
-            }
-            className="shrink-0 rounded-lg border border-border/60 bg-background/80 px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:border-border hover:bg-muted/35 hover:text-foreground"
-          >
-            {t("settings.fontSizeReset")}
-          </button>
+          <AgentActivationSwitch
+            checked={systemProxy.enabled}
+            title={t("settings.systemProxyEnable")}
+            disabled={proxyToggleDisabled}
+            onToggle={() => patchSystemProxy({ enabled: !systemProxy.enabled })}
+          />
+        </div>
+        <p className="text-xs text-muted-foreground">{t("settings.systemProxyDesc")}</p>
+        {systemProxyInvalid ? (
+          <p className="text-xs text-destructive">{t("settings.systemProxyInvalid")}</p>
+        ) : proxyToggleDisabled ? (
+          <p className="text-xs text-muted-foreground">{t("settings.systemProxyEnableHint")}</p>
+        ) : null}
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-12 lg:items-start">
+          <div className="space-y-1.5 sm:col-span-2 lg:col-span-2">
+            <Label className="text-xs font-medium text-muted-foreground">
+              {t("settings.systemProxyType")}
+            </Label>
+            <Select
+              value={systemProxy.type}
+              onValueChange={(value) => patchSystemProxy({ type: value as SystemProxyType })}
+            >
+              <SelectTrigger className="w-full">
+                <SelectValue>{systemProxy.type === "socks5" ? "SOCKS5" : "HTTP"}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="http">HTTP</SelectItem>
+                <SelectItem value="socks5">SOCKS5</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1.5 lg:col-span-4">
+            <Label
+              htmlFor="system-proxy-host"
+              className="text-xs font-medium text-muted-foreground"
+            >
+              {t("settings.systemProxyHost")}
+            </Label>
+            <Input
+              id="system-proxy-host"
+              value={proxyHostDraft ?? systemProxy.host}
+              placeholder="127.0.0.1"
+              onChange={(event) => setProxyHostDraft(event.currentTarget.value)}
+              onBlur={commitProxyHostDraft}
+            />
+          </div>
+          <div className="space-y-1.5 lg:col-span-2">
+            <Label
+              htmlFor="system-proxy-port"
+              className="text-xs font-medium text-muted-foreground"
+            >
+              {t("settings.systemProxyPort")}
+            </Label>
+            <Input
+              id="system-proxy-port"
+              type="number"
+              min={1}
+              max={65535}
+              value={proxyPortDraft ?? (systemProxy.port > 0 ? String(systemProxy.port) : "")}
+              placeholder={systemProxy.type === "socks5" ? "1080" : "7890"}
+              onChange={(event) => setProxyPortDraft(event.currentTarget.value)}
+              onBlur={commitProxyPortDraft}
+            />
+          </div>
+          <div className="space-y-1.5 lg:col-span-2">
+            <Label
+              htmlFor="system-proxy-username"
+              className="text-xs font-medium text-muted-foreground"
+            >
+              {t("settings.systemProxyUsername")}
+            </Label>
+            <Input
+              id="system-proxy-username"
+              value={proxyUsernameDraft ?? systemProxy.username}
+              onChange={(event) => setProxyUsernameDraft(event.currentTarget.value)}
+              onBlur={commitProxyUsernameDraft}
+            />
+          </div>
+          <div className="space-y-1.5 lg:col-span-2">
+            <Label
+              htmlFor="system-proxy-password"
+              className="text-xs font-medium text-muted-foreground"
+            >
+              {t("settings.systemProxyPassword")}
+            </Label>
+            <Input
+              id="system-proxy-password"
+              type="password"
+              value={proxyPasswordDraft ?? systemProxy.password}
+              onChange={(event) => setProxyPasswordDraft(event.currentTarget.value)}
+              onBlur={commitProxyPasswordDraft}
+            />
+            {systemProxy.passwordConfigured &&
+            !(proxyPasswordDraft ?? systemProxy.password).trim() ? (
+              <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                <span>{t("settings.systemProxyPasswordConfigured")}</span>
+                <button
+                  type="button"
+                  className="underline-offset-2 hover:text-foreground hover:underline"
+                  onClick={() => {
+                    setProxyPasswordDraft(null);
+                    patchSystemProxy({ password: "", passwordConfigured: false });
+                  }}
+                >
+                  {t("settings.systemProxyPasswordClear")}
+                </button>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      </section>
+
+      <section className="space-y-3 rounded-2xl border border-border/60 bg-card p-4">
+        <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+          <ScanText className="h-4 w-4 text-muted-foreground" />
+          {t("settings.fontSize")}
         </div>
 
         <div className="space-y-2">
