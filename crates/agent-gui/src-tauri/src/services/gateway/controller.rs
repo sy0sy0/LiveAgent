@@ -52,6 +52,7 @@ impl GatewayController {
                 connected_since: None,
                 last_heartbeat: None,
                 last_error: None,
+                protocol: None,
             }),
             outbound_tx: Mutex::new(None),
             outbound_control_tx: Mutex::new(None),
@@ -338,6 +339,7 @@ impl GatewayController {
                 connected_since: None,
                 last_heartbeat: None,
                 last_error: Some("gateway status lock poisoned".to_string()),
+                protocol: None,
             })
     }
 

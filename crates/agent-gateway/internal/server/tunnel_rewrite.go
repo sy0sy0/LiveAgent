@@ -53,10 +53,10 @@ func tunnelResponseRewriteKindFor(
 	}
 	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
 
-	switch {
-	case mediaType == "text/html" || mediaType == "application/xhtml+xml":
+	switch mediaType {
+	case "text/html", "application/xhtml+xml":
 		return tunnelResponseRewriteHTML
-	case mediaType == "text/css":
+	case "text/css":
 		return tunnelResponseRewriteCSS
 	default:
 		return tunnelResponseRewriteNone

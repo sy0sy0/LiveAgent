@@ -8,7 +8,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::runtime::platform::expand_tilde_path;
+use crate::runtime::platform::{expand_tilde_path, strip_windows_verbatim_prefix};
 
 const DEFAULT_HTTP_TIMEOUT_MS: u64 = 10_000;
 
@@ -75,7 +75,11 @@ pub(crate) fn resolve_workdir(workdir: Option<String>) -> Result<PathBuf, String
     if !metadata.is_dir() {
         return Err("Hook 工作目录必须是目录".to_string());
     }
-    fs::canonicalize(base).map_err(|e| format!("解析 Hook 工作目录失败：{e}"))
+    // The resolved path is stringified into PromptRunRequest.workdir and used
+    // as a child-process cwd: keep it in classic Win32 form, not `\\?\`.
+    fs::canonicalize(base)
+        .map(strip_windows_verbatim_prefix)
+        .map_err(|e| format!("解析 Hook 工作目录失败：{e}"))
 }
 
 fn build_header_map(headers: &Option<BTreeMap<String, String>>) -> Result<HeaderMap, String> {
@@ -95,9 +99,13 @@ fn build_header_map(headers: &Option<BTreeMap<String, String>>) -> Result<Header
     Ok(map)
 }
 
-pub(crate) fn build_http_client() -> Result<Client, String> {
+/// `timeout_ms` bounds every request made by the returned client; `None`
+/// keeps the legacy 10s default used by hooks.
+pub(crate) fn build_http_client(timeout_ms: Option<u64>) -> Result<Client, String> {
     Client::builder()
-        .timeout(Duration::from_millis(DEFAULT_HTTP_TIMEOUT_MS))
+        .timeout(Duration::from_millis(
+            timeout_ms.unwrap_or(DEFAULT_HTTP_TIMEOUT_MS).max(1),
+        ))
         .build()
         .map_err(|e| format!("创建 Hook HTTP client 失败：{e}"))
 }

@@ -105,7 +105,12 @@ impl ActivityBatch {
         self.changed.insert(rel);
     }
 
-    fn absorb(&mut self, workdir: &Path, canonical_workdir: Option<&Path>, event: notify::Result<Event>) {
+    fn absorb(
+        &mut self,
+        workdir: &Path,
+        canonical_workdir: Option<&Path>,
+        event: notify::Result<Event>,
+    ) {
         let event = match event {
             Ok(event) => event,
             Err(_) => {
@@ -268,7 +273,9 @@ fn sample_workdir(workdir: &Path) -> PollSample {
 }
 
 fn mtime_of(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).ok().and_then(|meta| meta.modified().ok())
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
 }
 
 fn run_poll_fallback(workdir: String, stop: Arc<AtomicBool>, service: Weak<WorkspaceWatchService>) {
@@ -324,7 +331,10 @@ mod tests {
     #[test]
     fn classify_rel_path_routes_worktree_git_meta_and_ignored() {
         for rel in ["src/main.rs", "README.md", "a/b/c.txt", ".gitignore"] {
-            assert!(matches!(classify_rel_path(rel), PathClass::Worktree), "{rel}");
+            assert!(
+                matches!(classify_rel_path(rel), PathClass::Worktree),
+                "{rel}"
+            );
         }
         for rel in [
             ".git/HEAD",
@@ -337,7 +347,10 @@ mod tests {
             ".git/refs/heads/main",
             ".git/refs/remotes/origin/main",
         ] {
-            assert!(matches!(classify_rel_path(rel), PathClass::GitMeta), "{rel}");
+            assert!(
+                matches!(classify_rel_path(rel), PathClass::GitMeta),
+                "{rel}"
+            );
         }
         for rel in [
             ".git",
@@ -348,7 +361,10 @@ mod tests {
             ".git/logs/HEAD",
             ".git/refs-backup/x",
         ] {
-            assert!(matches!(classify_rel_path(rel), PathClass::Ignored), "{rel}");
+            assert!(
+                matches!(classify_rel_path(rel), PathClass::Ignored),
+                "{rel}"
+            );
         }
     }
 }

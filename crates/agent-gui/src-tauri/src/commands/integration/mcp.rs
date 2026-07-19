@@ -1856,9 +1856,7 @@ mod tests {
         manager
             .ensure_client(offline_http_config("server-b"))
             .expect("ensure server-b");
-        let status = manager
-            .runtime_status("server-b")
-            .expect("status server-b");
+        let status = manager.runtime_status("server-b").expect("status server-b");
         assert_eq!(status.server_id, "server-b");
         assert!(manager.stop_client("server-b").expect("stop server-b"));
         assert!(

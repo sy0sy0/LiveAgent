@@ -35,7 +35,7 @@ func ImportReadableFiles(
 			return
 		}
 		if r.MultipartForm != nil {
-			defer r.MultipartForm.RemoveAll()
+			defer func() { _ = r.MultipartForm.RemoveAll() }()
 		}
 
 		workdir := strings.TrimSpace(r.FormValue("workdir"))

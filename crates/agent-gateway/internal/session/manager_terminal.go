@@ -20,11 +20,9 @@ func (m *Manager) SubscribeTerminalEvents() (<-chan *gatewayv1.TerminalEvent, fu
 
 	cleanup := func() {
 		m.syncHub.terminalMu.Lock()
-		if _, ok := m.syncHub.terminalSubscribers[subID]; ok {
-			// Do not close the channel here: broadcastTerminalEvent sends after
-			// copying subscribers, so closing can race with an in-flight send.
-			delete(m.syncHub.terminalSubscribers, subID)
-		}
+		// Do not close the channel here: broadcastTerminalEvent sends after
+		// copying subscribers, so closing can race with an in-flight send.
+		delete(m.syncHub.terminalSubscribers, subID)
 		m.syncHub.terminalMu.Unlock()
 	}
 

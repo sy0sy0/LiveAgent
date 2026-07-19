@@ -41,8 +41,7 @@ COPY --from=gateway-builder /out/liveagent-gateway /usr/local/bin/liveagent-gate
 USER liveagent
 
 ENV PORT=8080
-ENV LIVEAGENT_GATEWAY_GRPC_ADDR=:50051
 
-EXPOSE 8080 50051
+EXPOSE 8080
 
 ENTRYPOINT ["/usr/local/bin/liveagent-gateway"]

@@ -18,11 +18,9 @@ func (m *Manager) SubscribeSettingsSync() (<-chan *gatewayv1.SettingsSyncEvent, 
 
 	cleanup := func() {
 		m.syncHub.settingsMu.Lock()
-		if _, ok := m.syncHub.settingsSubscribers[subID]; ok {
-			// Do not close the channel here: broadcastSettingsSync sends after
-			// copying subscribers, so closing can race with an in-flight send.
-			delete(m.syncHub.settingsSubscribers, subID)
-		}
+		// Do not close the channel here: broadcastSettingsSync sends after
+		// copying subscribers, so closing can race with an in-flight send.
+		delete(m.syncHub.settingsSubscribers, subID)
 		m.syncHub.settingsMu.Unlock()
 	}
 

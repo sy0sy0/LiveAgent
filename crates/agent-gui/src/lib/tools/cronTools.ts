@@ -87,6 +87,14 @@ const MANAGE_CRON_TASK_PARAMETERS = Type.Object({
         "Remaining run count for this cron task. Omit or pass null for unlimited runs. Pass 0 only when the task should be exhausted and disabled.",
     }),
   ),
+  timeout_seconds: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      maximum: 600,
+      description:
+        "Execution timeout in seconds (1-600). Applies to the whole bash script, to each HTTP request, and to the prompt run for type=prompt. Omit on create for the 300s default; omit on update to keep the current value.",
+    }),
+  ),
   script: Type.Optional(
     Type.String({
       minLength: 1,
@@ -127,6 +135,12 @@ const MANAGE_CRON_TASK_PARAMETERS = Type.Object({
     Type.String({
       description:
         "Prompt content for type=prompt. Required for create when type is prompt. For update, pass this field only when you want to replace the stored prompt.",
+    }),
+  ),
+  workdir: Type.Optional(
+    Type.String({
+      description:
+        "Absolute workspace path the task runs in, for type=bash and type=prompt (ignored for type=http). On create, omitting this or passing an empty string pins the task to the workspace the agent is currently running in. On update, omit to keep the current value; an empty string also resolves to the agent's current workspace. If the pinned directory is missing at fire time the run fails and the task is disabled.",
     }),
   ),
 });
@@ -176,16 +190,32 @@ function requireTaskId(args: Record<string, unknown>, action: CronTaskAction) {
  */
 function collectTaskFields(
   args: Record<string, unknown>,
-  options: { requireCreateFields: boolean; currentChatModel?: SelectedModelInput },
+  options: {
+    requireCreateFields: boolean;
+    currentChatModel?: SelectedModelInput;
+    runtimeWorkdir?: string;
+  },
 ): Record<string, unknown> {
   const fields: Record<string, unknown> = {};
-  for (const key of ["name", "description", "cron", "type", "enabled", "script", "prompt"]) {
+  for (const key of [
+    "name",
+    "description",
+    "cron",
+    "type",
+    "enabled",
+    "script",
+    "prompt",
+    "workdir",
+  ]) {
     if (Object.hasOwn(args, key)) {
       fields[key] = args[key];
     }
   }
   if (Object.hasOwn(args, "remaining_executions")) {
     fields.remainingExecutions = args.remaining_executions;
+  }
+  if (Object.hasOwn(args, "timeout_seconds")) {
+    fields.timeoutSeconds = args.timeout_seconds;
   }
   if (Object.hasOwn(args, "requests") && Array.isArray(args.requests)) {
     fields.requests = (args.requests as unknown[]).map((entry) => {
@@ -197,18 +227,42 @@ function collectTaskFields(
     });
   }
 
+  // The model has no "follow the active workspace" spelling — that choice
+  // belongs to the settings UI. An explicitly empty workdir resolves to the
+  // workspace the agent is currently running in (Rust drops it for http).
+  if (Object.hasOwn(fields, "workdir")) {
+    const explicit = typeof fields.workdir === "string" ? fields.workdir.trim() : "";
+    const runtimeWorkdir = options.runtimeWorkdir?.trim();
+    if (!explicit && runtimeWorkdir) {
+      fields.workdir = runtimeWorkdir;
+    }
+  }
+
   if (options.requireCreateFields) {
     if (!Object.hasOwn(fields, "enabled")) {
       fields.enabled = true;
     }
+    // Tasks created from a conversation pin the workspace the agent is
+    // running in, unless the model explicitly chose another path. Http tasks
+    // never carry a workdir.
+    if (fields.type !== "http" && !Object.hasOwn(args, "workdir")) {
+      const runtimeWorkdir = options.runtimeWorkdir?.trim();
+      if (runtimeWorkdir) {
+        fields.workdir = runtimeWorkdir;
+      }
+    }
     if (fields.type === "prompt") {
-      // Prompt tasks always inherit the current runtime model.
+      // Prompt tasks never take the execution model or thinking level from
+      // the model's arguments: the current runtime model is inherited and
+      // the thinking level starts at "medium" (both editable later in the
+      // settings UI).
       if (!options.currentChatModel) {
         throw new Error(
           "CronTaskManager cannot create a prompt task without an active chat model.",
         );
       }
       fields.selectedModel = options.currentChatModel;
+      fields.reasoning = "medium";
     }
   }
   return fields;
@@ -217,13 +271,15 @@ function collectTaskFields(
 function formatTaskLine(task: CronTask, index?: number) {
   const prefix = index == null ? "" : `${index + 1}. `;
   const remaining = task.remainingExecutions ?? "unlimited";
+  const timeout = task.timeoutSeconds == null ? "" : ` | timeout_seconds=${task.timeoutSeconds}`;
   const error = task.lastError ? ` | last_error=${JSON.stringify(task.lastError)}` : "";
-  return `${prefix}task_id=${task.id} | name=${JSON.stringify(task.name)} | type=${task.type} | cron=${task.cron} | enabled=${task.enabled ? "true" : "false"} | remaining_executions=${remaining}${error}`;
+  return `${prefix}task_id=${task.id} | name=${JSON.stringify(task.name)} | type=${task.type} | cron=${task.cron} | enabled=${task.enabled ? "true" : "false"} | remaining_executions=${remaining}${timeout}${error}`;
 }
 
 function formatTaskDetails(task: CronTask) {
   const lines = [formatTaskLine(task)];
   if (task.description) lines.push(`description=${JSON.stringify(task.description)}`);
+  if (task.workdir) lines.push(`workdir=${JSON.stringify(task.workdir)}`);
   if (task.script) lines.push(`script:\n${task.script}`);
   if (task.prompt) lines.push(`prompt:\n${task.prompt}`);
   if (task.requests) {
@@ -234,6 +290,7 @@ function formatTaskDetails(task: CronTask) {
   if (task.selectedModel) {
     lines.push(`selected_model=${task.selectedModel.customProviderId}/${task.selectedModel.model}`);
   }
+  if (task.reasoning) lines.push(`reasoning=${task.reasoning}`);
   return lines.join("\n");
 }
 
@@ -247,20 +304,25 @@ function formatRunLine(run: CronRunRecord, index: number) {
 async function executeAction(
   args: Record<string, unknown>,
   currentChatModel?: SelectedModelInput,
+  runtimeWorkdir?: string,
 ): Promise<string> {
   const action = parseAction(args.action);
   await initAutomation();
 
   switch (action) {
     case "create": {
-      const item = collectTaskFields(args, { requireCreateFields: true, currentChatModel });
+      const item = collectTaskFields(args, {
+        requireCreateFields: true,
+        currentChatModel,
+        runtimeWorkdir,
+      });
       const snapshot = await applyCronOps([{ op: "create", item }]);
       const created = snapshot.tasks[snapshot.tasks.length - 1];
       return `Cron task created.\n${created ? formatTaskDetails(created) : ""}`.trim();
     }
     case "update": {
       const taskId = requireTaskId(args, action);
-      const patch = collectTaskFields(args, { requireCreateFields: false });
+      const patch = collectTaskFields(args, { requireCreateFields: false, runtimeWorkdir });
       if (Object.keys(patch).length === 0) {
         throw new Error("CronTaskManager update requires at least one field to change.");
       }
@@ -309,11 +371,12 @@ async function executeAction(
 
 export function createCronTools(params: {
   currentChatModel?: SelectedModelInput;
+  workdir?: string;
 }): BuiltinToolBundle {
   const toolCronTaskManager: Tool = {
     name: "CronTaskManager",
     description:
-      "Manage persistent scheduled tasks in Settings -> Cron. This is the built-in tool for scheduled automation in LiveAgent and is always available. Use action=create to create a new recurring task, action=read to list tasks or inspect one task, action=update to edit an existing task by task_id, action=delete to remove an existing task by task_id, and action=list_logs with task_id to view recent execution logs. If the user asks to modify, remove, or inspect logs for an existing scheduled task and you do not know the task_id or current configuration, call action=read first. Scheduled jobs must be represented with this cron tool rather than only described in text or faked with one-off execution. Supports bash, http, and prompt task types. Use remaining_executions for a finite remaining run count; omit it or pass null for unlimited runs. For bash tasks, provide a non-empty script string, not a JSON argv array. For prompt task creation, the cron model always inherits the current runtime model.",
+      "Manage persistent scheduled tasks in Settings -> Cron. This is the built-in tool for scheduled automation in LiveAgent and is always available. Use action=create to create a new recurring task, action=read to list tasks or inspect one task, action=update to edit an existing task by task_id, action=delete to remove an existing task by task_id, and action=list_logs with task_id to view recent execution logs. If the user asks to modify, remove, or inspect logs for an existing scheduled task and you do not know the task_id or current configuration, call action=read first. Scheduled jobs must be represented with this cron tool rather than only described in text or faked with one-off execution. Supports bash, http, and prompt task types. Use remaining_executions for a finite remaining run count; omit it or pass null for unlimited runs. Use timeout_seconds (1-600, default 300) to bound each run: it kills the bash script, each HTTP request, or the prompt run once exceeded. For bash tasks, provide a non-empty script string, not a JSON argv array. Prompt tasks configure their execution model and thinking level internally — creation always inherits the current runtime model and starts at a medium thinking level (the user can change both later in Settings -> Cron); there are no parameters for them, so never try to pass one. Newly created bash/prompt tasks are pinned to the workspace the agent is currently running in unless workdir explicitly names another path (an empty workdir also resolves to the current workspace).",
     parameters: MANAGE_CRON_TASK_PARAMETERS,
   };
 
@@ -351,6 +414,7 @@ export function createCronTools(params: {
       const text = await executeAction(
         (toolCall.arguments ?? {}) as Record<string, unknown>,
         params.currentChatModel,
+        params.workdir,
       );
       return {
         role: "toolResult",

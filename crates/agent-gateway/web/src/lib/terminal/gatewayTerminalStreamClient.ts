@@ -1,3 +1,10 @@
+import type { TerminalWireHeader } from "@/lib/gatewaySocketV2/adapters";
+import {
+  decodeTerminalServerFrame,
+  encodeTerminalHelloFrame,
+  encodeTerminalStreamFrame,
+  GATEWAY_V2_SUBPROTOCOL,
+} from "@/lib/gatewaySocketV2/adapters";
 import type {
   TerminalSession,
   TerminalStreamChunk,
@@ -7,38 +14,15 @@ import type {
   TerminalStreamSnapshot,
 } from "./types";
 
-const FRAME_VERSION = 1;
 const INPUT_FLUSH_BYTES = 4 * 1024;
 const INPUT_FLUSH_MS = 8;
 const INPUT_RETRY_MS = 25;
 const INPUT_HIGH_WATER_BYTES = 256 * 1024;
 const INPUT_LOW_WATER_BYTES = 128 * 1024;
 const ATTACH_RETRY_MS = 250;
-const KIND_BYTES: Record<string, number> = {
-  attach: 1,
-  input: 2,
-  resize: 3,
-  detach: 4,
-  output: 5,
-  snapshot: 6,
-  error: 7,
-};
 
-type TerminalFrameHeader = {
-  kind?: string;
-  streamId?: string;
-  sessionId?: string;
-  projectPathKey?: string;
-  seq?: number;
-  startOffset?: number;
-  endOffset?: number;
-  cols?: number;
-  rows?: number;
-  maxBytes?: number;
-  truncated?: boolean;
-  error?: string;
-  session?: unknown;
-};
+// 帧头形状沿用旧自定义帧的命名；v2 下由适配层映射到 TerminalStreamFrame。
+type TerminalFrameHeader = TerminalWireHeader;
 
 type PendingAttach = {
   handle: GatewayTerminalStreamHandle;
@@ -48,22 +32,16 @@ type PendingAttach = {
   retryTimerId: ReturnType<typeof setTimeout> | null;
 };
 
-function terminalStreamUrls() {
+function terminalStreamUrl() {
   const origin = terminalRuntimeOrigin();
   if (!origin) {
     throw new Error("Gateway terminal stream origin is unavailable");
   }
-  return [
-    buildTerminalStreamUrl(origin, "/ws/terminal"),
-    buildTerminalStreamUrl(origin, "/ws", "terminal=1"),
-  ].filter((url, index, urls) => urls.indexOf(url) === index);
-}
-
-function buildTerminalStreamUrl(origin: string, pathname: string, search = "") {
+  // v2 终端数据面唯一端点（旧 /ws/terminal 与 /ws?terminal=1 回退已淘汰）。
   const url = new URL(origin);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  url.pathname = pathname;
-  url.search = search;
+  url.pathname = "/ws/v2/terminal";
+  url.search = "";
   url.hash = "";
   return url.toString();
 }
@@ -107,47 +85,6 @@ function isRetryableAttachError(message: string) {
     normalized.includes("terminal stream connection") ||
     normalized.includes("terminal stream is not connected")
   );
-}
-
-function encodeFrame(
-  header: TerminalFrameHeader,
-  data: Uint8Array<ArrayBufferLike> = new Uint8Array(),
-) {
-  const kind = header.kind?.trim() ?? "";
-  const headerBytes = new TextEncoder().encode(JSON.stringify(header));
-  if (headerBytes.byteLength > 0xffff) {
-    throw new Error("Terminal stream header is too large");
-  }
-  const payload = new Uint8Array(4 + headerBytes.byteLength + data.byteLength);
-  payload[0] = FRAME_VERSION;
-  payload[1] = KIND_BYTES[kind] ?? 0;
-  new DataView(payload.buffer).setUint16(2, headerBytes.byteLength, false);
-  payload.set(headerBytes, 4);
-  payload.set(data, 4 + headerBytes.byteLength);
-  return payload;
-}
-
-function decodeFrame(payload: ArrayBuffer) {
-  const bytes = new Uint8Array(payload);
-  if (bytes.byteLength < 4 || bytes[0] !== FRAME_VERSION) {
-    throw new Error("Invalid terminal stream frame");
-  }
-  const headerLength = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint16(
-    2,
-    false,
-  );
-  const headerStart = 4;
-  const headerEnd = headerStart + headerLength;
-  if (bytes.byteLength < headerEnd) {
-    throw new Error("Truncated terminal stream frame");
-  }
-  const header = JSON.parse(
-    new TextDecoder().decode(bytes.subarray(headerStart, headerEnd)),
-  ) as TerminalFrameHeader;
-  return {
-    header,
-    data: bytes.slice(headerEnd),
-  };
 }
 
 function normalizeSession(input: unknown): TerminalSession {
@@ -490,7 +427,9 @@ export class BrowserGatewayTerminalStreamClient implements TerminalStreamClient 
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
       throw new Error("Terminal stream is not connected");
     }
-    this.socket.send(encodeFrame(header, data));
+    this.socket.send(
+      encodeTerminalStreamFrame(header, data ? new Uint8Array(data) : new Uint8Array()),
+    );
   }
 
   detach(streamId: string, session: TerminalSession, handle: GatewayTerminalStreamHandle) {
@@ -499,7 +438,7 @@ export class BrowserGatewayTerminalStreamClient implements TerminalStreamClient 
     if (this.socket?.readyState === WebSocket.OPEN) {
       try {
         this.socket.send(
-          encodeFrame({
+          encodeTerminalStreamFrame({
             kind: "detach",
             streamId,
             sessionId: sessionStillAttached ? undefined : session.id,
@@ -545,7 +484,6 @@ export class BrowserGatewayTerminalStreamClient implements TerminalStreamClient 
     if (this.socket?.readyState === WebSocket.OPEN) return;
     if (this.connectPromise) return this.connectPromise;
     this.connectPromise = new Promise<void>((resolve, reject) => {
-      const urls = terminalStreamUrls();
       let settled = false;
       let timeoutId: ReturnType<typeof setTimeout> | null = null;
       const clearAttemptTimeout = () => {
@@ -567,94 +505,84 @@ export class BrowserGatewayTerminalStreamClient implements TerminalStreamClient 
         this.socket = socket;
         resolve();
       };
-      const tryUrl = (index: number, previousError?: Error) => {
-        const url = urls[index];
-        if (!url) {
-          rejectOnce(previousError ?? new Error("Terminal stream connection failed"));
+      let url: string;
+      try {
+        url = terminalStreamUrl();
+      } catch (error) {
+        rejectOnce(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+      // v2：二进制 protobuf 帧 + 子协议协商 + hello 鉴权握手。
+      const socket = new WebSocket(url, GATEWAY_V2_SUBPROTOCOL);
+      socket.binaryType = "arraybuffer";
+      const failAttempt = (error: Error) => {
+        if (settled) return;
+        clearAttemptTimeout();
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onerror = null;
+        socket.onclose = null;
+        try {
+          socket.close();
+        } catch {
+          // The browser may already have torn the socket down.
+        }
+        rejectOnce(error);
+      };
+      timeoutId = setTimeout(() => {
+        failAttempt(new Error("Terminal stream connection timed out"));
+      }, 15_000);
+      socket.onopen = () => {
+        socket.send(encodeTerminalHelloFrame(this.token));
+      };
+      socket.onmessage = (event) => {
+        if (typeof event.data === "string") {
+          // v2 链路无文本帧；忽略。
           return;
         }
-        const socket = new WebSocket(url);
-        socket.binaryType = "arraybuffer";
-        let attemptFinished = false;
-        const failAttempt = (error: Error) => {
-          if (settled || attemptFinished) return;
-          attemptFinished = true;
-          clearAttemptTimeout();
-          socket.onopen = null;
-          socket.onmessage = null;
-          socket.onerror = null;
-          socket.onclose = null;
-          try {
-            socket.close();
-          } catch {
-            // The browser may already have torn the socket down.
-          }
-          if (index + 1 < urls.length) {
-            tryUrl(index + 1, error);
+        const decoded = decodeTerminalServerFrame(event.data as ArrayBuffer);
+        if (!decoded) return;
+        if (decoded.kind === "hello") {
+          if (decoded.ok) {
+            resolveOnce(socket);
           } else {
-            rejectOnce(error);
+            failAttempt(new Error(decoded.message || "Terminal stream auth failed"));
           }
-        };
-        timeoutId = setTimeout(() => {
-          failAttempt(new Error("Terminal stream connection timed out"));
-        }, 15_000);
-        socket.onopen = () => {
-          socket.send(JSON.stringify({ type: "auth", token: this.token }));
-        };
-        socket.onmessage = (event) => {
-          if (typeof event.data === "string") {
-            const payload = JSON.parse(event.data) as { type?: string; error?: string };
-            if (payload.type === "ready") {
-              resolveOnce(socket);
-            } else if (payload.type === "error") {
-              failAttempt(new Error(payload.error || "Terminal stream auth failed"));
-            }
-            return;
-          }
-          this.handleBinaryMessage(event.data as ArrayBuffer);
-        };
-        socket.onerror = () => {
-          failAttempt(new Error("Terminal stream connection failed"));
-        };
-        socket.onclose = () => {
-          if (!settled) {
-            failAttempt(new Error("Terminal stream connection closed"));
-            return;
-          }
-          if (this.socket === socket) {
-            this.socket = null;
-            this.handleSocketClosed();
-          }
-        };
+          return;
+        }
+        this.handleStreamFrame(decoded.header, decoded.data);
       };
-      tryUrl(0);
+      socket.onerror = () => {
+        failAttempt(new Error("Terminal stream connection failed"));
+      };
+      socket.onclose = () => {
+        if (!settled) {
+          failAttempt(new Error("Terminal stream connection closed"));
+          return;
+        }
+        if (this.socket === socket) {
+          this.socket = null;
+          this.handleSocketClosed();
+        }
+      };
     }).finally(() => {
       this.connectPromise = null;
     });
     return this.connectPromise;
   }
 
-  private handleBinaryMessage(payload: ArrayBuffer) {
-    let frame: { header: TerminalFrameHeader; data: Uint8Array };
-    try {
-      frame = decodeFrame(payload);
-    } catch {
-      return;
-    }
-    const kind = frame.header.kind ?? "";
+  private handleStreamFrame(header: TerminalFrameHeader, data: Uint8Array) {
+    const kind = header.kind ?? "";
     if (kind === "snapshot") {
-      this.resolveAttach(frame.header, frame.data);
+      this.resolveAttach(header, data);
       return;
     }
     if (kind === "output") {
-      this.emitOutput(frame.header, frame.data);
+      this.emitOutput(header, data);
       return;
     }
     if (kind === "error") {
-      this.rejectAttach(
-        frame.header.streamId ?? "",
-        frame.header.error || "Terminal stream failed",
-      );
+      this.rejectAttach(header.streamId ?? "", header.error || "Terminal stream failed");
     }
   }
 

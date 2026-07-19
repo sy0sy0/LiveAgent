@@ -15,9 +15,8 @@ use crate::commands::{
     settings::{load_providers, open_db},
     system::{
         system_create_project_folder_sync, system_import_uploaded_readable_files_sync,
-        system_list_skill_files_sync, system_read_skill_metadata_sync,
-        system_read_skill_text_sync, system_read_uploaded_image_preview_sync,
-        SystemReadableFileUploadInput,
+        system_list_skill_files_sync, system_read_skill_metadata_sync, system_read_skill_text_sync,
+        system_read_uploaded_image_preview_sync, SystemReadableFileUploadInput,
     },
 };
 use crate::services::automation::{
@@ -27,9 +26,8 @@ use crate::services::gateway::proto;
 use crate::services::memory::{
     MemoryAcceptArgs, MemoryBatchArgs, MemoryDeleteArgs, MemoryDeleteProjectArgs, MemoryListArgs,
     MemoryOrganizeDueClaimArgs, MemoryOrganizeRunCreateArgs, MemoryOrganizeRunListArgs,
-    MemoryOrganizeRunReadArgs, MemoryOrganizeRunUpdateArgs, MemoryQuotaSummaryArgs,
-    MemoryReadArgs, MemoryRecentRejectionsArgs, MemorySearchArgs, MemoryStore, MemoryUpdateArgs,
-    MemoryWriteArgs,
+    MemoryOrganizeRunReadArgs, MemoryOrganizeRunUpdateArgs, MemoryQuotaSummaryArgs, MemoryReadArgs,
+    MemoryRecentRejectionsArgs, MemorySearchArgs, MemoryStore, MemoryUpdateArgs, MemoryWriteArgs,
 };
 use crate::services::skills::system_manage_skill_sync;
 
@@ -54,28 +52,25 @@ pub async fn handle_cron_manage(
     let result_json = match action.as_str() {
         "snapshot" => {
             let store = Arc::clone(&store);
-            let snapshot =
-                tauri::async_runtime::spawn_blocking(move || store.snapshot())
-                    .await
-                    .map_err(|e| format!("gateway automation snapshot join failed: {e}"))??;
+            let snapshot = tauri::async_runtime::spawn_blocking(move || store.snapshot())
+                .await
+                .map_err(|e| format!("gateway automation snapshot join failed: {e}"))??;
             serialize_cron_manage_result(&snapshot)?
         }
         "cron_apply" => {
             let input = parse_apply_input(&request.task_json)?;
             let store = Arc::clone(&store);
-            let response =
-                tauri::async_runtime::spawn_blocking(move || store.cron_apply(input))
-                    .await
-                    .map_err(|e| format!("gateway cron apply join failed: {e}"))??;
+            let response = tauri::async_runtime::spawn_blocking(move || store.cron_apply(input))
+                .await
+                .map_err(|e| format!("gateway cron apply join failed: {e}"))??;
             serialize_cron_manage_result(&response)?
         }
         "hooks_apply" => {
             let input = parse_apply_input(&request.task_json)?;
             let store = Arc::clone(&store);
-            let response =
-                tauri::async_runtime::spawn_blocking(move || store.hooks_apply(input))
-                    .await
-                    .map_err(|e| format!("gateway hooks apply join failed: {e}"))??;
+            let response = tauri::async_runtime::spawn_blocking(move || store.hooks_apply(input))
+                .await
+                .map_err(|e| format!("gateway hooks apply join failed: {e}"))??;
             serialize_cron_manage_result(&response)?
         }
         "list_runs" => {
@@ -91,10 +86,9 @@ pub async fn handle_cron_manage(
         "clear_runs" => {
             let task_id = parse_required_cron_task_id(&request, "clear_runs")?;
             let store = Arc::clone(&store);
-            let cleared =
-                tauri::async_runtime::spawn_blocking(move || store.clear_runs(&task_id))
-                    .await
-                    .map_err(|e| format!("gateway clear_runs join failed: {e}"))??;
+            let cleared = tauri::async_runtime::spawn_blocking(move || store.clear_runs(&task_id))
+                .await
+                .map_err(|e| format!("gateway clear_runs join failed: {e}"))??;
             serialize_cron_manage_result(&json!({ "clearedCount": cleared }))?
         }
         "run_now" => {
@@ -102,8 +96,8 @@ pub async fn handle_cron_manage(
             let store = Arc::clone(&store);
             let response =
                 tauri::async_runtime::spawn_blocking(move || store.run_cron_task_now(&task_id))
-                .await
-                .map_err(|e| format!("gateway run_now join failed: {e}"))??;
+                    .await
+                    .map_err(|e| format!("gateway run_now join failed: {e}"))??;
             serialize_cron_manage_result(&response)?
         }
         "validate" => {
@@ -949,8 +943,8 @@ fn parse_runs_limit(raw: &str) -> Result<usize, String> {
     if trimmed.is_empty() {
         return Ok(100);
     }
-    let payload = serde_json::from_str::<Value>(trimmed)
-        .map_err(|e| format!("invalid runs query: {e}"))?;
+    let payload =
+        serde_json::from_str::<Value>(trimmed).map_err(|e| format!("invalid runs query: {e}"))?;
     Ok(payload
         .as_object()
         .and_then(|obj| obj.get("limit"))

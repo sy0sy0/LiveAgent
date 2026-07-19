@@ -464,7 +464,7 @@ func (m *Manager) SendTunnelFrameToAgent(frame *gatewayv1.TunnelFrame) error {
 }
 
 // dispatchTunnelFrame routes an agent frame to its visitor stream. It runs on
-// the agent gRPC read loop, so it must never block: a full stream channel
+// the agent stream read loop, so it must never block: a full stream channel
 // closes the stream (the visitor handler cancels) instead of waiting.
 func (m *Manager) dispatchTunnelFrame(frame *gatewayv1.TunnelFrame) {
 	if frame == nil {

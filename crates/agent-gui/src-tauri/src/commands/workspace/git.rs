@@ -3906,12 +3906,9 @@ mod tests {
         assert!(names.contains(&"rename-target"), "branches: {names:?}");
         assert!(!names.contains(&"rename-source"), "branches: {names:?}");
 
-        let renamed_current = git_rename_branch_sync(
-            workdir,
-            initial.head.clone(),
-            "renamed-current".to_string(),
-        )
-        .expect("rename current branch");
+        let renamed_current =
+            git_rename_branch_sync(workdir, initial.head.clone(), "renamed-current".to_string())
+                .expect("rename current branch");
         assert!(
             renamed_current.ok,
             "rename current failed: {}",
@@ -3991,7 +3988,11 @@ mod tests {
 
         run_temp_git(
             repo.path(),
-            &["update-ref", "refs/remotes/origin/base", initial_sha.as_str()],
+            &[
+                "update-ref",
+                "refs/remotes/origin/base",
+                initial_sha.as_str(),
+            ],
         );
         let from_remote = git_create_branch_sync(
             workdir.clone(),
@@ -4016,11 +4017,8 @@ mod tests {
             Some("no-such-ref".to_string()),
         );
         assert!(bogus.is_err(), "bogus start point should error");
-        let dashed = git_create_branch_sync(
-            workdir,
-            "from-dashed".to_string(),
-            Some("-d".to_string()),
-        );
+        let dashed =
+            git_create_branch_sync(workdir, "from-dashed".to_string(), Some("-d".to_string()));
         assert!(dashed.is_err(), "dashed start point should error");
     }
 

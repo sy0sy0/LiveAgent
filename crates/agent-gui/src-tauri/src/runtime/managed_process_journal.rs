@@ -181,7 +181,9 @@ pub fn delete_non_isolated_rows(
 /// from the result and deleted (they cannot be reasoned about safely).
 pub fn read_rows(conn: &Connection) -> Result<Vec<ManagedProcessJournalRow>, String> {
     let mut stmt = conn
-        .prepare("SELECT process_id, payload_json, owner_pid, owner_started_at FROM managed_processes")
+        .prepare(
+            "SELECT process_id, payload_json, owner_pid, owner_started_at FROM managed_processes",
+        )
         .map_err(|e| format!("读取 managed process journal 失败：{e}"))?;
     let raw_rows = stmt
         .query_map([], |row| {

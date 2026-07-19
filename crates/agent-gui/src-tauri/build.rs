@@ -25,20 +25,27 @@ fn main() {
         });
     println!("cargo:rustc-env=LIVEAGENT_APP_VERSION={app_version}");
 
-    let proto_dir = std::path::Path::new(&manifest_dir)
+    // v1/v2 proto 共用 agent-gateway 目录为 include 根，import 路径与 Go 侧 buf 模块一致；
+    // v2 经该路径 import v1 复用其消息。
+    let gateway_root = std::path::Path::new(&manifest_dir)
         .join("..")
         .join("..")
-        .join("agent-gateway")
+        .join("agent-gateway");
+    let proto_v1 = gateway_root.join("proto").join("v1").join("gateway.proto");
+    let proto_v2 = gateway_root
         .join("proto")
-        .join("v1");
-    let proto_file = proto_dir.join("gateway.proto");
+        .join("v2")
+        .join("gateway_ws.proto");
 
-    println!("cargo:rerun-if-changed={}", proto_file.display());
+    println!("cargo:rerun-if-changed={}", proto_v1.display());
+    println!("cargo:rerun-if-changed={}", proto_v2.display());
 
     tonic_prost_build::configure()
         .build_server(false)
-        .compile_protos(&[proto_file], &[proto_dir])
-        .expect("compile gateway proto");
+        // v1 gRPC 服务已随 v1 协议移除，proto 只含消息；桌面端仅消费消息类型。
+        .build_client(false)
+        .compile_protos(&[proto_v1, proto_v2], &[gateway_root])
+        .expect("compile gateway protos");
 
     tauri_build::build()
 }

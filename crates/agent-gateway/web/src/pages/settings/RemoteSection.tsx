@@ -154,28 +154,20 @@ function usePositiveIntegerDraft(
   };
 }
 
-function buildGrpcEndpoint(settings: AppSettings["remote"]) {
-  const explicitEndpoint = settings.grpcEndpoint.trim();
-  if (explicitEndpoint) {
-    if (/^https?:\/\//i.test(explicitEndpoint)) {
-      return explicitEndpoint.replace(/\/$/, "");
-    }
-    return `http://${explicitEndpoint.replace(/\/$/, "")}`;
-  }
-
+function buildGatewayEndpointPreview(settings: AppSettings["remote"]) {
   const gatewayUrl = settings.gatewayUrl.trim();
   if (!gatewayUrl) return "";
 
   try {
     const url = new URL(gatewayUrl);
-    const port = String(settings.grpcPort || 50051);
+    const port = String(settings.grpcPort || 443);
     url.port = port;
     url.pathname = "";
     url.search = "";
     url.hash = "";
     return url.toString().replace(/\/$/, "");
   } catch {
-    return `${gatewayUrl}:${settings.grpcPort || 50051}`;
+    return `${gatewayUrl}:${settings.grpcPort || 443}`;
   }
 }
 
@@ -244,7 +236,10 @@ export function RemoteSection(props: SettingsSectionProps) {
   }, [settings.remote.enabled]);
 
   const isConnected = Boolean(status.online);
-  const grpcEndpoint = useMemo(() => buildGrpcEndpoint(settings.remote), [settings.remote]);
+  const gatewayEndpointPreview = useMemo(
+    () => buildGatewayEndpointPreview(settings.remote),
+    [settings.remote],
+  );
 
   const statusText = isConnected
     ? t("settings.remoteConnected")
@@ -326,38 +321,18 @@ export function RemoteSection(props: SettingsSectionProps) {
               value={remoteGrpcPortDraft.draft}
               onBlur={remoteGrpcPortDraft.handleBlur}
               onChange={(e) => remoteGrpcPortDraft.handleChange(e.target.value)}
-              placeholder="50051"
+              placeholder="443"
               className="w-24 shrink-0 font-mono text-[13px]"
             />
           </div>
           <p className="text-[11px] leading-relaxed text-muted-foreground/70">
             {t("settings.remoteGatewayUrlHint")}
           </p>
-          <div className="space-y-1.5 pt-2">
-            <label className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
-              <Globe className="h-3 w-3" />
-              {t("settings.remoteGrpcEndpoint")}
-            </label>
-            <Input
-              type="text"
-              value={settings.remote.grpcEndpoint}
-              onChange={(e) =>
-                updateRemoteSettings(setSettings, {
-                  grpcEndpoint: e.target.value,
-                })
-              }
-              placeholder="http://tcp.proxy.rlwy.net:12345"
-              className="font-mono text-[13px]"
-            />
-            <p className="text-[11px] leading-relaxed text-muted-foreground/70">
-              {t("settings.remoteGrpcEndpointHint")}
-            </p>
-          </div>
-          {grpcEndpoint ? (
+          {gatewayEndpointPreview ? (
             <div className="flex items-center gap-2 rounded-lg bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground">
               <Globe className="h-3.5 w-3.5 shrink-0" />
-              <span className="min-w-0 flex-1 truncate font-mono">{grpcEndpoint}</span>
-              <CopyButton value={grpcEndpoint} />
+              <span className="min-w-0 flex-1 truncate font-mono">{gatewayEndpointPreview}</span>
+              <CopyButton value={gatewayEndpointPreview} />
             </div>
           ) : null}
         </div>

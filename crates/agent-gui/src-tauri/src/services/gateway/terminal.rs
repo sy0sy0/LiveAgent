@@ -1,8 +1,10 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use futures_util::SinkExt as _;
 use tokio::sync::{mpsc, watch};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt as _;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 use uuid::Uuid;
 
 use crate::commands::settings::RemoteSettingsPayload;
@@ -15,26 +17,26 @@ use crate::runtime::terminal::{
     TerminalSshCreateResponse, TerminalStreamEventPayload, TerminalStreamSnapshotResponse,
 };
 
+use super::gateway_proto::v2;
 use super::*;
 
 impl GatewayController {
-    pub(crate) fn spawn_terminal_stream(
+    /// v2 终端数据面（/ws/v2/terminal，角色 AGENT）：PTY/注册表侧播种口与 gRPC 版完全一致；
+    /// 由 connect_and_serve 在主链路建立后生成本任务，与主链路同生命周期。
+    pub(crate) fn spawn_terminal_stream_ws(
         self: &Arc<Self>,
-        client: proto::agent_gateway_client::AgentGatewayClient<tonic::transport::Channel>,
         config: RemoteSettingsPayload,
         stop_rx: watch::Receiver<bool>,
     ) -> tauri::async_runtime::JoinHandle<()> {
         let controller = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
-            controller
-                .run_terminal_stream(client, config, stop_rx)
-                .await;
+            controller.run_terminal_stream_ws(config, stop_rx).await;
         })
     }
 
-    pub(crate) async fn run_terminal_stream(
+    /// v2 终端流重连主循环，骨架与 gRPC 版一致（同一组退避常量）。
+    pub(crate) async fn run_terminal_stream_ws(
         self: Arc<Self>,
-        client: proto::agent_gateway_client::AgentGatewayClient<tonic::transport::Channel>,
         config: RemoteSettingsPayload,
         mut stop_rx: watch::Receiver<bool>,
     ) {
@@ -47,7 +49,7 @@ impl GatewayController {
 
             let attempt_started = Instant::now();
             let result = Arc::clone(&self)
-                .run_terminal_stream_once(client.clone(), config.clone(), stop_rx.clone())
+                .run_terminal_stream_ws_once(config.clone(), stop_rx.clone())
                 .await;
             if *stop_rx.borrow() {
                 break;
@@ -58,8 +60,10 @@ impl GatewayController {
                 reconnect_delay = GATEWAY_TERMINAL_STREAM_RECONNECT_MIN;
             }
             match result {
-                Ok(()) => eprintln!("gateway terminal stream closed; reconnecting"),
-                Err(error) => eprintln!("gateway terminal stream stopped: {error}; reconnecting"),
+                Ok(()) => eprintln!("gateway terminal ws stream closed; reconnecting"),
+                Err(error) => {
+                    eprintln!("gateway terminal ws stream stopped: {error}; reconnecting")
+                }
             }
 
             let delay = reconnect_delay;
@@ -78,33 +82,40 @@ impl GatewayController {
         self.set_terminal_stream_sender(None);
     }
 
-    pub(crate) async fn run_terminal_stream_once(
+    /// 单次 v2 终端流连接：hello ok=true 即就绪（v1 的合成 "gateway-ready" detach 握手帧不复存在），
+    /// 随后双向透传 TerminalStreamFrame；周期 WS Ping 取代 v1 的 detach 保活帧。
+    pub(crate) async fn run_terminal_stream_ws_once(
         self: Arc<Self>,
-        mut client: proto::agent_gateway_client::AgentGatewayClient<tonic::transport::Channel>,
         config: RemoteSettingsPayload,
         mut stop_rx: watch::Receiver<bool>,
     ) -> Result<(), String> {
-        let (terminal_tx, terminal_rx) = mpsc::channel::<proto::TerminalStreamFrame>(4096);
+        let ws_url = build_ws_url(
+            &config.gateway_url,
+            config.grpc_port,
+            GATEWAY_WS_TERMINAL_PATH,
+        )?;
+        let hello = build_client_hello(
+            &config.token,
+            effective_agent_id(&config),
+            crate::app_version().to_string(),
+        );
+
+        let connect = connect_terminal_ws(&ws_url, hello);
+        tokio::pin!(connect);
+        let (mut ws, _server_hello) = tokio::select! {
+            changed = stop_rx.changed() => {
+                let _ = changed;
+                return Ok(());
+            }
+            result = &mut connect => {
+                result.map_err(|error| format!("gateway terminal ws connect failed: {error}"))?
+            }
+        };
+
+        let (terminal_tx, mut terminal_rx) = mpsc::channel::<proto::TerminalStreamFrame>(4096);
+        self.set_terminal_stream_sender(Some(terminal_tx.clone()));
 
         let result = async {
-            queue_terminal_stream_handshake_frame(&terminal_tx)?;
-            let mut request = tonic::Request::new(ReceiverStream::new(terminal_rx));
-            insert_bearer_metadata(request.metadata_mut(), &config.token)?;
-            let response = tokio::select! {
-                changed = stop_rx.changed() => {
-                    if changed.is_err() || *stop_rx.borrow() {
-                        return Ok(());
-                    }
-                    return Ok(());
-                }
-                response = client.agent_terminal_connect(request) => {
-                    response.map_err(|error| {
-                        format_gateway_terminal_stream_rpc_error("open", &error, &config)
-                    })?
-                }
-            };
-            self.set_terminal_stream_sender(Some(terminal_tx.clone()));
-            let mut inbound = response.into_inner();
             let mut keepalive = tokio::time::interval(GATEWAY_TERMINAL_STREAM_KEEPALIVE_INTERVAL);
             keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             keepalive.tick().await;
@@ -116,19 +127,40 @@ impl GatewayController {
                         }
                     }
                     _ = keepalive.tick() => {
-                        queue_terminal_stream_keepalive_frame(&terminal_tx).await?;
+                        ws.send(WsMessage::Ping(Vec::new().into()))
+                            .await
+                            .map_err(|error| format!("gateway terminal ws keepalive failed: {error}"))?;
                     }
-                    message = inbound.message() => {
+                    frame = terminal_rx.recv() => {
+                        let Some(frame) = frame else {
+                            return Err("gateway terminal ws outbound channel closed".to_string());
+                        };
+                        let client_frame = v2::TerminalClientFrame {
+                            payload: Some(v2::terminal_client_frame::Payload::Frame(frame)),
+                        };
+                        ws.send(encode_ws_frame(&client_frame))
+                            .await
+                            .map_err(|error| format!("gateway terminal ws send failed: {error}"))?;
+                    }
+                    message = ws.next() => {
                         match message {
-                            Ok(Some(frame)) => {
-                                if let Err(error) = self.handle_terminal_stream_frame(frame).await {
-                                    eprintln!("handle gateway terminal stream frame failed: {error}");
+                            None => return Ok(()),
+                            Some(Err(error)) => {
+                                return Err(format!("gateway terminal ws receive failed: {error}"));
+                            }
+                            Some(Ok(WsMessage::Binary(data))) => {
+                                let server_frame: v2::TerminalServerFrame = decode_ws_frame(&data)?;
+                                if let Some(v2::terminal_server_frame::Payload::Frame(frame)) =
+                                    server_frame.payload
+                                {
+                                    if let Err(error) = self.handle_terminal_stream_frame(frame).await {
+                                        eprintln!("handle gateway terminal stream frame failed: {error}");
+                                    }
                                 }
                             }
-                            Ok(None) => return Ok(()),
-                            Err(error) => {
-                                return Err(format_gateway_terminal_stream_rpc_error("receive", &error, &config))
-                            }
+                            Some(Ok(WsMessage::Close(_))) => return Ok(()),
+                            // Ping/Pong 由 tungstenite 自动处理。
+                            Some(Ok(_)) => {}
                         }
                     }
                 }
@@ -802,50 +834,4 @@ pub(crate) fn build_terminal_event_envelope(payload: TerminalEventPayload) -> pr
             },
         )),
     }
-}
-
-pub(crate) fn queue_terminal_stream_handshake_frame(
-    sender: &mpsc::Sender<proto::TerminalStreamFrame>,
-) -> Result<(), String> {
-    // Some HTTP/2 proxies do not fully establish a bidi stream until the client
-    // sends its first DATA frame. `detach` is a gateway no-op and is not forwarded
-    // to browser terminal subscribers.
-    sender
-        .try_send(terminal_stream_noop_frame("desktop-handshake"))
-        .map_err(|error| format!("queue gateway terminal stream handshake failed: {error}"))
-}
-
-pub(crate) async fn queue_terminal_stream_keepalive_frame(
-    sender: &mpsc::Sender<proto::TerminalStreamFrame>,
-) -> Result<(), String> {
-    sender
-        .send(terminal_stream_noop_frame("desktop-keepalive"))
-        .await
-        .map_err(|error| format!("queue gateway terminal stream keepalive failed: {error}"))
-}
-
-pub(crate) fn terminal_stream_noop_frame(prefix: &str) -> proto::TerminalStreamFrame {
-    proto::TerminalStreamFrame {
-        kind: "detach".to_string(),
-        stream_id: format!("{}-{}", prefix.trim(), Uuid::new_v4()),
-        ..Default::default()
-    }
-}
-
-pub(crate) fn format_gateway_terminal_stream_rpc_error(
-    phase: &str,
-    error: &tonic::Status,
-    config: &RemoteSettingsPayload,
-) -> String {
-    let message = error.to_string();
-    if !is_h2_protocol_error(&message) {
-        return format!("gateway terminal stream {phase} failed: {message}");
-    }
-
-    let endpoint = build_grpc_url(config).unwrap_or_else(|_| "invalid endpoint".to_string());
-    format!(
-        "gateway terminal stream {phase} failed: {message}. \
-         The gateway terminal stream requires a gRPC endpoint that supports HTTP/2 bidi streams; \
-         check Remote gRPC Endpoint / gRPC port. Current endpoint: {endpoint}"
-    )
 }

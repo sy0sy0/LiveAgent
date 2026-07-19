@@ -1315,7 +1315,15 @@ html[data-liveagent-webui="gateway"] [role="textbox"]:focus-visible {
 
 .gateway-settings-overlay-open {
   opacity: 1;
-  transform: translateY(0);
+  /*
+   * `none` (identity) instead of translateY(0): a lingering transform on the
+   * overlay turns it into a permanent containing block + composited layer
+   * around the settings scroller. On Android Chrome that combination skips
+   * rasterizing parts of the scrolled content (cards render as blank gaps
+   * that move with scroll position). Transitions interpolate to/from `none`
+   * as identity, so the open/close motion is unchanged.
+   */
+  transform: none;
 }
 
 .gateway-settings-overlay aside > div:last-child > button {
@@ -3069,6 +3077,17 @@ html[data-liveagent-webui="gateway"]
 
   html[data-liveagent-webui="gateway"] .settings-cron-view-right {
     min-height: 0;
+  }
+
+  /* Stacked layout: the logs header (desktop close location) sits mid-modal,
+     so surface the hero copy of the close button at the modal's top-right,
+     right of run-now, and hide the logs-header one. */
+  html[data-liveagent-webui="gateway"] .settings-cron-view-hero-close {
+    display: flex;
+  }
+
+  html[data-liveagent-webui="gateway"] .settings-cron-logs-close {
+    display: none;
   }
 
   html[data-liveagent-webui="gateway"] .settings-log-row {

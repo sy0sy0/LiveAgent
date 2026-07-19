@@ -4,11 +4,9 @@ package liveagent.gateway.v1;
 
 option go_package = "github.com/liveagent/agent-gateway/internal/proto/v1;gatewayv1";
 
-service AgentGateway {
-  rpc AgentConnect(stream AgentEnvelope) returns (stream GatewayEnvelope);
-  rpc AgentTerminalConnect(stream TerminalStreamFrame) returns (stream TerminalStreamFrame);
-  rpc Authenticate(AuthRequest) returns (AuthResponse);
-}
+// 本文件是三端共享的业务消息单一事实源（v2 帧壳见 proto/v2/gateway_ws.proto，
+// 其载荷全部复用这里的消息）。v1 gRPC 服务 AgentGateway 已随 v1 协议移除；
+// 消息全部保留、永不弃用，编号只增不改。
 
 message AuthRequest {
   string token = 1;
@@ -599,6 +597,8 @@ message ChatMessageRef {
 
 message CancelChatRequest {
   string conversation_id = 1;
+  // 可选运行 id 提示：v2 浏览器链路用它消除同会话并发运行的歧义；桌面端可忽略。
+  string run_id = 2;
 }
 
 message ChatCommandRequest {

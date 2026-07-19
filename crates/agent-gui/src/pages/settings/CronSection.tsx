@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { useMemo, useState } from "react";
 import {
   AlertTriangle,
@@ -20,7 +21,7 @@ import {
   useAutomation,
 } from "../../lib/automation";
 import { buildModelOptions } from "../../lib/chat/page/chatPageHelpers";
-import { isAgentExecutionMode } from "../../lib/settings";
+import { isAgentExecutionMode, workspaceProjectPathKey } from "../../lib/settings";
 import { type CronTaskFormData, CronTaskModal } from "./CronTaskModal";
 import { CronTaskViewModal } from "./CronTaskViewModal";
 import { AgentActivationSwitch, ConfirmDeletePopover } from "./shared";
@@ -79,9 +80,24 @@ export function CronSection(props: SettingsSectionProps) {
         value: option.value,
         label: option.label,
         providerName: option.providerName,
+        providerId: option.providerId,
+        providerType: option.providerType,
       })),
     [settings],
   );
+  // Archived/hidden workspaces are not offered for pinning; a task already
+  // pinned to one keeps its path (the modal shows it as unavailable).
+  const workspaceOptions = useMemo(() => {
+    const excludedPathKeys = new Set(
+      [
+        ...settings.system.archivedWorkspaceProjectPaths,
+        ...settings.system.hiddenWorkspaceProjectPaths,
+      ].map(workspaceProjectPathKey),
+    );
+    return settings.system.workspaceProjects
+      .filter((project) => !excludedPathKeys.has(workspaceProjectPathKey(project.path)))
+      .map((project) => ({ path: project.path, name: project.name || project.path }));
+  }, [settings]);
 
   function runOps(run: () => Promise<unknown>) {
     setActionError(null);
@@ -107,6 +123,14 @@ export function CronSection(props: SettingsSectionProps) {
     runOps(() => applyCronOps([{ op: "delete", id }]));
   }
 
+  async function pickWorkdirDirectory(initialWorkdir: string): Promise<string | null> {
+    // The command is rename_all=snake_case: a camelCase key would silently
+    // deserialize the Option param as None (see memory: tauri-invoke-snake_case).
+    return await invoke<string | null>("system_pick_folder", {
+      initial_workdir: initialWorkdir || undefined,
+    });
+  }
+
   function handleToggle(task: CronTask) {
     if (isCronTaskExhausted(task)) return;
     runOps(() => applyCronOps([{ op: "update", id: task.id, patch: { enabled: !task.enabled } }]));
@@ -117,8 +141,8 @@ export function CronSection(props: SettingsSectionProps) {
   return (
     <div className="space-y-5">
       {/* Header */}
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
+      <div className="settings-section-heading-row flex items-center justify-between gap-4">
+        <div className="settings-section-title-group flex items-center gap-3">
           <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-amber-500/10">
             <Clock3 className="h-[18px] w-[18px] text-amber-500" />
           </div>
@@ -128,8 +152,8 @@ export function CronSection(props: SettingsSectionProps) {
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
-          <div className="flex items-center gap-2 rounded-lg bg-muted/50 px-2.5 py-1.5 text-xs text-muted-foreground">
+        <div className="settings-section-actions flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-2 whitespace-nowrap rounded-lg bg-muted/50 px-2.5 py-1.5 text-xs text-muted-foreground">
             <span className="tabular-nums font-medium text-foreground">{tasks.length}</span>
             {t("settings.cronCount")}
             <span className="text-border">|</span>
@@ -196,7 +220,7 @@ export function CronSection(props: SettingsSectionProps) {
                     : "border-border/40 bg-muted/20 opacity-60 hover:opacity-80"
                 }`}
               >
-                <div className="flex items-center gap-3 px-4 py-3">
+                <div className="settings-card-row flex items-center gap-3 px-4 py-3">
                   {/* Icon */}
                   <div
                     className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${tone.bg} ${tone.text}`}
@@ -254,7 +278,7 @@ export function CronSection(props: SettingsSectionProps) {
                   </div>
 
                   {/* Actions */}
-                  <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+                  <div className="settings-hover-actions flex items-center gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
                     <button
                       type="button"
                       onClick={() => setModal({ open: true, mode: "view", taskId: task.id })}
@@ -307,7 +331,9 @@ export function CronSection(props: SettingsSectionProps) {
           mode={modal.mode}
           initialData={modal.task}
           modelOptions={modelOptions}
+          workspaceOptions={workspaceOptions}
           executionMode={settings.system.executionMode}
+          onPickWorkdir={pickWorkdirDirectory}
           onSave={modal.mode === "add" ? handleAdd : handleEdit}
           onClose={() => setModal({ open: false })}
         />

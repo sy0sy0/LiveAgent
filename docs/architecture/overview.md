@@ -7,7 +7,7 @@
 | 桌面 GUI | `crates/agent-gui/src` | React、TypeScript、Vite、Tailwind | Chat shell、Settings、Skills Hub、MCP Hub、Memory UI、历史侧边栏、上传与流式渲染。 |
 | 桌面后端 | `crates/agent-gui/src-tauri/src` | Tauri 2、Rust、SQLite、tokio | 系统命令、文件/Shell/进程、MCP runtime、MemoryStore、CronManager、GatewayController、代理服务。 |
 | Agent 运行时 | `crates/agent-gui/src/lib/chat`、`crates/agent-gui/src/pages/chat`、`crates/agent-gui/src/lib/tools` | TypeScript、`@mariozechner/pi-ai` | 构造上下文、请求模型、执行工具、压缩上下文、持久化历史、发布 Gateway 事件。 |
-| Gateway | `crates/agent-gateway` | Go、gRPC、net/http、WebSocket | 桌面 Agent 与浏览器 WebUI 的远程中继、认证、会话管理、恢复缓冲、静态 WebUI 和分享页。 |
+| Gateway | `crates/agent-gateway` | Go、net/http、WebSocket+Protobuf（v2） | 桌面 Agent 与浏览器 WebUI 的远程中继、认证、会话管理、恢复缓冲、静态 WebUI 和分享页。 |
 | WebUI | `crates/agent-gateway/web` | React、TypeScript、Vite、WebSocket | 远程浏览器端 Chat/Settings/Hub 壳层，通过 Gateway 操作本地 Agent。 |
 | 资料与策略 | `doc/`、`docs/` | Markdown、SQL | 历史设计、专项计划、当前架构索引。 |
 
@@ -15,20 +15,20 @@
 
 | 进程/运行环境 | 入口 | 和谁通信 | 权限边界 |
 |---|---|---|---|
-| Tauri WebView | `crates/agent-gui/src/main.tsx`、`src/App.tsx` | Tauri invoke、Gateway gRPC bridge、模型 API | 用户可见桌面界面，触发本地能力但不直接访问 Rust 内部状态。 |
-| Tauri Rust 进程 | `src-tauri/src/main.rs`、`src-tauri/src/lib.rs` | 前端 invoke、SQLite、OS、Gateway gRPC、MCP server | 本地高权限真相源，负责系统能力、持久化与远程桥接。 |
-| Gateway Go 进程 | `crates/agent-gateway/cmd/gateway/main.go` | Desktop gRPC、Browser WebSocket/HTTP | 网络中继层，不直接执行本地工具。 |
-| Browser WebUI | `crates/agent-gateway/web/src/main.tsx`、`web/src/App.tsx` | Gateway `/ws`、`/api/*` | 远程 UI，仅持有 token、脱敏设置和本地浏览器缓存。 |
+| Tauri WebView | `crates/agent-gui/src/main.tsx`、`src/App.tsx` | Tauri invoke、Gateway bridge、模型 API | 用户可见桌面界面，触发本地能力但不直接访问 Rust 内部状态。 |
+| Tauri Rust 进程 | `src-tauri/src/main.rs`、`src-tauri/src/lib.rs` | 前端 invoke、SQLite、OS、Gateway WebSocket v2、MCP server | 本地高权限真相源，负责系统能力、持久化与远程桥接。 |
+| Gateway Go 进程 | `crates/agent-gateway/cmd/gateway/main.go` | Desktop/Browser WebSocket v2（Protobuf 帧）、HTTP | 网络中继层，不直接执行本地工具。 |
+| Browser WebUI | `crates/agent-gateway/web/src/main.tsx`、`web/src/App.tsx` | Gateway `/ws/v2`、`/api/*` | 远程 UI，仅持有 token、脱敏设置和本地浏览器缓存。 |
 
 ## 核心数据流
 
 | 数据流 | 步骤 | 关键路径 |
 |---|---|---|
 | 本地桌面对话 | GUI composer 提交消息，`ChatPage` 构造上下文，按 execution mode 进入 text 或 agent turn，模型流式返回，必要时执行 builtin tools，最后写入历史 SQLite。 | `src/pages/ChatPage.tsx`、`src/pages/chat/runTextConversationTurn.ts`、`src/pages/chat/runAgentConversationTurn.ts`、`src/lib/providers/llm.ts`、`src/lib/tools/builtinRegistry.ts` |
-| WebUI 远程对话 | WebUI optimistic echo 后先经 `/ws` 发 `chat.prepare`，Gateway 通过关联原生 Ping/Pong 验证 gRPC stream 并唤醒桌面 Chat Runtime；随后 `chat.command`（`chat.submit`/`chat.edit_resend`）accepted 并通过 `AgentConnect` 下发。桌面端本地运行并持续回传 `ChatEvent`/`ChatControlEvent`，Gateway 按 seq 经会话订阅（`chat.subscribe`/`chat.event`）推送给 WebUI。 | `web/src/lib/gatewaySocket.ts`、`internal/server/websocket_chat_handlers.go`、`internal/server/chat_commands.go`、`proto/v1/gateway.proto`、`src-tauri/src/services/gateway/*` |
+| WebUI 远程对话 | WebUI optimistic echo 后先经 `/ws/v2` 发 `chat_prepare`，Gateway 通过关联原生 Ping/Pong 验证桌面端信封流并唤醒桌面 Chat Runtime；随后 `chat_command`（`chat.submit`/`chat.edit_resend`）accepted 并经 `/ws/v2/agent` 信封流下发。桌面端本地运行并持续回传 `ChatEvent`/`ChatControlEvent`，Gateway 按 seq 经会话订阅（`chat.subscribe`/`chat.event`）推送给 WebUI。 | `web/src/lib/gatewaySocket.ts`、`internal/protocol/pbws/browser_local.go`、`internal/chatcmd/chatcmd.go`、`proto/v1/gateway.proto`、`src-tauri/src/services/gateway/*` |
 | 设置同步 | GUI load/save 设置到本地 SQLite，同时发布脱敏 settings snapshot 到 Gateway；WebUI 读取/更新 settings 时走 Gateway，普通 sync 不带真实 provider API key。 | `src/lib/settings/*`、`src-tauri/src/commands/settings.rs`、`src/lib/settings/sync.ts`、`web/src/lib/settings/sync.ts` |
 | 历史同步 | GUI 持久化 `chatHistory` 和 `chatHistorySegment`，操作后发布 history sync；Gateway 转发给 WebUI，WebUI 刷新列表或详情缓存。 | `src-tauri/src/commands/chat_history.rs`、`src-tauri/src/services/gateway.rs`、`web/src/lib/historySync.ts` |
-| 上传文件 | GUI 直接通过 Tauri 导入工作区 uploads；WebUI 走 Gateway HTTP multipart，Gateway 将 bytes 转成 gRPC request，桌面端导入本地工作区后返回文件引用。 | `src-tauri/src/commands/system.rs`、`internal/handler/upload.go`、`web/src/lib/uploadReadableFiles.ts` |
+| 上传文件 | GUI 直接通过 Tauri 导入工作区 uploads；WebUI 走 Gateway HTTP multipart，Gateway 将 bytes 转成 `UploadReadableFilesRequest` 信封，桌面端导入本地工作区后返回文件引用。 | `src-tauri/src/commands/system.rs`、`internal/handler/upload.go`、`web/src/lib/uploadReadableFiles.ts` |
 | 记忆召回 | 每轮 Chat 可调用 Rust `MemoryStore` 生成 overview 注入 system prompt；工具层暴露 `MemoryManager` 读写；Settings Memory 展示和管理同一套 store。 | `src-tauri/src/services/memory.rs`、`src/lib/chat/memory/*`、`src/lib/tools/memoryTools.ts`、`src/pages/settings/MemoryPanel.tsx` |
 
 ## 当前主要持久化
@@ -64,8 +64,7 @@ Browser WebUI
         │
         ▼
 Go Gateway
-  ├─ HTTP: /ws, /api/status, /api/files/import, /api/public/history-shares/{token}
-  ├─ gRPC: AgentGateway.AgentConnect, Authenticate
+  ├─ HTTP/WS: /ws/v2, /ws/v2/agent, /ws/v2/terminal, /api/status, /api/files/import, /api/public/history-shares/{token}
   └─ session.Manager: agent session, streams, settings/history subscribers, bounded chat relay window
         │
         ▼

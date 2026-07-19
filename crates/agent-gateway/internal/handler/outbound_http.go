@@ -173,8 +173,5 @@ func isSafeOutboundBlockedError(err error) bool {
 		return true
 	}
 	var credentials *safeurl.SendingCredentialsBlockedError
-	if errors.As(err, &credentials) {
-		return true
-	}
-	return false
+	return errors.As(err, &credentials)
 }

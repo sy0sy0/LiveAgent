@@ -116,7 +116,7 @@ LiveAgent is a **local-first** AI agent desktop client. It deeply integrates lar
 
 ### 🌐 Remote Gateway
 
-- **Access from any browser** — Go + gRPC gateway with a WebUI for remotely controlling the local agent
+- **Access from any browser** — Go gateway (WebSocket + Protobuf) with a WebUI for remotely controlling the local agent
 - **Disconnect recovery** — a bounded seq window replays short outages, with desktop-side persistence as the safety net
 
 ---
@@ -172,12 +172,11 @@ The desktop app works out of the box and depends on no server. Deploy the Gatewa
 # Pull the image (built by GitHub Actions, multi-arch: amd64 / arm64)
 docker pull ghcr.io/stack-cairn/liveagent-gateway:latest
 
-# Run in the background (gRPC → host 50051 | HTTP/WebSocket → host 50052)
+# Run in the background (HTTP/WebSocket → host 3000)
 docker run -d \
   --name liveagent-gateway \
   --restart unless-stopped \
-  -p 50051:50051 \
-  -p 50052:8080 \
+  -p 3000:8080 \
   -e LIVEAGENT_GATEWAY_TOKEN=your-token \
   ghcr.io/stack-cairn/liveagent-gateway:latest
 ```
@@ -190,8 +189,7 @@ docker pull ghcr.io/stack-cairn/liveagent-gateway:latest \
   && docker run -d \
     --name liveagent-gateway \
     --restart unless-stopped \
-    -p 50051:50051 \
-    -p 50052:8080 \
+    -p 3000:8080 \
     -e LIVEAGENT_GATEWAY_TOKEN=your-token \
     ghcr.io/stack-cairn/liveagent-gateway:latest \
   && docker image prune -f
@@ -200,60 +198,36 @@ docker pull ghcr.io/stack-cairn/liveagent-gateway:latest \
 <details>
 <summary><b>Nginx reverse proxy configuration</b> — reference for custom domains / TLS</summary>
 
-> The Gateway serves two kinds of traffic:
+> Since protocol v2, all traffic — the WebUI, the HTTP API, and the WebSocket links of both the browser and the desktop app — goes through the single HTTP port (default 3000).
 >
-> the desktop app's bidirectional gRPC stream (default 50051) and the browser's HTTP / WebSocket (default 50052).
->
-> When exposing through Nginx, proxy them separately. Both gRPC and WebSocket are long-lived connections, so raise the timeouts:
+> WebSocket upgrades happen on several paths (`/ws/v2`, `/ws/v2/agent`, `/ws/v2/terminal`, and tunnels under `/t/`), so the simplest correct setup enables the upgrade on the whole vhost:
 
 ```nginx
-# GUI Remote: gRPC Authenticate + AgentConnect
-location /liveagent.gateway.v1.AgentGateway/ {
-    grpc_pass grpc://127.0.0.1:50051;
-
-    grpc_set_header Host $host;
-    grpc_set_header Authorization $http_authorization;
-    grpc_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    grpc_set_header X-Forwarded-Proto $scheme;
-
-    grpc_socket_keepalive on;
-    grpc_read_timeout 24h;
-    grpc_send_timeout 24h;
-}
-
-# WebUI WebSocket
-location = /ws {
-    proxy_pass http://127.0.0.1:50052;
-
+# WebUI SPA/static/API + every WebSocket link (browser and desktop)
+location / {
+    proxy_pass http://127.0.0.1:3000;
     proxy_http_version 1.1;
+
+    # WebSocket upgrade
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
 
+    # Required: the Gateway's same-origin check compares the browser's
+    # Origin header against X-Forwarded-Proto + Host
     proxy_set_header Host $host;
     proxy_set_header Authorization $http_authorization;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
 
-    proxy_read_timeout 24h;
-    proxy_send_timeout 24h;
+    # The Gateway pings every WebSocket connection every 15s,
+    # so a generous-but-finite timeout is enough
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
     proxy_buffering off;
-}
-
-# WebUI SPA/static/API
-location / {
-    proxy_pass http://127.0.0.1:50052;
-
-    proxy_set_header Host $host;
-    proxy_set_header Authorization $http_authorization;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-
-    proxy_read_timeout 10m;
-    proxy_send_timeout 10m;
 }
 ```
 
-> Upstream ports map one-to-one to the host ports from the `docker run` above: gRPC 50051, HTTP/WebSocket 50052 (inside the container, HTTP actually listens on `PORT=8080`). The gRPC proxy requires Nginx to accept the desktop connection over HTTP/2 (`listen 443 ssl; http2 on;`).
+> The upstream port maps to the host port from the `docker run` above: HTTP/WebSocket 3000 (inside the container, HTTP actually listens on `PORT=8080`). The server block needs `listen 443 ssl;` and a `client_max_body_size` large enough for attachment uploads (e.g. `100m`).
 
 </details>
 
@@ -278,10 +252,10 @@ Expand the Development Guide below for the full set of Make commands.
                              │ WebSocket / HTTP
 ┌────────────────────────────▼─────────────────────────────────┐
 │                       Agent Gateway                           │
-│         Go · gRPC · HTTP · Session Manager · Event Store     │
+│    Go · WebSocket · HTTP · Session Manager · Event Store     │
 │               (Railway / Docker / self-hosted)                │
 └────────────────────────────┬─────────────────────────────────┘
-                             │ gRPC (bidirectional stream)
+                             │ WebSocket v2 (bidirectional stream)
 ┌────────────────────────────▼─────────────────────────────────┐
 │                        Agent GUI                              │
 │                   Tauri 2 · React 19 · Rust                  │
@@ -300,10 +274,10 @@ Expand the Development Guide below for the full set of Make commands.
 | **Agent GUI** · Build | Vite 8 + pnpm |
 | **Agent GUI** · Styling | Tailwind CSS 4 + Radix UI |
 | **Agent GUI** · Rendering | streamdown + KaTeX + Mermaid + Monaco Editor |
-| **Agent GUI** · Backend | Rust + Tokio + SQLite (rusqlite) + gRPC (tonic) |
+| **Agent GUI** · Backend | Rust + Tokio + SQLite (rusqlite) + WebSocket (tokio-tungstenite) |
 | **Agent GUI** · LLM | @earendil-works/pi-ai · @openai/codex-sdk · claude-agent-sdk |
 | **Gateway** · Language | Go 1.25 |
-| **Gateway** · Protocols | gRPC + Protobuf + HTTP + WebSocket |
+| **Gateway** · Protocols | WebSocket + Protobuf + HTTP |
 | **Gateway** · Web UI | React + Vite + Tailwind CSS (embedded) |
 | **Gateway** · Deployment | Docker multi-stage · Railway CI/CD |
 

@@ -42,7 +42,10 @@ impl WorkspaceWatchService {
             truncated,
         };
 
-        if let Err(error) = self.app_handle.emit(WORKSPACE_ACTIVITY_EVENT, payload.clone()) {
+        if let Err(error) = self
+            .app_handle
+            .emit(WORKSPACE_ACTIVITY_EVENT, payload.clone())
+        {
             eprintln!("emit workspace activity failed: {error}");
         }
 

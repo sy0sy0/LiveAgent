@@ -94,7 +94,7 @@ func (m *Manager) dispatchFromAgent(expected *AgentSession, env *gatewayv1.Agent
 	}
 
 	// Desired-state and probe payloads fan out broadcasts and relay probes;
-	// run them off the gRPC read loop so tunnel frames keep flowing.
+	// run them off the agent stream read loop so tunnel frames keep flowing.
 	if tunnelDesired := env.GetTunnelDesired(); tunnelDesired != nil {
 		go m.ApplyDesiredState(tunnelDesired)
 		return

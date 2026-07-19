@@ -343,10 +343,7 @@ func (m *Manager) SubscribeConversationStream(
 	stream := s.streamLocked(conversationID, now)
 	s.evictStreamLocked(stream, now)
 
-	reset := false
-	if clientEpoch != "" && clientEpoch != stream.streamEpoch {
-		reset = true
-	}
+	reset := clientEpoch != "" && clientEpoch != stream.streamEpoch
 	if afterSeq > stream.lastSeq {
 		reset = true
 	}

@@ -117,7 +117,7 @@ LiveAgent 是一个 **本地优先** 的 AI Agent 桌面客户端。它将大语
 
 ### 🌐 远程 Gateway
 
-- **浏览器随处访问** — Go + gRPC 网关,WebUI 远程操控本地 Agent
+- **浏览器随处访问** — Go 网关(WebSocket + Protobuf),WebUI 远程操控本地 Agent
 - **断线可恢复** — 有界 seq window 补齐短时断线,桌面端持久化兜底
 
 ---
@@ -173,12 +173,11 @@ LiveAgent 是一个 **本地优先** 的 AI Agent 桌面客户端。它将大语
 # 拉取镜像(GitHub Actions 自动构建,multi-arch: amd64 / arm64)
 docker pull ghcr.io/stack-cairn/liveagent-gateway:latest
 
-# 后台运行(gRPC → 宿主机 50051 ｜ HTTP/WebSocket → 宿主机 50052)
+# 后台运行(HTTP/WebSocket → 宿主机 3000)
 docker run -d \
   --name liveagent-gateway \
   --restart unless-stopped \
-  -p 50051:50051 \
-  -p 50052:8080 \
+  -p 3000:8080 \
   -e LIVEAGENT_GATEWAY_TOKEN=your-token \
   ghcr.io/stack-cairn/liveagent-gateway:latest
 ```
@@ -191,8 +190,7 @@ docker pull ghcr.io/stack-cairn/liveagent-gateway:latest \
   && docker run -d \
     --name liveagent-gateway \
     --restart unless-stopped \
-    -p 50051:50051 \
-    -p 50052:8080 \
+    -p 3000:8080 \
     -e LIVEAGENT_GATEWAY_TOKEN=your-token \
     ghcr.io/stack-cairn/liveagent-gateway:latest \
   && docker image prune -f
@@ -201,60 +199,35 @@ docker pull ghcr.io/stack-cairn/liveagent-gateway:latest \
 <details>
 <summary><b>Nginx 反向代理配置</b> — 自建域名 / TLS 时参考</summary>
 
-> Gateway 对外有两类流量：
+> 自 v2 协议起,WebUI、HTTP API 以及浏览器端和桌面端的 WebSocket 链路全部走同一个 HTTP 端口(默认 3000)。
 >
-> 桌面端的 gRPC 双向流 (默认 50051) 与浏览器端的 HTTP / WebSocket  (默认 50052)。
->
-> 经 Nginx 暴露时需要分别代理,注意 gRPC 与 WebSocket 均为长连接,超时需调大:
+> WebSocket 升级发生在多个路径上(`/ws/v2`、`/ws/v2/agent`、`/ws/v2/terminal`,以及 `/t/` 下的隧道),最省事且正确的做法是在整个 vhost 上启用升级:
 
 ```nginx
-# GUI Remote: gRPC Authenticate + AgentConnect
-location /liveagent.gateway.v1.AgentGateway/ {
-    grpc_pass grpc://127.0.0.1:50051;
-
-    grpc_set_header Host $host;
-    grpc_set_header Authorization $http_authorization;
-    grpc_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    grpc_set_header X-Forwarded-Proto $scheme;
-
-    grpc_socket_keepalive on;
-    grpc_read_timeout 24h;
-    grpc_send_timeout 24h;
-}
-
-# WebUI WebSocket
-location = /ws {
-    proxy_pass http://127.0.0.1:50052;
-
+# WebUI SPA/静态资源/API + 全部 WebSocket 链路(浏览器端与桌面端)
+location / {
+    proxy_pass http://127.0.0.1:3000;
     proxy_http_version 1.1;
+
+    # WebSocket 升级
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
 
+    # 必须透传:Gateway 的同源校验会拿浏览器的 Origin 头
+    # 与 X-Forwarded-Proto + Host 做比对
     proxy_set_header Host $host;
     proxy_set_header Authorization $http_authorization;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
 
-    proxy_read_timeout 24h;
-    proxy_send_timeout 24h;
+    # Gateway 每 15s 主动向每条 WebSocket 连接发 Ping,超时给足冗余即可
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
     proxy_buffering off;
-}
-
-# WebUI SPA/static/API
-location / {
-    proxy_pass http://127.0.0.1:50052;
-
-    proxy_set_header Host $host;
-    proxy_set_header Authorization $http_authorization;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-
-    proxy_read_timeout 10m;
-    proxy_send_timeout 10m;
 }
 ```
 
-> 上游端口与上方 `docker run` 的宿主机映射一一对应:gRPC 50051、HTTP/WebSocket 50052(容器内 HTTP 实际监听 `PORT=8080`)。gRPC 代理要求 Nginx 以 HTTP/2 接收桌面端连接(`listen 443 ssl; http2 on;`)。
+> 上游端口与上方 `docker run` 的宿主机映射对应:HTTP/WebSocket 3000(容器内 HTTP 实际监听 `PORT=8080`)。server 块需要 `listen 443 ssl;`,并把 `client_max_body_size` 调大到足够容纳附件上传(如 `100m`)。
 
 </details>
 
@@ -279,10 +252,10 @@ location / {
                              │ WebSocket / HTTP
 ┌────────────────────────────▼─────────────────────────────────┐
 │                       Agent Gateway                           │
-│         Go · gRPC · HTTP · Session Manager · Event Store     │
+│    Go · WebSocket · HTTP · Session Manager · Event Store     │
 │                    (Railway / Docker / 自部署)                 │
 └────────────────────────────┬─────────────────────────────────┘
-                             │ gRPC (双向流)
+                             │ WebSocket v2 (双向流)
 ┌────────────────────────────▼─────────────────────────────────┐
 │                        Agent GUI                              │
 │                   Tauri 2 · React 19 · Rust                  │
@@ -301,10 +274,10 @@ location / {
 | **Agent GUI** · 构建 | Vite 8 + pnpm |
 | **Agent GUI** · 样式 | Tailwind CSS 4 + Radix UI |
 | **Agent GUI** · 渲染 | streamdown + KaTeX + Mermaid + Monaco Editor |
-| **Agent GUI** · 后端 | Rust + Tokio + SQLite (rusqlite) + gRPC (tonic) |
+| **Agent GUI** · 后端 | Rust + Tokio + SQLite (rusqlite) + WebSocket (tokio-tungstenite) |
 | **Agent GUI** · LLM | @earendil-works/pi-ai · @openai/codex-sdk · claude-agent-sdk |
 | **Gateway** · 语言 | Go 1.25 |
-| **Gateway** · 协议 | gRPC + Protobuf + HTTP + WebSocket |
+| **Gateway** · 协议 | WebSocket + Protobuf + HTTP |
 | **Gateway** · Web UI | React + Vite + Tailwind CSS(嵌入式) |
 | **Gateway** · 部署 | Docker multi-stage · Railway CI/CD |
 

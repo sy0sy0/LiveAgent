@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::runtime::platform::expand_tilde_path;
+use crate::runtime::platform::{expand_tilde_path, strip_windows_verbatim_prefix};
 #[cfg(windows)]
 use crate::runtime::process::configure_child_process_group;
 
@@ -81,18 +81,7 @@ pub(crate) fn canonicalize_workdir(workdir: &str) -> Result<PathBuf, String> {
     }
     let canonical =
         fs::canonicalize(&path).map_err(|err| format!("failed to canonicalize workdir: {err}"))?;
-    Ok(strip_windows_unc_prefix(canonical))
-}
-
-pub(crate) fn strip_windows_unc_prefix(path: PathBuf) -> PathBuf {
-    #[cfg(windows)]
-    {
-        let s = path.to_string_lossy();
-        if let Some(stripped) = s.strip_prefix(r"\\?\") {
-            return PathBuf::from(stripped);
-        }
-    }
-    path
+    Ok(strip_windows_verbatim_prefix(canonical))
 }
 
 pub(crate) fn is_program_on_path(program: &str) -> bool {

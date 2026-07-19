@@ -18,7 +18,6 @@ use super::db::now_ms;
 use super::store::{AutomationStore, PromptQueueOutcome};
 use super::types::{CompletedRun, CronRunNowResponse, CronTask, HttpRequestSpec};
 
-const CRON_SCRIPT_TIMEOUT_MS: u64 = 60_000;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
@@ -74,9 +73,10 @@ impl AutomationScheduler {
     async fn run_loop(self: Arc<Self>) {
         {
             let store = Arc::clone(&self.store);
-            let recovered =
-                tauri::async_runtime::spawn_blocking(move || store.recover_interrupted_prompt_runs())
-                    .await;
+            let recovered = tauri::async_runtime::spawn_blocking(move || {
+                store.recover_interrupted_prompt_runs()
+            })
+            .await;
             match recovered {
                 Ok(Ok(count)) if count > 0 => {
                     eprintln!("automation: expired {count} prompt run(s) interrupted by restart");
@@ -143,10 +143,9 @@ impl AutomationScheduler {
         self.ensure_scheduler().await?;
 
         let store = Arc::clone(&self.store);
-        let (workdir, tasks) =
-            tauri::async_runtime::spawn_blocking(move || store.runnable_cron_tasks())
-                .await
-                .map_err(|e| format!("automation reload join 失败：{e}"))??;
+        let tasks = tauri::async_runtime::spawn_blocking(move || store.runnable_cron_tasks())
+            .await
+            .map_err(|e| format!("automation reload join 失败：{e}"))??;
 
         let desired: HashMap<String, CronTask> = tasks
             .into_iter()
@@ -192,14 +191,16 @@ impl AutomationScheduler {
             let cron_expr = task.cron.trim().to_string();
             let job = {
                 let manager = Arc::clone(self);
-                let task = task.clone();
-                let workdir = workdir.clone();
+                let task_id = task_id.clone();
+                // Only the id is captured: the task itself (and its workdir)
+                // is re-read from the store at fire time, so edits that keep
+                // the cron expression apply to the next fire without a job
+                // rebuild.
                 Job::new_async_tz(cron_expr.as_str(), Local, move |_job_id, _lock| {
                     let manager = Arc::clone(&manager);
-                    let task = task.clone();
-                    let workdir = workdir.clone();
+                    let task_id = task_id.clone();
                     Box::pin(async move {
-                        manager.fire(task, workdir);
+                        manager.fire(task_id).await;
                     })
                 })
             };
@@ -250,9 +251,38 @@ impl AutomationScheduler {
         });
     }
 
-    fn fire(self: &Arc<Self>, task: CronTask, workdir: String) {
-        if !self.start_fire(task.clone(), workdir, RunTrigger::Scheduled) {
-            self.record_run_detached(skipped_run(&task.id));
+    async fn fire(self: &Arc<Self>, task_id: String) {
+        let fresh = {
+            let store = Arc::clone(&self.store);
+            let task_id = task_id.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                store.cron_task_for_scheduled_fire(&task_id)
+            })
+            .await
+        };
+        match fresh {
+            Ok(Ok(Some((workdir, task)))) => {
+                if !self.start_fire(task.clone(), workdir, RunTrigger::Scheduled) {
+                    self.record_run_detached(skipped_run(&task.id));
+                }
+            }
+            // Task deleted since the job was registered; the next reload
+            // drops the job.
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                self.record_run_detached(failed_run(
+                    &task_id,
+                    format!("Cron task fire read failed: {error}"),
+                    false,
+                ));
+            }
+            Err(error) => {
+                self.record_run_detached(failed_run(
+                    &task_id,
+                    format!("Cron task fire read join failed: {error}"),
+                    false,
+                ));
+            }
         }
     }
 
@@ -265,12 +295,7 @@ impl AutomationScheduler {
         Ok(CronRunNowResponse { started_at })
     }
 
-    fn start_fire(
-        self: &Arc<Self>,
-        task: CronTask,
-        workdir: String,
-        trigger: RunTrigger,
-    ) -> bool {
+    fn start_fire(self: &Arc<Self>, task: CronTask, workdir: String, trigger: RunTrigger) -> bool {
         {
             let mut active = match self.active_runs.lock() {
                 Ok(guard) => guard,
@@ -288,12 +313,7 @@ impl AutomationScheduler {
         true
     }
 
-    async fn execute_fire(
-        self: Arc<Self>,
-        task: CronTask,
-        workdir: String,
-        trigger: RunTrigger,
-    ) {
+    async fn execute_fire(self: Arc<Self>, task: CronTask, workdir: String, trigger: RunTrigger) {
         let task_id = task.id.clone();
 
         if trigger == RunTrigger::Scheduled {
@@ -329,14 +349,36 @@ impl AutomationScheduler {
             }
         }
 
+        // A pinned workspace must exist before any execution; a vanished pin
+        // fails this run and disables the task so it stops re-firing into a
+        // directory that no longer exists. Follow-global tasks keep the
+        // legacy behavior (bash/prompt fail the run without disabling).
+        let workdir = match task.workdir.as_deref().map(str::trim) {
+            Some(pin) if !pin.is_empty() => match resolve_workdir(Some(pin.to_string())) {
+                Ok(resolved) => resolved.display().to_string(),
+                Err(error) => {
+                    let message = format!("Cron task workspace is unavailable ({pin}): {error}");
+                    self.record_run_detached(failed_run(
+                        &task_id,
+                        message.clone(),
+                        trigger.counted(),
+                    ));
+                    self.disable_task_detached(&task_id, message);
+                    self.clear_active(&task_id);
+                    return;
+                }
+            },
+            _ => workdir,
+        };
+
         if task.kind == "prompt" {
             let store = Arc::clone(&self.store);
             let queue_task = task.clone();
-            let result =
-                tauri::async_runtime::spawn_blocking(move || {
-                    store.queue_prompt_run(&queue_task, trigger.counted())
-                })
-                .await;
+            let queue_workdir = workdir.clone();
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                store.queue_prompt_run(&queue_task, &queue_workdir, trigger.counted())
+            })
+            .await;
             match result {
                 Ok(Ok(PromptQueueOutcome::Queued)) => {}
                 Ok(Ok(PromptQueueOutcome::SkippedActiveRun)) => {
@@ -363,14 +405,14 @@ impl AutomationScheduler {
             run.counted = trigger.counted();
             run
         })
-            .await
-            .unwrap_or_else(|error| {
-                failed_run(
-                    &task_id,
-                    format!("Cron task execution join failed: {error}"),
-                    false,
-                )
-            });
+        .await
+        .unwrap_or_else(|error| {
+            failed_run(
+                &task_id,
+                format!("Cron task execution join failed: {error}"),
+                false,
+            )
+        });
         self.record_run_detached(run);
         self.clear_active(&task_id);
     }
@@ -379,6 +421,22 @@ impl AutomationScheduler {
         if let Ok(mut active) = self.active_runs.lock() {
             active.remove(task_id);
         }
+    }
+
+    fn disable_task_detached(&self, task_id: &str, error: String) {
+        let store = Arc::clone(&self.store);
+        let task_id = task_id.to_string();
+        tauri::async_runtime::spawn(async move {
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                store.disable_task_with_error(&task_id, &error)
+            })
+            .await;
+            match result {
+                Ok(Err(error)) => eprintln!("禁用 cron 任务失败：{error}"),
+                Err(error) => eprintln!("禁用 cron 任务 join 失败：{error}"),
+                _ => {}
+            }
+        });
     }
 
     fn record_run_detached(&self, run: CompletedRun) {
@@ -434,9 +492,18 @@ fn execute_blocking(task: CronTask, workdir: String) -> CompletedRun {
 fn execute_bash(task: &CronTask, workdir: String) -> CompletedRun {
     let started_at = now_ms();
     let overall = Instant::now();
-    let script = task.script.as_deref().unwrap_or_default().trim().to_string();
+    let script = task
+        .script
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     if script.is_empty() {
-        return failed_run(&task.id, "No Bash script configured for this Cron task.".to_string(), true);
+        return failed_run(
+            &task.id,
+            "No Bash script configured for this Cron task.".to_string(),
+            true,
+        );
     }
     if workdir.trim().is_empty() {
         return failed_run(
@@ -453,7 +520,7 @@ fn execute_bash(task: &CronTask, workdir: String) -> CompletedRun {
         cwd.display().to_string(),
         script.clone(),
         None,
-        Some(CRON_SCRIPT_TIMEOUT_MS),
+        Some(task.timeout_seconds.saturating_mul(1_000)),
         None,
         None,
         None,
@@ -478,9 +545,13 @@ fn execute_http(task: &CronTask) -> CompletedRun {
     let overall = Instant::now();
     let requests = task.requests.clone().unwrap_or_default();
     if requests.is_empty() {
-        return failed_run(&task.id, "No HTTP requests configured for this Cron task.".to_string(), true);
+        return failed_run(
+            &task.id,
+            "No HTTP requests configured for this Cron task.".to_string(),
+            true,
+        );
     }
-    let client = match build_http_client() {
+    let client = match build_http_client(Some(task.timeout_seconds.saturating_mul(1_000))) {
         Ok(client) => client,
         Err(error) => return failed_run(&task.id, error, true),
     };
@@ -488,7 +559,11 @@ fn execute_http(task: &CronTask) -> CompletedRun {
     let mut sections = Vec::new();
     let mut success = true;
     for (index, request) in requests.into_iter().enumerate() {
-        let display = format!("{} {}", request.method.trim().to_uppercase(), request.url.trim());
+        let display = format!(
+            "{} {}",
+            request.method.trim().to_uppercase(),
+            request.url.trim()
+        );
         match run_single_http_request(&client, to_http_input(request)) {
             Ok(result) => sections.push(format_http_result(index + 1, &display, &result)),
             Err(error) => {

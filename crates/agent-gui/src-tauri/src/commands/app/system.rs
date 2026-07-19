@@ -1016,11 +1016,23 @@ fn validate_project_folder_name(name: &str) -> Result<&str, String> {
     Ok(trimmed)
 }
 
+/// Mirror of the fs command layer's `display_path`: strip the Windows `\\?\`
+/// verbatim prefix and use forward slashes so the returned path matches the
+/// shape `fs_roots`/`fs_list_dirs` hand to the WebUI picker (a mismatched
+/// shape shows up as a duplicate tree node after the parent refresh).
+fn project_folder_display_path(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = normalized.strip_prefix("//?/UNC/") {
+        return format!("//{rest}");
+    }
+    if let Some(rest) = normalized.strip_prefix("//?/") {
+        return rest.to_string();
+    }
+    normalized
+}
+
 fn canonicalize_project_folder(path: &Path) -> String {
-    fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
+    project_folder_display_path(&fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
 }
 
 pub(crate) fn system_create_project_folder_sync(
@@ -1260,6 +1272,22 @@ pub fn system_end_power_activity(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn project_folder_display_path_strips_verbatim_and_uses_forward_slashes() {
+        assert_eq!(
+            project_folder_display_path(Path::new(r"\\?\C:\Users\Me\Repo")),
+            "C:/Users/Me/Repo"
+        );
+        assert_eq!(
+            project_folder_display_path(Path::new(r"\\?\UNC\server\share\Repo")),
+            "//server/share/Repo"
+        );
+        assert_eq!(
+            project_folder_display_path(Path::new("/Users/me/repo")),
+            "/Users/me/repo"
+        );
+    }
 
     #[test]
     fn sanitize_uploaded_file_name_avoids_windows_reserved_names() {
@@ -1587,5 +1615,4 @@ mod tests {
             "archive"
         );
     }
-
 }

@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-
 )
 
 func TestTunnelResponseRewriteKindFor(t *testing.T) {

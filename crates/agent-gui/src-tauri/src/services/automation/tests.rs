@@ -138,10 +138,7 @@ fn cron_apply_reorder_requires_full_permutation() {
     let response = store
         .cron_apply(apply_input(
             base,
-            vec![
-                create_bash_task_op("a", "A"),
-                create_bash_task_op("b", "B"),
-            ],
+            vec![create_bash_task_op("a", "A"), create_bash_task_op("b", "B")],
         ))
         .expect("seed");
 
@@ -214,7 +211,9 @@ fn prompt_run_lifecycle_queue_claim_complete() {
     let (store, task) = store_with_task(create_prompt_task_op("p1"));
 
     assert!(matches!(
-        store.queue_prompt_run(&task, true).expect("queue prompt run"),
+        store
+            .queue_prompt_run(&task, "", true)
+            .expect("queue prompt run"),
         super::store::PromptQueueOutcome::Queued
     ));
 
@@ -224,7 +223,9 @@ fn prompt_run_lifecycle_queue_claim_complete() {
 
     // Second fire while pending is skipped.
     assert!(matches!(
-        store.queue_prompt_run(&task, true).expect("second queue"),
+        store
+            .queue_prompt_run(&task, "", true)
+            .expect("second queue"),
         super::store::PromptQueueOutcome::SkippedActiveRun
     ));
 
@@ -293,6 +294,7 @@ fn complete_prompt_run_input_uses_camel_case_wire_fields() {
     }))
     .expect("deserialize legacy prompt request");
     assert!(legacy_request.counted);
+    assert_eq!(legacy_request.workdir, "");
 }
 
 #[test]
@@ -311,7 +313,7 @@ fn manual_prompt_run_does_not_consume_remaining_execution() {
     });
 
     store
-        .queue_prompt_run(&task, false)
+        .queue_prompt_run(&task, "", false)
         .expect("queue manual prompt run");
     let claims = store.claim_prompt_runs().expect("claim manual prompt run");
     assert_eq!(claims.len(), 1);
@@ -346,7 +348,7 @@ fn interrupted_manual_prompt_run_does_not_consume_remaining_execution() {
     });
 
     store
-        .queue_prompt_run(&task, false)
+        .queue_prompt_run(&task, "", false)
         .expect("queue manual prompt run");
     assert_eq!(
         store
@@ -385,7 +387,7 @@ fn manual_run_context_allows_disabled_exhausted_task() {
 fn released_prompt_run_returns_to_pending() {
     let (store, task) = store_with_task(create_prompt_task_op("p1"));
     assert!(matches!(
-        store.queue_prompt_run(&task, true).expect("queue"),
+        store.queue_prompt_run(&task, "", true).expect("queue"),
         super::store::PromptQueueOutcome::Queued
     ));
     let claims = store.claim_prompt_runs().expect("claim");
@@ -400,10 +402,8 @@ fn released_prompt_run_returns_to_pending() {
 #[test]
 fn recover_marks_interrupted_runs_expired() {
     let (store, task) = store_with_task(create_prompt_task_op("p1"));
-    store.queue_prompt_run(&task, true).expect("queue");
-    let recovered = store
-        .recover_interrupted_prompt_runs()
-        .expect("recover");
+    store.queue_prompt_run(&task, "", true).expect("queue");
+    let recovered = store.recover_interrupted_prompt_runs().expect("recover");
     assert_eq!(recovered, 1);
 
     let runs = store.list_runs("p1", 10).expect("list runs");
@@ -487,8 +487,14 @@ fn masked_headers_round_trip_keeps_stored_secret() {
 
     let task = &masked.cron.tasks[0];
     let headers = task.requests.as_ref().unwrap()[0].headers.as_ref().unwrap();
-    assert_eq!(headers.get("Authorization").map(String::as_str), Some("Bearer secret-token"));
-    assert_eq!(task.requests.as_ref().unwrap()[0].url, "https://example.com/hook-v2");
+    assert_eq!(
+        headers.get("Authorization").map(String::as_str),
+        Some("Bearer secret-token")
+    );
+    assert_eq!(
+        task.requests.as_ref().unwrap()[0].url,
+        "https://example.com/hook-v2"
+    );
 }
 
 #[test]
@@ -533,4 +539,316 @@ fn hooks_apply_validates_event_and_conflicts() {
         .hooks_apply(apply_input(base, vec![]))
         .expect("stale hooks apply");
     assert_eq!(conflict.status, ApplyStatus::Conflict);
+}
+
+#[test]
+fn cron_apply_persists_and_trims_workdir() {
+    let (store, task) = store_with_task(AutomationOp::Create {
+        item: json!({
+            "id": "pinned-bash",
+            "name": "Pinned Bash",
+            "cron": "0 * * * * *",
+            "enabled": true,
+            "type": "bash",
+            "script": "pwd",
+            "workdir": "  /tmp/pinned-workspace  ",
+        }),
+    });
+    assert_eq!(task.workdir.as_deref(), Some("/tmp/pinned-workspace"));
+
+    let (_, empty_task) = store_with_task(AutomationOp::Create {
+        item: json!({
+            "id": "unpinned-bash",
+            "name": "Unpinned Bash",
+            "cron": "0 * * * * *",
+            "enabled": true,
+            "type": "bash",
+            "script": "pwd",
+            "workdir": "",
+        }),
+    });
+    assert!(empty_task.workdir.is_none());
+
+    // Round-trips through config_json.
+    let reread = store
+        .cron_task_for_manual_run("pinned-bash")
+        .expect("reload pinned task")
+        .1;
+    assert_eq!(reread.workdir.as_deref(), Some("/tmp/pinned-workspace"));
+}
+
+#[test]
+fn cron_apply_update_empty_workdir_clears_pin() {
+    let (store, task) = store_with_task(AutomationOp::Create {
+        item: json!({
+            "id": "pinned",
+            "name": "Pinned",
+            "cron": "0 * * * * *",
+            "enabled": true,
+            "type": "bash",
+            "script": "pwd",
+            "workdir": "/tmp/pinned-workspace",
+        }),
+    });
+
+    // A patch without the workdir key keeps the stored pin (old clients).
+    let revision = store.snapshot().expect("snapshot").cron.revision;
+    let kept = store
+        .cron_apply(apply_input(
+            revision,
+            vec![AutomationOp::Update {
+                id: task.id.clone(),
+                patch: json!({ "name": "Renamed" }),
+            }],
+        ))
+        .expect("patch without workdir");
+    assert_eq!(
+        kept.cron.tasks[0].workdir.as_deref(),
+        Some("/tmp/pinned-workspace")
+    );
+
+    // An explicit empty string clears the pin (follow the active workspace).
+    let cleared = store
+        .cron_apply(apply_input(
+            kept.cron.revision,
+            vec![AutomationOp::Update {
+                id: task.id.clone(),
+                patch: json!({ "workdir": "" }),
+            }],
+        ))
+        .expect("patch clearing workdir");
+    assert!(cleared.cron.tasks[0].workdir.is_none());
+}
+
+#[test]
+fn cron_apply_http_task_drops_workdir() {
+    let (_, task) = store_with_task(AutomationOp::Create {
+        item: json!({
+            "id": "http-task",
+            "name": "Http",
+            "cron": "0 * * * * *",
+            "enabled": true,
+            "type": "http",
+            "requests": [{ "url": "https://example.com/ping", "method": "GET" }],
+            "workdir": "/tmp/pinned-workspace",
+        }),
+    });
+    assert!(task.workdir.is_none());
+}
+
+#[test]
+fn manual_run_resolves_task_workdir() {
+    let (store, task) = store_with_task(AutomationOp::Create {
+        item: json!({
+            "id": "pinned",
+            "name": "Pinned",
+            "cron": "0 * * * * *",
+            "enabled": true,
+            "type": "bash",
+            "script": "pwd",
+            "workdir": "/tmp/pinned-workspace",
+        }),
+    });
+    let (workdir, _) = store
+        .cron_task_for_manual_run(&task.id)
+        .expect("manual run context");
+    assert_eq!(workdir, "/tmp/pinned-workspace");
+
+    // Without a pin the resolution falls back to the global workdir, which is
+    // empty in the in-memory store (no system_settings table).
+    let (unpinned_store, unpinned) = store_with_task(create_bash_task_op("plain", "Plain"));
+    let (fallback_workdir, _) = unpinned_store
+        .cron_task_for_manual_run(&unpinned.id)
+        .expect("manual run context without pin");
+    assert_eq!(fallback_workdir, "");
+}
+
+#[test]
+fn scheduled_fire_reads_fresh_task() {
+    let (store, task) = store_with_task(AutomationOp::Create {
+        item: json!({
+            "id": "fresh",
+            "name": "Fresh",
+            "cron": "0 * * * * *",
+            "enabled": true,
+            "type": "bash",
+            "script": "pwd",
+            "workdir": "/tmp/pinned-workspace",
+        }),
+    });
+
+    let fired = store
+        .cron_task_for_scheduled_fire(&task.id)
+        .expect("scheduled fire read");
+    let (workdir, fresh) = fired.expect("task exists");
+    assert_eq!(workdir, "/tmp/pinned-workspace");
+    assert_eq!(fresh.id, task.id);
+
+    // A deleted task resolves to None instead of an error.
+    assert!(store
+        .cron_task_for_scheduled_fire("missing-task")
+        .expect("missing task read")
+        .is_none());
+}
+
+#[test]
+fn queue_prompt_run_stamps_workdir() {
+    let (store, task) = store_with_task(create_prompt_task_op("p1"));
+    store
+        .queue_prompt_run(&task, "/tmp/pinned-workspace", true)
+        .expect("queue with workdir");
+    let claims = store.claim_prompt_runs().expect("claim");
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].workdir, "/tmp/pinned-workspace");
+    // No per-task reasoning configured -> empty (runner default).
+    assert_eq!(claims[0].reasoning, "");
+}
+
+#[test]
+fn cron_apply_validates_and_stamps_prompt_reasoning() {
+    let (store, task) = store_with_task(AutomationOp::Create {
+        item: json!({
+            "id": "thinker",
+            "name": "Thinker",
+            "cron": "0 * * * * *",
+            "enabled": true,
+            "type": "prompt",
+            "prompt": "Summarize the repo",
+            "selectedModel": { "customProviderId": "provider-a", "model": "gpt-5" },
+            "reasoning": "xhigh",
+        }),
+    });
+    assert_eq!(task.reasoning.as_deref(), Some("xhigh"));
+
+    // Queue carries the level to the runner.
+    store
+        .queue_prompt_run(&task, "", true)
+        .expect("queue with reasoning");
+    let claims = store.claim_prompt_runs().expect("claim");
+    assert_eq!(claims[0].reasoning, "xhigh");
+
+    // Empty clears back to the runtime default; unknown levels are rejected.
+    let revision = store.snapshot().expect("snapshot").cron.revision;
+    let cleared = store
+        .cron_apply(apply_input(
+            revision,
+            vec![AutomationOp::Update {
+                id: task.id.clone(),
+                patch: json!({ "reasoning": "" }),
+            }],
+        ))
+        .expect("clear reasoning");
+    assert!(cleared.cron.tasks[0].reasoning.is_none());
+
+    let error = store
+        .cron_apply(apply_input(
+            cleared.cron.revision,
+            vec![AutomationOp::Update {
+                id: task.id.clone(),
+                patch: json!({ "reasoning": "ultra" }),
+            }],
+        ))
+        .expect_err("reject unknown reasoning level");
+    assert!(error.contains("reasoning"));
+}
+
+#[test]
+fn disable_task_with_error_flips_enabled_and_bumps_revision() {
+    let (store, task) = store_with_task(create_bash_task_op("a", "First"));
+    let before = store.snapshot().expect("snapshot before").cron;
+    assert!(before.tasks[0].enabled);
+
+    store
+        .disable_task_with_error(&task.id, "Cron task workspace is unavailable")
+        .expect("disable task");
+
+    let after = store.snapshot().expect("snapshot after").cron;
+    assert_eq!(after.revision, before.revision + 1);
+    assert!(!after.tasks[0].enabled);
+    assert_eq!(
+        after.tasks[0].last_error.as_deref(),
+        Some("Cron task workspace is unavailable")
+    );
+
+    // Disabling an unknown task is a no-op instead of an error.
+    store
+        .disable_task_with_error("missing-task", "irrelevant")
+        .expect("disable missing task");
+    let unchanged = store.snapshot().expect("snapshot unchanged").cron;
+    assert_eq!(unchanged.revision, after.revision);
+}
+
+#[test]
+fn cron_apply_defaults_and_validates_timeout_seconds() {
+    // Creates without the field resolve to the default and always serialize it.
+    let (store, task) = store_with_task(create_bash_task_op("a", "First"));
+    assert_eq!(task.timeout_seconds, DEFAULT_CRON_TIMEOUT_SECONDS);
+    let wire = serde_json::to_value(&task).expect("serialize task");
+    assert_eq!(wire.get("timeoutSeconds"), Some(&json!(300)));
+
+    let revision = store.snapshot().expect("snapshot").cron.revision;
+    let response = store
+        .cron_apply(apply_input(
+            revision,
+            vec![AutomationOp::Update {
+                id: task.id.clone(),
+                patch: json!({ "timeoutSeconds": 45 }),
+            }],
+        ))
+        .expect("apply timeout update");
+    assert_eq!(response.status, ApplyStatus::Ok);
+    assert_eq!(response.cron.tasks[0].timeout_seconds, 45);
+
+    // Patches that do not name the field keep the stored value.
+    let response = store
+        .cron_apply(apply_input(
+            response.cron.revision,
+            vec![AutomationOp::Update {
+                id: task.id.clone(),
+                patch: json!({ "name": "Renamed" }),
+            }],
+        ))
+        .expect("apply unrelated update");
+    assert_eq!(response.cron.tasks[0].timeout_seconds, 45);
+
+    // Out-of-range and non-integer values are rejected, not silently clamped.
+    let revision = response.cron.revision;
+    for bad in [json!(0), json!(601), json!("300"), json!(-5)] {
+        let error = store
+            .cron_apply(apply_input(
+                revision,
+                vec![AutomationOp::Update {
+                    id: task.id.clone(),
+                    patch: json!({ "timeoutSeconds": bad }),
+                }],
+            ))
+            .expect_err("reject invalid timeout");
+        assert!(error.contains("timeoutSeconds"), "error: {error}");
+    }
+}
+
+#[test]
+fn queue_prompt_run_lease_uses_task_timeout() {
+    let (store, task) = store_with_task(create_prompt_task_op("p1"));
+    let revision = store.snapshot().expect("snapshot").cron.revision;
+    let response = store
+        .cron_apply(apply_input(
+            revision,
+            vec![AutomationOp::Update {
+                id: task.id.clone(),
+                patch: json!({ "timeoutSeconds": 30 }),
+            }],
+        ))
+        .expect("apply timeout update");
+    let task = response.cron.tasks[0].clone();
+
+    assert!(matches!(
+        store
+            .queue_prompt_run(&task, "", true)
+            .expect("queue prompt run"),
+        super::store::PromptQueueOutcome::Queued
+    ));
+    let claims = store.claim_prompt_runs().expect("claim");
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].lease_expires_at - claims[0].started_at, 30_000);
 }

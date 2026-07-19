@@ -9,7 +9,7 @@ WebUI 是 Gateway 承载的浏览器端操作台。它复用/复制了大量 GUI
 | 模块 | 路径 | 职责 |
 |---|---|---|
 | App shell | `crates/agent-gateway/web/src/App.tsx` | 登录、socket 生命周期、settings/history/chat 状态、页面切换、composer/transcript。 |
-| Socket client | `web/src/lib/gatewaySocket.ts` | WebSocket 请求/响应、广播监听、连接超时、原生 Chat Runtime 唤醒、Chat command ACK 恢复与错误处理。 |
+| Socket client | `web/src/lib/gatewaySocket.ts` | v2 WebSocket（Protobuf 帧）请求/响应、广播监听、连接超时、原生 Chat Runtime 唤醒、Chat command ACK 恢复与错误处理；proto 生成代码位于 `web/src/lib/proto/gen/`。 |
 | Conversation stream | `web/src/lib/chat/stream/conversationStreamClient.ts` | 按会话持久订阅注册表：维护 `after_seq`/`stream_epoch` 游标、重连自动重订阅、gap resync 与有界退避重试。 |
 | Gateway types | `web/src/lib/gatewayTypes.ts` | WebUI 侧协议类型。 |
 | Settings storage | `web/src/lib/webSettings.ts`、`web/src/lib/settings/*` | 浏览器本地设置缓存、脱敏 provider snapshot、settings sync payload。 |
@@ -23,7 +23,7 @@ WebUI 是 Gateway 承载的浏览器端操作台。它复用/复制了大量 GUI
 | 阶段 | 行为 |
 |---|---|
 | token 读取 | WebUI 从浏览器存储读取 token，或通过 LoginPage 输入。 |
-| socket 创建 | `getGatewayWebSocketClient(token)` 建立 `/ws` 连接；连接建立总超时为 10 秒，认证另有 15 秒超时，旧连接迟到的 close 不会误伤新连接。 |
+| socket 创建 | `getGatewayWebSocketClient(token)` 建立 `/ws/v2` 连接（Protobuf 二进制帧，子协议 `liveagent.v2.pb`）；连接建立总超时为 10 秒，认证另有 15 秒超时，旧连接迟到的 close 不会误伤新连接。 |
 | 状态订阅 | 订阅 Gateway status，展示 Desktop Agent online/offline。 |
 | 请求响应 | 所有 request 带 id，Gateway 用同 id 返回 payload 或 error。 |
 | Chat 唤醒 | 用户消息先即时 optimistic echo，再串行发送 `chat.prepare`；Gateway 通过关联原生 Ping/Pong 真正唤醒桌面 Chat Runtime，并让紧随其后的 command 复用同一 Agent session 上 2 秒内的新鲜探测，避免正常路径重复一个原生 RTT。准备请求最多等待 2.5 秒，旧 Gateway 不支持该方法时回退到 `status.get`，最终仍由 `chat.command` 作为兜底唤醒信号。 |

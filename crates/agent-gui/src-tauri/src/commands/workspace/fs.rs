@@ -61,7 +61,10 @@ enum FsError {
     OutOfBounds(String),
 
     #[error("{path} does not exist")]
-    NotFound { path: String, did_you_mean: Vec<String> },
+    NotFound {
+        path: String,
+        did_you_mean: Vec<String>,
+    },
 
     #[error("{path} is not a directory")]
     NotADirectory { path: String, entry_kind: String },
@@ -171,25 +174,37 @@ impl From<FsError> for FsCommandError {
         let message = err.to_string();
         let (code, path, entry_kind, did_you_mean) = match err {
             FsError::InvalidWorkdir(_) => (FsErrorCode::InvalidWorkdir, None, None, Vec::new()),
-            FsError::InvalidRelPath(path) => (FsErrorCode::InvalidPath, Some(path), None, Vec::new()),
+            FsError::InvalidRelPath(path) => {
+                (FsErrorCode::InvalidPath, Some(path), None, Vec::new())
+            }
             FsError::OutOfBounds(path) => (FsErrorCode::OutOfBounds, Some(path), None, Vec::new()),
             FsError::NotFound { path, did_you_mean } => {
                 (FsErrorCode::NotFound, Some(path), None, did_you_mean)
             }
-            FsError::NotADirectory { path, entry_kind } => {
-                (FsErrorCode::NotADirectory, Some(path), Some(entry_kind), Vec::new())
-            }
-            FsError::NotAFile { path, entry_kind } => {
-                (FsErrorCode::NotAFile, Some(path), Some(entry_kind), Vec::new())
-            }
+            FsError::NotADirectory { path, entry_kind } => (
+                FsErrorCode::NotADirectory,
+                Some(path),
+                Some(entry_kind),
+                Vec::new(),
+            ),
+            FsError::NotAFile { path, entry_kind } => (
+                FsErrorCode::NotAFile,
+                Some(path),
+                Some(entry_kind),
+                Vec::new(),
+            ),
             FsError::UnsupportedTarget { path, .. } => {
                 (FsErrorCode::UnsupportedTarget, Some(path), None, Vec::new())
             }
             FsError::RequiresFullRead { path } => {
                 (FsErrorCode::RequiresFullRead, Some(path), None, Vec::new())
             }
-            FsError::StaleFile { path, .. } => (FsErrorCode::StaleFile, Some(path), None, Vec::new()),
-            FsError::EditNoMatch { path } => (FsErrorCode::EditNoMatch, Some(path), None, Vec::new()),
+            FsError::StaleFile { path, .. } => {
+                (FsErrorCode::StaleFile, Some(path), None, Vec::new())
+            }
+            FsError::EditNoMatch { path } => {
+                (FsErrorCode::EditNoMatch, Some(path), None, Vec::new())
+            }
             FsError::EditAmbiguous { path, .. } => {
                 (FsErrorCode::EditAmbiguous, Some(path), None, Vec::new())
             }
@@ -301,7 +316,9 @@ fn nearest_entries(parent: &Path, missing_name: &str, limit: usize) -> Vec<Strin
         let lower = name.to_lowercase();
         let rank = if lower == needle {
             0
-        } else if lower.starts_with(&needle) || needle.starts_with(&lower) || lower.contains(&needle)
+        } else if lower.starts_with(&needle)
+            || needle.starts_with(&lower)
+            || lower.contains(&needle)
         {
             1
         } else if levenshtein_at_most(&lower, &needle, 2) {
@@ -312,7 +329,11 @@ fn nearest_entries(parent: &Path, missing_name: &str, limit: usize) -> Vec<Strin
         ranked.push((rank, name));
     }
     ranked.sort();
-    ranked.into_iter().take(limit).map(|(_, name)| name).collect()
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|(_, name)| name)
+        .collect()
 }
 
 fn not_found_error(workdir: &Path, rel: &Path) -> FsError {
@@ -1291,11 +1312,12 @@ fn read_local_preview_file(target: PathBuf, logical_path: String) -> Result<Read
         ));
     }
 
-    let mime_type =
-        infer_workspace_preview_mime(&target, &bytes).ok_or_else(|| FsError::UnsupportedTarget {
+    let mime_type = infer_workspace_preview_mime(&target, &bytes).ok_or_else(|| {
+        FsError::UnsupportedTarget {
             path: logical_path.clone(),
             message: "File type is not supported for preview".to_string(),
-        })?;
+        }
+    })?;
 
     Ok(build_workspace_preview_response(
         logical_path,
@@ -2268,7 +2290,9 @@ fn read_inline_svg_image_source(source: &str) -> Result<ReadResponse, FsError> {
     let bytes = source.as_bytes().to_vec();
     validate_image_size(label, bytes.len())?;
     if !looks_like_svg(&bytes) {
-        return Err(FsError::Other(format!("{label} is not valid SVG image data")));
+        return Err(FsError::Other(format!(
+            "{label} is not valid SVG image data"
+        )));
     }
     let mime_type = resolve_supported_image_mime(label, Some("image/svg+xml"), None, &bytes)?;
     let display_label = format!("inline-svg:{mime_type}:{} bytes", bytes.len());
@@ -2414,8 +2438,7 @@ fn fs_read_image_source_sync(
     source_type: Option<String>,
     mime_type: Option<String>,
 ) -> Result<ReadResponse, FsCommandError> {
-    fs_read_image_source_impl(workdir, source, source_type, mime_type)
-        .map_err(FsCommandError::from)
+    fs_read_image_source_impl(workdir, source, source_type, mime_type).map_err(FsCommandError::from)
 }
 
 fn fs_read_image_source_impl(
@@ -2478,8 +2501,7 @@ pub(crate) fn fs_read_workspace_image_sync(
     path: String,
 ) -> Result<ReadResponse, FsCommandError> {
     let wd = canonicalize_workdir(&workdir)?;
-    fs_read_workspace_image_impl(&wd, &path)
-        .map_err(|e| FsCommandError::from(e).with_workdir(&wd))
+    fs_read_workspace_image_impl(&wd, &path).map_err(|e| FsCommandError::from(e).with_workdir(&wd))
 }
 
 fn fs_read_workspace_image_impl(wd: &Path, path: &str) -> Result<ReadResponse, FsError> {
@@ -2939,7 +2961,9 @@ fn fs_write_text_impl(
     let expected = parse_expected_version(expected_mtime_ms, expected_content_hash)?;
 
     if mode != "rewrite" {
-        return Err(FsError::Other("Write.mode only supports rewrite".to_string()));
+        return Err(FsError::Other(
+            "Write.mode only supports rewrite".to_string(),
+        ));
     }
 
     let (target, existed_before) = match fs::symlink_metadata(&raw_target) {
@@ -3053,9 +3077,11 @@ fn fs_edit_text_impl(
     let rel = sanitize_rel_path(path)?;
     let logical_path = logical_rel_path(&rel);
     let target = resolve_existing_file_target(wd, &rel)?;
-    let expected = parse_expected_version(expected_mtime_ms, expected_content_hash)?
-        .ok_or_else(|| FsError::RequiresFullRead {
-            path: logical_path.clone(),
+    let expected =
+        parse_expected_version(expected_mtime_ms, expected_content_hash)?.ok_or_else(|| {
+            FsError::RequiresFullRead {
+                path: logical_path.clone(),
+            }
         })?;
 
     if old_string.is_empty() {
@@ -3378,8 +3404,7 @@ pub(crate) fn fs_rename_sync(
     to_path: String,
 ) -> Result<RenameResponse, FsCommandError> {
     let wd = canonicalize_workdir(&workdir)?;
-    fs_rename_impl(&wd, &from_path, &to_path)
-        .map_err(|e| FsCommandError::from(e).with_workdir(&wd))
+    fs_rename_impl(&wd, &from_path, &to_path).map_err(|e| FsCommandError::from(e).with_workdir(&wd))
 }
 
 fn fs_rename_impl(wd: &Path, from_path: &str, to_path: &str) -> Result<RenameResponse, FsError> {
@@ -3690,12 +3715,7 @@ fn build_workspace_walker(
 }
 
 fn build_ignore_walker(base: &Path, max_depth: Option<usize>) -> ignore::Walk {
-    build_workspace_walker(
-        base,
-        max_depth,
-        requested_visibility(None, true),
-        false,
-    )
+    build_workspace_walker(base, max_depth, requested_visibility(None, true), false)
 }
 
 fn visible_paths_for_hidden_marking(
@@ -3885,7 +3905,10 @@ fn fs_glob_impl(
         });
     };
     let base = if target_kind == "file" {
-        target.parent().map(Path::to_path_buf).unwrap_or_else(|| wd.to_path_buf())
+        target
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| wd.to_path_buf())
     } else {
         target
     };
@@ -3897,7 +3920,9 @@ fn fs_glob_impl(
 
     let sort_by = sort_by.unwrap_or_else(|| "path".to_string());
     if sort_by != "path" {
-        return Err(FsError::Other("Glob.sort_by only supports path".to_string()));
+        return Err(FsError::Other(
+            "Glob.sort_by only supports path".to_string(),
+        ));
     }
 
     let mut builder = GlobSetBuilder::new();
@@ -4539,14 +4564,9 @@ mod tests {
     }
 
     fn mention_test_entries(workdir: &Path, show_hidden: Option<bool>) -> Vec<MentionFileEntry> {
-        fs_mention_list_sync(
-            workdir.display().to_string(),
-            Some(100),
-            None,
-            show_hidden,
-        )
-        .expect("mention list should succeed")
-        .entries
+        fs_mention_list_sync(workdir.display().to_string(), Some(100), None, show_hidden)
+            .expect("mention list should succeed")
+            .entries
     }
 
     fn png_like_bytes() -> Vec<u8> {
@@ -4809,7 +4829,10 @@ mod tests {
                 "expected invalid path error for {path:?}, got {:?}",
                 error.code
             );
-            assert!(!error.message.trim().is_empty(), "expected error for {path:?}");
+            assert!(
+                !error.message.trim().is_empty(),
+                "expected error for {path:?}"
+            );
         }
 
         let _ = fs::remove_dir_all(workdir);
@@ -4935,7 +4958,10 @@ mod tests {
         );
         assert_eq!(decode_xml_entities("&#65;&#x4E2D;"), "A中");
         // 非法实体走宽容降级：保留原文。
-        assert_eq!(decode_xml_entities("keep &bogus; text"), "keep &bogus; text");
+        assert_eq!(
+            decode_xml_entities("keep &bogus; text"),
+            "keep &bogus; text"
+        );
         assert_eq!(decode_xml_entities("no entities"), "no entities");
     }
 
@@ -5199,7 +5225,10 @@ mod tests {
         for path in ["", "/tmp/liveagent-outside", "../outside", "src"] {
             let error = fs_create_dir_sync(workdir.display().to_string(), path.to_string())
                 .expect_err("invalid or existing target should fail");
-            assert!(!error.message.trim().is_empty(), "expected error for {path:?}");
+            assert!(
+                !error.message.trim().is_empty(),
+                "expected error for {path:?}"
+            );
         }
 
         let _ = fs::remove_dir_all(workdir);
@@ -5382,8 +5411,12 @@ mod tests {
         fs::write(workdir.join("ignored_dir/child.txt"), "ignored").expect("write ignored child");
 
         let legacy_entries = list_test_entries(&workdir, None);
-        assert!(legacy_entries.iter().any(|entry| entry.path == ".hidden.txt"));
-        assert!(!legacy_entries.iter().any(|entry| entry.path == "ignored.txt"));
+        assert!(legacy_entries
+            .iter()
+            .any(|entry| entry.path == ".hidden.txt"));
+        assert!(!legacy_entries
+            .iter()
+            .any(|entry| entry.path == "ignored.txt"));
 
         let hidden_entries = list_test_entries(&workdir, Some(false));
         let hidden_paths = hidden_entries
@@ -5425,14 +5458,14 @@ mod tests {
         assert!(status.success(), "chflags hidden failed");
 
         let hidden_entries = list_test_entries(&workdir, Some(false));
-        assert!(!hidden_entries.iter().any(|entry| entry.path == "finder-hidden.txt"));
+        assert!(!hidden_entries
+            .iter()
+            .any(|entry| entry.path == "finder-hidden.txt"));
 
         let shown_entries = list_test_entries(&workdir, Some(true));
-        assert!(
-            shown_entries
-                .iter()
-                .any(|entry| entry.path == "finder-hidden.txt" && entry.hidden)
-        );
+        assert!(shown_entries
+            .iter()
+            .any(|entry| entry.path == "finder-hidden.txt" && entry.hidden));
 
         let _ = fs::remove_dir_all(workdir);
     }
@@ -5453,14 +5486,14 @@ mod tests {
             .expect("create hidden file");
 
         let hidden_entries = list_test_entries(&workdir, Some(false));
-        assert!(!hidden_entries.iter().any(|entry| entry.path == "windows-hidden.txt"));
+        assert!(!hidden_entries
+            .iter()
+            .any(|entry| entry.path == "windows-hidden.txt"));
 
         let shown_entries = list_test_entries(&workdir, Some(true));
-        assert!(
-            shown_entries
-                .iter()
-                .any(|entry| entry.path == "windows-hidden.txt" && entry.hidden)
-        );
+        assert!(shown_entries
+            .iter()
+            .any(|entry| entry.path == "windows-hidden.txt" && entry.hidden));
 
         let _ = fs::remove_dir_all(workdir);
     }
@@ -5567,8 +5600,7 @@ mod tests {
         fs::write(workdir.join(".gitignore"), "ignored_dir/\n").expect("write gitignore");
         fs::write(workdir.join("visible.txt"), "visible").expect("write visible file");
         fs::write(workdir.join(".hidden.txt"), "hidden").expect("write hidden file");
-        fs::write(workdir.join("ignored_dir/child.txt"), "ignored")
-            .expect("write ignored file");
+        fs::write(workdir.join("ignored_dir/child.txt"), "ignored").expect("write ignored file");
 
         let shown_entries = mention_test_entries(&workdir, Some(true));
         let entry = |path: &str| {

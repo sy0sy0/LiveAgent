@@ -119,9 +119,10 @@ func countLines(s string) int {
 	}
 	n := 1
 	for i := 0; i < len(s); i++ {
-		if s[i] == '\n' {
+		switch s[i] {
+		case '\n':
 			n++
-		} else if s[i] == '\r' {
+		case '\r':
 			n++
 			if i+1 < len(s) && s[i+1] == '\n' {
 				i++

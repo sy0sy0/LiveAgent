@@ -2,21 +2,22 @@ use std::future::Future;
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
-use reqwest::Url;
+use futures_util::SinkExt as _;
 use serde_json::Value;
 use tauri::Emitter;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt as _;
-use tonic::metadata::MetadataValue;
-use tonic::transport::{ClientTlsConfig, Endpoint};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::commands::settings::RemoteSettingsPayload;
 use crate::runtime::terminal::TerminalEventPayload;
 use crate::services::gateway_bridge;
 
+use super::gateway_proto::v2;
 use super::*;
 
+/// 后台任务句柄的 RAII 中止器。
 struct AbortTaskOnDrop(tauri::async_runtime::JoinHandle<()>);
 
 impl Drop for AbortTaskOnDrop {
@@ -94,83 +95,40 @@ impl GatewayController {
         }
     }
 
+    /// v2 主链路（v1 gRPC 回退已随 v1 协议移除）：hello 握手完成鉴权与会话登记后双向收发
+    /// 信封（双通道合并、状态迁移、对账、分发），外加传输层存活看门狗。任何失败（网关不可达、
+    /// 握手失败、鉴权被拒、链路中断）一律上抛错误消息，由外层 run 循环统一退避重连。
     pub(crate) async fn connect_and_serve(
         self: &Arc<Self>,
         config: RemoteSettingsPayload,
         config_rx: &mut watch::Receiver<RemoteSettingsPayload>,
     ) -> Result<(), String> {
-        let grpc_url = build_grpc_url(&config)?;
-        // The heartbeat interval setting drives the h2 keepalive cadence; the
-        // lower bound stays above the gateway's keepalive enforcement MinTime.
-        let keepalive_interval = Duration::from_secs(config.heartbeat_interval.clamp(10, 60));
-        let endpoint = build_endpoint(&grpc_url, keepalive_interval)?;
-        let channel = endpoint.connect_lazy();
+        let ws_url = build_ws_url(&config.gateway_url, config.grpc_port, GATEWAY_WS_AGENT_PATH)?;
+        let hello = build_client_hello(
+            &config.token,
+            effective_agent_id(&config),
+            crate::app_version().to_string(),
+        );
 
-        let mut client = proto::agent_gateway_client::AgentGatewayClient::new(channel)
-            .max_decoding_message_size(GATEWAY_GRPC_MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(GATEWAY_GRPC_MAX_MESSAGE_BYTES);
-        let mut auth_request = tonic::Request::new(proto::AuthRequest {
-            token: config.token.clone(),
-            agent_id: effective_agent_id(&config),
-            agent_version: crate::app_version().to_string(),
-        });
-        insert_bearer_metadata(auth_request.metadata_mut(), &config.token)?;
-
-        let auth_call = client.authenticate(auth_request);
-        let auth_response = match await_abortable_on_reconfigure(&config, config_rx, async move {
-            tokio::time::timeout(Duration::from_secs(10), auth_call)
-                .await
-                .map_err(|_| "gateway authenticate timed out".to_string())?
-                .map_err(|e| format!("gateway authenticate failed: {e}"))
-                .map(|response| response.into_inner())
+        let connect_result = await_abortable_on_reconfigure(&config, config_rx, async move {
+            Ok(connect_agent_ws(&ws_url, hello).await)
         })
-        .await?
-        {
-            Some(response) => response,
+        .await?;
+        let (mut ws, server_hello) = match connect_result {
             None => return Ok(()),
+            Some(established) => established?,
         };
-        if !auth_response.success {
-            return Err(if auth_response.message.trim().is_empty() {
-                "gateway authentication failed".to_string()
-            } else {
-                auth_response.message
-            });
-        }
-
-        let terminal_client = client.clone();
 
         let (outbound_tx, outbound_rx) = mpsc::channel::<proto::AgentEnvelope>(4096);
         self.set_outbound_sender(Some(outbound_tx));
-        // Control lane: Pong replies must not queue behind streamed data
-        // envelopes, or wake probes time out precisely when a reply is
-        // saturating the data queue. Merged fairly into the same stream below.
+        // 控制小通道：Pong 不排在数据信封之后（下方公平合并进出站流）。
         let (outbound_control_tx, outbound_control_rx) =
             mpsc::channel::<proto::AgentEnvelope>(GATEWAY_OUTBOUND_CONTROL_QUEUE_DEPTH);
         self.set_outbound_control_sender(Some(outbound_control_tx));
         let (terminal_stop_tx, terminal_stop_rx) = watch::channel(false);
-        let terminal_task =
-            self.spawn_terminal_stream(terminal_client, config.clone(), terminal_stop_rx);
+        let terminal_task = self.spawn_terminal_stream_ws(config.clone(), terminal_stop_rx);
 
         let serve_result = async {
-            let mut connect_request = tonic::Request::new(
-                ReceiverStream::new(outbound_control_rx).merge(ReceiverStream::new(outbound_rx)),
-            );
-            insert_bearer_metadata(connect_request.metadata_mut(), &config.token)?;
-
-            let connect_call = client.agent_connect(connect_request);
-            let response = match await_abortable_on_reconfigure(&config, config_rx, async move {
-                tokio::time::timeout(Duration::from_secs(10), connect_call)
-                    .await
-                    .map_err(|_| "open gateway stream timed out".to_string())?
-                    .map_err(|e| format!("open gateway stream failed: {e}"))
-            })
-            .await?
-            {
-                Some(response) => response,
-                None => return Ok(()),
-            };
-            let mut inbound = response.into_inner();
-
             let connected_at = now_unix_seconds();
             self.publish_status(|status| {
                 status.online = true;
@@ -178,17 +136,31 @@ impl GatewayController {
                 status.configured = true;
                 status.gateway_url = config.gateway_url.clone();
                 status.agent_id = effective_agent_id(&config);
-                status.session_id = Some(auth_response.session_id.clone());
+                status.session_id = Some(server_hello.session_id.clone());
                 status.connected_since = Some(connected_at);
                 status.last_heartbeat = Some(connected_at);
                 status.last_error = None;
+                status.protocol = Some("v2".to_string());
             });
 
             let _reconcile_task = AbortTaskOnDrop(self.spawn_post_connect_reconciliation());
 
-            // Dead links are detected by the transport-level HTTP/2 keepalive
-            // configured on the endpoint and surface as receive errors here.
+            let mut outbound = ReceiverStream::new(outbound_control_rx)
+                .merge(ReceiverStream::new(outbound_rx));
+
+            // 存活看门狗（取代 h2 keepalive）：任何入站帧刷新计时；静默超 3×心跳周期发 WS Ping
+            // 探活，宽限期内仍无入站则判链路已死走重连。服务端 Ping 的 Pong 由 tungstenite 自动回。
+            let heartbeat_period = if server_hello.heartbeat_period_seconds > 0 {
+                Duration::from_secs(u64::from(server_hello.heartbeat_period_seconds))
+            } else {
+                GATEWAY_WS_DEFAULT_HEARTBEAT_PERIOD
+            };
+            let idle_timeout = heartbeat_period * 3;
+            let mut last_inbound = Instant::now();
+            let mut probe_deadline: Option<Instant> = None;
+
             let receive_result = loop {
+                let watchdog_deadline = probe_deadline.unwrap_or(last_inbound + idle_timeout);
                 tokio::select! {
                     changed = config_rx.changed() => {
                         if changed.is_err() {
@@ -199,17 +171,71 @@ impl GatewayController {
                             break Ok(());
                         }
                     }
-                    message = inbound.message() => {
-                        match message {
-                            Err(err) => break Err(format!("gateway stream receive failed: {err}")),
-                            Ok(None) => break Err("gateway stream closed".to_string()),
-                            Ok(Some(envelope)) => {
-                                self.touch_heartbeat();
-                                if let Err(error) = self.handle_gateway_envelope(envelope).await {
-                                    break Err(error);
+                    envelope = outbound.next() => {
+                        match envelope {
+                            None => break Err("gateway outbound channels closed".to_string()),
+                            Some(envelope) => {
+                                let frame = v2::AgentClientFrame {
+                                    payload: Some(v2::agent_client_frame::Payload::Envelope(envelope)),
+                                };
+                                if let Err(error) = ws.send(encode_ws_frame(&frame)).await {
+                                    break Err(format!("gateway ws send failed: {error}"));
                                 }
                             }
                         }
+                    }
+                    message = ws.next() => {
+                        match message {
+                            None => break Err("gateway ws stream closed".to_string()),
+                            Some(Err(error)) => break Err(format!("gateway ws receive failed: {error}")),
+                            Some(Ok(message)) => {
+                                last_inbound = Instant::now();
+                                probe_deadline = None;
+                                match message {
+                                    WsMessage::Binary(data) => {
+                                        let frame: v2::AgentServerFrame = match decode_ws_frame(&data) {
+                                            Ok(frame) => frame,
+                                            Err(error) => break Err(error),
+                                        };
+                                        // 重复 hello 或空帧：忽略（服务端同样宽容）。
+                                        if let Some(v2::agent_server_frame::Payload::Envelope(envelope)) = frame.payload {
+                                            self.touch_heartbeat();
+                                            if let Err(error) = self.handle_gateway_envelope(envelope).await {
+                                                break Err(error);
+                                            }
+                                        }
+                                    }
+                                    WsMessage::Close(frame) => {
+                                        break Err(match frame {
+                                            Some(frame) => format!(
+                                                "gateway ws closed (code {}): {}",
+                                                u16::from(frame.code),
+                                                frame.reason
+                                            ),
+                                            None => "gateway ws closed".to_string(),
+                                        });
+                                    }
+                                    // v2 链路不允许文本帧，视为协议错误。
+                                    WsMessage::Text(_) => {
+                                        break Err("gateway ws sent unexpected text frame".to_string());
+                                    }
+                                    // Ping/Pong 由 tungstenite 处理，此处仅刷新看门狗。
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(watchdog_deadline)) => {
+                        if probe_deadline.is_some() {
+                            break Err(format!(
+                                "gateway ws link stale: no inbound frames for {}s",
+                                idle_timeout.saturating_add(GATEWAY_WS_PROBE_GRACE).as_secs()
+                            ));
+                        }
+                        if let Err(error) = ws.send(WsMessage::Ping(Vec::new().into())).await {
+                            break Err(format!("gateway ws liveness ping failed: {error}"));
+                        }
+                        probe_deadline = Some(Instant::now() + GATEWAY_WS_PROBE_GRACE);
                     }
                 }
             };
@@ -492,95 +518,11 @@ pub(crate) fn build_error_response_envelope(
     }
 }
 
-pub(crate) fn build_grpc_url(config: &RemoteSettingsPayload) -> Result<String, String> {
-    let grpc_endpoint = config.grpc_endpoint.trim();
-    if !grpc_endpoint.is_empty() {
-        let with_scheme =
-            if grpc_endpoint.starts_with("http://") || grpc_endpoint.starts_with("https://") {
-                grpc_endpoint.to_string()
-            } else {
-                format!("http://{grpc_endpoint}")
-            };
-        let mut url =
-            Url::parse(&with_scheme).map_err(|e| format!("invalid gateway gRPC endpoint: {e}"))?;
-        if url.scheme() != "http" && url.scheme() != "https" {
-            return Err("gateway gRPC endpoint must start with http:// or https://".to_string());
-        }
-        url.set_path("");
-        url.set_query(None);
-        url.set_fragment(None);
-        return Ok(url.to_string().trim_end_matches('/').to_string());
-    }
-
-    let trimmed = config.gateway_url.trim();
-    if trimmed.is_empty() {
-        return Err("gateway URL is empty".to_string());
-    }
-
-    let mut url = Url::parse(trimmed).map_err(|e| format!("invalid gateway URL: {e}"))?;
-    if url.scheme() != "http" && url.scheme() != "https" {
-        return Err("gateway URL must start with http:// or https://".to_string());
-    }
-    url.set_port(Some(config.grpc_port))
-        .map_err(|_| "failed to apply gRPC port to gateway URL".to_string())?;
-    url.set_path("");
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url.to_string().trim_end_matches('/').to_string())
-}
-
-pub(crate) fn is_h2_protocol_error(message: &str) -> bool {
-    let normalized = message.to_ascii_lowercase();
-    normalized.contains("h2 protocol error") || normalized.contains("http2 error")
-}
-
-pub(crate) fn build_endpoint(
-    grpc_url: &str,
-    keepalive_interval: Duration,
-) -> Result<Endpoint, String> {
-    // HTTP/2 keepalive owns dead-link detection: PING frames bypass stream
-    // flow control, so congestion or streaming never delays them.
-    let endpoint = Endpoint::from_shared(grpc_url.to_string())
-        .map_err(|e| format!("invalid gateway endpoint: {e}"))?
-        .connect_timeout(Duration::from_secs(10))
-        .tcp_keepalive(Some(Duration::from_secs(30)))
-        .http2_keep_alive_interval(keepalive_interval)
-        .keep_alive_timeout(Duration::from_secs(15))
-        .keep_alive_while_idle(true);
-
-    if grpc_url.starts_with("https://") {
-        ensure_rustls_crypto_provider();
-        let host = Url::parse(grpc_url)
-            .ok()
-            .and_then(|url| url.host_str().map(ToString::to_string))
-            .ok_or_else(|| "failed to extract TLS host from gateway URL".to_string())?;
-        endpoint
-            .tls_config(
-                ClientTlsConfig::new()
-                    .with_enabled_roots()
-                    .domain_name(host),
-            )
-            .map_err(|e| format!("configure gateway TLS failed: {e}"))
-    } else {
-        Ok(endpoint)
-    }
-}
-
 pub(crate) fn ensure_rustls_crypto_provider() {
     static INSTALL_DEFAULT_PROVIDER: Once = Once::new();
     INSTALL_DEFAULT_PROVIDER.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
-}
-
-pub(crate) fn insert_bearer_metadata(
-    metadata: &mut tonic::metadata::MetadataMap,
-    token: &str,
-) -> Result<(), String> {
-    let value = MetadataValue::try_from(format!("Bearer {}", token.trim()))
-        .map_err(|e| format!("invalid gateway authorization metadata: {e}"))?;
-    metadata.insert("authorization", value);
-    Ok(())
 }
 
 pub(crate) fn is_remote_configured(config: &RemoteSettingsPayload) -> bool {
@@ -616,4 +558,5 @@ pub(crate) fn set_disconnected_status(
     status.connected_since = None;
     status.last_heartbeat = None;
     status.last_error = last_error;
+    status.protocol = None;
 }

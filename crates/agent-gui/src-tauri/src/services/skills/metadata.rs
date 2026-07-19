@@ -226,7 +226,10 @@ pub(crate) fn first_readme_description_line(content: &str) -> Option<String> {
     })
 }
 
-pub(crate) fn fallback_readme_description(readme_file: &Path, name: &str) -> Result<String, String> {
+pub(crate) fn fallback_readme_description(
+    readme_file: &Path,
+    name: &str,
+) -> Result<String, String> {
     let content = fs::read_to_string(readme_file)
         .map_err(|e| format!("Failed to read README.md fallback: {e}"))?;
     let description = first_readme_description_line(&content)

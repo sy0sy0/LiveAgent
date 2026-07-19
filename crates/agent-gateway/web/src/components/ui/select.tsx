@@ -88,8 +88,15 @@ SelectContent.displayName = SelectPrimitive.Content.displayName;
 
 export const SelectItem = React.forwardRef<
   React.ElementRef<typeof SelectPrimitive.Item>,
-  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Item>
->(({ className, children, ...props }, ref) => (
+  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Item> & {
+    /**
+     * Optional secondary line rendered under the item label. Kept OUTSIDE
+     * ItemText on purpose: ItemText must stay text-only (it feeds typeahead
+     * and the trigger's value reflection), so rich item layouts go here.
+     */
+    description?: React.ReactNode;
+  }
+>(({ className, children, description, ...props }, ref) => (
   <SelectPrimitive.Item
     ref={ref}
     className={cn(
@@ -98,12 +105,26 @@ export const SelectItem = React.forwardRef<
     )}
     {...props}
   >
-    <span className="absolute right-2 flex h-3.5 w-3.5 items-center justify-center">
+    <span
+      className={cn(
+        "absolute right-2 flex h-3.5 w-3.5 items-center justify-center",
+        description != null && "top-1/2 -translate-y-1/2",
+      )}
+    >
       <SelectPrimitive.ItemIndicator>
         <Check className="h-4 w-4" />
       </SelectPrimitive.ItemIndicator>
     </span>
-    <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
+    {description == null ? (
+      <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
+    ) : (
+      <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
+        <span className="truncate text-[10px] leading-tight text-muted-foreground/70">
+          {description}
+        </span>
+      </span>
+    )}
   </SelectPrimitive.Item>
 ));
 SelectItem.displayName = SelectPrimitive.Item.displayName;

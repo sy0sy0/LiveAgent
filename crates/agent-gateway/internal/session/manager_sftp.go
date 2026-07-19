@@ -17,11 +17,9 @@ func (m *Manager) SubscribeSftpEvents() (<-chan *gatewayv1.SftpEvent, func()) {
 
 	cleanup := func() {
 		m.syncHub.sftpMu.Lock()
-		if _, ok := m.syncHub.sftpSubscribers[subID]; ok {
-			// Do not close the channel here: broadcastSftpEvent sends after
-			// copying subscribers, so closing can race with an in-flight send.
-			delete(m.syncHub.sftpSubscribers, subID)
-		}
+		// Do not close the channel here: broadcastSftpEvent sends after
+		// copying subscribers, so closing can race with an in-flight send.
+		delete(m.syncHub.sftpSubscribers, subID)
 		m.syncHub.sftpMu.Unlock()
 	}
 

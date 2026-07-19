@@ -68,4 +68,7 @@ test("buildSkillsSystemPrompt marks explicit mentions without granting disabled 
   assert.match(prompt, /- code-review \(skillFile: code-review\/SKILL\.md, baseDir: code-review\)/);
   assert.doesNotMatch(prompt, /disabled\/SKILL\.md/);
   assert.ok(prompt.includes("`$` mentions never grant access to disabled Skills"));
+  assert.match(prompt, /skill:\/\/<baseDir>\/\.\.\./);
+  assert.doesNotMatch(prompt, /root=["']skills["']/);
+  assert.doesNotMatch(prompt, /Read\(root=/);
 });

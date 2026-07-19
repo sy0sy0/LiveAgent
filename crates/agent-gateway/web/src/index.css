@@ -782,12 +782,16 @@
   /* Settings page section transitions */
   .settings-section-enter {
     animation: settingsSectionIn 0.28s cubic-bezier(0.16, 1, 0.3, 1);
-    will-change: transform, opacity;
+    /*
+     * No `will-change` here: this class sits on the settings scroll container
+     * itself, and a permanent layer promotion on a scroller makes Android
+     * Chrome skip rasterizing parts of the scrolled content (blank card-sized
+     * gaps). The one-shot mount animation self-promotes while it runs.
+     */
   }
 
   .settings-section-title-enter {
     animation: settingsSectionTitleIn 0.22s cubic-bezier(0.16, 1, 0.3, 1);
-    will-change: transform, opacity;
   }
 
   .settings-section-shell {
@@ -2233,4 +2237,12 @@ body > div:not(#root) [data-streamdown="mermaid"] svg {
     transparent 100%
   );
   mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 1.25rem), transparent 100%);
+}
+
+/* Composer chip spacing — the gap after a chip is pure presentation; no
+ * spacer character lives in the DOM (serialization re-inserts the word
+ * boundary between a chip token and adjacent content). Outside @layer so
+ * it beats the chip's own mx-0.5 utility (unlayered wins in Tailwind v4). */
+.mention-composer .mention-chip {
+  margin-inline-end: 0.375rem;
 }

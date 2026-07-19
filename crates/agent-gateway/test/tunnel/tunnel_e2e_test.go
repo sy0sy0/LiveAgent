@@ -51,7 +51,7 @@ func (a *fakeAgent) run() {
 				continue
 			}
 			outbound.Ack(nil)
-			frame := outbound.GatewayEnvelope.GetTunnelFrame()
+			frame := outbound.GetTunnelFrame()
 			if frame == nil {
 				continue
 			}
@@ -320,7 +320,7 @@ func TestTunnelHTMLRewriteInjectsShimAndDropsContentLength(t *testing.T) {
 					continue
 				}
 				outbound.Ack(nil)
-				frame := outbound.GatewayEnvelope.GetTunnelFrame()
+				frame := outbound.GetTunnelFrame()
 				if frame == nil ||
 					frame.GetKind() != gatewayv1.TunnelFrameKind_TUNNEL_FRAME_KIND_HTTP_REQUEST_START {
 					continue

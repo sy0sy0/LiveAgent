@@ -18,12 +18,17 @@ import {
 import { createPortal } from "react-dom";
 import { useLocale } from "../../i18n";
 import {
+  type CodeMentionReference,
+  codeMentionDisplayName,
+  codeMentionLineLabel,
+  createCodeMentionReference,
   createFileMentionReference,
   escapeMarkdownReferenceLabel,
   type FileMentionKind,
   type FileMentionReference,
   fileMentionDisplayName,
   fileMentionTitle,
+  formatCodeMentionToken,
   formatFileMentionToken,
   formatMarkdownReferenceDestination,
 } from "../../lib/chat/messages/mentionReferences";
@@ -127,6 +132,7 @@ export interface MentionComposerHandle {
   insertSkillMention: (skill: MentionComposerSkillMention) => void;
   insertCommitMention: (commit: MentionComposerCommitMention) => void;
   insertGitFileMention: (file: MentionComposerGitFileMention) => void;
+  insertCodeMention: (reference: CodeMentionReference) => void;
   clear: () => void;
   focus: () => void;
   /**
@@ -152,7 +158,8 @@ export type MentionComposerDraftSegment =
   | { type: "largePaste"; paste: MentionComposerLargePaste }
   | { type: "skillMention"; skill: MentionComposerSkillMention }
   | { type: "commitMention"; commit: MentionComposerCommitMention }
-  | { type: "gitFileMention"; file: MentionComposerGitFileMention };
+  | { type: "gitFileMention"; file: MentionComposerGitFileMention }
+  | { type: "codeMention"; reference: CodeMentionReference };
 
 export type MentionComposerDraft = {
   segments: MentionComposerDraftSegment[];
@@ -162,6 +169,7 @@ export type MentionComposerDraft = {
   skillMentions: MentionComposerSkillMention[];
   commitMentions: MentionComposerCommitMention[];
   gitFileMentions: MentionComposerGitFileMention[];
+  codeMentions: CodeMentionReference[];
   isEmpty: boolean;
 };
 
@@ -221,6 +229,9 @@ const GIT_FILE_MENTION_REF_NAME_ATTR = "data-git-file-ref-name";
 const GIT_FILE_MENTION_REMOTE_NAME_ATTR = "data-git-file-remote-name";
 const GIT_FILE_MENTION_REMOTE_URL_ATTR = "data-git-file-remote-url";
 const GIT_FILE_MENTION_GITHUB_URL_ATTR = "data-git-file-github-url";
+const CODE_MENTION_PATH_ATTR = "data-code-mention-path";
+const CODE_MENTION_START_ATTR = "data-code-mention-start";
+const CODE_MENTION_END_ATTR = "data-code-mention-end";
 const LARGE_PASTE_TAG_ATTR = "data-large-paste-id";
 const LARGE_PASTE_CHAR_THRESHOLD = 8_000;
 const LARGE_PASTE_LINE_THRESHOLD = 200;
@@ -229,7 +240,6 @@ const COMPOSER_CONTEXT_MENU_WIDTH = 184;
 const COMPOSER_CONTEXT_MENU_HEIGHT = 154;
 const COMPOSER_CONTEXT_MENU_MARGIN = 12;
 const CARET_ANCHOR_TEXT = "\u200B";
-const CARET_SPACER_TEXT = "\u00A0";
 const IME_ENTER_SUPPRESS_WINDOW_MS = 300;
 const IME_COMPOSITION_END_ENTER_TAIL_MS = 80;
 // Must match the .composer-typewriter-char animation duration in index.css.
@@ -303,6 +313,38 @@ function serializeChildrenToSegments(
   parent: Node,
   largePastes: Map<string, MentionComposerLargePaste>,
 ): MentionComposerDraftSegment[] {
+  return injectMentionBoundarySpaces(collectDraftSegments(parent, largePastes));
+}
+
+/** A chip's visual gap is CSS margin with no character behind it; re-insert
+ *  the word boundary at serialization time so a token never glues onto the
+ *  content on either side of it. */
+function injectMentionBoundarySpaces(
+  segments: MentionComposerDraftSegment[],
+): MentionComposerDraftSegment[] {
+  const out: MentionComposerDraftSegment[] = [];
+  for (const segment of segments) {
+    const prev = out[out.length - 1];
+    if (prev != null && prev.type !== "text") {
+      if (segment.type !== "text" || !/^\s/.test(segment.text)) {
+        pushTextSegment(out, " ");
+      }
+    } else if (prev?.type === "text" && segment.type !== "text" && !/\s$/.test(prev.text)) {
+      prev.text += " ";
+    }
+    if (segment.type === "text") {
+      pushTextSegment(out, segment.text);
+    } else {
+      out.push(segment);
+    }
+  }
+  return out;
+}
+
+function collectDraftSegments(
+  parent: Node,
+  largePastes: Map<string, MentionComposerLargePaste>,
+): MentionComposerDraftSegment[] {
   const parts: MentionComposerDraftSegment[] = [];
   parent.childNodes.forEach((child) => {
     if (child.nodeType === Node.TEXT_NODE) {
@@ -320,6 +362,11 @@ function serializeChildrenToSegments(
         const file = gitFileMentionFromElement(el);
         if (file) {
           parts.push({ type: "gitFileMention", file });
+        }
+      } else if (el.hasAttribute(CODE_MENTION_PATH_ATTR)) {
+        const reference = codeMentionFromElement(el);
+        if (reference) {
+          parts.push({ type: "codeMention", reference });
         }
       } else if (el.hasAttribute(COMMIT_MENTION_SHA_ATTR)) {
         const commit = commitMentionFromElement(el);
@@ -355,7 +402,7 @@ function serializeChildrenToSegments(
           if (el.tagName === "DIV" || el.tagName === "P") {
             if (parts.length > 0) pushTextSegment(parts, "\n");
           }
-          for (const segment of serializeChildrenToSegments(el, largePastes)) {
+          for (const segment of collectDraftSegments(el, largePastes)) {
             if (segment.type === "text") {
               pushTextSegment(parts, segment.text);
             } else {
@@ -380,6 +427,7 @@ function serializeChildren(
       if (segment.type === "skillMention") return formatSkillMentionToken(segment.skill);
       if (segment.type === "commitMention") return formatCommitMentionToken(segment.commit);
       if (segment.type === "gitFileMention") return formatGitFileMentionToken(segment.file);
+      if (segment.type === "codeMention") return formatCodeMentionToken(segment.reference);
       return segment.text;
     })
     .join("");
@@ -391,9 +439,10 @@ function editorTextIsEmpty(editor: HTMLElement) {
 }
 
 /** Unlike editorTextIsEmpty, this doesn't trim — a leading/trailing space
- *  still counts as content so the placeholder hides as soon as the user types. */
+ *  still counts as content so the placeholder hides as soon as the user types.
+ *  Zero-width caret anchors are artifacts, not content, and are ignored. */
 function editorHasNoContent(editor: HTMLElement) {
-  return (editor.textContent || "").length === 0;
+  return removeCaretAnchors(editor.textContent || "").length === 0;
 }
 
 function editorRangeIsInsideRoot(root: HTMLElement, range: Range) {
@@ -797,6 +846,16 @@ function gitFileMentionFromElement(el: HTMLElement): MentionComposerGitFileMenti
   });
 }
 
+function codeMentionFromElement(el: HTMLElement): CodeMentionReference | null {
+  const path = el.getAttribute(CODE_MENTION_PATH_ATTR)?.trim() ?? "";
+  if (!path) return null;
+  return createCodeMentionReference({
+    path,
+    startLine: Number(el.getAttribute(CODE_MENTION_START_ATTR) ?? "1"),
+    endLine: Number(el.getAttribute(CODE_MENTION_END_ATTR) ?? "1"),
+  });
+}
+
 function createMentionIcon(svgMarkup: string) {
   const template = document.createElement("template");
   template.innerHTML = svgMarkup.trim();
@@ -832,24 +891,24 @@ function isComposerChipElement(node: Node | null): node is HTMLElement {
       node.hasAttribute(SKILL_MENTION_NAME_ATTR) ||
       node.hasAttribute(COMMIT_MENTION_SHA_ATTR) ||
       node.hasAttribute(GIT_FILE_MENTION_PATH_ATTR) ||
+      node.hasAttribute(CODE_MENTION_PATH_ATTR) ||
       node.hasAttribute(LARGE_PASTE_TAG_ATTR))
   );
 }
 
-function createCaretAnchorText(afterRaw: string, options?: { ensureLeadingSpace?: boolean }) {
+/** The caret's rest position in the text right after a chip: at the end of an
+ *  existing leading-whitespace run (the run and the chip form one atomic unit
+ *  for caret purposes), otherwise after a zero-width anchor. The visual gap
+ *  after a chip is pure CSS margin — never a spacer character; serialization
+ *  re-adds the word boundary (injectMentionBoundarySpaces). */
+function createCaretAnchorText(afterRaw: string) {
   const cleaned = removeCaretAnchors(afterRaw);
   const matchedWhitespace = cleaned.match(/^\s+/)?.[0] ?? "";
-  const leadingWhitespace =
-    matchedWhitespace || (options?.ensureLeadingSpace === true ? CARET_SPACER_TEXT : "");
-  const rest = cleaned.slice(matchedWhitespace.length);
-  if (leadingWhitespace.length > 0) {
-    return {
-      text: `${leadingWhitespace}${rest}`,
-      caretOffset: leadingWhitespace.length,
-    };
+  if (matchedWhitespace.length > 0) {
+    return { text: cleaned, caretOffset: matchedWhitespace.length };
   }
   return {
-    text: `${CARET_ANCHOR_TEXT}${rest}`,
+    text: `${CARET_ANCHOR_TEXT}${cleaned}`,
     caretOffset: CARET_ANCHOR_TEXT.length,
   };
 }
@@ -893,17 +952,39 @@ function ensureCaretAnchorAfterChip(chip: HTMLElement): { textNode: Text; offset
   const next = chip.nextSibling;
   if (next?.nodeType === Node.TEXT_NODE) {
     const textNode = next as Text;
-    const anchor = createCaretAnchorText(textNode.data, { ensureLeadingSpace: true });
+    const anchor = createCaretAnchorText(textNode.data);
     if (textNode.data !== anchor.text) {
       textNode.data = anchor.text;
     }
     return { textNode, offset: anchor.caretOffset };
   }
 
-  const anchor = createCaretAnchorText("", { ensureLeadingSpace: true });
+  const anchor = createCaretAnchorText("");
   const textNode = document.createTextNode(anchor.text);
   parent.insertBefore(textNode, next);
   return { textNode, offset: anchor.caretOffset };
+}
+
+/** A text position right before the chip. Without a preceding text node the
+ *  caret would sit on a bare element offset, which browsers render at the
+ *  chip's inner edge — so create a zero-width anchor to host it instead. */
+function ensureCaretAnchorBeforeChip(chip: HTMLElement): { textNode: Text; offset: number } | null {
+  const parent = chip.parentNode;
+  if (!parent) return null;
+
+  const prev = chip.previousSibling;
+  if (prev?.nodeType === Node.TEXT_NODE) {
+    const textNode = prev as Text;
+    // An empty text node has no text box to carry the caret; seed it.
+    if (textNode.data.length === 0) {
+      textNode.data = CARET_ANCHOR_TEXT;
+    }
+    return { textNode, offset: textNode.data.length };
+  }
+
+  const textNode = document.createTextNode(CARET_ANCHOR_TEXT);
+  parent.insertBefore(textNode, chip);
+  return { textNode, offset: textNode.data.length };
 }
 
 function normalizeCaretAfterChip(root: HTMLElement) {
@@ -932,6 +1013,15 @@ function normalizeCaretAfterChip(root: HTMLElement) {
     const childBefore = node.childNodes[offset - 1] ?? null;
     if (isComposerChipElement(childBefore)) {
       const anchor = ensureCaretAnchorAfterChip(childBefore);
+      if (!anchor) return false;
+      placeCaretInTextNode(anchor.textNode, anchor.offset);
+      return true;
+    }
+    // An element-position caret right before a chip renders at the chip's
+    // inner edge; move it into a real text position before the chip.
+    const childAfter = node.childNodes[offset] ?? null;
+    if (isComposerChipElement(childAfter)) {
+      const anchor = ensureCaretAnchorBeforeChip(childAfter);
       if (!anchor) return false;
       placeCaretInTextNode(anchor.textNode, anchor.offset);
       return true;
@@ -1085,20 +1175,14 @@ function createFileMentionChip(path: string, kind: FileMentionKind) {
   return chip;
 }
 
-function insertMentionChipElement(
-  ctx: MentionContext,
-  chip: HTMLElement,
-  options?: { ensureSpaceAfterChip?: boolean },
-) {
+function insertMentionChipElement(ctx: MentionContext, chip: HTMLElement) {
   const { textNode, triggerOffset, query } = ctx;
   const text = textNode.textContent || "";
   const parent = textNode.parentNode!;
 
   const beforeText = text.slice(0, triggerOffset);
   const afterRaw = text.slice(triggerOffset + 1 + query.length);
-  const anchor = createCaretAnchorText(afterRaw, {
-    ensureLeadingSpace: options?.ensureSpaceAfterChip === true,
-  });
+  const anchor = createCaretAnchorText(afterRaw);
   const afterNode = document.createTextNode(anchor.text);
 
   if (beforeText) {
@@ -1115,7 +1199,7 @@ function insertMentionChipElement(
 function insertMentionChip(ctx: MentionContext, path: string, kind: "file" | "dir") {
   const chip = createFileMentionChip(path, kind);
   if (!chip) return;
-  insertMentionChipElement(ctx, chip, { ensureSpaceAfterChip: true });
+  insertMentionChipElement(ctx, chip);
 }
 
 function createSkillMentionChip(skill: MentionComposerSkillMention) {
@@ -1206,6 +1290,25 @@ function createGitFileMentionChip(fileInput: MentionComposerGitFileMention) {
   return chip;
 }
 
+function createCodeMentionChip(referenceInput: CodeMentionReference) {
+  const reference = createCodeMentionReference(referenceInput);
+  if (!reference) return null;
+  const chip = document.createElement("span");
+  chip.setAttribute(CODE_MENTION_PATH_ATTR, reference.path);
+  chip.setAttribute(CODE_MENTION_START_ATTR, String(reference.startLine));
+  chip.setAttribute(CODE_MENTION_END_ATTR, String(reference.endLine));
+  chip.contentEditable = "false";
+  chip.className = mentionChipClassName("codeRef", { selectable: false });
+  const lineLabel = codeMentionLineLabel(reference);
+  chip.title = `${reference.path}:${lineLabel}`;
+  chip.setAttribute("aria-label", `${reference.path}:${lineLabel}`);
+
+  chip.appendChild(createFileTypeMentionIcon(reference.path, "file"));
+
+  chip.appendChild(document.createTextNode(`${codeMentionDisplayName(reference)}：${lineLabel}`));
+  return chip;
+}
+
 function createLargePasteChip(paste: MentionComposerLargePaste) {
   const chip = document.createElement("span");
   chip.setAttribute(LARGE_PASTE_TAG_ATTR, paste.id);
@@ -1225,14 +1328,8 @@ function createLargePasteChip(paste: MentionComposerLargePaste) {
   return chip;
 }
 
-function insertNodeAtCursor(
-  root: HTMLElement,
-  node: Node,
-  options?: { ensureSpaceAfterNode?: boolean },
-) {
-  const anchor = createCaretAnchorText("", {
-    ensureLeadingSpace: options?.ensureSpaceAfterNode === true,
-  });
+function insertNodeAtCursor(root: HTMLElement, node: Node) {
+  const anchor = createCaretAnchorText("");
   const afterNode = document.createTextNode(anchor.text);
   const sel = window.getSelection();
   if (sel && sel.rangeCount > 0) {
@@ -1413,14 +1510,137 @@ function deleteChipBeforeCursor(
     placeCaretInTextNode(nextCaretTextNode, 0);
   } else {
     const previousNode = chipIndex > 0 ? (parent.childNodes[chipIndex - 1] ?? null) : null;
+    const followingNode = parent.childNodes[chipIndex] ?? null;
     if (previousNode?.nodeType === Node.TEXT_NODE) {
       const previousTextNode = previousNode as Text;
       placeCaretInTextNode(previousTextNode, previousTextNode.data.length);
+    } else if (isComposerChipElement(previousNode)) {
+      const anchor = ensureCaretAnchorAfterChip(previousNode);
+      if (anchor) {
+        placeCaretInTextNode(anchor.textNode, anchor.offset);
+      }
+    } else if (isComposerChipElement(followingNode)) {
+      const anchor = ensureCaretAnchorBeforeChip(followingNode);
+      if (anchor) {
+        placeCaretInTextNode(anchor.textNode, anchor.offset);
+      }
     } else {
       placeCaretInNode(parent, Math.min(chipIndex, parent.childNodes.length));
     }
   }
 
+  return true;
+}
+
+function placeCaretBeforeChip(chip: HTMLElement) {
+  const prev = chip.previousSibling;
+  if (isComposerChipElement(prev)) {
+    // Adjacent chips: rest at the canonical anchor after the previous one.
+    const anchor = ensureCaretAnchorAfterChip(prev);
+    if (!anchor) return false;
+    placeCaretInTextNode(anchor.textNode, anchor.offset);
+    return true;
+  }
+  const anchor = ensureCaretAnchorBeforeChip(chip);
+  if (!anchor) return false;
+  placeCaretInTextNode(anchor.textNode, anchor.offset);
+  return true;
+}
+
+function placeCaretAfterChip(chip: HTMLElement) {
+  const anchor = ensureCaretAnchorAfterChip(chip);
+  if (!anchor) return false;
+  placeCaretInTextNode(anchor.textNode, anchor.offset);
+  return true;
+}
+
+/** Check if the content right after the cursor is a mention chip, return it if so. */
+function chipAfterCursor(root: HTMLElement): HTMLElement | null {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || !sel.isCollapsed) return null;
+
+  const { startContainer: node, startOffset: offset } = sel.getRangeAt(0);
+  if (!root.contains(node)) return null;
+
+  if (node.nodeType === Node.TEXT_NODE) {
+    const textNode = node as Text;
+    const rest = textNode.data.slice(offset);
+    if (removeCaretAnchors(rest).length === 0 && isComposerChipElement(textNode.nextSibling)) {
+      return textNode.nextSibling;
+    }
+    return null;
+  }
+
+  if (node === root || (node.nodeType === Node.ELEMENT_NODE && root.contains(node))) {
+    const childAfter = (node as HTMLElement).childNodes[offset] ?? null;
+    if (isComposerChipElement(childAfter)) {
+      return childAfter;
+    }
+  }
+
+  return null;
+}
+
+/** Move a caret that ended up inside a non-editable chip back outside it. */
+function ejectCaretFromChip(root: HTMLElement, side: "before" | "after") {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || !sel.isCollapsed) return false;
+
+  const node = sel.getRangeAt(0).startContainer;
+  if (!root.contains(node)) return false;
+
+  const chip = closestComposerChipFromNode(root, node);
+  if (!chip) return false;
+  return side === "before" ? placeCaretBeforeChip(chip) : placeCaretAfterChip(chip);
+}
+
+/**
+ * ←/→ treat a chip plus its caret anchor as one atomic unit: the caret only
+ * ever rests right before the chip or at the anchor after it. The browser's
+ * default one-character move would land between chip and anchor, where the
+ * keyup normalisation snaps it straight back (the caret would never cross).
+ */
+function stepCaretOverChip(root: HTMLElement, direction: "left" | "right") {
+  if (ejectCaretFromChip(root, direction === "left" ? "before" : "after")) {
+    return true;
+  }
+  if (direction === "left") {
+    const target = chipBeforeCursor(root);
+    return target ? placeCaretBeforeChip(target.chip) : false;
+  }
+  const chip = chipAfterCursor(root);
+  return chip ? placeCaretAfterChip(chip) : false;
+}
+
+/** Forward-delete twin of deleteChipBeforeCursor: remove the chip right
+ *  after the cursor together with its caret anchor, mirroring how Backspace
+ *  treats chip + anchor as one atomic unit (native forward delete would
+ *  drop only the chip element and leave its anchor space behind). */
+function deleteChipAfterCursor(
+  root: HTMLElement,
+  largePastes: Map<string, MentionComposerLargePaste>,
+) {
+  const chip = chipAfterCursor(root);
+  if (!chip) return false;
+
+  const largePasteId = chip.getAttribute(LARGE_PASTE_TAG_ATTR);
+  if (largePasteId) {
+    largePastes.delete(largePasteId);
+  }
+
+  const next = chip.nextSibling;
+  if (next?.nodeType === Node.TEXT_NODE) {
+    const nextTextNode = next as Text;
+    nextTextNode.data = stripLeadingCaretAnchorText(nextTextNode.data);
+    if (nextTextNode.data.length === 0) {
+      nextTextNode.remove();
+    }
+  }
+
+  chip.remove();
+  // The collapsed caret stayed where it was; it may now sit on a bare
+  // element offset right next to another chip — re-anchor it.
+  normalizeCaretAfterChip(root);
   return true;
 }
 
@@ -1450,6 +1670,7 @@ function Popup({
   onSelect: (suggestion: MentionSuggestion) => void;
 }) {
   const popupRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
   const hlRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     hlRef.current?.scrollIntoView({ block: "nearest" });
@@ -1487,11 +1708,29 @@ function Popup({
         "mention-popup-enter fixed z-[100] overflow-hidden rounded-2xl",
         "border border-black/[0.075] bg-popover text-popover-foreground shadow-sm ring-0 dark:border-white/[0.15]",
       )}
+      onMouseDown={(event) => {
+        // Any mousedown inside the popup must not blur the editor (blur closes
+        // the mention session), except on the native scrollbar strip where
+        // preventDefault would break thumb dragging in some engines.
+        const list = listRef.current;
+        if (list) {
+          const rect = list.getBoundingClientRect();
+          const onScrollbar =
+            event.clientX >= rect.left + list.clientLeft + list.clientWidth &&
+            event.clientY >= rect.top &&
+            event.clientY <= rect.bottom;
+          if (onScrollbar) return;
+        }
+        event.preventDefault();
+      }}
     >
       <div className="px-3.5 pb-1.5 pt-3 text-xs font-medium text-muted-foreground">
         {trigger === "skill" ? "Skills" : "文件"}
       </div>
-      <div className="mention-popup-scroll relative flex max-h-[320px] flex-col gap-0.5 overflow-y-auto px-2 pb-2">
+      <div
+        ref={listRef}
+        className="mention-popup-scroll relative flex max-h-[320px] flex-col overflow-y-auto px-2 pb-2"
+      >
         {isLoading && (
           <div className="px-2 py-2 text-xs text-muted-foreground">Indexing files...</div>
         )}
@@ -1514,7 +1753,11 @@ function Popup({
               }
               ref={i === highlightIndex ? hlRef : undefined}
               className={cn(
-                "mention-popup-item group flex h-[30px] cursor-pointer items-center gap-3 rounded-lg px-3 text-xs leading-5 transition-colors",
+                // Rows are 38px hitboxes with 2px transparent borders so the
+                // visual 34px row keeps the 4px gap while clicks in the gap
+                // still land on a row instead of a dead strip. shrink-0 stops
+                // the max-h flex column from compressing rows before it scrolls.
+                "mention-popup-item group flex h-[38px] shrink-0 cursor-pointer items-center gap-3 rounded-lg border-y-2 border-transparent bg-clip-padding px-3 text-xs leading-5 transition-colors",
                 i === highlightIndex
                   ? "bg-foreground/[0.07] text-foreground"
                   : "text-foreground/85 hover:bg-foreground/[0.05] dark:text-foreground/90",
@@ -2086,6 +2329,7 @@ export const MentionComposer = memo(
           skillMentions: [],
           commitMentions: [],
           gitFileMentions: [],
+          codeMentions: [],
           isEmpty: true,
         };
       }
@@ -2095,6 +2339,7 @@ export const MentionComposer = memo(
       const skillMentions: MentionComposerSkillMention[] = [];
       const commitMentions: MentionComposerCommitMention[] = [];
       const gitFileMentions: MentionComposerGitFileMention[] = [];
+      const codeMentions: CodeMentionReference[] = [];
       const textParts: string[] = [];
       const textWithoutLargePastesParts: string[] = [];
       for (const segment of segments) {
@@ -2123,6 +2368,11 @@ export const MentionComposer = memo(
           const token = formatGitFileMentionToken(segment.file);
           textParts.push(token);
           textWithoutLargePastesParts.push(token);
+        } else if (segment.type === "codeMention") {
+          codeMentions.push(segment.reference);
+          const token = formatCodeMentionToken(segment.reference);
+          textParts.push(token);
+          textWithoutLargePastesParts.push(token);
         }
       }
 
@@ -2136,6 +2386,7 @@ export const MentionComposer = memo(
         skillMentions,
         commitMentions,
         gitFileMentions,
+        codeMentions,
         isEmpty: editorTextIsEmpty(el),
       };
     }, []);
@@ -2264,6 +2515,9 @@ export const MentionComposer = memo(
               el.appendChild(createCommitMentionChip(segment.commit));
             } else if (segment.type === "gitFileMention") {
               el.appendChild(createGitFileMentionChip(segment.file));
+            } else if (segment.type === "codeMention") {
+              const chip = createCodeMentionChip(segment.reference);
+              if (chip) el.appendChild(chip);
             } else if (segment.text) {
               el.appendChild(document.createTextNode(segment.text));
             }
@@ -2287,7 +2541,7 @@ export const MentionComposer = memo(
           el.focus();
           const chip = createFileMentionChip(path, kind);
           if (!chip) return;
-          insertNodeAtCursor(el, chip, { ensureSpaceAfterNode: true });
+          insertNodeAtCursor(el, chip);
           closeMentionSession();
           refreshEmptyState();
         },
@@ -2297,7 +2551,7 @@ export const MentionComposer = memo(
           finishTypewriter();
           resetPromptHistoryRecall();
           el.focus();
-          insertNodeAtCursor(el, createSkillMentionChip(skill), { ensureSpaceAfterNode: true });
+          insertNodeAtCursor(el, createSkillMentionChip(skill));
           closeMentionSession();
           refreshEmptyState();
         },
@@ -2307,7 +2561,7 @@ export const MentionComposer = memo(
           finishTypewriter();
           resetPromptHistoryRecall();
           el.focus();
-          insertNodeAtCursor(el, createCommitMentionChip(commit), { ensureSpaceAfterNode: true });
+          insertNodeAtCursor(el, createCommitMentionChip(commit));
           closeMentionSession();
           refreshEmptyState();
         },
@@ -2317,7 +2571,19 @@ export const MentionComposer = memo(
           finishTypewriter();
           resetPromptHistoryRecall();
           el.focus();
-          insertNodeAtCursor(el, createGitFileMentionChip(file), { ensureSpaceAfterNode: true });
+          insertNodeAtCursor(el, createGitFileMentionChip(file));
+          closeMentionSession();
+          refreshEmptyState();
+        },
+        insertCodeMention: (reference: CodeMentionReference) => {
+          const el = editorRef.current;
+          if (!el) return;
+          finishTypewriter();
+          resetPromptHistoryRecall();
+          el.focus();
+          const chip = createCodeMentionChip(reference);
+          if (!chip) return;
+          insertNodeAtCursor(el, chip);
           closeMentionSession();
           refreshEmptyState();
         },
@@ -2647,7 +2913,9 @@ export const MentionComposer = memo(
       resetPromptHistoryRecall();
       closeComposerContextMenu();
       const el = editorRef.current;
-      if (el) {
+      // Mutating the composing text node (or moving the selection) mid-IME
+      // cancels the composition; compositionEnd re-runs the anchor cleanup.
+      if (el && !isComposingRef.current) {
         removeStaleCaretAnchorsAroundSelection(el);
         normalizeCaretAfterChip(el);
       }
@@ -2667,6 +2935,12 @@ export const MentionComposer = memo(
     const handleKeyUp = useCallback(
       (e: KeyboardEvent<HTMLDivElement>) => {
         if (disabled || isComposingRef.current || isImeKeyboardEvent(e)) return;
+        const el = editorRef.current;
+        // Arrow moves must never leave the caret inside a non-editable chip
+        // (WebKit can drop it there); eject toward the travel direction.
+        if (el && e.key.startsWith("Arrow")) {
+          ejectCaretFromChip(el, e.key === "ArrowLeft" ? "before" : "after");
+        }
         if (
           e.key === "ArrowDown" ||
           e.key === "ArrowUp" ||
@@ -2674,9 +2948,14 @@ export const MentionComposer = memo(
           e.key === "Enter" ||
           e.key === "Escape"
         ) {
+          // ↑/↓ move the caret by x-position and can land on chip-boundary
+          // dead zones just like clicks do; keep them anchor-normalised.
+          if (el && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+            removeStaleCaretAnchorsAroundSelection(el);
+            normalizeCaretAfterChip(el);
+          }
           return;
         }
-        const el = editorRef.current;
         if (el) {
           removeStaleCaretAnchorsAroundSelection(el);
           normalizeCaretAfterChip(el);
@@ -2689,7 +2968,9 @@ export const MentionComposer = memo(
     const handleMouseUp = useCallback(() => {
       const el = editorRef.current;
       if (!el) return;
-      if (normalizeCaretAfterChip(el)) {
+      // WebKit can drop a click's caret inside the non-editable chip itself.
+      const ejected = ejectCaretFromChip(el, "after");
+      if (normalizeCaretAfterChip(el) || ejected) {
         refreshMention();
       }
     }, [refreshMention]);
@@ -2929,10 +3210,40 @@ export const MentionComposer = memo(
           }
         }
 
+        // ←/→ next to a mention chip: step over the whole chip. The default
+        // single-character move would land inside the caret-anchor dead zone
+        // and get snapped right back — or, in WebKit, inside the chip itself.
+        if (
+          (e.key === "ArrowLeft" || e.key === "ArrowRight") &&
+          !e.shiftKey &&
+          !e.altKey &&
+          !e.ctrlKey &&
+          !e.metaKey
+        ) {
+          const el = editorRef.current;
+          if (el && stepCaretOverChip(el, e.key === "ArrowLeft" ? "left" : "right")) {
+            e.preventDefault();
+            scheduleComposerSelectionScroll(el);
+            return;
+          }
+        }
+
         // Backspace: delete mention chip if cursor is right after one
         if (e.key === "Backspace") {
           const el = editorRef.current;
           if (el && deleteChipBeforeCursor(el, largePastesRef.current)) {
+            e.preventDefault();
+            resetPromptHistoryRecall();
+            refreshEmptyState();
+            refreshMention();
+            return;
+          }
+        }
+
+        // Delete: forward-delete the chip right after the cursor as one unit
+        if (e.key === "Delete") {
+          const el = editorRef.current;
+          if (el && deleteChipAfterCursor(el, largePastesRef.current)) {
             e.preventDefault();
             resetPromptHistoryRecall();
             refreshEmptyState();

@@ -994,7 +994,7 @@ export function normalizeRemoteSettings(input: unknown): RemoteSettings {
   return {
     enabled: obj.enabled === true,
     gatewayUrl: normalizeBaseUrl(typeof obj.gatewayUrl === "string" ? obj.gatewayUrl : ""),
-    grpcPort: normalizeIntegerInRange(obj.grpcPort, 1, 65_535, 50051),
+    grpcPort: normalizeIntegerInRange(obj.grpcPort, 1, 65_535, 443),
     grpcEndpoint: normalizeGrpcEndpoint(obj.grpcEndpoint),
     token: normalizeApiKey(typeof obj.token === "string" ? obj.token : ""),
     agentId: normalizeOptionalText(obj.agentId),
@@ -1955,7 +1955,7 @@ export function getDefaultSettings(): AppSettings {
     remote: {
       enabled: false,
       gatewayUrl: "",
-      grpcPort: 50051,
+      grpcPort: 443,
       grpcEndpoint: "",
       token: "",
       agentId: "",

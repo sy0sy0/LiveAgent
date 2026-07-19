@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 
 use super::types::{
     CronRunRecord, CronSnapshot, CronTask, HookDef, HooksSnapshot, HttpRequestSpec, RunState,
-    SelectedModelRef,
+    SelectedModelRef, DEFAULT_CRON_TIMEOUT_SECONDS,
 };
 
 pub const RUN_RETENTION_PER_TASK: u32 = 200;
@@ -33,8 +33,7 @@ pub fn truncate_run_output(text: &str) -> String {
 
 pub fn open_automation_connection() -> Result<Connection, String> {
     let db_path = crate::commands::settings::config_db_path()?;
-    let conn =
-        Connection::open(db_path).map_err(|e| format!("打开 automation 数据库失败：{e}"))?;
+    let conn = Connection::open(db_path).map_err(|e| format!("打开 automation 数据库失败：{e}"))?;
     conn.busy_timeout(Duration::from_secs(5))
         .map_err(|e| format!("设置 SQLite busy_timeout 失败：{e}"))?;
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -168,6 +167,16 @@ fn task_config_json(task: &CronTask) -> Result<String, String> {
                 .map_err(|e| format!("序列化 cron selectedModel 失败：{e}"))?,
         );
     }
+    if let Some(reasoning) = &task.reasoning {
+        config.insert("reasoning".to_string(), Value::String(reasoning.clone()));
+    }
+    if let Some(workdir) = &task.workdir {
+        config.insert("workdir".to_string(), Value::String(workdir.clone()));
+    }
+    config.insert(
+        "timeoutSeconds".to_string(),
+        Value::Number(task.timeout_seconds.into()),
+    );
     serde_json::to_string(&Value::Object(config))
         .map_err(|e| format!("序列化 cron config 失败：{e}"))
 }
@@ -283,6 +292,9 @@ struct TaskConfig {
     requests: Option<Vec<HttpRequestSpec>>,
     prompt: Option<String>,
     selected_model: Option<SelectedModelRef>,
+    reasoning: Option<String>,
+    workdir: Option<String>,
+    timeout_seconds: Option<u64>,
 }
 
 fn parse_task_config(config_json: &str) -> TaskConfig {
@@ -310,6 +322,15 @@ fn parse_task_config(config_json: &str) -> TaskConfig {
             .get("selectedModel")
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok()),
+        reasoning: map
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        workdir: map
+            .get("workdir")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        timeout_seconds: map.get("timeoutSeconds").and_then(Value::as_u64),
     }
 }
 
@@ -325,11 +346,16 @@ fn cron_task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronTask> {
         remaining_executions: row
             .get::<_, Option<i64>>("remaining_runs")?
             .map(|value| value.max(0) as u64),
+        timeout_seconds: config
+            .timeout_seconds
+            .unwrap_or(DEFAULT_CRON_TIMEOUT_SECONDS),
         kind: row.get("kind")?,
         script: config.script,
         requests: config.requests,
         prompt: config.prompt,
         selected_model: config.selected_model,
+        reasoning: config.reasoning,
+        workdir: config.workdir,
         last_error: row.get("last_error")?,
     })
 }

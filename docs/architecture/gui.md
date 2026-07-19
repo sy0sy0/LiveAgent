@@ -79,10 +79,10 @@
 | 机制 | 当前实现 |
 |---|---|
 | 稳定 WebView listener | `useGatewayBridgeListeners` 用 ref 保存 worker id 和最新回调，effect 只在组件挂载/卸载时注册或销毁；普通 React render 不再重建 listener、制造接收空窗或重复上报 `suspended`。 |
-| 原生往返唤醒 | Rust 收到 `chat-runtime-wake-` 前缀的关联 Ping 后 emit `gateway:chat-runtime-wake`；所有 Pong（唤醒与心跳）经专用出站控制通道（64 深，与数据队列 merge 进同一 gRPC stream）`try_send` 返回，token 流打满数据队列时探测仍可被应答，且绝不阻塞 inbound receive loop。 |
+| 原生往返唤醒 | Rust 收到 `chat-runtime-wake-` 前缀的关联 Ping 后 emit `gateway:chat-runtime-wake`；所有 Pong（唤醒与心跳）经专用出站控制通道（64 深，与数据队列 merge 进同一信封流（v2 WebSocket））`try_send` 返回，token 流打满数据队列时探测仍可被应答，且绝不阻塞 inbound receive loop。 |
 | 生命周期 nudge | `online`、`focus`、`pageshow`、`visibilitychange`、WebView `resume` 与 Tauri `RunEvent::Resumed` 会唤醒 runtime；`online`/focus 类事件经 `gateway_nudge_connection` 走 offline/stale-heartbeat 健康检查后才重建连接（不强制），仅 `RunEvent::Resumed` 保留强制重连。 |
-| 快速重连 | gRPC 自动重连从 250ms 指数退避到 5s，稳定连接 30s 后重置；stale 判断使用 heartbeat interval 加 20s（最多 60s）。 |
-| inbound 优先 | `AgentConnect` 建立后立即进入 inbound receive loop。Runtime status 先恢复，settings、terminal、tunnel、process 与 run ledger 延迟 200ms 后在可中止后台任务中低优先级 replay，并在批次间 yield。 |
+| 快速重连 | 信封流自动重连从 250ms 指数退避到 5s（v2 `/ws/v2/agent`），稳定连接 30s 后重置；stale 判断使用 heartbeat interval 加 20s（最多 60s）。 |
+| inbound 优先 | 信封流（`/ws/v2/agent`）建立后立即进入 inbound receive loop。Runtime status 先恢复，settings、terminal、tunnel、process 与 run ledger 延迟 200ms 后在可中止后台任务中低优先级 replay，并在批次间 yield。 |
 | 启动空窗消除 | WebView 在 Tauri listener 异步注册完成前就先 heartbeat + drain 一次；native wake、request-ready 与 Gateway online 事件都会继续触发 drain。 |
 
 ## 本地持久化模型
@@ -101,7 +101,7 @@
 | 取舍 | 原因 |
 |---|---|
 | ChatPage 仍是总编排层 | 对话运行时跨模型、工具、历史、压缩、记忆、Gateway、上传和 UI 状态，保留一个编排中心能减少跨模块隐式状态。 |
-| 高权限能力放 Rust | 文件系统、Shell、MCP 进程、SQLite、Gateway gRPC、Cron 更适合在 Tauri 后端做权限与生命周期控制。 |
+| 高权限能力放 Rust | 文件系统、Shell、MCP 进程、SQLite、Gateway 连接、Cron 更适合在 Tauri 后端做权限与生命周期控制。 |
 | GUI 与 WebUI 复制部分 UI | 两端运行环境不同，WebUI 不能直接调用 Tauri，但需要维持体验 parity，因此复制 settings/hub/chat 组件并接入 shims。 |
 | Settings 按域保存 | provider secret、remote、cron、memory 等域有不同验证和同步策略，分域保存便于限制泄露与减少误覆盖。 |
 | Gateway 控制面优先 | 远程首条 Chat command 与 Ping/Pong 必须先于大体积状态 reconciliation；后台 snapshot replay 只负责最终一致性，不阻塞 inbound。 |

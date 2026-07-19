@@ -43,6 +43,17 @@ export const HTTP_METHODS: HttpMethod[] = [
 /// desktop; sending it back in a patch keeps the stored secret unchanged.
 export const MASKED_HEADER_VALUE = "__liveagent-masked__";
 
+/**
+ * Per-task execution timeout (seconds) applied to bash scripts, each http
+ * request and the prompt run lease. Bounds mirror the Rust validator
+ * (`MIN/MAX_CRON_TIMEOUT_SECONDS`); the max matches the shell runner's hard
+ * ten-minute cap. Snapshots from desktops older than this field omit it —
+ * resolve absent values to the default for display.
+ */
+export const DEFAULT_CRON_TIMEOUT_SECONDS = 300;
+export const MIN_CRON_TIMEOUT_SECONDS = 1;
+export const MAX_CRON_TIMEOUT_SECONDS = 600;
+
 export function canHttpMethodHaveBody(method: HttpMethod): boolean {
   return method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE";
 }
@@ -67,11 +78,18 @@ export type CronTask = {
   cron: string;
   enabled: boolean;
   remainingExecutions?: number;
+  /** Execution timeout in seconds; absent (pre-field snapshot) = 300. */
+  timeoutSeconds?: number;
   type: CronTaskType;
   script?: string;
   requests?: HttpRequestSpec[];
   prompt?: string;
   selectedModel?: SelectedModelRef;
+  /** Thinking level for prompt tasks; absent/empty = runtime default. */
+  reasoning?: string;
+  /** Workspace path pinned for this task; absent/empty = follow the globally
+   * active workspace. Never set on http tasks. */
+  workdir?: string;
   lastError?: string;
 };
 
@@ -155,6 +173,12 @@ export type PromptRunRequest = {
   startedAt: number;
   leaseExpiresAt: number;
   counted: boolean;
+  /** Resolved at queue time (task pin or global workdir). Empty on rows
+   * queued before this field existed; the runner falls back to the global
+   * workdir then. */
+  workdir: string;
+  /** Task thinking level; empty means the runner's default. */
+  reasoning: string;
 };
 
 export type CompletePromptRunInput = {

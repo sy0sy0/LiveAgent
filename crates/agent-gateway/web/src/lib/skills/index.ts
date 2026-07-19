@@ -149,12 +149,13 @@ type SystemManageSkillResponse = {
   clawhubSlug?: string | null;
   clawhubDownloadUrl?: string | null;
   external?: ExternalToolScan[] | null;
+  externalMcp?: ExternalMcpToolScan[] | null;
 };
 
 export type ExternalSkillEntry = {
   name: string;
   description: string;
-  /** 技能目录绝对路径（桌面端机器上），可直接作为 install 动作的 source */
+  /** 技能目录绝对路径，可直接作为 install 动作的 source */
   baseDir: string;
   skillFile: string;
 };
@@ -164,6 +165,28 @@ export type ExternalToolScan = {
   rootDir: string;
   exists: boolean;
   skills: ExternalSkillEntry[];
+  errors: string[];
+};
+
+export type ExternalMcpServerEntry = {
+  id: string;
+  transport: "stdio" | "http" | "sse";
+  command: string;
+  args: string[];
+  url: string;
+  env: Record<string, string>;
+  headers: Record<string, string>;
+  cwd?: string | null;
+  timeoutMs?: number | null;
+  /** 来源作用域："user" 或项目路径（Claude Code 的项目级配置） */
+  origin: string;
+};
+
+export type ExternalMcpToolScan = {
+  tool: string;
+  configPath: string;
+  exists: boolean;
+  servers: ExternalMcpServerEntry[];
   errors: string[];
 };
 
@@ -509,6 +532,11 @@ export async function scanExternalSkills(): Promise<ExternalToolScan[]> {
   return response.external ?? [];
 }
 
+export async function scanExternalMcpServers(): Promise<ExternalMcpToolScan[]> {
+  const response = await manageSkill({ action: "scan_external_mcp" });
+  return response.externalMcp ?? [];
+}
+
 export async function startSkillInstallJob(
   params: Record<string, unknown>,
 ): Promise<SkillInstallJobSnapshot> {
@@ -552,18 +580,18 @@ export function buildSkillsSystemPrompt(params: {
   });
 
   return [
-    'The following Skills are enabled by the user (discovered from the fixed Skills directory exposed to file tools as root="skills").',
+    "The following Skills are enabled by the user. Skill files are exposed to file tools through skill://<baseDir>/... paths.",
     "",
     "Usage Rules (aligned with Claude Code behavior):",
     "- Skills with metadata use progressive disclosure; their full contents are not automatically injected into context.",
     "- README.md fallback Skills without metadata are loaded inline below because there is no metadata to disclose progressively.",
     "- Only the Skills listed below are enabled for this conversation. SkillsManager(action=list) may be used to review the enabled Skills visible to this chat, but it must not be used to enumerate or infer other installed Skills.",
     "- Only when you determine that a metadata Skill is genuinely needed should you call SkillsManager with action=read to read the full Skill file and then follow its workflow exactly.",
-    "- SkillsManager.path uses the skillFile below. It is relative to the fixed Skills root directory and may point to SKILL.md, skill.md, skill.json, or README.md.",
-    '- For files referenced inside an enabled Skill, use file tools with root="skills" and a path relative to the fixed Skills root, for example Read(root="skills", path="<baseDir>/references/guide.md"), List, Glob, Grep, Write, Edit, or Delete.',
+    "- SkillsManager.path uses the skillFile below and may point to SKILL.md, skill.md, skill.json, or README.md.",
+    '- For files referenced inside an enabled Skill, use file tools with skill://<baseDir>/... paths, for example Read(path="skill://<baseDir>/references/guide.md"), List, Glob, Grep, Write, Edit, or Delete.',
     "- You may update files inside enabled Skills when the user asks you to optimize or maintain them. Create, install, search/install from ClawHub, validate, package, or delete user Skills through SkillsManager actions.",
-    '- Never expand the fixed Skills root into an absolute local path in any tool call. If a path belongs to a Skill, keep it root-relative and set root="skills".',
-    '- If Skill content contains absolute local paths, home-directory paths, drive-letter paths, or shell snippets that read Skill files with cat/ls/find/grep, treat those path fragments as non-portable examples and convert them to root="skills" file-tool calls.',
+    "- Absolute local paths, ~/..., and file:// forms are auto-normalized by file tools; prefer skill://<baseDir>/... for enabled Skill files.",
+    "- If Skill content contains shell snippets that read Skill files with cat/ls/find/grep, route those reads through Read/List/Glob/Grep instead of Bash.",
     "- Do not guess a Skill's exact instructions or script paths before reading the Skill file.",
     "- Relative paths inside a Skill (scripts/, references/, assets/, and so on) are resolved relative to baseDir.",
     "- If a Skill contains the {baseDir} placeholder, interpret it as the baseDir value in the metadata below (relative to the Skills root directory).",

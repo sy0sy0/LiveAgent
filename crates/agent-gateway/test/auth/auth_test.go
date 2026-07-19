@@ -1,16 +1,11 @@
 package auth_test
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/liveagent/agent-gateway/internal/auth"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
 )
 
 func TestHTTPMiddlewareRequiresValidBearerToken(t *testing.T) {
@@ -86,51 +81,5 @@ func TestValidateTokenTrimsAndRejectsEmptyValues(t *testing.T) {
 	}
 	if auth.ValidateToken("wrong-token", "secret-token") {
 		t.Fatal("ValidateToken should reject mismatched tokens")
-	}
-}
-
-func TestGRPCUnaryInterceptorAuthBoundary(t *testing.T) {
-	t.Parallel()
-
-	interceptor := auth.GRPCUnaryInterceptor(" secret-token\r\n")
-	handler := func(_ context.Context, req any) (any, error) {
-		return req, nil
-	}
-
-	got, err := interceptor(
-		context.Background(),
-		"auth request",
-		&grpc.UnaryServerInfo{FullMethod: "/liveagent.gateway.v1.AgentGateway/Authenticate"},
-		handler,
-	)
-	if err != nil {
-		t.Fatalf("Authenticate should bypass metadata auth: %v", err)
-	}
-	if got != "auth request" {
-		t.Fatalf("handler result = %#v", got)
-	}
-
-	_, err = interceptor(
-		context.Background(),
-		"protected request",
-		&grpc.UnaryServerInfo{FullMethod: "/liveagent.gateway.v1.AgentGateway/Other"},
-		handler,
-	)
-	if status.Code(err) != codes.Unauthenticated {
-		t.Fatalf("missing metadata code = %v, want %v", status.Code(err), codes.Unauthenticated)
-	}
-
-	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer secret-token"))
-	got, err = interceptor(
-		ctx,
-		"protected request",
-		&grpc.UnaryServerInfo{FullMethod: "/liveagent.gateway.v1.AgentGateway/Other"},
-		handler,
-	)
-	if err != nil {
-		t.Fatalf("valid bearer metadata rejected: %v", err)
-	}
-	if got != "protected request" {
-		t.Fatalf("handler result = %#v", got)
 	}
 }

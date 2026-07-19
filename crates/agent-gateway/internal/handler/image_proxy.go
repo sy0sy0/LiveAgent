@@ -47,7 +47,7 @@ func imageProxyWithClient(client outboundHTTPClient) http.HandlerFunc {
 			http.Error(w, fmt.Sprintf("failed to load image through proxy: %v", err), http.StatusBadGateway)
 			return
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 			http.Error(w, fmt.Sprintf("image proxy upstream returned HTTP status %d", resp.StatusCode), http.StatusBadGateway)

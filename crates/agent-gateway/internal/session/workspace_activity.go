@@ -83,7 +83,7 @@ func (m *Manager) SubscribeWorkspaceActivity(
 }
 
 // broadcastWorkspaceActivity fans one agent event out to the subscribers of
-// its workdir. Runs on the agent gRPC read loop, so it must never block: a
+// its workdir. Runs on the agent stream read loop, so it must never block: a
 // full subscriber channel drops the event (consumers converge on the next
 // one, and revision gaps are already tolerated client-side).
 func (m *Manager) broadcastWorkspaceActivity(event *gatewayv1.WorkspaceActivityEvent) {

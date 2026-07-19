@@ -7,11 +7,18 @@ use uuid::Uuid;
 
 use super::types::{
     http_method_can_have_body, CronTask, HookDef, HttpRequestSpec, SelectedModelRef,
-    CRON_TASK_KINDS, HOOK_EVENTS, HOOK_KINDS, HTTP_METHODS, MASKED_HEADER_VALUE,
+    CRON_REASONING_LEVELS, CRON_TASK_KINDS, DEFAULT_CRON_TIMEOUT_SECONDS, HOOK_EVENTS, HOOK_KINDS,
+    HTTP_METHODS, MASKED_HEADER_VALUE,
 };
 
 pub const MIN_HOOK_TIMEOUT_MS: u64 = 1_000;
 pub const MAX_HOOK_TIMEOUT_MS: u64 = 10 * 60_000;
+
+/// Cron timeout bounds. The upper bound mirrors the shell runner's hard cap
+/// (MAX_SHELL_TIMEOUT_MS): a larger stored value would silently be cut to ten
+/// minutes for bash tasks, so validation refuses to store one.
+pub const MIN_CRON_TIMEOUT_SECONDS: u64 = 1;
+pub const MAX_CRON_TIMEOUT_SECONDS: u64 = 600;
 
 pub fn validate_cron_expression(expression: &str) -> Result<(), String> {
     let trimmed = expression.trim();
@@ -74,6 +81,24 @@ fn parse_remaining_executions(
             .map(Some)
             .ok_or_else(|| format!("{label}.remainingExecutions 必须是非负整数")),
         Some(_) => Err(format!("{label}.remainingExecutions 必须是非负整数")),
+    }
+}
+
+fn parse_timeout_seconds(map: &Map<String, Value>, label: &str) -> Result<u64, String> {
+    match map.get("timeoutSeconds") {
+        None | Some(Value::Null) => Ok(DEFAULT_CRON_TIMEOUT_SECONDS),
+        Some(Value::Number(number)) => {
+            let value = number
+                .as_u64()
+                .ok_or_else(|| format!("{label}.timeoutSeconds 必须是正整数（秒）"))?;
+            if !(MIN_CRON_TIMEOUT_SECONDS..=MAX_CRON_TIMEOUT_SECONDS).contains(&value) {
+                return Err(format!(
+                    "{label}.timeoutSeconds 必须在 {MIN_CRON_TIMEOUT_SECONDS}-{MAX_CRON_TIMEOUT_SECONDS} 秒之间"
+                ));
+            }
+            Ok(value)
+        }
+        Some(_) => Err(format!("{label}.timeoutSeconds 必须是正整数（秒）")),
     }
 }
 
@@ -167,15 +192,16 @@ fn parse_headers(
     }
 }
 
-fn parse_selected_model(
-    value: Option<&Value>,
-    label: &str,
-) -> Result<SelectedModelRef, String> {
+fn parse_selected_model(value: Option<&Value>, label: &str) -> Result<SelectedModelRef, String> {
     let map = value
         .and_then(Value::as_object)
         .ok_or_else(|| format!("{label}.selectedModel 不能为空"))?;
     Ok(SelectedModelRef {
-        custom_provider_id: required_string(map, "customProviderId", &format!("{label}.selectedModel"))?,
+        custom_provider_id: required_string(
+            map,
+            "customProviderId",
+            &format!("{label}.selectedModel"),
+        )?,
         model: required_string(map, "model", &format!("{label}.selectedModel"))?,
     })
 }
@@ -190,6 +216,7 @@ pub fn validate_cron_task(value: Value, label: &str) -> Result<CronTask, String>
     let cron = required_string(&map, "cron", label)?;
     validate_cron_expression(&cron)?;
     let remaining_executions = parse_remaining_executions(&map, label)?;
+    let timeout_seconds = parse_timeout_seconds(&map, label)?;
     let enabled =
         bool_with_default(&map, "enabled", label, false)? && remaining_executions != Some(0);
     let kind = map
@@ -209,11 +236,14 @@ pub fn validate_cron_task(value: Value, label: &str) -> Result<CronTask, String>
         cron,
         enabled,
         remaining_executions,
+        timeout_seconds,
         kind: kind.clone(),
         script: None,
         requests: None,
         prompt: None,
         selected_model: None,
+        reasoning: None,
+        workdir: None,
         last_error: None,
     };
 
@@ -227,8 +257,25 @@ pub fn validate_cron_task(value: Value, label: &str) -> Result<CronTask, String>
         "prompt" => {
             task.prompt = Some(required_string(&map, "prompt", label)?);
             task.selected_model = Some(parse_selected_model(map.get("selectedModel"), label)?);
+            // Empty/missing means the runtime default thinking level.
+            let reasoning = optional_string(&map, "reasoning");
+            if !reasoning.is_empty() {
+                if !CRON_REASONING_LEVELS.contains(&reasoning.as_str()) {
+                    return Err(format!("{label}.reasoning 不支持：{reasoning}"));
+                }
+                task.reasoning = Some(reasoning);
+            }
         }
         _ => unreachable!(),
+    }
+
+    // Empty/missing/null all mean "follow the active workspace"; http tasks
+    // never carry a workdir.
+    if kind != "http" {
+        let workdir = optional_string(&map, "workdir");
+        if !workdir.is_empty() {
+            task.workdir = Some(workdir);
+        }
     }
 
     Ok(task)
@@ -298,9 +345,12 @@ pub fn validate_hook(value: Value, label: &str) -> Result<HookDef, String> {
 
 /// Merge a partial patch onto a stored item (top-level keys), returning the
 /// merged object for re-validation.
-pub fn merge_patch(stored: &impl serde::Serialize, patch: Value, label: &str) -> Result<Value, String> {
-    let base = serde_json::to_value(stored)
-        .map_err(|e| format!("{label} 序列化失败：{e}"))?;
+pub fn merge_patch(
+    stored: &impl serde::Serialize,
+    patch: Value,
+    label: &str,
+) -> Result<Value, String> {
+    let base = serde_json::to_value(stored).map_err(|e| format!("{label} 序列化失败：{e}"))?;
     let mut merged = expect_object(base, label)?;
     let patch = expect_object(patch, &format!("{label}.patch"))?;
     for (key, value) in patch {
@@ -314,10 +364,7 @@ pub fn merge_patch(stored: &impl serde::Serialize, patch: Value, label: &str) ->
 
 /// Replace masked header values in `incoming` with the currently stored values
 /// so remote clients can round-trip requests without seeing secrets.
-pub fn restore_masked_headers(
-    incoming: &mut Value,
-    stored_requests: Option<&[HttpRequestSpec]>,
-) {
+pub fn restore_masked_headers(incoming: &mut Value, stored_requests: Option<&[HttpRequestSpec]>) {
     let Some(requests) = incoming.get_mut("requests").and_then(Value::as_array_mut) else {
         return;
     };

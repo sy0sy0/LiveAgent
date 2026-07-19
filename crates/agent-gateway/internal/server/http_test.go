@@ -11,6 +11,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/liveagent/agent-gateway/internal/config"
 	gatewayv1 "github.com/liveagent/agent-gateway/internal/proto/v1"
+	"github.com/liveagent/agent-gateway/internal/protocol/shared"
 	"github.com/liveagent/agent-gateway/internal/session"
 )
 
@@ -81,7 +82,7 @@ func TestWebSocketRejectsForeignOrigin(t *testing.T) {
 	ts := httptest.NewServer(NewHTTPServer(&config.Config{Token: "dev-token"}, session.NewManager()))
 	defer ts.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws"
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws/v2"
 	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
 		"Origin": []string{"https://evil.example"},
 	})
@@ -94,53 +95,6 @@ func TestWebSocketRejectsForeignOrigin(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("websocket response status = %d, want %d", resp.StatusCode, http.StatusForbidden)
-	}
-}
-
-func TestNewHTTPServerRoutesTerminalStreamWebSocket(t *testing.T) {
-	ts := httptest.NewServer(NewHTTPServer(&config.Config{Token: "dev-token"}, session.NewManager()))
-	defer ts.Close()
-
-	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws/terminal"
-	assertTerminalStreamWebSocketReady(t, wsURL, ts.URL)
-}
-
-func TestNewHTTPServerRoutesTerminalStreamWebSocketFallback(t *testing.T) {
-	ts := httptest.NewServer(NewHTTPServer(&config.Config{Token: "dev-token"}, session.NewManager()))
-	defer ts.Close()
-
-	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws?terminal=1"
-	assertTerminalStreamWebSocketReady(t, wsURL, ts.URL)
-}
-
-func assertTerminalStreamWebSocketReady(t *testing.T, wsURL string, origin string) {
-	t.Helper()
-	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
-		"Origin": []string{origin},
-	})
-	if err != nil {
-		if resp != nil {
-			t.Fatalf("terminal stream websocket status = %d, err = %v", resp.StatusCode, err)
-		}
-		t.Fatalf("dial terminal stream websocket: %v", err)
-	}
-	defer conn.Close()
-
-	if err := conn.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatalf("set terminal stream auth write deadline: %v", err)
-	}
-	if err := conn.WriteJSON(map[string]any{"type": "auth", "token": "dev-token"}); err != nil {
-		t.Fatalf("write terminal stream auth: %v", err)
-	}
-	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatalf("set terminal stream auth read deadline: %v", err)
-	}
-	var authResp map[string]any
-	if err := conn.ReadJSON(&authResp); err != nil {
-		t.Fatalf("read terminal stream auth response: %v", err)
-	}
-	if authResp["type"] != "ready" {
-		t.Fatalf("terminal stream auth response = %#v, want ready", authResp)
 	}
 }
 
@@ -302,12 +256,11 @@ func TestPublicHistoryShareReturnsUnavailableWhenAgentOffline(t *testing.T) {
 	}
 }
 
-
 func TestOriginAllowedRequiresStrictOriginForPublicHosts(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "http://gateway.test:8080/api/chat/commands", nil)
 	req.Header.Set("Origin", "http://gateway.test:5173")
 
-	if originAllowed(req) {
+	if shared.OriginAllowed(req) {
 		t.Fatal("expected same hostname with different public port to be rejected")
 	}
 }
@@ -316,7 +269,7 @@ func TestOriginAllowedPermitsLoopbackDevPorts(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/chat/commands", nil)
 	req.Header.Set("Origin", "http://localhost:5173")
 
-	if !originAllowed(req) {
+	if !shared.OriginAllowed(req) {
 		t.Fatal("expected loopback development origins to be allowed across ports")
 	}
 }
@@ -327,8 +280,7 @@ func TestOriginAllowedUsesForwardedProtoForSameOrigin(t *testing.T) {
 	req.Header.Set("X-Forwarded-Proto", "https")
 	req.Header.Set("Origin", "https://gateway.test")
 
-	if !originAllowed(req) {
+	if !shared.OriginAllowed(req) {
 		t.Fatal("expected forwarded https origin to be allowed")
 	}
 }
-

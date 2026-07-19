@@ -70,7 +70,13 @@ const SelectScrollUpButton = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <SelectPrimitive.ScrollUpArrow
     ref={ref}
-    className={cn("flex cursor-default items-center justify-center py-1", className)}
+    // Base UI renders scroll arrows position:absolute (inline style); they
+    // must be anchored and given a background or they float transparently
+    // over the list items.
+    className={cn(
+      "left-0 top-0 z-[1] flex w-full cursor-default items-center justify-center rounded-t-md bg-popover py-1",
+      className,
+    )}
     {...props}
   >
     <ChevronUp className="h-4 w-4" />
@@ -84,7 +90,10 @@ const SelectScrollDownButton = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <SelectPrimitive.ScrollDownArrow
     ref={ref}
-    className={cn("flex cursor-default items-center justify-center py-1", className)}
+    className={cn(
+      "bottom-0 left-0 z-[1] flex w-full cursor-default items-center justify-center rounded-b-md bg-popover py-1",
+      className,
+    )}
     {...props}
   >
     <ChevronDown className="h-4 w-4" />
@@ -126,8 +135,15 @@ SelectContent.displayName = "SelectContent";
 
 export const SelectItem = React.forwardRef<
   HTMLDivElement,
-  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Item>
->(({ className, children, ...props }, ref) => (
+  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Item> & {
+    /**
+     * Optional secondary line rendered under the item label. Kept OUTSIDE
+     * ItemText on purpose: ItemText must stay text-only (it feeds typeahead
+     * and the trigger's value reflection), so rich item layouts go here.
+     */
+    description?: React.ReactNode;
+  }
+>(({ className, children, description, ...props }, ref) => (
   <SelectPrimitive.Item
     ref={ref}
     className={cn(
@@ -136,12 +152,26 @@ export const SelectItem = React.forwardRef<
     )}
     {...props}
   >
-    <span className="absolute right-2 flex h-3.5 w-3.5 items-center justify-center">
+    <span
+      className={cn(
+        "absolute right-2 flex h-3.5 w-3.5 items-center justify-center",
+        description != null && "top-1/2 -translate-y-1/2",
+      )}
+    >
       <SelectPrimitive.ItemIndicator>
         <Check className="h-4 w-4" />
       </SelectPrimitive.ItemIndicator>
     </span>
-    <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
+    {description == null ? (
+      <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
+    ) : (
+      <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
+        <span className="truncate text-[10px] leading-tight text-muted-foreground/70">
+          {description}
+        </span>
+      </span>
+    )}
   </SelectPrimitive.Item>
 ));
 SelectItem.displayName = "SelectItem";

@@ -17,22 +17,28 @@ import (
 	"github.com/liveagent/agent-gateway/internal/config"
 	"github.com/liveagent/agent-gateway/internal/handler"
 	gatewayv1 "github.com/liveagent/agent-gateway/internal/proto/v1"
+	"github.com/liveagent/agent-gateway/internal/protocol/pbws"
 	"github.com/liveagent/agent-gateway/internal/session"
 )
 
 func NewHTTPServer(cfg *config.Config, sm *session.Manager) http.Handler {
 	rootMux := http.NewServeMux()
-	webSocketServer := NewWebSocketServer(cfg, sm)
-	terminalWebSocketServer := NewTerminalWebSocketServer(cfg, sm)
 	rootMux.HandleFunc("GET /healthz", handler.Health())
-	rootMux.Handle("/ws", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if isTerminalWebSocketFallback(r) {
-			terminalWebSocketServer.ServeHTTP(w, r)
-			return
-		}
-		webSocketServer.ServeHTTP(w, r)
-	}))
-	rootMux.Handle("/ws/terminal", terminalWebSocketServer)
+
+	// v2 统一协议（WebSocket+Protobuf）三链路。
+	v2 := pbws.NewServer(cfg, sm)
+	rootMux.Handle("/ws/v2", v2.BrowserHandler())
+	rootMux.Handle("/ws/v2/agent", v2.AgentHandler())
+	rootMux.Handle("/ws/v2/terminal", v2.TerminalHandler())
+
+	// v1 路由（JSON 信封 /ws、二进制终端流 /ws/terminal）已移除：显式回 410，
+	// 让未刷新的旧客户端得到可诊断的拒绝，而不是落进 SPA fallback 拿到 index.html。
+	goneV1 := func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "v1 websocket protocol removed; upgrade to /ws/v2", http.StatusGone)
+	}
+	rootMux.HandleFunc("/ws", goneV1)
+	rootMux.HandleFunc("/ws/terminal", goneV1)
+
 	rootMux.HandleFunc("/t/", publicTunnelProxy(sm))
 	rootMux.HandleFunc("GET /image-proxy", handler.ImageProxy(cfg.RequestTimeout))
 	rootMux.HandleFunc("GET /api/public/history-shares/{token}", publicHistoryShare(cfg, sm))
@@ -88,11 +94,6 @@ func NewHTTPServer(cfg *config.Config, sm *session.Manager) http.Handler {
 	return rootMux
 }
 
-func isTerminalWebSocketFallback(r *http.Request) bool {
-	value := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("terminal")))
-	return value == "1" || value == "true" || value == "stream"
-}
-
 func isWebUIStaticAssetPath(cleanPath string) bool {
 	cleanPath = strings.TrimSpace(cleanPath)
 	if cleanPath == "" || cleanPath == "." || cleanPath == "index.html" {
@@ -117,7 +118,7 @@ func publicHistoryShare(cfg *config.Config, sm *session.Manager) http.HandlerFun
 		defer cancel()
 
 		requestID := "public-history-share-" + uuid.NewString()
-		response, err := awaitAgentUnaryResponse(ctx, sm, requestID, &gatewayv1.GatewayEnvelope{
+		response, err := sm.AwaitUnaryResponse(ctx, requestID, &gatewayv1.GatewayEnvelope{
 			RequestId: requestID,
 			Timestamp: time.Now().Unix(),
 			Payload: &gatewayv1.GatewayEnvelope_HistoryShareResolve{
@@ -152,7 +153,7 @@ func publicHistoryShare(cfg *config.Config, sm *session.Manager) http.HandlerFun
 			"conversation_id":     share.GetConversationId(),
 			"messages_json":       share.GetMessagesJson(),
 			"total_message_count": share.GetTotalMessageCount(),
-			"conversation":        websocketConversationSummaryPayload(share.GetConversation()),
+			"conversation":        conversationSummaryPayload(share.GetConversation()),
 			"redact_tool_content": share.GetRedactToolContent(),
 		})
 	}

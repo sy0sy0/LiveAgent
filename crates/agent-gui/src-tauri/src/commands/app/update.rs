@@ -570,8 +570,8 @@ pub fn app_restart(app: AppHandle) -> Result<(), String> {
     {
         registry.shutdown_cleanup();
     }
-    if let Some(power) = app
-        .try_state::<std::sync::Arc<crate::services::power_activity::PowerActivityManager>>()
+    if let Some(power) =
+        app.try_state::<std::sync::Arc<crate::services::power_activity::PowerActivityManager>>()
     {
         power.clear_all();
     }

@@ -48,6 +48,15 @@ import type {
   WorkspaceActivity,
   WorkspaceActivityEventPayload,
 } from "@/lib/workspace-activity/types";
+import type { DecodedServerFrame } from "./gatewaySocketV2/adapters";
+import {
+  decodeServerFrame,
+  decodeServerFrameBinary,
+  encodeHelloFrame,
+  encodePongFrame,
+  encodeRequestFrame,
+  GATEWAY_V2_SUBPROTOCOL,
+} from "./gatewaySocketV2/adapters";
 import type {
   AgentStatus,
   ChatQueueResponse,
@@ -68,13 +77,6 @@ import type {
   MemoryManagePayload,
   RunningConversationSummary,
 } from "./gatewayTypes";
-
-type GatewaySocketEnvelope = {
-  id?: string;
-  type: string;
-  payload?: unknown;
-  error?: string;
-};
 
 type StatusListener = (status: AgentStatus | null, error: string | null) => void;
 type HistoryListener = (event: GatewayHistoryEvent) => void;
@@ -545,7 +547,8 @@ function buildWebSocketUrl() {
   }
   const url = new URL(origin);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  url.pathname = "/ws";
+  // v2 统一线协议端点（WebSocket + Protobuf 二进制帧）。
+  url.pathname = "/ws/v2";
   url.search = "";
   url.hash = "";
   return url.toString();
@@ -1263,6 +1266,8 @@ export class GatewayWebSocketClient {
   private reconnectNoticeTimer: number | null = null;
   private reconnectAttempt = 0;
   private reconnecting = false;
+  // hello 判定鉴权失败（随后 4401 关闭）：置位抑制自动重连，显式新连接尝试会清除。
+  private authRejected = false;
   private lastForegroundWakeupAt = 0;
   // A hidden tab must not paint offline state the user cannot see from
   // throttled timers; the verdict is deferred until a foreground recheck.
@@ -2120,7 +2125,12 @@ export class GatewayWebSocketClient {
     if (filter?.cwdEmpty === true) {
       payload.cwd_empty = true;
     }
-    return this.requestWithRecovery<HistoryList>("history.list", payload);
+    // running_conversations v1 由网关顺带附上，v2 改由 chat_activities 帧提供：并行取回合并，返回形状不变。
+    const [list, runningConversations] = await Promise.all([
+      this.requestWithRecovery<HistoryList>("history.list", payload),
+      this.listChatActivities().catch(() => [] as RunningConversationSummary[]),
+    ]);
+    return { ...list, running_conversations: runningConversations };
   }
 
   async listHistoryWorkdirs(): Promise<HistoryWorkdirsResponse> {
@@ -2523,6 +2533,10 @@ export class GatewayWebSocketClient {
     if (!this.shouldMaintainConnection()) {
       return;
     }
+    // 鉴权已被服务端拒绝：坏 token 的自动重连只会撞上同一个 4401。
+    if (this.authRejected) {
+      return;
+    }
     if (this.socket?.readyState === WebSocket.OPEN && this.authenticated) {
       return;
     }
@@ -2753,11 +2767,7 @@ export class GatewayWebSocketClient {
       });
 
       try {
-        this.sendEnvelope({
-          id: requestId,
-          type,
-          payload,
-        });
+        this.sendFrame(encodeRequestFrame(requestId, type, payload));
       } catch (error) {
         host.clearTimeout(timeoutId);
         this.pending.delete(requestId);
@@ -2788,7 +2798,10 @@ export class GatewayWebSocketClient {
     const socketUrl = buildWebSocketUrl();
     let reconnectAfterTimeout = false;
     this.connectPromise = new Promise<void>((resolve, reject) => {
-      const socket = new WebSocket(socketUrl);
+      // 显式连接尝试清除鉴权失败标记；自动重连循环不会反复敲门坏 token。
+      this.authRejected = false;
+      const socket = new WebSocket(socketUrl, GATEWAY_V2_SUBPROTOCOL);
+      socket.binaryType = "arraybuffer";
       const host = getRuntimeHost();
       let settled = false;
       let authTimeoutId: number | null = null;
@@ -2900,13 +2913,7 @@ export class GatewayWebSocketClient {
           timeoutId: authTimeoutId,
         });
 
-        this.sendEnvelope({
-          id: authId,
-          type: "auth",
-          payload: {
-            token: this.token,
-          },
-        });
+        this.sendFrame(encodeHelloFrame(authId, this.token));
       };
     }).finally(() => {
       this.connectPromise = null;
@@ -2918,137 +2925,172 @@ export class GatewayWebSocketClient {
     await this.connectPromise;
   }
 
-  private sendEnvelope(envelope: GatewaySocketEnvelope) {
+  // sendFrame 发送一帧已编码的 v2 二进制帧。
+  private sendFrame(frame: Uint8Array<ArrayBuffer>) {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
       throw new Error("Gateway WebSocket is not connected");
     }
-    this.socket.send(JSON.stringify(envelope));
+    this.socket.send(frame);
   }
 
-  private handleMessage(raw: string) {
+  private handleMessage(raw: unknown) {
     this.markInboundActivity();
-    let envelope: GatewaySocketEnvelope;
+    // v2 链路只承载二进制帧；文本帧仅计入存活。
+    if (!(raw instanceof ArrayBuffer) && !ArrayBuffer.isView(raw)) {
+      return;
+    }
+    let decoded: DecodedServerFrame | null;
     try {
-      envelope = JSON.parse(raw) as GatewaySocketEnvelope;
+      decoded = decodeServerFrame(
+        decodeServerFrameBinary(raw instanceof ArrayBuffer ? raw : (raw as Uint8Array)),
+        { agentOnline: this.lastStatus?.online === true },
+      );
     } catch {
       return;
     }
+    if (!decoded) {
+      return;
+    }
 
-    const requestId = typeof envelope.id === "string" ? envelope.id : "";
-    if (envelope.type === "ping") {
+    if (decoded.kind === "hello") {
+      const pending = this.pending.get(decoded.requestId);
+      if (!pending) {
+        return;
+      }
+      const host = getRuntimeHost();
+      host.clearTimeout(pending.timeoutId);
+      this.pending.delete(decoded.requestId);
+      if (decoded.ok) {
+        pending.resolve({ ok: true });
+      } else {
+        // 服务端将以 4401 关闭：标记鉴权失败阻断自动重连，交由上层以 v1 同款鉴权错误 UX 呈现。
+        this.authRejected = true;
+        pending.reject(new Error(decoded.message || "unauthorized"));
+      }
+      return;
+    }
+
+    if (decoded.kind === "ping") {
+      // 应用层心跳：回送 pong（镜像 v1 的 JSON ping/pong）。
       try {
-        this.sendEnvelope({
-          id: this.nextRequestId("pong"),
-          type: "pong",
-          payload:
-            envelope.payload && typeof envelope.payload === "object"
-              ? envelope.payload
-              : { timestamp: Date.now() },
-        });
+        this.sendFrame(encodePongFrame(decoded.timestamp || Date.now()));
       } catch {
         // The close handler will drive reconnect if the socket is already gone.
       }
       return;
     }
 
-    if (envelope.type === "history.event") {
-      const event = envelope.payload as GatewayHistoryEvent;
+    if (decoded.kind === "event") {
+      this.handleEvent(decoded.type, decoded.payload);
+      return;
+    }
+
+    const pending = decoded.requestId ? this.pending.get(decoded.requestId) : null;
+    if (!pending) {
+      return;
+    }
+    const host = getRuntimeHost();
+    host.clearTimeout(pending.timeoutId);
+    this.pending.delete(decoded.requestId);
+    if (decoded.kind === "error") {
+      pending.reject(new Error(decoded.message || "Request failed"));
+      return;
+    }
+    pending.resolve(decoded.payload);
+  }
+
+  // 分发广播事件；payload 已由适配层还原为 v1 JSON 线格式，既有归一化器原样复用。
+  private handleEvent(type: string, payload: unknown) {
+    if (type === "history.event") {
+      const event = payload as GatewayHistoryEvent;
       if (event?.kind === "upsert" || event?.kind === "delete") {
         this.emitHistory(event);
       }
       return;
     }
 
-    if (envelope.type === "settings.event") {
-      const event = envelope.payload as GatewaySettingsSyncPayload;
+    if (type === "settings.event") {
+      const event = payload as GatewaySettingsSyncPayload;
       if (event && typeof event === "object") {
         this.emitSettings(event);
       }
       return;
     }
 
-    if (envelope.type === "terminal.event") {
-      const event = normalizeTerminalEvent(envelope.payload as RawTerminalEvent);
+    if (type === "terminal.event") {
+      const event = normalizeTerminalEvent(payload as RawTerminalEvent);
       if (event) {
         this.emitTerminal(event);
       }
       return;
     }
 
-    if (envelope.type === "sftp.event") {
-      const event = normalizeSftpTransferEvent(envelope.payload as RawSftpEvent);
+    if (type === "sftp.event") {
+      const event = normalizeSftpTransferEvent(payload as RawSftpEvent);
       if (event) {
         this.emitSftpTransfer(event);
       }
       return;
     }
 
-    if (envelope.type === "process.state") {
-      const payload =
-        envelope.payload && typeof envelope.payload === "object"
-          ? (envelope.payload as RawManagedProcessStatePayload)
-          : null;
-      if (payload) {
-        this.emitProcessState(normalizeManagedProcessState(payload));
+    if (type === "process.state") {
+      const statePayload =
+        payload && typeof payload === "object" ? (payload as RawManagedProcessStatePayload) : null;
+      if (statePayload) {
+        this.emitProcessState(normalizeManagedProcessState(statePayload));
       }
       return;
     }
 
-    if (envelope.type === "tunnel.state") {
-      const payload =
-        envelope.payload && typeof envelope.payload === "object"
-          ? (envelope.payload as RawTunnelStatePayload)
-          : null;
-      if (payload) {
-        this.emitTunnelState(normalizeTunnelStateSnapshot(payload));
+    if (type === "tunnel.state") {
+      const statePayload =
+        payload && typeof payload === "object" ? (payload as RawTunnelStatePayload) : null;
+      if (statePayload) {
+        this.emitTunnelState(normalizeTunnelStateSnapshot(statePayload));
       }
       return;
     }
 
-    if (envelope.type === "status.event") {
-      const payload =
-        envelope.payload && typeof envelope.payload === "object"
-          ? (envelope.payload as AgentStatus)
-          : null;
-      if (payload && typeof payload.online === "boolean") {
+    if (type === "status.event") {
+      const statusPayload =
+        payload && typeof payload === "object" ? (payload as AgentStatus) : null;
+      if (statusPayload && typeof statusPayload.online === "boolean") {
         this.clearReconnectNoticeTimer();
-        this.emitStatus(payload, null);
+        this.emitStatus(statusPayload, null);
       }
       return;
     }
 
-    if (envelope.type === "workspace.activity") {
-      const payload =
-        envelope.payload && typeof envelope.payload === "object"
-          ? (envelope.payload as RawWorkspaceActivityPayload)
-          : null;
-      const activity = payload ? normalizeWorkspaceActivity(payload) : null;
+    if (type === "workspace.activity") {
+      const activityPayload =
+        payload && typeof payload === "object" ? (payload as RawWorkspaceActivityPayload) : null;
+      const activity = activityPayload ? normalizeWorkspaceActivity(activityPayload) : null;
       if (activity) {
         this.emitWorkspaceActivity(activity);
       }
       return;
     }
 
-    if (envelope.type === "chat_queue.event") {
-      const snapshot = normalizeChatQueueEvent(envelope.payload as RawChatQueueEvent);
+    if (type === "chat_queue.event") {
+      const snapshot = normalizeChatQueueEvent(payload as RawChatQueueEvent);
       if (snapshot) {
         this.emitChatQueue(snapshot);
       }
       return;
     }
 
-    if (envelope.type === "chat.event") {
-      this.conversationStreams.handleChatEvent(envelope.payload);
+    if (type === "chat.event") {
+      this.conversationStreams.handleChatEvent(payload);
       return;
     }
 
-    if (envelope.type === "chat.subscription_reset") {
-      this.conversationStreams.handleSubscriptionReset(envelope.payload);
+    if (type === "chat.subscription_reset") {
+      this.conversationStreams.handleSubscriptionReset(payload);
       return;
     }
 
-    if (envelope.type === "chat.activity") {
-      const event = normalizeActivityEvent(envelope.payload);
+    if (type === "chat.activity") {
+      const event = normalizeActivityEvent(payload);
       if (event) {
         for (const listener of this.chatActivityListeners) {
           listener(event);
@@ -3057,33 +3099,14 @@ export class GatewayWebSocketClient {
       return;
     }
 
-    if (envelope.type === "chat.command_update") {
-      const update = normalizeCommandUpdate(envelope.payload);
+    if (type === "chat.command_update") {
+      const update = normalizeCommandUpdate(payload);
       if (update) {
         for (const listener of this.chatCommandUpdateListeners) {
           listener(update);
         }
       }
-      return;
     }
-
-    const pending = requestId ? this.pending.get(requestId) : null;
-    if (!pending) {
-      return;
-    }
-
-    const host = getRuntimeHost();
-    host.clearTimeout(pending.timeoutId);
-    this.pending.delete(requestId);
-
-    if (envelope.type === "error") {
-      pending.reject(
-        new Error(typeof envelope.error === "string" ? envelope.error : "Request failed"),
-      );
-      return;
-    }
-
-    pending.resolve(envelope.payload);
   }
 
   private handleDisconnect(error: Error) {

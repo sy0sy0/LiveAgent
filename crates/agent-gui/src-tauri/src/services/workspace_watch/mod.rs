@@ -82,11 +82,12 @@ impl WorkspaceWatchService {
         let desired: BTreeSet<String> = inner.local.union(&inner.gateway).cloned().collect();
         // Dropping a handle stops its watcher (native watcher teardown ends
         // the aggregator; the polling fallback observes the stop flag).
-        inner.watchers.retain(|workdir, _| desired.contains(workdir));
+        inner
+            .watchers
+            .retain(|workdir, _| desired.contains(workdir));
         for workdir in desired {
             if !inner.watchers.contains_key(&workdir) {
-                let handle =
-                    watcher::spawn_workdir_watcher(workdir.clone(), Arc::downgrade(self));
+                let handle = watcher::spawn_workdir_watcher(workdir.clone(), Arc::downgrade(self));
                 inner.watchers.insert(workdir, handle);
             }
         }

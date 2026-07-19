@@ -15,6 +15,23 @@ pub(crate) fn expand_tilde_path(raw: &str) -> PathBuf {
     PathBuf::from(trimmed)
 }
 
+/// `fs::canonicalize` returns `\\?\`-verbatim paths on Windows. Classic Win32
+/// form is required for child-process cwd (cmd.exe / Windows PowerShell
+/// mishandle verbatim) and for user-facing workdir strings. No-op elsewhere.
+pub(crate) fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let raw = path.to_string_lossy();
+        if let Some(stripped) = raw.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{stripped}"));
+        }
+        if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped.to_string());
+        }
+    }
+    path
+}
+
 pub(crate) fn maybe_augment_macos_path(command: &mut Command) {
     if !cfg!(target_os = "macos") {
         return;

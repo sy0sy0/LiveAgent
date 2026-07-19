@@ -34,10 +34,14 @@
 | GUI build | `pnpm -C crates/agent-gui build` |
 | WebUI build | `pnpm -C crates/agent-gateway/web build` |
 | Gateway tests | `cd crates/agent-gateway && go test ./...` |
+| Gateway lint | `cd crates/agent-gateway && golangci-lint run ./...` |
+| Proto 检查 | `make proto-check`（buf lint + 对 origin/main 的 breaking 检查） |
 | Tauri/Rust tests | `cargo test --manifest-path crates/agent-gui/src-tauri/Cargo.toml` |
 | 前端专项测试 | `pnpm -C crates/agent-gui test:frontend` |
 | diff 空白检查 | `git diff --check` |
 | 当前改动 | `git status --short` |
+
+工具链版本由根 `mise.toml` 固定（git 跟踪），`mise install` 一键对齐，CI 使用相同版本。
 
 实际脚本名称可能随 package.json 调整，运行前以当前 manifest 为准。
 
@@ -56,11 +60,24 @@
 
 | 项 | 说明 |
 |---|---|
-| HTTP | `internal/server/http.go` 注册 `/ws`、`/api/status`、`/api/files/import`、public share 和静态资源。 |
-| gRPC | `cmd/gateway/main.go` 创建 `AgentGateway` gRPC server，并启用 token interceptor。 |
-| Proto | 修改 `proto/v1/gateway.proto` 后需要重新生成 Go 文件。 |
-| Shutdown | `make dev-gateway` 应支持 Ctrl+C 后 HTTP 与 gRPC 干净退出。 |
+| HTTP | `internal/server/http.go` 注册 `/ws/v2*` 三链路、`/api/status`、`/api/files/import`、public share 和静态资源。 |
+| Proto | 改 `proto/v1|v2/*.proto` 后执行 `make proto`（buf 生成 Go+TS），生成物随源同 PR 提交；`make proto-check` 把关破坏性变更。 |
+| Shutdown | `make dev-gateway` 应支持 Ctrl+C 后 HTTP 干净退出。 |
 | WebUI embed | Gateway build 通常依赖 `make webui` 先产出静态资源。 |
+| 新增桌面端能力 | v1 envelope 加臂（编号只增不改）→ `make proto` → v2 直通白名单（`internal/protocol/pbws/guard.go`）放行 → 各端生成物随源同 PR 提交；新增网关本地操作则在 v2 帧（`proto/v2/gateway_ws.proto`）加臂。 |
+| 弃用惯例 | Go `// Deprecated: <原因；替代物；删除条件>`、Rust `#[deprecated]`、TS `@deprecated`、proto `option deprecated`；弃用代码原地保留只修 bug，删除前先经使用打点观察（v1 协议已按此流程移除，记录见 [protocol-v2-migration.md](../architecture/protocol-v2-migration.md)）。 |
+
+## Gateway 分层（新代码放哪里）
+
+| 代码类型 | 位置 |
+|---|---|
+| 传输机制（写泵/背压/心跳，帧格式无关） | `internal/transport/wscore` |
+| v2 协议编解码/握手/直通/扇出 | `internal/protocol/pbws` |
+| 跨协议域逻辑（终端门控、Origin 校验等） | `internal/protocol/shared` |
+| chat 命令编排 | `internal/chatcmd` |
+| 会话状态与关联路由（transport 无关） | `internal/session` |
+| 日志装置与协议使用打点 | `internal/observability` |
+| HTTP 入口与 public share | `internal/server` |
 
 ## GUI/WebUI 双端改造检查
 

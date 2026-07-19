@@ -18,6 +18,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          # buf breaking 需要完整历史以对比 origin/main 的 proto 契约。
+          fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:
@@ -31,16 +34,15 @@ jobs:
       - name: Install pnpm
         run: npm install -g pnpm@10.32.1
 
-      - name: Install protobuf toolchain
+      - name: Install buf
+        uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+          version: 1.71.0
+
+      - name: Install protobuf Go plugins
         run: |
-          sudo apt-get update
-          sudo apt-get install -y unzip
-          curl -fsSL -o "$RUNNER_TEMP/protoc.zip" \
-            https://github.com/protocolbuffers/protobuf/releases/download/v34.0/protoc-34.0-linux-x86_64.zip
-          unzip -q "$RUNNER_TEMP/protoc.zip" -d "$RUNNER_TEMP/protoc"
-          echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
-          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Build embedded Gateway WebUI
@@ -49,10 +51,19 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm build
 
+      - name: Proto lint and breaking-change check
+        run: make proto-check BUF_BREAKING_AGAINST='../../.git#branch=origin/main,subdir=crates/agent-gateway'
+
       - name: Check generated protobuf
         run: |
           make proto
-          git diff --exit-code -- crates/agent-gateway/internal/proto/v1
+          git diff --exit-code -- crates/agent-gateway/internal/proto
+
+      - name: Lint gateway
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2
+          working-directory: crates/agent-gateway
 
       - name: Test gateway
         working-directory: crates/agent-gateway

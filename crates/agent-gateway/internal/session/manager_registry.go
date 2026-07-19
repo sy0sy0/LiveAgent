@@ -2,7 +2,6 @@ package session
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"time"
 
@@ -55,7 +54,6 @@ func (m *Manager) SetSession(s *AgentSession) {
 		previous.Close()
 	}
 	if s != nil && sessionChanged {
-		m.cmdQueue.DrainTo(s)
 		// Replay the watched-workdir set: a freshly connected agent starts
 		// with an empty watch set and only learns a non-empty one from this
 		// push. An empty set needs no replay.
@@ -99,23 +97,6 @@ func (m *Manager) ClearSessionIfHeartbeatStale(session *AgentSession, timeout ti
 		return false
 	}
 	if lastPing := m.registry.session.LastPing; !lastPing.IsZero() && now.Sub(lastPing) <= timeout {
-		m.registry.mu.Unlock()
-		return false
-	}
-	m.registry.session = nil
-	clearRuntimeStatusLocked(m.registry)
-	m.registry.mu.Unlock()
-
-	session.Close()
-	m.clearTerminalSessionSnapshot()
-	go m.onAgentSessionCleared()
-	return true
-}
-
-func (m *Manager) clearSessionForEpoch(sessionEpoch uint64) bool {
-	m.registry.mu.Lock()
-	session := m.registry.session
-	if session == nil || m.registry.sessionEpoch != sessionEpoch {
 		m.registry.mu.Unlock()
 		return false
 	}
@@ -293,16 +274,6 @@ func normalizeRuntimeState(state string) string {
 	}
 }
 
-func (m *Manager) SendToAgent(env *gatewayv1.GatewayEnvelope) error {
-	m.registry.mu.RLock()
-	session := m.registry.session
-	m.registry.mu.RUnlock()
-	if session == nil {
-		return ErrAgentOffline
-	}
-	return session.SendToAgent(env)
-}
-
 func (m *Manager) SendToAgentContext(ctx context.Context, env *gatewayv1.GatewayEnvelope) error {
 	m.registry.mu.RLock()
 	session := m.registry.session
@@ -313,38 +284,10 @@ func (m *Manager) SendToAgentContext(ctx context.Context, env *gatewayv1.Gateway
 	return session.SendToAgentContext(ctx, env)
 }
 
-func (m *Manager) SendToAgentOrQueue(ctx context.Context, env *gatewayv1.GatewayEnvelope) error {
-	err := m.SendToAgentContext(ctx, env)
-	if errors.Is(err, ErrAgentOffline) {
-		return m.cmdQueue.Enqueue(ctx, env)
-	}
-	return err
-}
-
 func (m *Manager) currentSessionEpoch() uint64 {
 	m.registry.mu.RLock()
 	defer m.registry.mu.RUnlock()
 	return m.registry.sessionEpoch
-}
-
-func (m *Manager) RegisterStream(requestID string) (<-chan *gatewayv1.AgentEnvelope, <-chan struct{}, func(), error) {
-	m.registry.mu.RLock()
-	session := m.registry.session
-	m.registry.mu.RUnlock()
-	if session == nil {
-		return nil, nil, nil, ErrAgentOffline
-	}
-
-	stream, err := session.registerStream(requestID)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	cleanup := func() {
-		session.unregisterStream(requestID, stream)
-	}
-
-	return stream.ch, stream.done, cleanup, nil
 }
 
 // RegisterStreamAndSendContext binds response correlation and request delivery

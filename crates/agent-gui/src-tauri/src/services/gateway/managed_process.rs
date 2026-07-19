@@ -119,8 +119,7 @@ impl GatewayController {
                 let process_id = request.process_id.trim().to_string();
                 let process_id = (!process_id.is_empty()).then_some(process_id);
                 let snapshot =
-                    run_registry_task(registry, move |registry| registry.clear(process_id))
-                        .await?;
+                    run_registry_task(registry, move |registry| registry.clear(process_id)).await?;
                 Ok(proto::ManagedProcessResponse {
                     action,
                     snapshot: Some(build_managed_process_snapshot_proto(&snapshot)),

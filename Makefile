@@ -3,7 +3,6 @@
 AGENT_GUI_DIR := crates/agent-gui
 AGENT_GATEWAY_DIR := crates/agent-gateway
 AGENT_GATEWAY_WEB_DIR := $(AGENT_GATEWAY_DIR)/web
-AGENT_GATEWAY_PROTO_FILE := proto/v1/gateway.proto
 
 HOST_ARCH := $(shell uname -m)
 
@@ -26,14 +25,13 @@ DESKTOP_RELEASE_TAURI_CONFIG_FLAGS ?= --config $(DESKTOP_RELEASE_TAURI_CONFIG) $
 
 DEV_GATEWAY_TOKEN ?= dev-token
 DEV_GATEWAY_HTTP_ADDR ?= :50052
-DEV_GATEWAY_GRPC_ADDR ?= :50051
 DEV_WEBUI_PROXY_API ?= http://localhost:50052
 GATEWAY_DOCKER_IMAGE ?= liveagent-gateway:local
 RELEASE_TAG ?=
 
 .PHONY: all dev build desktop-build-macos desktop-build-macos-release desktop-build-macos-intel desktop-build-macos-m desktop-build-windows desktop-build-linux github-release-main check-github-release-tag help
 .PHONY: dev-gateway dev-webui
-.PHONY: proto webui gateway-build gateway-docker-build gateway-docker-run gateway-docker-smoke build-linux build-linux-amd build-linux-arm
+.PHONY: proto proto-check webui gateway-build gateway-docker-build gateway-docker-run gateway-docker-smoke build-linux build-linux-amd build-linux-arm
 .PHONY: clean check-rust-target-% check-macos-signing-identity check-macos-notary-profile desktop-store-macos-notary-profile desktop-wait-macos-notary desktop-staple-macos desktop-verify-macos
 
 all: build gateway-build
@@ -109,23 +107,23 @@ check-github-release-tag:
 
 ## Gateway development
 dev-gateway:
-	go -C $(AGENT_GATEWAY_DIR) run ./cmd/gateway --token=$(DEV_GATEWAY_TOKEN) --http-addr=$(DEV_GATEWAY_HTTP_ADDR) --grpc-addr=$(DEV_GATEWAY_GRPC_ADDR)
+	go -C $(AGENT_GATEWAY_DIR) run ./cmd/gateway --token=$(DEV_GATEWAY_TOKEN) --http-addr=$(DEV_GATEWAY_HTTP_ADDR)
 
 dev-webui:
 	npm_config_proxy_api=$(DEV_WEBUI_PROXY_API) pnpm --dir $(AGENT_GATEWAY_WEB_DIR) dev
 
 ## Gateway build and generated assets
 proto:
-	@command -v protoc >/dev/null || (echo "protoc is required" && exit 1)
-	@command -v protoc-gen-go >/dev/null || (echo "protoc-gen-go is required. Run: go install google.golang.org/protobuf/cmd/protoc-gen-go@latest" && exit 1)
-	@command -v protoc-gen-go-grpc >/dev/null || (echo "protoc-gen-go-grpc is required. Run: go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest" && exit 1)
-	protoc \
-		--proto_path=$(AGENT_GATEWAY_DIR) \
-		--go_out=$(AGENT_GATEWAY_DIR) \
-		--go_opt=module=github.com/liveagent/agent-gateway \
-		--go-grpc_out=$(AGENT_GATEWAY_DIR) \
-		--go-grpc_opt=module=github.com/liveagent/agent-gateway \
-		$(AGENT_GATEWAY_PROTO_FILE)
+	@command -v buf >/dev/null || (echo "buf is required. Run: mise install" && exit 1)
+	cd $(AGENT_GATEWAY_DIR) && buf generate
+
+# buf breaking 的对比基线（本地默认与当前 HEAD 对比；CI 覆写为 origin/main）。
+BUF_BREAKING_AGAINST ?= ../../.git#subdir=$(AGENT_GATEWAY_DIR)
+
+proto-check:
+	@command -v buf >/dev/null || (echo "buf is required. Run: mise install" && exit 1)
+	cd $(AGENT_GATEWAY_DIR) && buf lint
+	cd $(AGENT_GATEWAY_DIR) && buf breaking --against '$(BUF_BREAKING_AGAINST)'
 
 webui:
 	pnpm --dir $(AGENT_GATEWAY_WEB_DIR) install --offline
@@ -138,7 +136,7 @@ gateway-docker-build:
 	docker build -t $(GATEWAY_DOCKER_IMAGE) .
 
 gateway-docker-run:
-	docker run --rm -p 8080:8080 -p 50051:50051 -e LIVEAGENT_GATEWAY_TOKEN=$(DEV_GATEWAY_TOKEN) $(GATEWAY_DOCKER_IMAGE)
+	docker run --rm -p 8080:8080 -e LIVEAGENT_GATEWAY_TOKEN=$(DEV_GATEWAY_TOKEN) $(GATEWAY_DOCKER_IMAGE)
 
 gateway-docker-smoke: gateway-docker-build
 	@set -e; \

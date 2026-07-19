@@ -56,6 +56,25 @@ const webAutomationBackendSource = readFileSync(
   new URL("../../../agent-gateway/web/src/lib/automation/backend.ts", import.meta.url),
   "utf8",
 );
+const guiCronModalSource = readFileSync(
+  new URL("../../src/pages/settings/CronTaskModal.tsx", import.meta.url),
+  "utf8",
+);
+const webCronModalSource = readFileSync(
+  new URL(
+    "../../../agent-gateway/web/src/pages/settings/CronTaskModal.tsx",
+    import.meta.url,
+  ),
+  "utf8",
+);
+const cronToolsSource = readFileSync(
+  new URL("../../src/lib/tools/cronTools.ts", import.meta.url),
+  "utf8",
+);
+const builtinRegistrySource = readFileSync(
+  new URL("../../src/lib/tools/builtinRegistry.ts", import.meta.url),
+  "utf8",
+);
 
 test.beforeEach(() => {
   invokeCalls.length = 0;
@@ -155,4 +174,68 @@ test("Auto Prompt reconciles pending runs without relying only on events", () =>
     /window\.setInterval\(requestClaim, PROMPT_RUN_RECONCILE_INTERVAL_MS\)/,
   );
   assert.match(runnerSource, /window\.clearInterval\(reconcileTimer\)/);
+});
+
+test("Auto Prompt run prefers the queue-time workdir with a global fallback", () => {
+  assert.match(
+    runnerSource,
+    /const workdir = \(request\.workdir \?\? ""\)\.trim\(\) \|\| settings\.system\.workdir\.trim\(\)/,
+  );
+});
+
+test("Cron workspace pin stays wired across GUI and WebUI", () => {
+  for (const source of [guiCronModalSource, webCronModalSource]) {
+    // Radix SelectItem rejects empty-string values, so "follow active" must
+    // go through the sentinel and map back to "" on save; the custom-path
+    // mode keeps arbitrary (tool-pinned) paths visible and editable.
+    assert.match(
+      source,
+      /const FOLLOW_ACTIVE_WORKSPACE_VALUE = "__follow-active-workspace__"/,
+    );
+    assert.match(source, /const CUSTOM_WORKDIR_VALUE = "__custom-workdir__"/);
+    assert.match(
+      source,
+      /customWorkdir \? CUSTOM_WORKDIR_VALUE : workdir \|\| FOLLOW_ACTIVE_WORKSPACE_VALUE/,
+    );
+    // The save payload must always carry the workdir key: an empty string is
+    // the explicit clear signal — dropping the key would keep a stale pin.
+    assert.match(source, /workdir: type === "http" \? "" : workdir\.trim\(\)/);
+    assert.match(source, /workspaceOptions: CronWorkspaceOption\[\]/);
+    // Windows pins may spell the same directory differently than the
+    // workspace list ("\" vs "/", drive-letter case): matching must be
+    // shape-insensitive and snap to the list entry's spelling.
+    assert.match(source, /function comparableWorkdirPath\(path: string\)/);
+    assert.match(source, /const isWindowsShape = \/\^\[A-Za-z\]:\/\.test\(normalized\)/);
+    assert.match(
+      source,
+      /findWorkspaceOptionByPath\(workspaceOptions, initialWorkdir\)\?\.path \?\? initialWorkdir/,
+    );
+    assert.match(
+      source,
+      /Boolean\(initialWorkdir && !findWorkspaceOptionByPath\(workspaceOptions, initialWorkdir\)\)/,
+    );
+    assert.match(source, /: findWorkspaceOptionByPath\(workspaceOptions, workdir\)/);
+  }
+  for (const source of [guiCronViewSource, webCronViewSource]) {
+    assert.match(source, /\{task\.workdir \? \(/);
+  }
+});
+
+test("CronTaskManager create pins the agent's current workspace by default", () => {
+  // Create with the workdir key absent injects the runtime workspace (http
+  // tasks excluded); an explicitly EMPTY workdir also resolves to the
+  // runtime workspace — the model has no "follow active workspace" spelling.
+  assert.match(cronToolsSource, /fields\.type !== "http" && !Object\.hasOwn\(args, "workdir"\)/);
+  assert.match(cronToolsSource, /if \(Object\.hasOwn\(fields, "workdir"\)\)/);
+  assert.match(cronToolsSource, /if \(!explicit && runtimeWorkdir\)/);
+  assert.match(cronToolsSource, /fields\.workdir = runtimeWorkdir/);
+  // Prompt creation force-sets the runtime model and a medium thinking
+  // level in code — neither is a model-facing parameter.
+  assert.match(cronToolsSource, /fields\.selectedModel = options\.currentChatModel/);
+  assert.match(cronToolsSource, /fields\.reasoning = "medium"/);
+  // The registry wires the runtime workdir into the tool bundle.
+  assert.match(
+    builtinRegistrySource,
+    /createCronTools\(\{\s*currentChatModel: params\.currentChatModel,\s*workdir: params\.workdir,\s*\}\)/,
+  );
 });

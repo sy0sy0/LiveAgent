@@ -13,6 +13,7 @@ import {
   findProviderModelConfig,
   isAgentDevMode,
   isAgentExecutionMode,
+  type ReasoningLevel,
 } from "../../lib/settings";
 import {
   buildSkillsSystemPrompt,
@@ -100,6 +101,27 @@ async function buildCronSkillsContext(settings: AppSettings) {
   };
 }
 
+const CRON_REASONING_LEVELS: ReasoningLevel[] = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
+/**
+ * Per-task thinking level from the queue row; empty/unknown values (e.g.
+ * tasks saved before the field existed) fall back to the runtime default so
+ * legacy tasks keep their pre-existing behavior.
+ */
+function resolveCronReasoning(value: string | undefined): ReasoningLevel {
+  return value && (CRON_REASONING_LEVELS as string[]).includes(value)
+    ? (value as ReasoningLevel)
+    : DEFAULT_CHAT_RUNTIME_CONTROLS.reasoning;
+}
+
 async function executeCronPromptRun(
   settings: AppSettings,
   request: PromptRunRequest,
@@ -111,7 +133,10 @@ async function executeCronPromptRun(
     );
   }
 
-  const workdir = settings.system.workdir.trim();
+  // The request carries the workdir resolved at queue time (task pin or the
+  // global workdir); rows queued before that field existed fall back to the
+  // current global workdir.
+  const workdir = (request.workdir ?? "").trim() || settings.system.workdir.trim();
   if (!workdir) {
     throw new Error("Tool mode requires a project directory from the chat sidebar.");
   }
@@ -186,7 +211,7 @@ async function executeCronPromptRun(
       baseUrl: provider.baseUrl,
       apiKey: provider.apiKey,
       requestFormat: provider.requestFormat,
-      reasoning: DEFAULT_CHAT_RUNTIME_CONTROLS.reasoning,
+      reasoning: resolveCronReasoning(request.reasoning),
       promptCachingEnabled: true,
       nativeWebSearchEnabled: DEFAULT_CHAT_RUNTIME_CONTROLS.nativeWebSearchEnabled,
       useSystemProxy: provider.useSystemProxy,

@@ -210,7 +210,7 @@ pub(crate) fn run_hook_http_requests_sync(
         return Err("Hook 至少需要一个 HTTP 请求".to_string());
     }
     let scope_id = normalize_scope_id(scope_id);
-    let client = build_http_client()?;
+    let client = build_http_client(None)?;
 
     let mut results = Vec::with_capacity(requests.len());
     let mut all_ok = true;
@@ -331,10 +331,7 @@ mod tests {
             script.to_string(),
             None,
             Some(format!("scope-{}", Uuid::new_v4())),
-            vec![(
-                "LIVEAGENT_HOOK_EVENT".to_string(),
-                "agent_end".to_string(),
-            )],
+            vec![("LIVEAGENT_HOOK_EVENT".to_string(), "agent_end".to_string())],
         )
         .expect("run hook script");
         assert_eq!(result.exit_code, 0);

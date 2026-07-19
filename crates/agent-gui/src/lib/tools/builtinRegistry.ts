@@ -189,6 +189,7 @@ async function buildBaseBuiltinToolBundles(params: BuildBuiltinBaseToolRegistryP
       : []),
     createCronTools({
       currentChatModel: params.currentChatModel,
+      workdir: params.workdir,
     }),
     createMcpManagerTools({
       workdir: params.workdir,

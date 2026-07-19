@@ -29,9 +29,23 @@ use crate::services::memory::MemoryStore;
 use crate::services::tunnel::{TunnelProxy, TunnelStore};
 use crate::services::workspace_watch::WorkspaceWatchService;
 
-pub mod proto {
-    tonic::include_proto!("liveagent.gateway.v1");
+/// 网关 proto 生成模块。v2 帧壳经 prost `super::v1::` 路径复用 v1 业务消息，两版本必须并列嵌套。
+/// （纯消息生成，无 gRPC 服务；直接 include OUT_DIR 产物，不再依赖运行时 tonic。）
+pub mod gateway_proto {
+    // v1 整包生成；AuthRequest/AuthResponse 等历史消息按 proto 纪律保留但不再构造：抑制 dead_code。
+    #[allow(dead_code)]
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/liveagent.gateway.v1.rs"));
+    }
+    // v2 整包生成，浏览器链路专用帧类型桌面端不构造：抑制 dead_code。
+    #[allow(dead_code)]
+    pub mod v2 {
+        include!(concat!(env!("OUT_DIR"), "/liveagent.gateway.v2.rs"));
+    }
 }
+
+/// 兼容别名：既有代码一律以 `proto::` 引用 v1 业务消息，别名使其零改动。
+pub use gateway_proto::v1 as proto;
 
 mod chat;
 mod chat_inbox;
@@ -47,6 +61,7 @@ mod terminal;
 mod tests;
 mod types;
 mod util;
+mod ws_transport;
 
 pub(crate) use chat::*;
 pub(crate) use chat_inbox::*;
@@ -58,6 +73,7 @@ pub(crate) use sftp::*;
 pub(crate) use terminal::*;
 pub use types::*;
 pub(crate) use util::*;
+pub(crate) use ws_transport::*;
 
 pub(crate) const UI_ONLY_SETTINGS_SYNC_FIELDS: &[&str] = &[
     "skills",
@@ -67,15 +83,18 @@ pub(crate) const UI_ONLY_SETTINGS_SYNC_FIELDS: &[&str] = &[
     "theme",
     "locale",
 ];
-pub(crate) const GATEWAY_GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 // Small dedicated lane for latency-sensitive control replies (Pongs). It is
-// merged into the same gRPC outbound stream but never sits behind thousands
-// of queued data envelopes, so wake probes stay answerable while a reply is
-// streaming tokens through the saturated data queue.
+// merged into the same outbound envelope stream but never sits behind
+// thousands of queued data envelopes, so wake probes stay answerable while a
+// reply is streaming tokens through the saturated data queue.
 pub(crate) const GATEWAY_OUTBOUND_CONTROL_QUEUE_DEPTH: usize = 64;
 pub(crate) const GATEWAY_RECONNECT_MIN: Duration = Duration::from_millis(250);
 pub(crate) const GATEWAY_RECONNECT_MAX: Duration = Duration::from_secs(5);
 pub(crate) const GATEWAY_RECONNECT_STABLE_AFTER: Duration = Duration::from_secs(30);
+// v2 主链路存活看门狗（取代 v1 gRPC 的 h2 keepalive）：ServerHello 未给心跳周期时的回退值，
+// 以及静默超 3×心跳周期发 WS Ping 探活后的宽限时长。
+pub(crate) const GATEWAY_WS_DEFAULT_HEARTBEAT_PERIOD: Duration = Duration::from_secs(30);
+pub(crate) const GATEWAY_WS_PROBE_GRACE: Duration = Duration::from_secs(10);
 pub(crate) const GATEWAY_POST_CONNECT_REPLAY_DELAY: Duration = Duration::from_millis(200);
 pub(crate) const GATEWAY_TERMINAL_STREAM_RECONNECT_MIN: Duration = Duration::from_millis(250);
 pub(crate) const GATEWAY_TERMINAL_STREAM_RECONNECT_MAX: Duration = Duration::from_secs(5);

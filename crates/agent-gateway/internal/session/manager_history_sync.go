@@ -15,11 +15,9 @@ func (m *Manager) SubscribeHistorySync() (<-chan *gatewayv1.HistorySyncEvent, fu
 
 	cleanup := func() {
 		m.syncHub.historyMu.Lock()
-		if _, ok := m.syncHub.historySubscribers[subID]; ok {
-			// Do not close the channel here: broadcastHistorySync sends after
-			// copying subscribers, so closing can race with an in-flight send.
-			delete(m.syncHub.historySubscribers, subID)
-		}
+		// Do not close the channel here: broadcastHistorySync sends after
+		// copying subscribers, so closing can race with an in-flight send.
+		delete(m.syncHub.historySubscribers, subID)
 		m.syncHub.historyMu.Unlock()
 	}
 

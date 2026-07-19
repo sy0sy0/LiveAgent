@@ -8,7 +8,7 @@ import (
 	gatewayv1 "github.com/liveagent/agent-gateway/internal/proto/v1"
 )
 
-// Ingress normalization: the three agent-facing gRPC payloads (ChatEvent,
+// Ingress normalization: the three agent-facing envelope payloads (ChatEvent,
 // ChatControlEvent, ChatRuntimeSnapshot) converge here into one append API on
 // the conversation stream store. Payload shaping and tool-result trimming
 // happen exactly once, so every subscriber observes identical events.

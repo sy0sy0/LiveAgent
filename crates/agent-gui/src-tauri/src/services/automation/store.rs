@@ -12,8 +12,6 @@ use super::scheduler::AutomationScheduler;
 use super::types::*;
 use super::validate;
 
-pub const PROMPT_RUN_TIMEOUT_MS: i64 = 5 * 60_000;
-
 /// Fan-out target for store mutations. All change notifications originate
 /// here so every writer (UI apply, LLM tool, gateway relay, executor
 /// decrement) produces exactly the same broadcast.
@@ -239,6 +237,30 @@ impl AutomationStore {
         Ok(())
     }
 
+    /// Disable a task after an unrecoverable fire-time failure (e.g. its
+    /// pinned workspace directory disappeared) so it stops re-firing until
+    /// the user fixes and re-enables it.
+    pub fn disable_task_with_error(&self, task_id: &str, error: &str) -> Result<(), String> {
+        let snapshot = {
+            let conn = self.lock_conn()?;
+            let updated = conn
+                .execute(
+                    "UPDATE automation_cron_tasks
+                     SET enabled = 0, last_error = ?2, updated_at = ?3
+                     WHERE task_id = ?1",
+                    params![task_id, error, db::now_ms()],
+                )
+                .map_err(|e| format!("禁用 automation_cron_tasks 失败：{e}"))?;
+            if updated == 0 {
+                return Ok(());
+            }
+            db::bump_revision(&conn, db::CRON_REVISION_KEY)?;
+            db::read_cron_snapshot(&conn)?
+        };
+        self.with_notifier(|notifier| notifier.cron_changed(&snapshot));
+        Ok(())
+    }
+
     /// Fresh enabled/remaining recheck immediately before a fire executes.
     pub fn task_can_run(&self, task_id: &str) -> Result<bool, String> {
         let conn = self.lock_conn()?;
@@ -290,20 +312,27 @@ impl AutomationStore {
     pub fn queue_prompt_run(
         &self,
         task: &CronTask,
+        workdir: &str,
         counted: bool,
     ) -> Result<PromptQueueOutcome, String> {
-        let prompt = task.prompt.as_deref().unwrap_or_default().trim().to_string();
+        let prompt = task
+            .prompt
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         if prompt.is_empty() {
             return Err("Auto Prompt task has no prompt content.".to_string());
         }
-        let selected_model = task
-            .selected_model
-            .as_ref()
-            .ok_or_else(|| "Auto Prompt task is missing the selected model configuration.".to_string())?;
+        let selected_model = task.selected_model.as_ref().ok_or_else(|| {
+            "Auto Prompt task is missing the selected model configuration.".to_string()
+        })?;
         let provider_id = selected_model.custom_provider_id.trim().to_string();
         let model = selected_model.model.trim().to_string();
         if provider_id.is_empty() || model.is_empty() {
-            return Err("Auto Prompt task has an invalid selected model configuration.".to_string());
+            return Err(
+                "Auto Prompt task has an invalid selected model configuration.".to_string(),
+            );
         }
 
         let request = {
@@ -334,8 +363,11 @@ impl AutomationStore {
                 provider_id,
                 model,
                 started_at,
-                lease_expires_at: started_at + PROMPT_RUN_TIMEOUT_MS,
+                lease_expires_at: started_at
+                    + (task.timeout_seconds.max(1) as i64).saturating_mul(1_000),
                 counted,
+                workdir: workdir.to_string(),
+                reasoning: task.reasoning.clone().unwrap_or_default(),
             };
             let request_json = serde_json::to_string(&request)
                 .map_err(|e| format!("序列化 prompt run 请求失败：{e}"))?;
@@ -643,15 +675,29 @@ impl AutomationStore {
         .map_err(|e| format!("清理 automation_cron_runs 失败：{e}"))
     }
 
-    /// Enabled, non-exhausted tasks plus the workdir bash tasks execute in.
-    pub fn runnable_cron_tasks(&self) -> Result<(String, Vec<CronTask>), String> {
+    /// Enabled, non-exhausted tasks for the scheduler's diff reload. Workdirs
+    /// are resolved per task at fire time, not here.
+    pub fn runnable_cron_tasks(&self) -> Result<Vec<CronTask>, String> {
         let conn = self.lock_conn()?;
-        let workdir = read_system_workdir(&conn)?;
         let tasks = db::read_cron_tasks(&conn)?
             .into_iter()
             .filter(|task| task.enabled && task.remaining_executions != Some(0))
             .collect();
-        Ok((workdir, tasks))
+        Ok(tasks)
+    }
+
+    /// Fresh task + resolved workdir for a scheduled fire. Returns `Ok(None)`
+    /// when the task no longer exists (the next reload drops its job).
+    pub fn cron_task_for_scheduled_fire(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<(String, CronTask)>, String> {
+        let conn = self.lock_conn()?;
+        let Some(task) = db::read_cron_task(&conn, task_id)? else {
+            return Ok(None);
+        };
+        let workdir = task_workdir(&conn, &task)?;
+        Ok(Some((workdir, task)))
     }
 
     pub fn cron_task_for_manual_run(&self, task_id: &str) -> Result<(String, CronTask), String> {
@@ -676,7 +722,7 @@ impl AutomationStore {
                 return Err("Cron task is already running.".to_string());
             }
         }
-        Ok((read_system_workdir(&conn)?, task))
+        Ok((task_workdir(&conn, &task)?, task))
     }
 }
 
@@ -786,10 +832,7 @@ fn ensure_id(item: &mut Value) {
         .unwrap_or_default()
         .is_empty();
     if missing {
-        map.insert(
-            "id".to_string(),
-            Value::String(Uuid::new_v4().to_string()),
-        );
+        map.insert("id".to_string(), Value::String(Uuid::new_v4().to_string()));
     }
 }
 
@@ -885,6 +928,15 @@ fn decrement_remaining(conn: &Connection, task_id: &str) -> Result<CronMutationE
     )
     .map_err(|e| format!("更新 remaining_runs 失败：{e}"))?;
     Ok(CronMutationEffect::Changed)
+}
+
+/// Single resolution point for a cron task's working directory: the task's
+/// pinned workspace path when set, otherwise the global system workdir.
+fn task_workdir(conn: &Connection, task: &CronTask) -> Result<String, String> {
+    match task.workdir.as_deref().map(str::trim) {
+        Some(workdir) if !workdir.is_empty() => Ok(workdir.to_string()),
+        _ => read_system_workdir(conn),
+    }
 }
 
 fn read_system_workdir(conn: &Connection) -> Result<String, String> {

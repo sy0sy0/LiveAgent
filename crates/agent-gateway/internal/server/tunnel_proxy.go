@@ -455,7 +455,7 @@ func streamTunnelHTTPRequestBody(
 	defer func() {
 		result <- resultErr
 	}()
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 
 	buffer := make([]byte, tunnelBodyChunkSize)
 	sent := 0

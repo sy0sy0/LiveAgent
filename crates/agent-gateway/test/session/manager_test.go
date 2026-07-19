@@ -75,16 +75,22 @@ func TestClearSessionDoesNotCloseReplacement(t *testing.T) {
 	assertDoneOpen(t, second.Done())
 
 	env := &gatewayv1.GatewayEnvelope{RequestId: "still-current"}
-	if err := sm.SendToAgent(env); err != nil {
-		t.Fatalf("SendToAgent after stale ClearSession: %v", err)
-	}
+	// SendToAgentContext 等待送达 Ack；在旁路读取并 Ack 出站信封后再收敛。
+	sendErr := make(chan error, 1)
+	go func() {
+		sendErr <- sm.SendToAgentContext(context.Background(), env)
+	}()
 	select {
 	case got := <-second.Outbound():
+		got.Ack(nil)
 		if got.GetRequestId() != "still-current" {
 			t.Fatalf("request id = %q, want still-current", got.GetRequestId())
 		}
 	case <-time.After(time.Second):
 		t.Fatalf("timed out waiting for current session outbound message")
+	}
+	if err := <-sendErr; err != nil {
+		t.Fatalf("SendToAgentContext after stale ClearSession: %v", err)
 	}
 
 	sm.ClearSession(second)
@@ -92,7 +98,7 @@ func TestClearSessionDoesNotCloseReplacement(t *testing.T) {
 	if status := sm.Status(); status.Online {
 		t.Fatalf("status online = true after clearing current session")
 	}
-	if err := sm.SendToAgent(env); !errors.Is(err, session.ErrAgentOffline) {
+	if err := sm.SendToAgentContext(context.Background(), env); !errors.Is(err, session.ErrAgentOffline) {
 		t.Fatalf("SendToAgent after clearing current session = %v, want ErrAgentOffline", err)
 	}
 }
@@ -123,7 +129,7 @@ func TestClearSessionIfHeartbeatStaleClosesOnlyCurrentSession(t *testing.T) {
 	if status := sm.Status(); status.Online {
 		t.Fatalf("status online = true after current session heartbeat timeout")
 	}
-	if err := sm.SendToAgent(&gatewayv1.GatewayEnvelope{RequestId: "after-timeout"}); !errors.Is(err, session.ErrAgentOffline) {
+	if err := sm.SendToAgentContext(context.Background(), &gatewayv1.GatewayEnvelope{RequestId: "after-timeout"}); !errors.Is(err, session.ErrAgentOffline) {
 		t.Fatalf("SendToAgent after heartbeat timeout = %v, want ErrAgentOffline", err)
 	}
 }
@@ -230,9 +236,14 @@ func TestDispatchFromStaleSessionIsIgnored(t *testing.T) {
 	second := session.NewAgentSession(sm.LatestAuthSnapshot())
 	sm.SetSession(second)
 
-	ch, done, cleanup, err := sm.RegisterStream("request-1")
+	// RegisterStreamAndSendContext 等待送达 Ack；没有服务泵，用一次性 drain 代替。
+	go func() {
+		outbound := <-second.Outbound()
+		outbound.Ack(nil)
+	}()
+	ch, done, cleanup, err := sm.RegisterStreamAndSendContext(context.Background(), "request-1", &gatewayv1.GatewayEnvelope{RequestId: "request-1"})
 	if err != nil {
-		t.Fatalf("RegisterStream: %v", err)
+		t.Fatalf("RegisterStreamAndSendContext: %v", err)
 	}
 	defer cleanup()
 
@@ -285,7 +296,7 @@ func TestSendToAgentUnblocksWhenSessionCloses(t *testing.T) {
 			}
 		}()
 		for i := 0; i < 128; i += 1 {
-			_ = sm.SendToAgent(&gatewayv1.GatewayEnvelope{RequestId: fmt.Sprintf("request-%d", i)})
+			_ = sm.SendToAgentContext(context.Background(), &gatewayv1.GatewayEnvelope{RequestId: fmt.Sprintf("request-%d", i)})
 		}
 		errCh <- nil
 	}()
@@ -311,7 +322,7 @@ func TestSendToAgentContextTimeoutKeepsSessionAlive(t *testing.T) {
 	sm.SetSession(sess)
 
 	for i := 0; i < cap(sess.Outbound()); i += 1 {
-		if err := sm.SendToAgent(&gatewayv1.GatewayEnvelope{RequestId: fmt.Sprintf("queued-%d", i)}); err != nil {
+		if err := sess.SendToAgent(&gatewayv1.GatewayEnvelope{RequestId: fmt.Sprintf("queued-%d", i)}); err != nil {
 			t.Fatalf("prime outbound queue: %v", err)
 		}
 	}
@@ -341,7 +352,7 @@ func TestSendPingBypassesFullOutboundQueue(t *testing.T) {
 	sm.SetSession(sess)
 
 	for i := 0; i < cap(sess.Outbound()); i += 1 {
-		if err := sm.SendToAgent(&gatewayv1.GatewayEnvelope{RequestId: fmt.Sprintf("queued-%d", i)}); err != nil {
+		if err := sess.SendToAgent(&gatewayv1.GatewayEnvelope{RequestId: fmt.Sprintf("queued-%d", i)}); err != nil {
 			t.Fatalf("prime outbound queue: %v", err)
 		}
 	}

@@ -1,5 +1,7 @@
 fn default_remote_grpc_port() -> u16 {
-    50051
+    // v1 gRPC 监听（:50051）已随 v1 协议删除；默认对齐网关 HTTP 默认端口，
+    // v2 WebSocket 经该端口建连（字段名 grpc_port 为 v1 命名遗留，实义网关端口）。
+    443
 }
 
 fn default_remote_auto_reconnect() -> bool {

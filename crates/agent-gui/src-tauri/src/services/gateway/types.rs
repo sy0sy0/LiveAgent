@@ -14,6 +14,8 @@ pub struct GatewayStatusSnapshot {
     pub connected_since: Option<i64>,
     pub last_heartbeat: Option<i64>,
     pub last_error: Option<String>,
+    /// 协议链路："v2"（WebSocket+Protobuf）或 "v1"（弃用的 gRPC 回退）；未连接时 None。
+    pub protocol: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

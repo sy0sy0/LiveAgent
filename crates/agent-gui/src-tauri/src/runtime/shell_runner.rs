@@ -10,7 +10,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use crate::runtime::platform::{expand_tilde_path, maybe_augment_macos_path, shell_basename};
+use crate::runtime::platform::{
+    expand_tilde_path, maybe_augment_macos_path, shell_basename, strip_windows_verbatim_prefix,
+};
 use crate::runtime::process::{configure_child_process_group, terminate_child_process_tree};
 
 const MAX_STDOUT_BYTES: usize = 400 * 1024; // 400KB
@@ -130,7 +132,9 @@ fn canonicalize_workdir(workdir: &str) -> Result<PathBuf, ShellError> {
         return Err(ShellError::InvalidWorkdir(workdir.to_string()));
     }
 
-    Ok(fs::canonicalize(&p)?)
+    // Strip the Windows `\\?\` verbatim prefix: this path becomes the child
+    // process cwd and the model-visible workdir string.
+    Ok(strip_windows_verbatim_prefix(fs::canonicalize(&p)?))
 }
 
 fn normalize_rel_path_input(input: &str) -> String {
@@ -172,7 +176,9 @@ fn sanitize_rel_path_core(input: &str) -> Result<Option<PathBuf>, ShellError> {
 }
 
 fn ensure_within_workdir_existing(workdir: &Path, target: &Path) -> Result<PathBuf, ShellError> {
-    let canon = fs::canonicalize(target)?;
+    // Both sides are verbatim-stripped so the prefix check compares like
+    // shapes on Windows (workdir came from canonicalize_workdir).
+    let canon = strip_windows_verbatim_prefix(fs::canonicalize(target)?);
     if !canon.starts_with(workdir) {
         return Err(ShellError::OutOfBounds(canon.display().to_string()));
     }
@@ -190,7 +196,7 @@ fn is_absolute_cwd_input(value: &str) -> bool {
 fn resolve_absolute_cwd(value: &str) -> Result<PathBuf, ShellError> {
     let invalid =
         || ShellError::Other(format!("cwd does not exist or is not a directory: {value}"));
-    let canon = fs::canonicalize(value).map_err(|_| invalid())?;
+    let canon = strip_windows_verbatim_prefix(fs::canonicalize(value).map_err(|_| invalid())?);
     let md = fs::metadata(&canon).map_err(|_| invalid())?;
     if !md.is_dir() {
         return Err(invalid());
@@ -504,7 +510,10 @@ where
         for (key, value) in &system_proxy_envs {
             c.env(key, value);
         }
-        c.envs(envs.iter().map(|(key, value)| (key.as_str(), value.as_str())));
+        c.envs(
+            envs.iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        );
         if candidate.augment_macos_path {
             maybe_augment_macos_path(&mut c);
         }

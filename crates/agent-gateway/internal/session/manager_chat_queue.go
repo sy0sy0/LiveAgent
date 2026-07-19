@@ -36,9 +36,7 @@ func (m *Manager) SubscribeChatQueueEvents() (<-chan *gatewayv1.ChatQueueEvent, 
 
 	cleanup := func() {
 		m.syncHub.chatQueueMu.Lock()
-		if _, ok := m.syncHub.chatQueueSubscribers[subID]; ok {
-			delete(m.syncHub.chatQueueSubscribers, subID)
-		}
+		delete(m.syncHub.chatQueueSubscribers, subID)
 		m.syncHub.chatQueueMu.Unlock()
 	}
 

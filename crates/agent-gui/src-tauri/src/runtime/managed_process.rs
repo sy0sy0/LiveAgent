@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::Emitter;
 
 use crate::runtime::managed_process_journal as journal;
-use crate::runtime::platform::expand_tilde_path;
+use crate::runtime::platform::{expand_tilde_path, strip_windows_verbatim_prefix};
 use crate::runtime::process::{
     kill_child_process_tree_best_effort, probe_process_start_time, process_start_time_ms,
     signal_process_tree_by_pid, terminate_child_process_tree, terminate_process_tree_by_pid,
@@ -44,7 +44,10 @@ pub struct ManagedProcessNotifier {
 
 impl ManagedProcessNotifier {
     fn changed(&self, snapshot: &ManagedProcessSnapshot) {
-        if let Err(error) = self.app_handle.emit(MANAGED_PROCESS_CHANGED_EVENT, snapshot) {
+        if let Err(error) = self
+            .app_handle
+            .emit(MANAGED_PROCESS_CHANGED_EVENT, snapshot)
+        {
             eprintln!("emit {MANAGED_PROCESS_CHANGED_EVENT} failed: {error}");
         }
         if let Some(gateway) = self.gateway.upgrade() {
@@ -193,7 +196,11 @@ fn canonicalize_workdir(workdir: &str) -> Result<PathBuf, String> {
     if !metadata.is_dir() {
         return Err(format!("workdir must be a directory: {workdir}"));
     }
-    fs::canonicalize(&path).map_err(|err| format!("Failed to canonicalize workdir: {err}"))
+    // Strip the Windows `\\?\` verbatim prefix: the result becomes the child
+    // process cwd (cmd.exe rejects verbatim paths) and the record's display cwd.
+    fs::canonicalize(&path)
+        .map(strip_windows_verbatim_prefix)
+        .map_err(|err| format!("Failed to canonicalize workdir: {err}"))
 }
 
 fn sanitize_rel_cwd(input: Option<String>, workdir: &Path) -> Result<PathBuf, String> {
@@ -225,7 +232,11 @@ fn sanitize_rel_cwd(input: Option<String>, workdir: &Path) -> Result<PathBuf, St
         }
     }
     let target = workdir.join(out);
-    let canonical = fs::canonicalize(&target).map_err(|_| format!("cwd does not exist: {raw}"))?;
+    // Same verbatim-stripped shape as the workdir so starts_with compares
+    // like forms on Windows.
+    let canonical = strip_windows_verbatim_prefix(
+        fs::canonicalize(&target).map_err(|_| format!("cwd does not exist: {raw}"))?,
+    );
     if !canonical.starts_with(workdir) {
         return Err(format!("cwd is outside workdir: {raw}"));
     }
@@ -597,10 +608,7 @@ impl ManagedProcessRegistry {
                     signal_process_tree_by_pid(entry.pid, true);
                 } else {
                     // Restored entry: no handle, terminate the group by pid.
-                    terminate_process_tree_by_pid(
-                        entry.pid,
-                        Duration::from_millis(STOP_GRACE_MS),
-                    );
+                    terminate_process_tree_by_pid(entry.pid, Duration::from_millis(STOP_GRACE_MS));
                     entry.exit_code = None;
                 }
                 entry.finished_at = Some(now_ms());
@@ -735,10 +743,7 @@ impl ManagedProcessRegistry {
                 RecordProbe::Unknown => {}
                 RecordProbe::AliveMatching if record.isolated => restored.push(record),
                 RecordProbe::AliveMatching => {
-                    terminate_process_tree_by_pid(
-                        record.pid,
-                        Duration::from_millis(STOP_GRACE_MS),
-                    );
+                    terminate_process_tree_by_pid(record.pid, Duration::from_millis(STOP_GRACE_MS));
                     drop_ids.push(record.id);
                 }
                 RecordProbe::Gone => drop_ids.push(record.id),
@@ -1182,9 +1187,7 @@ mod tests {
 
         // Next launch.
         let registry = ManagedProcessRegistry::with_journal_conn(open_conn());
-        registry
-            .startup_reconcile()
-            .expect("reconcile should work");
+        registry.startup_reconcile().expect("reconcile should work");
 
         assert!(
             wait_until(|| !process_alive(plain_pid)),
