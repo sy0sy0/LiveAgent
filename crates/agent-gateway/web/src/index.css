@@ -117,9 +117,20 @@
   font-display: swap;
 }
 
+/*
+ * Route Tailwind's mono theme font through the user-configurable code font.
+ * A hand-written `.font-mono` override only covers bare class usage — variant
+ * forms (`[&_pre>code]:font-mono`), `@apply font-mono`, and preflight's
+ * code/kbd/samp/pre rule all resolve from the built-in `--font-mono` theme
+ * variable, so the override must happen at the theme level.
+ */
+@theme {
+  --font-mono: var(--code-font-family);
+}
+
 @layer utilities {
-  .font-openai-chat {
-    font-family: "OpenAI Sans Semibold", "PingFang SC", "Microsoft YaHei", sans-serif;
+  .font-chat {
+    font-family: var(--chat-font-family);
   }
 
   /*
@@ -135,11 +146,32 @@
     max-width: 100%;
     max-height: 100%;
   }
+
+  /*
+   * Streamdown pan-zoom always attaches `transition-transform duration-150`.
+   * That eases zoom-button / wheel scale changes nicely, but it also eases
+   * every pointermove pan update — large diagrams lag and jitter while
+   * dragging. Keep the idle transition; drop it only for an active drag:
+   * `:active` covers the pointerdown frame before React flips the cursor,
+   * and the grabbing cursor (set on the pan surface) covers the rest of the
+   * gesture, including pointer-captured moves outside the element.
+   */
+  [data-streamdown="mermaid"] [role="application"]:active,
+  [data-streamdown="mermaid"] [style*="cursor: grabbing"] [role="application"],
+  [data-streamdown="mermaid"] [style*="cursor:grabbing"] [role="application"] {
+    transition: none !important;
+    transition-property: none !important;
+  }
 }
 
 @layer base {
   :root {
     color-scheme: light;
+    --app-font-family: ui-sans-serif, system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+    --chat-font-family: "OpenAI Sans Semibold", "PingFang SC", "Microsoft YaHei", sans-serif;
+    --code-font-family:
+      "SF Mono", SFMono-Regular, Menlo, Monaco, "Cascadia Code", Consolas, "Liberation Mono",
+      monospace;
 
     --background: 0 0% 100%;
     --foreground: 222.2 84% 4.9%;
@@ -309,8 +341,16 @@
 
   body {
     @apply bg-background text-foreground;
+    font-family: var(--app-font-family);
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
   }
 
   input,
@@ -358,32 +398,16 @@
     background: hsl(var(--muted-foreground) / 0.35);
   }
 
-  /* Upload file list scrollbar */
+  /* Upload file list: scrollable without a visible scrollbar */
   .upload-file-list {
-    scrollbar-width: thin;
-    scrollbar-color: transparent transparent;
-    transition: scrollbar-color 0.3s;
-  }
-  .upload-file-list:hover {
-    scrollbar-color: hsl(var(--muted-foreground) / 0.25) transparent;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
   }
   .upload-file-list::-webkit-scrollbar {
-    height: 4px;
-  }
-  .upload-file-list::-webkit-scrollbar-track {
-    background: transparent;
-    margin: 0 8px;
-  }
-  .upload-file-list::-webkit-scrollbar-thumb {
-    background: transparent;
-    border-radius: 2px;
-    transition: background 0.3s;
-  }
-  .upload-file-list:hover::-webkit-scrollbar-thumb {
-    background: hsl(var(--muted-foreground) / 0.25);
-  }
-  .upload-file-list:hover::-webkit-scrollbar-thumb:hover {
-    background: hsl(var(--muted-foreground) / 0.4);
+    display: none;
+    width: 0;
+    height: 0;
   }
 
   .tool-text-scroll {
@@ -794,6 +818,23 @@
     animation: settingsSectionTitleIn 0.22s cubic-bezier(0.16, 1, 0.3, 1);
   }
 
+  /* Provider dialog: panel switches (sections are keyed by panel id, so the
+   * class replays on every switch). */
+  .provider-panel-enter {
+    animation: providerPanelIn 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  @keyframes providerPanelIn {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
   .settings-section-shell {
     position: relative;
     isolation: isolate;
@@ -822,6 +863,29 @@
   .ssh-collapsible-inner {
     min-height: 0;
     overflow: hidden;
+  }
+
+  /* SSH port-forward dialog entrance (Base UI drives [data-starting-style]). */
+  .ssh-forward-dialog-backdrop {
+    opacity: 1;
+    transition: opacity 180ms ease;
+  }
+
+  .ssh-forward-dialog-backdrop[data-starting-style] {
+    opacity: 0;
+  }
+
+  .ssh-forward-dialog-popup {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    transition:
+      opacity 180ms ease,
+      transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .ssh-forward-dialog-popup[data-starting-style] {
+    opacity: 0;
+    transform: translateY(12px) scale(0.985);
   }
 
   @keyframes settingsSectionIn {
@@ -872,7 +936,7 @@
     /* Slide from the anchor side; flipped placements override per data-side. */
     --sidebar-menu-slide-x: -6px;
     --sidebar-menu-slide-y: 0px;
-    transform-origin: var(--radix-dropdown-menu-content-transform-origin);
+    transform-origin: var(--transform-origin);
   }
 
   .sidebar-context-menu[data-side="left"] {
@@ -965,6 +1029,7 @@
   @media (prefers-reduced-motion: reduce) {
     .settings-section-enter,
     .settings-section-title-enter,
+    .provider-panel-enter,
     .chat-history-scope-enter {
       animation: none;
     }
@@ -976,17 +1041,27 @@
     }
 
     .ssh-auth-panel,
-    .ssh-collapsible {
+    .ssh-collapsible,
+    .ssh-forward-dialog-backdrop,
+    .ssh-forward-dialog-popup {
       transition-duration: 1ms;
     }
   }
 
-  /* Mention composer placeholder */
+  /* Mention composer placeholder. left/right pin the box to the editor's own
+     padding box, and padding-right inherits its pr-8 (expand-button gutter) so
+     the placeholder wraps exactly like real typed text instead of running
+     under the button — the containing block's padding box already includes
+     that padding, so without this it overlaps regardless of which ancestor
+     is positioned. */
   .mention-composer.is-empty::before {
     content: attr(data-placeholder);
     color: hsl(var(--muted-foreground));
     pointer-events: none;
     position: absolute;
+    left: 0;
+    right: 0;
+    padding-right: inherit;
   }
 
   /* Composer typewriter: freshly typed characters fade in softly.
@@ -1182,61 +1257,46 @@
   /* Branch selector dropdown shares the reasoning-select motion. */
   .composer-branch-dropdown[data-state="open"] {
     animation: composerReasoningDropdownIn 0.18s cubic-bezier(0.16, 1, 0.3, 1);
-    transform-origin: var(--radix-dropdown-menu-content-transform-origin, bottom left);
+    transform-origin: var(--transform-origin, bottom left);
   }
 
   .composer-branch-dropdown[data-state="closed"] {
     animation: composerReasoningDropdownOut 0.12s cubic-bezier(0.4, 0, 1, 1) forwards;
-    transform-origin: var(--radix-dropdown-menu-content-transform-origin, bottom left);
+    transform-origin: var(--transform-origin, bottom left);
   }
 
   /* Chat header model selector: grow out of the trigger with a soft slide.
-   * Radix keeps the popup mounted while the data-state="closed" animation
-   * plays, so exit stays keyframe-driven; `forwards` holds the final frame
-   * until unmount. */
+   * Base UI drives the popup lifecycle, so enter/exit are keyed off
+   * data-starting-style / data-ending-style and the transition delays
+   * unmount. */
   .model-selector-dropdown {
     /* Slide from the anchor side; flipped placement overrides per data-side. */
     --model-menu-slide-y: -6px;
-    transform-origin: var(--radix-dropdown-menu-content-transform-origin, top left);
+    transform-origin: var(--transform-origin);
+    transition:
+      opacity 0.18s cubic-bezier(0.16, 1, 0.3, 1),
+      transform 0.18s cubic-bezier(0.16, 1, 0.3, 1);
   }
 
   .model-selector-dropdown[data-side="top"] {
     --model-menu-slide-y: 6px;
   }
 
-  .model-selector-dropdown[data-state="open"] {
-    animation: modelSelectorDropdownIn 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+  .model-selector-dropdown[data-starting-style],
+  .model-selector-dropdown[data-ending-style] {
+    opacity: 0;
+    transform: translateY(var(--model-menu-slide-y)) scale(0.96);
   }
 
-  .model-selector-dropdown[data-state="closed"] {
-    animation: modelSelectorDropdownOut 0.12s cubic-bezier(0.4, 0, 1, 1) forwards;
-  }
-
-  @keyframes modelSelectorDropdownIn {
-    from {
-      opacity: 0;
-      transform: translateY(var(--model-menu-slide-y)) scale(0.96);
-    }
-    to {
-      opacity: 1;
-      transform: translateY(0) scale(1);
-    }
-  }
-
-  @keyframes modelSelectorDropdownOut {
-    from {
-      opacity: 1;
-      transform: translateY(0) scale(1);
-    }
-    to {
-      opacity: 0;
-      transform: translateY(calc(var(--model-menu-slide-y) / 2)) scale(0.98);
-    }
+  .model-selector-dropdown[data-ending-style] {
+    transition-duration: 0.12s;
+    transition-timing-function: cubic-bezier(0.4, 0, 1, 1);
+    transform: translateY(calc(var(--model-menu-slide-y) / 2)) scale(0.98);
   }
 
   /* `backwards` (not `both`): a filled forwards animation would keep holding
    * transform after it ends and suppress the item highlight translate. */
-  .model-selector-dropdown[data-state="open"] .model-selector-item {
+  .model-selector-dropdown[data-open] .model-selector-item {
     animation: modelSelectorItemIn 0.18s cubic-bezier(0.16, 1, 0.3, 1) backwards;
   }
 
@@ -1263,6 +1323,7 @@
 
     .composer-reasoning-trigger,
     .composer-reasoning-trigger > svg:last-child,
+    .model-selector-dropdown,
     .model-selector-trigger,
     .model-selector-trigger svg {
       transition: none !important;
@@ -1347,10 +1408,60 @@
     animation: toolExpandIn 0.22s cubic-bezier(0.16, 1, 0.3, 1);
   }
 
+  /* AskUserQuestion 切题：按方向轻微滑入（forward 从右、backward 从左） */
+  @keyframes askQuestionSlideForward {
+    from {
+      opacity: 0;
+      transform: translateX(10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+
+  @keyframes askQuestionSlideBackward {
+    from {
+      opacity: 0;
+      transform: translateX(-10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+
+  .ask-question-enter-forward {
+    animation: askQuestionSlideForward 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .ask-question-enter-backward {
+    animation: askQuestionSlideBackward 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  /* “其他（自行输入）”展开输入框：轻微下滑+淡入，呼应磨砂玻璃质感。 */
+  @keyframes askCustomInputReveal {
+    from {
+      opacity: 0;
+      transform: translateY(-3px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .ask-custom-input-enter {
+    animation: askCustomInputReveal 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
   /* Respect reduced motion */
   @media (prefers-reduced-motion: reduce) {
     .tool-expand,
-    .lazy-collapse-reveal {
+    .lazy-collapse-reveal,
+    .ask-question-enter-forward,
+    .ask-question-enter-backward,
+    .ask-custom-input-enter {
       animation: none !important;
     }
   }
@@ -1970,6 +2081,18 @@ body > div:has([data-streamdown="table-fullscreen"]):not(#root) {
 body > div:not(#root) [data-streamdown="mermaid"] svg {
   -webkit-transform: translateZ(0);
   transform: translateZ(0);
+}
+/*
+ * The SVG translateZ above promotes a second compositor layer under the pan
+ * transform. Fine while idle, but during drag WebKit thrash-composites the
+ * nested layers on large diagrams. Drop the SVG's own transform for the
+ * gesture; the portal layer above still keeps the fullscreen paint fix.
+ */
+body > div:not(#root) [data-streamdown="mermaid"]:has([role="application"]:active) svg,
+body > div:not(#root) [data-streamdown="mermaid"]:has([style*="cursor: grabbing"]) svg,
+body > div:not(#root) [data-streamdown="mermaid"]:has([style*="cursor:grabbing"]) svg {
+  -webkit-transform: none;
+  transform: none;
 }
 
 /* Git review diff views live under app chrome that disables selection by default. */

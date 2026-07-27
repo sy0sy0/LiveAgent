@@ -20,6 +20,7 @@ import {
 } from "../../components/icons";
 
 import { Button } from "../../components/ui/button";
+import { useConfirmDialog } from "../../components/ui/confirm-dialog";
 import { Input } from "../../components/ui/input";
 import { Label } from "../../components/ui/label";
 import { Textarea } from "../../components/ui/textarea";
@@ -38,7 +39,8 @@ import {
   type SshScanResult,
   scanSshImportCandidates,
 } from "../../lib/ssh/scan";
-import { ConfirmActionPopover, ConfirmDeletePopover, PromptTag } from "./shared";
+import type { TerminalSession } from "../../lib/terminal/types";
+import { ConfirmActionPopover, PromptTag } from "./shared";
 import type { SettingsSectionProps } from "./types";
 
 type SshViewMode = "list" | "grid";
@@ -52,6 +54,71 @@ type SshKnownHostResetStatus = {
 type SshKnownHostResetResponse = {
   deleted: number;
 };
+
+type RawTerminalListResponse = {
+  sessions?: TerminalSession[];
+};
+
+type SshReconnectTarget = {
+  id: string;
+  projectPathKey: string;
+};
+
+/** Non-empty secret input replaces the stored secret; empty input keeps it. */
+function sshSecretInputChanged(draftValue: string, storedValue: string) {
+  const next = draftValue.trim();
+  if (!next) return false;
+  return next !== storedValue.trim();
+}
+
+/**
+ * Whether the edited draft changes anything an established connection depends
+ * on. Cosmetic fields (name, description, sort order, `*Configured` flags)
+ * never count.
+ */
+export function sshHostConnectionFieldsChanged(
+  before: SshHostConfig,
+  draft: Omit<SshHostConfig, "id">,
+): boolean {
+  if (
+    before.host.trim() !== draft.host.trim() ||
+    before.port !== draft.port ||
+    before.username.trim() !== draft.username.trim() ||
+    before.authType !== draft.authType
+  ) {
+    return true;
+  }
+  if (
+    before.proxy.type !== draft.proxy.type ||
+    before.proxy.url.trim() !== draft.proxy.url.trim() ||
+    before.proxy.port !== draft.proxy.port ||
+    before.proxy.username.trim() !== draft.proxy.username.trim() ||
+    sshSecretInputChanged(draft.proxy.password, before.proxy.password)
+  ) {
+    return true;
+  }
+  if (draft.authType === "password") {
+    return sshSecretInputChanged(draft.password, before.password);
+  }
+  if (draft.authType === "privateKey") {
+    return (
+      sshSecretInputChanged(draft.privateKey, before.privateKey) ||
+      draft.privateKeyPath.trim() !== before.privateKeyPath.trim() ||
+      sshSecretInputChanged(draft.privateKeyPassphrase, before.privateKeyPassphrase)
+    );
+  }
+  return false;
+}
+
+async function listActiveSshSessions(hostId: string): Promise<TerminalSession[]> {
+  const response = await invoke<RawTerminalListResponse>("terminal_list", {});
+  return (response.sessions ?? []).filter(
+    (session) =>
+      session.kind === "ssh" &&
+      session.ssh?.hostId === hostId &&
+      session.ssh.status !== "disconnected",
+  );
+}
 
 function normalizePortInput(value: string) {
   const port = Number(value);
@@ -825,19 +892,15 @@ function SshHostCard(props: {
       >
         <Pencil className="h-3.5 w-3.5" />
       </Button>
-      <ConfirmDeletePopover name={host.name} onConfirm={onDelete}>
-        {(open) => (
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-7 w-7 text-muted-foreground hover:text-destructive"
-            onClick={open}
-            title={t("settings.delete")}
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-          </Button>
-        )}
-      </ConfirmDeletePopover>
+      <Button
+        variant="ghost"
+        size="icon"
+        className="h-7 w-7 text-muted-foreground hover:text-destructive"
+        onClick={onDelete}
+        title={t("settings.delete")}
+      >
+        <Trash2 className="h-3.5 w-3.5" />
+      </Button>
     </div>
   );
 
@@ -957,7 +1020,7 @@ function SshViewModeToggle(props: { value: SshViewMode; onChange: (value: SshVie
 }
 
 export function SshSection(props: SettingsSectionProps) {
-  const { settings, setSettings } = props;
+  const { settings, setSettings, saveState } = props;
   const { t } = useLocale();
   const [viewMode, setViewMode] = useState<SshViewMode>("list");
   const [modalOpen, setModalOpen] = useState(false);
@@ -968,6 +1031,9 @@ export function SshSection(props: SettingsSectionProps) {
     null,
   );
   const knownHostResetTimerRef = useRef<number | null>(null);
+  const { confirm: requestSshConfirm, dialog: sshConfirmDialog } = useConfirmDialog();
+  const saveStatusRef = useRef(saveState?.status ?? "idle");
+  saveStatusRef.current = saveState?.status ?? "idle";
   const hosts = settings.ssh.hosts;
 
   useEffect(() => {
@@ -978,7 +1044,7 @@ export function SshSection(props: SettingsSectionProps) {
     };
   }, []);
 
-  function showKnownHostResetStatus(status: SshKnownHostResetStatus) {
+  function showKnownHostResetStatus(status: SshKnownHostResetStatus, durationMs = 5000) {
     if (knownHostResetTimerRef.current !== null) {
       window.clearTimeout(knownHostResetTimerRef.current);
     }
@@ -986,7 +1052,133 @@ export function SshSection(props: SettingsSectionProps) {
     knownHostResetTimerRef.current = window.setTimeout(() => {
       setKnownHostResetStatus((current) => (current?.hostId === status.hostId ? null : current));
       knownHostResetTimerRef.current = null;
-    }, 5000);
+    }, durationMs);
+  }
+
+  // The settings save pipeline is asynchronous on both ends (Tauri patch
+  // command / gateway SettingsUpdate round-trip). Reconnects re-read the host
+  // config from the store, so they must not start before the save landed.
+  async function waitForSettingsSaved(timeoutMs = 15000): Promise<"saved" | "error" | "timeout"> {
+    const startedAt = Date.now();
+    for (;;) {
+      const status = saveStatusRef.current;
+      if (status === "saved" || status === "idle") return "saved";
+      if (status === "error") return "error";
+      if (Date.now() - startedAt >= timeoutMs) return "timeout";
+      await new Promise((resolve) => window.setTimeout(resolve, 150));
+    }
+  }
+
+  async function runSshReconnectBatch(hostId: string, targets: SshReconnectTarget[]) {
+    let reconnected = 0;
+    let kbiFailures = 0;
+    let hostKeyFailures = 0;
+    const otherFailures: string[] = [];
+    for (const target of targets) {
+      try {
+        await invoke("terminal_ssh_reconnect", {
+          session_id: target.id,
+          project_path_key: target.projectPathKey,
+        });
+        reconnected += 1;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.includes("already in progress")) {
+          // An automatic reconnect is running; every attempt re-reads the
+          // saved settings, so the update still lands.
+          reconnected += 1;
+        } else if (message.includes("keyboard-interactive")) {
+          kbiFailures += 1;
+        } else if (message.includes("host key")) {
+          hostKeyFailures += 1;
+        } else {
+          otherFailures.push(message);
+        }
+      }
+    }
+    if (reconnected === targets.length) {
+      showKnownHostResetStatus(
+        {
+          hostId,
+          kind: "success",
+          message: t("settings.sshReconnectResultSuccess").replace("{count}", String(reconnected)),
+        },
+        8000,
+      );
+      return;
+    }
+    const details: string[] = [];
+    if (kbiFailures > 0) {
+      details.push(t("settings.sshReconnectResultKbi").replace("{count}", String(kbiFailures)));
+    }
+    if (hostKeyFailures > 0) {
+      details.push(
+        t("settings.sshReconnectResultHostKey").replace("{count}", String(hostKeyFailures)),
+      );
+    }
+    if (otherFailures.length > 0) {
+      details.push(otherFailures[0]);
+    }
+    const summary = t("settings.sshReconnectResultPartial")
+      .replace("{reconnected}", String(reconnected))
+      .replace("{total}", String(targets.length));
+    showKnownHostResetStatus(
+      {
+        hostId,
+        kind: "error",
+        message: [summary, ...details].join(" "),
+      },
+      10000,
+    );
+  }
+
+  async function promptSshReconnectAfterSave(host: SshHostConfig, nextAuthType: SshAuthType) {
+    let sessions: TerminalSession[];
+    try {
+      sessions = await listActiveSshSessions(host.id);
+    } catch {
+      // Session listing unavailable (e.g. web terminal disabled) — the update
+      // still applies on the next connect, so stay silent.
+      return;
+    }
+    if (sessions.length === 0) return;
+    const count = String(sessions.length);
+    if (nextAuthType === "keyboardInteractive") {
+      await requestSshConfirm({
+        title: t("settings.sshReconnectKbiTitle"),
+        subtitle: host.name,
+        description: t("settings.sshReconnectKbiNotice").replace("{count}", count),
+        confirmLabel: t("settings.sshReconnectKbiGotIt"),
+        cancelLabel: t("settings.cancel"),
+        closeLabel: t("settings.sshReconnectKbiGotIt"),
+        tone: "warning",
+        hideCancel: true,
+      });
+      return;
+    }
+    const proceed = await requestSshConfirm({
+      title: t("settings.sshReconnectPromptTitle"),
+      subtitle: host.name,
+      description: t("settings.sshReconnectPromptDesc").replace("{count}", count),
+      detail: t("settings.sshReconnectPromptDetail"),
+      confirmLabel: t("settings.sshReconnectPromptConfirm").replace("{count}", count),
+      cancelLabel: t("settings.sshReconnectPromptKeep"),
+      tone: "warning",
+    });
+    if (!proceed) return;
+    const saveOutcome = await waitForSettingsSaved();
+    if (saveOutcome !== "saved") {
+      showKnownHostResetStatus({
+        hostId: host.id,
+        kind: "error",
+        message: t("settings.sshReconnectSaveFailed"),
+      });
+      return;
+    }
+    await runSshReconnectBatch(
+      host.id,
+      sessions.map((session) => ({ id: session.id, projectPathKey: session.projectPathKey })),
+    );
   }
 
   function openAdd() {
@@ -1005,6 +1197,10 @@ export function SshSection(props: SettingsSectionProps) {
   }
 
   function handleSave(data: SshHostDraft) {
+    const target = editingHost;
+    if (target && sshHostConnectionFieldsChanged(target, data)) {
+      void promptSshReconnectAfterSave(target, data.authType);
+    }
     setSettings((prev) => {
       if (editingHost) {
         return updateSsh(prev, {
@@ -1076,6 +1272,40 @@ export function SshSection(props: SettingsSectionProps) {
         id,
       ),
     );
+  }
+
+  async function handleDeleteRequest(host: SshHostConfig) {
+    let sessions: TerminalSession[] = [];
+    try {
+      sessions = await listActiveSshSessions(host.id);
+    } catch {
+      sessions = [];
+    }
+    const proceed = await requestSshConfirm({
+      title: t("settings.deleteConfirm"),
+      subtitle: host.name,
+      description:
+        sessions.length > 0
+          ? t("settings.sshDeleteActiveWarning").replace("{count}", String(sessions.length))
+          : t("settings.deleteConfirmDesc"),
+      confirmLabel: t("settings.delete"),
+      cancelLabel: t("settings.cancel"),
+      tone: "destructive",
+    });
+    if (!proceed) return;
+    // Close before deleting so the sessions never outlive their host config;
+    // best-effort — a session that already ended is fine to ignore.
+    for (const session of sessions) {
+      try {
+        await invoke("terminal_close", {
+          session_id: session.id,
+          project_path_key: session.projectPathKey,
+        });
+      } catch {
+        // ignore
+      }
+    }
+    handleDelete(host.id);
   }
 
   async function handleResetKnownHost(host: SshHostConfig) {
@@ -1214,7 +1444,7 @@ export function SshSection(props: SettingsSectionProps) {
                 }
                 resettingKnownHost={knownHostResettingId === host.id}
                 onEdit={() => openEdit(host)}
-                onDelete={() => handleDelete(host.id)}
+                onDelete={() => void handleDeleteRequest(host)}
                 onResetKnownHost={() => void handleResetKnownHost(host)}
               />
             ))}
@@ -1236,6 +1466,7 @@ export function SshSection(props: SettingsSectionProps) {
           onClose={() => setImportOpen(false)}
         />
       ) : null}
+      {sshConfirmDialog}
     </>
   );
 }

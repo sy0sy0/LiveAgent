@@ -1,8 +1,8 @@
 // Per-conversation extraction controller: the single owner of extraction
 // lifecycle state. Fixes three defects of the old pipeline:
 //  - throttle TOCTOU: gating + claim happen synchronously before any await;
-//  - abort races: each run owns its AbortController, detached from the chat
-//    request signal — a new user turn never kills an in-flight extraction;
+//  - abort races: each run owns its AbortController and links the originating
+//    chat userStop signal without sharing request-scoped controller churn;
 //  - state leaks: dispose() clears a conversation's state on deletion, and an
 //    LRU cap bounds the map.
 // Concurrency model is coalesce-skip: at most one run per conversation; while
@@ -33,7 +33,7 @@ export function __setMemoryExtractionEngineForTests(next: EngineFn | null) {
 
 export type MemoryExtractionRequest = Omit<
   MemoryExtractionEngineParams,
-  "signal" | "alreadyWrittenSlugs" | "confirmationDeferralOnly"
+  "alreadyWrittenSlugs" | "confirmationDeferralOnly"
 >;
 
 type ConversationExtractionState = {
@@ -132,6 +132,13 @@ async function process(
   state.lastExtractedUserKey = currentUserKey;
   const abort = new AbortController();
   state.abort = abort;
+  const parentSignal = request.signal;
+  const abortFromParent = () => abort.abort();
+  if (parentSignal?.aborted) {
+    abort.abort();
+  } else {
+    parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+  }
 
   try {
     const result = await engine({
@@ -147,6 +154,7 @@ async function process(
     state.abort = undefined;
     const queued = state.queued;
     state.queued = undefined;
+    parentSignal?.removeEventListener("abort", abortFromParent);
     if (queued && !abort.signal.aborted) {
       void process(conversationId, queued, true);
     }
@@ -163,8 +171,8 @@ export const memoryExtraction = {
     return process(key, request);
   },
 
-  /** New user turn: reset per-turn dedup state. Does NOT abort in-flight
-   *  extraction — it belongs to the previous turn and may finish its writes. */
+  /** New user turn: reset per-turn dedup state. The originating turn's
+   *  userStop signal owns cancellation of any in-flight extraction. */
   noteTurnBoundary(conversationId: string) {
     const state = states.get(conversationId.trim());
     if (!state) return;

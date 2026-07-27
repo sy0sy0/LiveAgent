@@ -61,6 +61,14 @@ test("buildProviderModelsUrl defaults to /v1/models and falls back to official e
       "https://generativelanguage.googleapis.com/v1beta",
       "default",
     ),
+    "https://generativelanguage.googleapis.com/v1/models",
+  );
+  assert.equal(
+    providerUtils.buildProviderModelsUrl(
+      "gemini",
+      "https://generativelanguage.googleapis.com/v1beta",
+      "official",
+    ),
     "https://generativelanguage.googleapis.com/v1beta/models",
   );
   assert.equal(
@@ -77,43 +85,55 @@ test("buildProviderModelsUrl defaults to /v1/models and falls back to official e
   );
 });
 
-test("buildProviderModelsAttempts orders default before official with provider headers", () => {
-  const gemini = providerUtils.buildProviderModelsAttempts(
-    "gemini",
-    "https://relay.example.com",
-    "test-key",
-  );
-  assert.equal(gemini.length, 2);
-  assert.deepEqual(
-    gemini.map((attempt) => attempt.kind),
-    ["default", "official"],
-  );
-  assert.equal(gemini[0].headers.Authorization, "Bearer test-key");
-  assert.equal(gemini[0].headers["x-goog-api-key"], "test-key");
-  assert.equal(gemini[1].headers.Authorization, undefined);
-  assert.equal(gemini[1].headers["x-goog-api-key"], "test-key");
+test("buildProviderModelsAttempts uses Authorization first and official auth second", () => {
+  const attemptsByProvider = ["claude_code", "codex", "gemini", "xai"].map((type) => [
+    type,
+    providerUtils.buildProviderModelsAttempts(type, "test-key"),
+  ]);
 
-  const claude = providerUtils.buildProviderModelsAttempts(
-    "claude_code",
-    "https://relay.example.com",
-    "test-key",
-  );
-  assert.equal(claude.length, 2);
-  assert.equal(claude[0].headers.Authorization, "Bearer test-key");
-  assert.equal(claude[0].headers["anthropic-version"], "2023-06-01");
-  assert.equal(claude[1].headers.Authorization, undefined);
-  assert.equal(claude[1].headers["x-api-key"], "test-key");
-  assert.equal(claude[1].headers["anthropic-version"], "2023-06-01");
+  for (const [type, attempts] of attemptsByProvider) {
+    assert.equal(attempts[0].kind, "default", type);
+    assert.equal(attempts[0].headers.Authorization, "Bearer test-key");
+    assert.equal(attempts[0].headers["x-api-key"], undefined);
+    assert.equal(attempts[0].headers["x-goog-api-key"], undefined);
+  }
 
-  const codex = providerUtils.buildProviderModelsAttempts(
-    "codex",
-    "https://relay.example.com",
-    "test-key",
-  );
-  assert.equal(codex.length, 2);
-  assert.equal(codex[0].headers["x-api-key"], "test-key");
-  assert.equal(codex[1].headers["x-api-key"], undefined);
-  assert.equal(codex[1].headers.Authorization, "Bearer test-key");
+  // codex/xai 官方形式与首次尝试一致，收敛为一次；claude_code/gemini 带官方鉴权头重试。
+  const attemptsFor = Object.fromEntries(attemptsByProvider);
+  for (const type of ["codex", "xai"]) {
+    assert.deepEqual(
+      attemptsFor[type].map((attempt) => attempt.kind),
+      ["default"],
+      type,
+    );
+  }
+  for (const type of ["claude_code", "gemini"]) {
+    assert.deepEqual(
+      attemptsFor[type].map((attempt) => attempt.kind),
+      ["default", "official"],
+      type,
+    );
+    assert.equal(attemptsFor[type][1].headers.Authorization, undefined);
+  }
+  assert.equal(attemptsFor.claude_code[1].headers["x-api-key"], "test-key");
+  assert.equal(attemptsFor.claude_code[1].headers["anthropic-version"], "2023-06-01");
+  assert.equal(attemptsFor.gemini[1].headers["x-goog-api-key"], "test-key");
+
+  const inferenceOnlyHeaders = [
+    "x-app",
+    "user-agent",
+    "anthropic-beta",
+    "anthropic-dangerous-direct-browser-access",
+    "session_id",
+    "conversation_id",
+  ];
+  for (const [, attempts] of attemptsByProvider) {
+    for (const attempt of attempts) {
+      const headerNames = Object.keys(attempt.headers).map((name) => name.toLowerCase());
+      assert.ok(!headerNames.some((name) => name.startsWith("x-stainless-")));
+      for (const name of inferenceOnlyHeaders) assert.ok(!headerNames.includes(name), name);
+    }
+  }
 });
 
 test("provider model fetch identity changes when system proxy routing changes", () => {
@@ -167,12 +187,16 @@ test("fetchModelsFromApi falls back to the official gemini endpoint on 404", asy
     async (calls) => {
       const models = await providerUtils.fetchModelsFromApi(
         "gemini",
-        "https://relay.example.com",
+        "https://generativelanguage.googleapis.com/v1beta",
         "test-key",
       );
       assert.equal(calls.length, 2);
       assert.ok(calls[0].url.endsWith("/proxy/gemini/v1/models"));
       assert.ok(calls[1].url.endsWith("/proxy/gemini/v1beta/models"));
+      assert.equal(calls[0].options.headers.Authorization, "Bearer test-key");
+      assert.equal(calls[0].options.headers["x-goog-api-key"], undefined);
+      assert.equal(calls[1].options.headers.Authorization, undefined);
+      assert.equal(calls[1].options.headers["x-goog-api-key"], "test-key");
       assert.deepEqual(
         models.map((model) => model.id),
         ["gemini-2.5-pro"],
@@ -237,11 +261,11 @@ test("fetchModelsFromApi surfaces the informative failure when every attempt fai
   );
 });
 
-test("fetchModelsFromApi retries claude_code with official anthropic headers", async () => {
+test("fetchModelsFromApi retries claude_code with official anthropic auth", async () => {
   await withFetchStub(
     (_url, callIndex) =>
       callIndex === 1
-        ? jsonResponse(401, { error: "authorization header rejected" })
+        ? jsonResponse(401, { error: "authorization rejected" })
         : jsonResponse(200, { data: [{ id: "claude-opus-4-8" }] }),
     async (calls) => {
       const models = await providerUtils.fetchModelsFromApi(
@@ -251,12 +275,55 @@ test("fetchModelsFromApi retries claude_code with official anthropic headers", a
       );
       assert.equal(calls.length, 2);
       assert.equal(calls[0].options.headers.Authorization, "Bearer test-key");
+      assert.equal(calls[0].options.headers["x-api-key"], undefined);
       assert.equal(calls[1].options.headers.Authorization, undefined);
       assert.equal(calls[1].options.headers["x-api-key"], "test-key");
       assert.deepEqual(
         models.map((model) => model.id),
         ["claude-opus-4-8"],
       );
+    },
+  );
+});
+
+test("fetchModelsFromApi requests OpenAI-compatible providers exactly once", async () => {
+  for (const type of ["codex", "xai"]) {
+    await withFetchStub(
+      () => jsonResponse(503, { error: "temporary failure" }),
+      async (calls) => {
+        // 官方形式与首次尝试完全一致，失败后不得原样重发同一请求。
+        await assert.rejects(
+          providerUtils.fetchModelsFromApi(type, `https://${type}.example.com/v1`, "test-key"),
+          /temporary failure/,
+        );
+        assert.equal(calls.length, 1);
+        assert.ok(calls[0].url.endsWith(`/proxy/${type}/v1/models`));
+        assert.equal(calls[0].options.headers.Authorization, "Bearer test-key");
+      },
+    );
+  }
+});
+
+test("fetchModelsFromApi canonicalizes a known 1M Claude model before display", async () => {
+  await withFetchStub(
+    () =>
+      jsonResponse(200, {
+        data: [
+          {
+            id: "claude-opus-4-6",
+            contextWindow: 999_999,
+            maxOutputToken: 128_000,
+          },
+        ],
+      }),
+    async () => {
+      const [model] = await providerUtils.fetchModelsFromApi(
+        "claude_code",
+        "https://relay.example.com",
+        "test-key",
+      );
+      assert.equal(model.contextWindow, 1_000_000);
+      assert.equal(providerUtils.formatTokenCount(model.contextWindow), "1M");
     },
   );
 });
@@ -298,4 +365,101 @@ test("gateway WebUI forwards the system proxy choice to desktop model fetching",
     if (previousWindow === undefined) delete globalThis.window;
     else globalThis.window = previousWindow;
   }
+});
+test("formatTokenCount uses M units without changing K units", () => {
+  assert.equal(providerUtils.formatTokenCount(999), "999");
+  assert.equal(providerUtils.formatTokenCount(1_000), "1K");
+  assert.equal(providerUtils.formatTokenCount(200_000), "200K");
+  assert.equal(providerUtils.formatTokenCount(999_999), "1000K");
+  assert.equal(providerUtils.formatTokenCount(1_000_000), "1M");
+  assert.equal(providerUtils.formatTokenCount(1_500_000), "1.5M");
+  assert.equal(providerUtils.formatTokenCount(2_000_000), "2M");
+  const opus = providerUtils.createDraftModelConfig("claude_code", "claude-opus-4-6");
+  const haiku = providerUtils.createDraftModelConfig("claude_code", "claude-haiku-4-5");
+  assert.equal(providerUtils.formatTokenCount(opus.contextWindow), "1M");
+  assert.equal(providerUtils.formatTokenCount(haiku.contextWindow), "200K");
+});
+
+test("normalizeFetchedModels preserves owned_by metadata and old entries remain compatible", () => {
+  const [legacyModel] = providerUtils.normalizeFetchedModels([{ id: "relay-model" }], "codex");
+  assert.equal(legacyModel.id, "relay-model");
+  assert.equal(legacyModel.ownedBy, undefined);
+
+  const [ownedModel] = providerUtils.normalizeFetchedModels(
+    [{ id: "relay-model", ownedBy: " ", owned_by: " Anthropic " }],
+    "codex",
+  );
+  assert.equal(ownedModel.id, "relay-model");
+  assert.equal(ownedModel.ownedBy, "Anthropic");
+});
+
+test("mergeFetchedModels enriches existing settings with fetched owner metadata", () => {
+  assert.deepEqual(
+    providerUtils.mergeFetchedModels(
+      [
+        {
+          id: "relay-model",
+          contextWindow: 128_000,
+          maxOutputToken: 16_384,
+          ownedBy: "anthropic",
+        },
+      ],
+      [
+        {
+          id: "relay-model",
+          contextWindow: 777_000,
+          maxOutputToken: 9_999,
+        },
+      ],
+    ),
+    [
+      {
+        id: "relay-model",
+        contextWindow: 777_000,
+        maxOutputToken: 9_999,
+        ownedBy: "anthropic",
+      },
+    ],
+  );
+});
+
+test("mergeFetchedModels immediately normalizes a stale 1000K context to 1M", () => {
+  const [model] = providerUtils.mergeFetchedModels(
+    [
+      {
+        id: "claude-opus-4-6",
+        contextWindow: 1_000_000,
+        maxOutputToken: 128_000,
+      },
+    ],
+    [
+      {
+        id: "claude-opus-4-6",
+        contextWindow: 999_999,
+        maxOutputToken: 64_000,
+      },
+    ],
+  );
+  assert.equal(model.contextWindow, 1_000_000);
+  assert.equal(model.maxOutputToken, 64_000);
+  assert.equal(providerUtils.formatTokenCount(model.contextWindow), "1M");
+});
+
+test("model bulk helpers count and apply only selected active states", () => {
+  const activeModels = new Set(["enabled-model", "untouched-model"]);
+  const selectedModels = new Set(["enabled-model", "disabled-model"]);
+
+  assert.deepEqual(providerUtils.getModelBulkActionCounts(selectedModels, activeModels), {
+    enableCount: 1,
+    disableCount: 1,
+  });
+  assert.deepEqual(
+    [...providerUtils.applyModelBulkActiveState(activeModels, selectedModels, true)].sort(),
+    ["disabled-model", "enabled-model", "untouched-model"],
+  );
+  assert.deepEqual(
+    [...providerUtils.applyModelBulkActiveState(activeModels, selectedModels, false)].sort(),
+    ["untouched-model"],
+  );
+  assert.deepEqual([...activeModels].sort(), ["enabled-model", "untouched-model"]);
 });

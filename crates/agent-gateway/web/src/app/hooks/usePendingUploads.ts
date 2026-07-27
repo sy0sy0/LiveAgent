@@ -1,6 +1,7 @@
 import { type DragEvent, type RefObject, useCallback, useEffect, useRef, useState } from "react";
 
 import type { MentionComposerHandle } from "@/components/chat/MentionComposer";
+import type { NotifyItem } from "@/components/chat/NotifyToast";
 import { t as translate } from "@/i18n";
 import type { PendingUploadedFile } from "@/lib/chat/uploadedFiles";
 import { mergePendingUploadedFiles } from "@/lib/chat/uploadedFiles";
@@ -20,6 +21,7 @@ import { formatTranslation } from "../historyUtils";
 
 type UsePendingUploadsParams = {
   token: string;
+  resolveAgentID: () => Promise<string>;
   historyShareToken: string | null;
   settingsSyncReady: boolean;
   settingsOpen: boolean;
@@ -30,12 +32,15 @@ type UsePendingUploadsParams = {
   selectedHistoryId: string;
   displayedConversationWorkdirRef: RefObject<string>;
   composerRef: RefObject<MentionComposerHandle | null>;
-  setChatError: (message: string | null) => void;
+  // Upload feedback goes to the top-right toast stack, never into the
+  // transcript area — a failed upload is not conversation output.
+  addNotify: (type: NotifyItem["type"], message: string) => void;
 };
 
 export function usePendingUploads(params: UsePendingUploadsParams) {
   const {
     token,
+    resolveAgentID,
     historyShareToken,
     settingsSyncReady,
     settingsOpen,
@@ -46,7 +51,7 @@ export function usePendingUploads(params: UsePendingUploadsParams) {
     selectedHistoryId,
     displayedConversationWorkdirRef,
     composerRef,
-    setChatError,
+    addNotify,
   } = params;
 
   const [pendingUploadedFiles, setPendingUploadedFiles] = useState<PendingUploadedFile[]>([]);
@@ -162,21 +167,21 @@ export function usePendingUploads(params: UsePendingUploadsParams) {
         return;
       }
       if (isUploadingFilesRef.current) {
-        setChatError(translate("chat.upload.uploading", locale));
+        addNotify("warning", translate("chat.upload.uploading", locale));
         return;
       }
       if (executionMode === "text") {
-        setChatError(translate("chat.upload.onlyInTools", locale));
+        addNotify("warning", translate("chat.upload.onlyInTools", locale));
         return;
       }
       const workdir = displayedConversationWorkdirRef.current.trim();
       if (!workdir) {
-        setChatError(translate("chat.upload.requireWorkdir", locale));
+        addNotify("warning", translate("chat.upload.requireWorkdir", locale));
         return;
       }
       const targetConversationId = displayedConversationIdRef.current;
       if (!targetConversationId) {
-        setChatError("请先选择或创建会话后再上传文件。");
+        addNotify("warning", "请先选择或创建会话后再上传文件。");
         return;
       }
 
@@ -184,7 +189,8 @@ export function usePendingUploads(params: UsePendingUploadsParams) {
       setPendingUploadsForConversation(targetConversationId, currentUploads);
       const remainingFileSlots = Math.max(0, MAX_UPLOAD_FILES - currentUploads.length);
       if (remainingFileSlots === 0) {
-        setChatError(
+        addNotify(
+          "warning",
           formatTranslation(translate("chat.upload.maxFilesIgnored", locale), {
             max: MAX_UPLOAD_FILES,
             count: filesToImport.length,
@@ -195,21 +201,20 @@ export function usePendingUploads(params: UsePendingUploadsParams) {
 
       const importBatch = filesToImport.slice(0, remainingFileSlots);
       const ignoredForLimit = filesToImport.length - importBatch.length;
-      setChatError(null);
       setUploadingFiles(true);
       try {
-        const result = await importReadableFiles(token, workdir, importBatch);
+        const agentID = await resolveAgentID();
+        const result = await importReadableFiles(token, agentID, workdir, importBatch);
         // An import that settles after its upload context was invalidated
-        // must not resurrect cleared attachments: the files landed under the
-        // old workdir, so their relative paths are stale there.
+        // must not resurrect cleared attachments: files picked inside the
+        // old workspace are not readable from the new one.
         if (
+          (await resolveAgentID()) !== agentID ||
           executionModeRef.current === "text" ||
           (isDisplayedConversation(targetConversationId) &&
             displayedConversationWorkdirRef.current.trim() !== workdir)
         ) {
-          if (isDisplayedConversation(targetConversationId)) {
-            setChatError("上传目标已失效，已忽略本次导入的文件。");
-          }
+          addNotify("warning", "上传目标已失效，已忽略本次导入的文件");
           return;
         }
         registerLocalUploadedImagePreviews({
@@ -227,39 +232,35 @@ export function usePendingUploads(params: UsePendingUploadsParams) {
           }
         }
 
-        const warnings: string[] = [];
         if (result.files.length === 0 && result.skipped.length > 0) {
-          warnings.push(`所选文件均无法导入：\n${result.skipped.join("\n")}`);
+          addNotify("error", `所选文件均无法导入：\n${result.skipped.join("\n")}`);
         } else if (result.skipped.length > 0) {
-          warnings.push(`以下文件已跳过：\n${result.skipped.join("\n")}`);
+          addNotify("warning", `以下文件已跳过：\n${result.skipped.join("\n")}`);
         }
         if (ignoredForLimit > 0) {
-          warnings.push(
+          addNotify(
+            "warning",
             formatTranslation(translate("chat.upload.maxFilesIgnored", locale), {
               max: MAX_UPLOAD_FILES,
               count: ignoredForLimit,
             }),
           );
         }
-        if (warnings.length > 0 && isDisplayedConversation(targetConversationId)) {
-          setChatError(warnings.join("\n"));
-        }
       } catch (error) {
-        if (isDisplayedConversation(targetConversationId)) {
-          setChatError(asErrorMessage(error, "导入文件失败"));
-        }
+        addNotify("error", asErrorMessage(error, "导入文件失败"));
       } finally {
         setUploadingFiles(false);
       }
     },
     [
+      addNotify,
       composerRef,
       displayedConversationWorkdirRef,
       executionMode,
       getPendingUploadsForConversation,
       isDisplayedConversation,
       locale,
-      setChatError,
+      resolveAgentID,
       setPendingUploadsForConversation,
       setUploadingFiles,
       token,
@@ -294,13 +295,13 @@ export function usePendingUploads(params: UsePendingUploadsParams) {
       void readClipboardFiles()
         .then((files) => {
           if (files.length === 0) {
-            setChatError("无法读取剪贴板中的文件，请尝试拖拽或点击上传。");
+            addNotify("warning", "无法读取剪贴板中的文件，请尝试拖拽或点击上传。");
             return;
           }
           return handleImportReadableFiles(files);
         })
         .catch((error) => {
-          setChatError(asErrorMessage(error, "读取剪贴板文件失败"));
+          addNotify("error", asErrorMessage(error, "读取剪贴板文件失败"));
         });
     };
 
@@ -310,11 +311,11 @@ export function usePendingUploads(params: UsePendingUploadsParams) {
     };
   }, [
     activeView,
+    addNotify,
     handleImportReadableFiles,
     historyShareToken,
     settingsOpen,
     settingsSyncReady,
-    setChatError,
     token,
   ]);
 
@@ -364,12 +365,12 @@ export function usePendingUploads(params: UsePendingUploadsParams) {
       const files = Array.from(event.dataTransfer.files ?? []);
       if (files.length === 0) return;
       if (!options.canDropUpload) {
-        setChatError(options.disabledMessage);
+        addNotify("warning", options.disabledMessage);
         return;
       }
       void handleImportReadableFiles(files);
     },
-    [handleImportReadableFiles, setChatError],
+    [addNotify, handleImportReadableFiles],
   );
 
   return {

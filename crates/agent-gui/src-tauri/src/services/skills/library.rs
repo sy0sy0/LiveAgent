@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
+use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -291,6 +292,11 @@ pub(crate) fn skill_summary_from_dir(
         skill_file,
         base_dir,
         built_in,
+        installed_at: fs::metadata(skill_dir)
+            .ok()
+            .and_then(|metadata| metadata.created().or_else(|_| metadata.modified()).ok())
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok()),
         source: read_skill_source_metadata(skill_dir),
     })
 }

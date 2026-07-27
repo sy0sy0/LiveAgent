@@ -9,13 +9,9 @@ import {
 } from "../chat/conversation/conversationState";
 import { createTurnCancellationFromSignal } from "../chat/conversation/turnCancellation";
 import { runAssistantWithTools } from "../chat/runner/agentRunner";
+import type { ProviderRuntimeConfig } from "../providers/runtime/types";
 import type { RuntimePlatform } from "../runtimePlatform";
-import type {
-  CodexRequestFormat,
-  ProviderId,
-  ProviderModelConfig,
-  ReasoningLevel,
-} from "../settings";
+import type { ProviderId } from "../settings";
 import { renderMessageBusSnapshot } from "./bus";
 import { toolErrorResult } from "./errors";
 import type { SubagentWorktreeIpc } from "./ipc/worktree";
@@ -48,22 +44,12 @@ import {
   truncateText,
 } from "./utils";
 
-export type SubagentProviderRuntime = {
-  baseUrl: string;
-  apiKey: string;
-  requestFormat?: CodexRequestFormat;
-  reasoning?: ReasoningLevel;
-  promptCachingEnabled?: boolean;
-  nativeWebSearchEnabled?: boolean;
-  modelConfig?: ProviderModelConfig;
-};
-
 type ChildToolExecutor = (toolCall: ToolCall, signal?: AbortSignal) => Promise<ToolResultMessage>;
 
 export type SubagentRunEnvironment = {
   providerId: ProviderId;
   model: string;
-  runtime: SubagentProviderRuntime;
+  runtime: ProviderRuntimeConfig;
   runtimePlatform?: RuntimePlatform;
   workdir: string;
   sessionId?: string;
@@ -615,7 +601,7 @@ export async function executeSubagentRun(
 
         // controller 内部消化非中止失败（含 prune 降级）；用户中止会原样抛出。
         compactionAppliedState = null;
-        const compactedContext = await compaction.compactDuringRun({
+        const { context: compactedContext } = await compaction.compactDuringRun({
           trigger: "post-tool",
           state: view,
         });

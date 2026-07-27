@@ -3,8 +3,8 @@ use uuid::Uuid;
 
 use crate::commands::settings::{
     load_gateway_settings_sync_snapshot, open_db, redact_gateway_settings_sync_payload,
-    PROVIDER_API_KEY_UPDATES_FIELD, SSH_PATCH_FIELD, SSH_SECRET_UPDATES_FIELD,
-    SYSTEM_PROXY_PASSWORD_UPDATE_FIELD,
+    PROVIDER_API_KEY_UPDATES_FIELD, PROVIDER_USAGE_QUERY_SECRET_UPDATES_FIELD, SSH_PATCH_FIELD,
+    SSH_SECRET_UPDATES_FIELD, SYSTEM_PROXY_PASSWORD_UPDATE_FIELD,
 };
 
 use super::*;
@@ -118,6 +118,8 @@ pub(crate) fn build_local_settings_update_event_payload(payload: Value) -> Resul
         _ => return Err("gateway settings sync payload must be an object".to_string()),
     };
     let provider_api_key_updates = event.remove(PROVIDER_API_KEY_UPDATES_FIELD);
+    let provider_usage_query_secret_updates =
+        event.remove(PROVIDER_USAGE_QUERY_SECRET_UPDATES_FIELD);
     let ssh_secret_updates = event.remove(SSH_SECRET_UPDATES_FIELD);
     let system_proxy_password_update = event.remove(SYSTEM_PROXY_PASSWORD_UPDATE_FIELD);
     event.remove("remote");
@@ -127,6 +129,12 @@ pub(crate) fn build_local_settings_update_event_payload(payload: Value) -> Resul
     };
     if let Some(updates) = provider_api_key_updates {
         public_event.insert(PROVIDER_API_KEY_UPDATES_FIELD.to_string(), updates);
+    }
+    if let Some(updates) = provider_usage_query_secret_updates {
+        public_event.insert(
+            PROVIDER_USAGE_QUERY_SECRET_UPDATES_FIELD.to_string(),
+            updates,
+        );
     }
     if let Some(updates) = ssh_secret_updates {
         public_event.insert(SSH_SECRET_UPDATES_FIELD.to_string(), updates);
@@ -146,6 +154,8 @@ pub(crate) fn build_local_settings_update_event_payload_with_ssh(
         _ => return Err("gateway settings sync payload must be an object".to_string()),
     };
     let provider_api_key_updates = event.remove(PROVIDER_API_KEY_UPDATES_FIELD);
+    let provider_usage_query_secret_updates =
+        event.remove(PROVIDER_USAGE_QUERY_SECRET_UPDATES_FIELD);
     let ssh_secret_updates = event.remove(SSH_SECRET_UPDATES_FIELD);
     let system_proxy_password_update = event.remove(SYSTEM_PROXY_PASSWORD_UPDATE_FIELD);
     event.remove("remote");
@@ -157,6 +167,12 @@ pub(crate) fn build_local_settings_update_event_payload_with_ssh(
     };
     if let Some(updates) = provider_api_key_updates {
         public_event.insert(PROVIDER_API_KEY_UPDATES_FIELD.to_string(), updates);
+    }
+    if let Some(updates) = provider_usage_query_secret_updates {
+        public_event.insert(
+            PROVIDER_USAGE_QUERY_SECRET_UPDATES_FIELD.to_string(),
+            updates,
+        );
     }
     if let Some(updates) = ssh_secret_updates {
         public_event.insert(SSH_SECRET_UPDATES_FIELD.to_string(), updates);

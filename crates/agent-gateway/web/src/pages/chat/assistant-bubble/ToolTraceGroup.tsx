@@ -60,8 +60,15 @@ function ToolTraceGroupInner(props: {
   runningToolCallIds?: string[];
   readOnly?: boolean;
   redactToolContent?: boolean;
+  isAborted?: boolean;
 }) {
-  const { items, runningToolCallIds = [], readOnly = false, redactToolContent = false } = props;
+  const {
+    items,
+    runningToolCallIds = [],
+    readOnly = false,
+    redactToolContent = false,
+    isAborted = false,
+  } = props;
   const { t } = useLocale();
   const counts = useMemo(
     () => getToolGroupCounts(items, runningToolCallIds),
@@ -140,6 +147,7 @@ function ToolTraceGroupInner(props: {
               <MemoToolCallItem
                 key={getToolTraceKey(item, index)}
                 item={item}
+                isAborted={isAborted}
                 readOnly={readOnly}
                 redactToolContent={redactToolContent}
                 isRunning={Boolean(
@@ -168,6 +176,7 @@ export const ToolTraceGroup = memo(
   (previous, next) =>
     previous.readOnly === next.readOnly &&
     previous.redactToolContent === next.redactToolContent &&
+    previous.isAborted === next.isAborted &&
     previous.items.length === next.items.length &&
     previous.items.every(
       (item, index) =>

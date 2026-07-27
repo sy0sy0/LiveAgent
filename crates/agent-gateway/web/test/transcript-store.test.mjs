@@ -151,6 +151,30 @@ test("optimistic user bubble binds to its run keeping its key", () => {
   assert.equal(users[0].key, optimisticKey, "user bubble keeps its identity");
 });
 
+test("a desktop identity echo binds the live turn to its persisted message id", () => {
+  const store = createTranscriptStore();
+  store.applyEvent(userMessage("run-1", 1, "same prompt"));
+  store.applyEvent(runStarted("run-1", 2));
+  store.applyEvent(userMessage("run-1", 3, "same prompt", { message_id: "m1" }));
+  store.applyHistorySnapshot(
+    [
+      {
+        id: "hu:m1",
+        kind: "user",
+        text: "same prompt",
+        attachments: [],
+        messageRef: messageRef("m1"),
+      },
+    ],
+    { mode: "replace" },
+  );
+  store.flush();
+
+  const users = allRows(store.getSnapshot()).filter((row) => row.kind === "user");
+  assert.equal(users.length, 1);
+  assert.equal(users[0].messageRef?.messageId, "m1");
+});
+
 test("failed run appends an error entry and clears busy", () => {
   const store = createTranscriptStore();
   store.applyEvent(runStarted("run-1", 1));
@@ -160,6 +184,118 @@ test("failed run appends an error entry and clears busy", () => {
   assert.equal(snapshot.activeRun, null);
   const text = allRows(snapshot).map((row) => rowText(row)).join("\n");
   assert.match(text, /model exploded/);
+});
+
+test("inferred desktop_run_lost marks the streamed copy stale so enrich adopts the persisted reply", () => {
+  const store = createTranscriptStore();
+  store.applyEvent(userMessage("run-1", 1, "hello"));
+  store.applyEvent(runStarted("run-1", 2));
+  store.applyEvent(token("run-1", 3, "partial"));
+  store.applyEvent(
+    runFinished("run-1", 4, "failed", {
+      error_code: "desktop_run_lost",
+      message: "The desktop runtime stopped reporting this run.",
+    }),
+  );
+  store.flush();
+  assert.equal(store.getSnapshot().activeRun, null);
+  assert.equal(store.getSnapshot().needsHistoryRefresh, true);
+
+  // The run actually kept going on the desktop and persisted the full reply;
+  // the truncated streamed copy must not be treated as authoritative.
+  store.applyHistorySnapshot(
+    [
+      { id: "hu:m1", kind: "user", text: "hello", attachments: [], messageRef: messageRef("m1") },
+      { id: "ht:hu:m1>0", kind: "assistant", text: "partial plus the rest of the reply", round: 1 },
+    ],
+    { mode: "enrich" },
+  );
+  store.flush();
+  const text = allRows(store.getSnapshot()).map(rowText).join("\n");
+  assert.match(text, /partial plus the rest of the reply/, "persisted reply adopted");
+  assert.doesNotMatch(text, /stopped reporting/, "inferred error entry replaced by real content");
+  assert.equal(store.getSnapshot().needsHistoryRefresh, false);
+});
+
+test("a genuine failure keeps the streamed copy authoritative under enrich", () => {
+  const store = createTranscriptStore();
+  store.applyEvent(userMessage("run-1", 1, "hello"));
+  store.applyEvent(runStarted("run-1", 2));
+  store.applyEvent(token("run-1", 3, "streamed reply"));
+  store.applyEvent(runFinished("run-1", 4, "failed", { message: "model exploded" }));
+  store.flush();
+
+  store.applyHistorySnapshot(
+    [
+      { id: "hu:m1", kind: "user", text: "hello", attachments: [], messageRef: messageRef("m1") },
+      { id: "ht:hu:m1>0", kind: "assistant", text: "some other persisted text", round: 1 },
+    ],
+    { mode: "enrich" },
+  );
+  store.flush();
+  const text = allRows(store.getSnapshot()).map(rowText).join("\n");
+  assert.match(text, /streamed reply/, "streamed content kept");
+  assert.doesNotMatch(text, /some other persisted text/, "no wholesale adoption without contentStale");
+});
+
+test("a resurrected run reopens its truncated turn in place and finishes normally", () => {
+  const store = createTranscriptStore();
+  store.applyEvent(userMessage("run-1", 1, "hello"));
+  store.applyEvent(runStarted("run-1", 2));
+  store.applyEvent(token("run-1", 3, "part one "));
+  store.applyEvent(
+    runFinished("run-1", 4, "failed", {
+      error_code: "desktop_run_lost",
+      message: "The desktop runtime stopped reporting this run.",
+    }),
+  );
+  store.flush();
+  assert.equal(store.getSnapshot().activeRun, null);
+
+  // The gateway falsified the loss verdict: the same run restarts and keeps
+  // streaming into the same turn.
+  store.applyEvent(runStarted("run-1", 5));
+  store.applyEvent(token("run-1", 6, "part two"));
+  store.flush();
+  const live = store.getSnapshot();
+  assertUniqueKeys(live);
+  assert.equal(live.activeRun?.runId, "run-1", "activity restored");
+  const liveText = allRows(live).map(rowText).join("\n");
+  assert.match(liveText, /part one/);
+  assert.match(liveText, /part two/);
+  assert.doesNotMatch(liveText, /stopped reporting/, "resurrection removes the inferred error");
+  assert.equal(live.needsHistoryRefresh, true, "persisted history still owns final convergence");
+
+  store.applyEvent(runFinished("run-1", 7));
+  store.flush();
+  assert.equal(store.getSnapshot().activeRun, null, "genuine completion settles the revived run");
+});
+
+test("an authoritative terminal replaces an inferred loss without leaving its error", () => {
+  const store = createTranscriptStore();
+  store.applyEvent(userMessage("run-1", 1, "hello"));
+  store.applyEvent(runStarted("run-1", 2));
+  store.applyEvent(token("run-1", 3, "partial"));
+  store.applyEvent(
+    runFinished("run-1", 4, "failed", {
+      error_code: "desktop_run_lost",
+      message: "The desktop runtime stopped reporting this run.",
+    }),
+  );
+  store.flush();
+
+  store.applyEvent(
+    runFinished("run-1", 5, "failed", {
+      error_code: "provider_error",
+      message: "provider failed",
+    }),
+  );
+  store.flush();
+  const snapshot = store.getSnapshot();
+  const text = allRows(snapshot).map(rowText).join("\n");
+  assert.match(text, /provider failed/);
+  assert.doesNotMatch(text, /stopped reporting/);
+  assert.equal(snapshot.needsHistoryRefresh, true, "history still owns final tail convergence");
 });
 
 test("run_queued removes the turn entirely", () => {
@@ -373,6 +509,7 @@ test("replace keeps the active exchange and trims its persisted echo", () => {
   store.addOptimisticUserEntry({ clientRequestId: "client-2", text: "new prompt" });
   store.applyEvent(userMessage("run-2", 1, "new prompt", { client_request_id: "client-2" }));
   store.applyEvent(runStarted("run-2", 2, { client_request_id: "client-2" }));
+  store.applyEvent(userMessage("run-2", 3, "new prompt", { message_id: "m2" }));
   store.flush();
   const userKey = allRows(store.getSnapshot()).find((row) => row.kind === "user" && row.text === "new prompt")?.key;
   assert.ok(userKey);
@@ -501,6 +638,144 @@ test("reset sync rebuilds the active turn from a runtime snapshot", () => {
   assert.doesNotMatch(text, /will be lost/);
 });
 
+test("active sync trims a history-first copy of the running exchange", () => {
+  const store = createTranscriptStore();
+  store.applyHistorySnapshot(
+    [
+      {
+        id: "hu:m1",
+        kind: "user",
+        text: "明天是什么天气",
+        attachments: [],
+        messageRef: messageRef("m1"),
+      },
+      {
+        id: "ht:hu:m1>0",
+        kind: "assistant",
+        text: "请告诉我你所在的城市",
+        round: 1,
+      },
+    ],
+    { mode: "replace" },
+  );
+
+  store.applySync({
+    conversationId: "conv-1",
+    streamEpoch: "epoch-1",
+    latestSeq: 2,
+    reset: true,
+    activity: {
+      runId: "run-1",
+      state: "running",
+      startedSeq: 2,
+      toolStatus: "Vibing",
+      toolStatusIsCompaction: false,
+      updatedAt: 1,
+    },
+    snapshot: {
+      runId: "run-1",
+      revision: 2,
+      entriesJson: JSON.stringify([
+        {
+          id: "snapshot-user",
+          kind: "user",
+          text: "明天是什么天气",
+          attachments: [],
+          messageId: "m1",
+        },
+        {
+          id: "snapshot-assistant",
+          kind: "assistant",
+          text: "请告诉我你所在的城市",
+          round: 1,
+        },
+      ]),
+      toolStatus: "Vibing",
+      toolStatusIsCompaction: false,
+      asOfSeq: 2,
+    },
+    events: [],
+  });
+  store.flush();
+
+  const snapshot = store.getSnapshot();
+  assert.equal(
+    allRows(snapshot).filter((row) => row.kind === "user").length,
+    1,
+    "history and runtime snapshot describe one prompt",
+  );
+  assert.equal(
+    allRows(snapshot).filter((row) => row.kind === "assistant").length,
+    1,
+    "the partial reply also renders from one source",
+  );
+  assert.equal(snapshot.activeRun?.runId, "run-1");
+});
+
+test("active sync preserves an older completed exchange with the same prompt text", () => {
+  const store = createTranscriptStore();
+  store.applyHistorySnapshot(
+    [
+      {
+        id: "hu:m1",
+        kind: "user",
+        text: "重复问题",
+        attachments: [],
+        messageRef: messageRef("m1"),
+      },
+      { id: "ht:hu:m1>0", kind: "assistant", text: "相同回答", round: 1 },
+    ],
+    { mode: "replace" },
+  );
+
+  store.applySync({
+    conversationId: "conv-1",
+    streamEpoch: "epoch-1",
+    latestSeq: 2,
+    reset: true,
+    activity: {
+      runId: "run-2",
+      state: "running",
+      startedSeq: 2,
+      toolStatus: "Vibing",
+      toolStatusIsCompaction: false,
+      updatedAt: 2,
+    },
+    snapshot: {
+      runId: "run-2",
+      revision: 2,
+      entriesJson: JSON.stringify([
+        {
+          id: "snapshot-user",
+          kind: "user",
+          text: "重复问题",
+          attachments: [],
+          messageId: "m2",
+        },
+        {
+          id: "snapshot-assistant",
+          kind: "assistant",
+          text: "相同回答，继续生成",
+          round: 1,
+        },
+      ]),
+      toolStatus: "Vibing",
+      toolStatusIsCompaction: false,
+      asOfSeq: 2,
+    },
+    events: [],
+  });
+  store.flush();
+
+  const snapshot = store.getSnapshot();
+  assert.equal(allRows(snapshot).filter((row) => row.kind === "user").length, 2);
+  assert.equal(allRows(snapshot).filter((row) => row.kind === "assistant").length, 2);
+  const text = allRows(snapshot).map((row) => rowText(row)).join("\n");
+  assert.match(text, /相同回答/);
+  assert.match(text, /相同回答，继续生成/);
+  assert.equal(snapshot.activeRun?.runId, "run-2");
+});
+
 test("reset keeps the optimistic pending bubble and binds it on replay", () => {
   // The old pipeline wiped the live segment on reset while leaving its
   // adoption bookkeeping behind, so the replayed seed re-appended a second
@@ -546,6 +821,85 @@ test("tool status mirrors into the snapshot and clears on run end", () => {
   store.applyEvent(runFinished("run-1", 3));
   store.flush();
   assert.equal(store.getSnapshot().toolStatus, null);
+});
+
+test("retry attempts mirror into the snapshot, survive plain status updates and clear on run end", () => {
+  const store = createTranscriptStore();
+  store.applyEvent(runStarted("run-1", 1));
+  store.applyEvent({
+    type: "tool_status",
+    conversation_id: "conv-1",
+    run_id: "run-1",
+    seq: 2,
+    status: "连接已断开，正在重试 (1/5)...",
+    retryAttempts: [{ attempt: 1, maxAttempts: 5, errorMessage: "503 service unavailable" }],
+  });
+  store.flush();
+  let snapshot = store.getSnapshot();
+  assert.equal(snapshot.retryAttempts.length, 1);
+  assert.equal(snapshot.retryAttempts[0].attempt, 1);
+  assert.equal(snapshot.retryAttempts[0].maxAttempts, 5);
+  assert.equal(snapshot.retryAttempts[0].errorMessage, "503 service unavailable");
+
+  // A status-only update (retryAttempts null) leaves the list untouched.
+  store.applyEvent({
+    type: "tool_status",
+    conversation_id: "conv-1",
+    run_id: "run-1",
+    seq: 3,
+    status: "模型生成中...",
+    retryAttempts: null,
+  });
+  store.flush();
+  snapshot = store.getSnapshot();
+  assert.equal(snapshot.toolStatus, "模型生成中...");
+  assert.equal(snapshot.retryAttempts.length, 1, "plain status update keeps retry history");
+
+  // An explicit empty array clears the list (fresh network attempt).
+  store.applyEvent({
+    type: "tool_status",
+    conversation_id: "conv-1",
+    run_id: "run-1",
+    seq: 4,
+    status: "模型生成中...",
+    retryAttempts: [],
+  });
+  store.flush();
+  assert.equal(store.getSnapshot().retryAttempts.length, 0);
+
+  store.applyEvent({
+    type: "tool_status",
+    conversation_id: "conv-1",
+    run_id: "run-1",
+    seq: 5,
+    status: "连接已断开，正在重试 (1/5)...",
+    retryAttempts: [{ attempt: 1, maxAttempts: 5, errorMessage: "rate limited" }],
+  });
+  store.applyEvent(runFinished("run-1", 6));
+  store.flush();
+  assert.equal(store.getSnapshot().retryAttempts.length, 0, "run end clears retry history");
+});
+
+test("retry attempts reset at the next run_started", () => {
+  const store = createTranscriptStore();
+  store.applyEvent(runStarted("run-1", 1));
+  store.applyEvent({
+    type: "tool_status",
+    conversation_id: "conv-1",
+    run_id: "run-1",
+    seq: 2,
+    status: "连接已断开，正在重试 (2/5)...",
+    retryAttempts: [
+      { attempt: 1, maxAttempts: 5, errorMessage: "503" },
+      { attempt: 2, maxAttempts: 5, errorMessage: "timeout" },
+    ],
+  });
+  store.flush();
+  assert.equal(store.getSnapshot().retryAttempts.length, 2);
+
+  store.applyEvent(runStarted("run-2", 3));
+  store.flush();
+  assert.equal(store.getSnapshot().retryAttempts.length, 0);
 });
 
 test("replay idempotency: a resubscribe replaying applied events changes nothing", () => {
@@ -1501,4 +1855,208 @@ test("hidden tab: flush() commits immediately and cancels the pending timer", as
   } finally {
     uninstall();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Edit-resend identity binding (message_ref on user_message / forwarded
+// identity echo / rebase divergence). Regression suite for the "consecutive
+// GUI edits render every past version as its own user bubble" bug: the new
+// prompt's stable identity must enter the stream so the NEXT rebased can
+// anchor on it.
+
+function wireMessageRef(messageId, messageIndex = 0) {
+  return {
+    segment_index: 0,
+    message_index: messageIndex,
+    segment_id: "segment-1",
+    message_id: messageId,
+    role: "user",
+    content_hash: `hash-${messageId}`,
+  };
+}
+
+function rebasedEvent(seq, baseMessageId, baseIndex = 0) {
+  return {
+    type: "rebased",
+    conversation_id: "conv-1",
+    seq,
+    base_message_ref: wireMessageRef(baseMessageId, baseIndex),
+    reason: "edit_resend",
+  };
+}
+
+test("user_message binds its message_ref so consecutive GUI edits truncate instead of piling up", () => {
+  const store = createTranscriptStore();
+  let seq = 0;
+  const editRound = (runId, messageId, text, baseMessageId) => {
+    if (baseMessageId) {
+      store.applyEvent(rebasedEvent(++seq, baseMessageId));
+    }
+    store.applyEvent(runStarted(runId, ++seq));
+    store.applyEvent(
+      userMessage(runId, ++seq, text, { message_ref: wireMessageRef(messageId) }),
+    );
+    store.applyEvent(token(runId, ++seq, `reply to ${text}`));
+    store.applyEvent(runFinished(runId, ++seq));
+  };
+
+  editRound("run-1", "m1", "v1");
+  editRound("run-2", "m2", "v2", "m1");
+  editRound("run-3", "m3", "v3", "m2");
+  store.flush();
+
+  const users = allRows(store.getSnapshot()).filter((row) => row.kind === "user");
+  assert.deepEqual(
+    users.map((row) => rowText(row)),
+    ["v3"],
+    "each edit replaces the previous version; only the latest bubble remains",
+  );
+  assert.equal(users[0].messageRef?.messageId, "m3", "latest bubble carries its own ref");
+});
+
+test("forwarded identity echo retrofits the persisted ref onto a seeded turn", () => {
+  const store = createTranscriptStore();
+  store.addOptimisticUserEntry({ clientRequestId: "client-1", text: "webui prompt" });
+  // Gateway-seeded user_message (no ref — ids are minted at desktop persist
+  // time), then the identity-bearing desktop echo the gateway forwards once.
+  // The single user slot upserts identity instead of adding a bubble.
+  store.applyEvent(userMessage("run-1", 1, "webui prompt", { client_request_id: "client-1" }));
+  store.applyEvent(runStarted("run-1", 2, { client_request_id: "client-1" }));
+  store.applyEvent(
+    userMessage("run-1", 3, "webui prompt", {
+      message_id: "m7",
+      message_ref: wireMessageRef("m7"),
+    }),
+  );
+  store.applyEvent(token("run-1", 4, "reply"));
+  store.applyEvent(runFinished("run-1", 5));
+  store.flush();
+
+  const users = allRows(store.getSnapshot()).filter((row) => row.kind === "user");
+  assert.equal(users.length, 1, "forwarded echo upserts, never adds a second bubble");
+  assert.equal(users[0].messageRef?.messageId, "m7", "forwarded echo attached the ref");
+
+  // The bound ref anchors the next edit's truncation.
+  store.applyEvent(rebasedEvent(6, "m7"));
+  store.flush();
+  assert.equal(allRows(store.getSnapshot()).length, 0, "rebase anchored on the bound ref");
+});
+
+test("rebased with a missing anchor signals divergence and flags a history refresh", () => {
+  let divergences = 0;
+  const store = createTranscriptStore({
+    onDivergence: () => {
+      divergences += 1;
+    },
+  });
+  // Old-desktop shape: user_message without message_ref, so the settled turn
+  // has no persisted identity.
+  store.applyEvent(userMessage("run-1", 1, "v1"));
+  store.applyEvent(runStarted("run-1", 2));
+  store.applyEvent(token("run-1", 3, "reply-1"));
+  store.applyEvent(runFinished("run-1", 4));
+  store.applyEvent(rebasedEvent(5, "m1"));
+  store.flush();
+
+  assert.equal(divergences, 1, "anchor miss must not stay silent");
+  assert.equal(store.getSnapshot().needsHistoryRefresh, true, "refresh loop armed");
+
+  // A replay of the same missing anchor must not ping-pong resyncs.
+  store.applyEvent({ ...rebasedEvent(5, "m1"), seq: 6 });
+  store.flush();
+  assert.equal(divergences, 1, "one resync per unique missing anchor");
+});
+
+test("rebase divergence: next history snapshot authoritatively drops stale edit versions", () => {
+  const store = createTranscriptStore();
+  // The pile-up state: two ref-less settled edit versions plus the rebased
+  // events whose anchors were never bound (old desktop / lost bindings).
+  store.applyEvent(userMessage("run-1", 1, "v1"));
+  store.applyEvent(runStarted("run-1", 2));
+  store.applyEvent(token("run-1", 3, "reply-1"));
+  store.applyEvent(runFinished("run-1", 4));
+  store.applyEvent(rebasedEvent(5, "m1"));
+  store.applyEvent(userMessage("run-2", 6, "v2"));
+  store.applyEvent(runStarted("run-2", 7));
+  store.applyEvent(token("run-2", 8, "reply-2"));
+  store.applyEvent(runFinished("run-2", 9));
+  store.flush();
+
+  const bubbles = allRows(store.getSnapshot()).filter((row) => row.kind === "user");
+  assert.deepEqual(
+    bubbles.map((row) => rowText(row)),
+    ["v1", "v2"],
+    "precondition: the bug state renders both versions",
+  );
+
+  // The quiet refresh (enrich) fires; the divergence forces it into an
+  // authoritative replace that drops the deleted v1 suffix.
+  store.applyHistorySnapshot(
+    [
+      { id: "hu:m2", kind: "user", text: "v2", attachments: [], messageRef: messageRef("m2") },
+      { id: "ht:hu:m2>0", kind: "assistant", text: "reply-2 (persisted)", round: 1 },
+    ],
+    { mode: "enrich" },
+  );
+  store.flush();
+
+  const snapshot = store.getSnapshot();
+  const users = allRows(snapshot).filter((row) => row.kind === "user");
+  assert.deepEqual(
+    users.map((row) => rowText(row)),
+    ["v2"],
+    "server-deleted edit version dropped by the reconciling replace",
+  );
+  assert.equal(snapshot.needsHistoryRefresh, false, "divergence cleared after reconciliation");
+});
+
+test("ref-bearing replay converges regardless of history/replay arrival order", () => {
+  const historyEntries = [
+    { id: "hu:m3", kind: "user", text: "v3", attachments: [], messageRef: messageRef("m3") },
+    { id: "ht:hu:m3>0", kind: "assistant", text: "reply-3", round: 1 },
+  ];
+  const replay = (store) => {
+    let seq = 0;
+    for (const [runId, messageId, text, base] of [
+      ["run-1", "m1", "v1", null],
+      ["run-2", "m2", "v2", "m1"],
+      ["run-3", "m3", "v3", "m2"],
+    ]) {
+      if (base) {
+        store.applyEvent(rebasedEvent(++seq, base));
+      }
+      store.applyEvent(runStarted(runId, ++seq));
+      store.applyEvent(
+        userMessage(runId, ++seq, text, { message_ref: wireMessageRef(messageId) }),
+      );
+      store.applyEvent(token(runId, ++seq, `reply to ${text}`));
+      store.applyEvent(runFinished(runId, ++seq));
+    }
+  };
+
+  // history first, replay after.
+  const historyFirst = createTranscriptStore();
+  historyFirst.applyHistorySnapshot(historyEntries, { mode: "replace" });
+  replay(historyFirst);
+  historyFirst.flush();
+  assert.deepEqual(
+    allRows(historyFirst.getSnapshot())
+      .filter((row) => row.kind === "user")
+      .map((row) => rowText(row)),
+    ["v3"],
+    "history-first converges to the final version",
+  );
+
+  // replay first, history after.
+  const replayFirst = createTranscriptStore();
+  replay(replayFirst);
+  replayFirst.applyHistorySnapshot(historyEntries, { mode: "replace" });
+  replayFirst.flush();
+  assert.deepEqual(
+    allRows(replayFirst.getSnapshot())
+      .filter((row) => row.kind === "user")
+      .map((row) => rowText(row)),
+    ["v3"],
+    "replay-first converges to the final version",
+  );
 });

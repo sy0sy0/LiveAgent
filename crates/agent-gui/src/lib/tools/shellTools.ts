@@ -17,6 +17,11 @@ import {
   resolveBashTimeoutPolicy,
 } from "./bashTimeoutPolicy";
 import { type BuiltinToolBundle, createBuiltinMetadataMap } from "./builtinTypes";
+import {
+  invokeWithAbort,
+  requestRuntimeCancel,
+  throwIfToolInvocationAborted,
+} from "./invokeWithAbort";
 import { formatResolvedTarget, type ResolvedPath, ToolPathResolver } from "./pathUtils";
 import { assertSkillPathAllowedByPolicy, type SkillAccessPolicy } from "./skillAccessPolicy";
 
@@ -35,10 +40,6 @@ type ShellRunResponse = {
   stdio_open_after_exit?: boolean;
   effective_timeout_ms: number;
   duration_ms: number;
-};
-
-type ShellCancelResponse = {
-  cancelled: boolean;
 };
 
 type ManagedProcessRecord = {
@@ -90,10 +91,6 @@ function createShellRunId(toolCallId: string) {
   return `bash-${toolCallId || "tool"}-${createUuid()}`;
 }
 
-function delay(ms: number) {
-  return new Promise((resolve) => globalThis.setTimeout(resolve, ms));
-}
-
 function strictToolParameters(properties: Record<string, unknown>) {
   return Type.Object(properties as any, { additionalProperties: false });
 }
@@ -107,22 +104,6 @@ function assertKnownArguments(toolName: string, args: unknown, allowed: readonly
       `${toolName} received unsupported argument${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}`,
     );
   }
-}
-
-function requestShellCancel(runId: string) {
-  void (async () => {
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      try {
-        const response = await invoke<ShellCancelResponse>("shell_cancel", {
-          run_id: runId,
-        } as any);
-        if (response.cancelled) return;
-      } catch {
-        return;
-      }
-      await delay(50);
-    }
-  })();
 }
 
 type ShellSyntaxScan = {
@@ -322,12 +303,8 @@ function buildCancelledResult(params: {
     exit_code: -1,
     shell: params.shell || "unknown",
     platform: params.runtimePlatform,
-    profile: params.runtimePlatform === "windows" ? "windows-pwsh" : undefined,
-    shell_family: params.runtimePlatform
-      ? params.runtimePlatform === "windows"
-        ? "powershell"
-        : "posix"
-      : undefined,
+    profile: params.runtimePlatform === "windows" ? "windows-git-bash" : undefined,
+    shell_family: params.runtimePlatform ? "posix" : undefined,
     stdout: "",
     stderr: "Cancelled",
     stdout_truncated: false,
@@ -379,14 +356,12 @@ export function createShellTools(params: {
   const platformLabel = runtimePlatformLabel(runtimePlatform);
   const shellPolicy =
     runtimePlatform === "windows"
-      ? 'Windows runs Bash commands with the native Windows shell chain: pwsh first, then Windows PowerShell, then cmd. Use PowerShell syntax by default: `Write-Output`, `$env:NAME = "value"`, semicolon separators, and `Start-Process` when a process must be detached. Do not assume Git Bash, `export`, `nohup`, `/dev/null`, or POSIX background syntax.'
+      ? "Windows runs Bash commands with Git Bash (POSIX semantics) when available, falling back to pwsh, then Windows PowerShell, then cmd only if Git Bash is not installed. Write POSIX/bash syntax by default: `export NAME=value`, `&&`, `/dev/null`, forward-slash paths. If the result header reports `shell_family: powershell` or `shell_family: cmd`, Git Bash is missing on this machine — switch to PowerShell syntax and suggest installing Git for Windows or setting LIVEAGENT_GIT_BASH_PATH."
       : runtimePlatform === "macos"
         ? "macOS runs Bash commands with POSIX shell syntax: zsh first, then Bash, then sh."
         : "Linux runs Bash commands with POSIX shell syntax: Bash first, then zsh, then sh.";
   const backgroundPolicy =
-    runtimePlatform === "windows"
-      ? "For dev servers, watchers, or long-running commands on Windows, use ManagedProcess instead of detached shell syntax."
-      : "Background commands using `&` must detach stdout and stderr first, for example `nohup command > /tmp/liveagent-task.log 2>&1 < /dev/null &`; otherwise the tool rejects them because inherited pipes can keep Bash running forever.";
+    "Background commands using `&` must detach stdout and stderr first, for example `nohup command > /tmp/liveagent-task.log 2>&1 < /dev/null &`; otherwise the tool rejects them because inherited pipes can keep Bash running forever. Prefer ManagedProcess for dev servers, watchers, or anything long-running.";
   const workdir = params.workdir;
   const allowSkillsRoot = params.skillsRootEnabled === true;
   const allowManagedProcess = params.managedProcessEnabled !== false;
@@ -572,18 +547,19 @@ export function createShellTools(params: {
     command: string;
     stdout: string;
     stderr: string;
+    shellFamily?: string;
   }) {
     const combined = [params.command, params.stdout, params.stderr].join("\n");
     const hints: string[] = [];
 
     if (
       runtimePlatform === "windows" &&
-      /(^|[\s;&|])(?:export|nohup)\b|\/dev\/null|not recognized as|不是内部或外部命令|无法将.*识别为/i.test(
-        combined,
-      )
+      (params.shellFamily === "powershell" || params.shellFamily === "cmd")
     ) {
       hints.push(
-        'Hint: This Bash tool is running with Windows-native shells. Use PowerShell syntax such as `Write-Output`, `$env:NAME = "value"`, and `;`, or use ManagedProcess for long-running commands.',
+        `Hint: Git Bash was not found, so this command ran under ${
+          params.shellFamily === "cmd" ? "cmd" : "PowerShell"
+        } where POSIX syntax like \`export\`, \`nohup\`, and \`/dev/null\` fails. Rewrite the command in PowerShell syntax for now, and suggest installing Git for Windows or setting LIVEAGENT_GIT_BASH_PATH to restore Bash semantics.`,
       );
     }
 
@@ -772,7 +748,7 @@ export function createShellTools(params: {
         const command =
           typeof toolCall.arguments?.command === "string" ? toolCall.arguments.command.trim() : "";
         if (!command) throw new Error('ManagedProcess.command is required for action="start"');
-        if (runtimePlatform !== "windows" && scanShellSyntax(command).background) {
+        if (scanShellSyntax(command).background) {
           throw new Error(
             "ManagedProcess.command must be a foreground command. Remove `&`; ManagedProcess starts it in the background and captures logs automatically.",
           );
@@ -783,19 +759,30 @@ export function createShellTools(params: {
           required: false,
           allowExternal: true,
         });
+        throwIfToolInvocationAborted(signal);
         const cwd = backendCwd(cwdResolved);
         const label =
           typeof toolCall.arguments?.label === "string"
             ? toolCall.arguments.label.trim()
             : undefined;
         const isolated = toolCall.arguments?.isolated === true;
-        const response = await invoke<ManagedProcessStartResponse>("managed_process_start", {
-          workdir,
-          command,
-          cwd: cwd || undefined,
-          label: label || undefined,
-          isolated: isolated || undefined,
-        } as any);
+        const response = await invokeWithAbort<ManagedProcessStartResponse>(
+          "managed_process_start",
+          {
+            workdir,
+            command,
+            cwd: cwd || undefined,
+            label: label || undefined,
+            isolated: isolated || undefined,
+          },
+          signal,
+          {
+            onLateResult: (lateResponse) =>
+              invoke("managed_process_stop", { process_id: lateResponse.process.id } as any).then(
+                () => undefined,
+              ),
+          },
+        );
         return buildManagedProcessToolResult({
           toolCall,
           details: response,
@@ -810,9 +797,11 @@ export function createShellTools(params: {
       }
 
       if (action === "status") {
-        const response = await invoke<ManagedProcessStatusResponse>("managed_process_status", {
-          process_id: processId || undefined,
-        } as any);
+        const response = await invokeWithAbort<ManagedProcessStatusResponse>(
+          "managed_process_status",
+          { process_id: processId || undefined },
+          signal,
+        );
         const lines = [
           `ManagedProcess status count=${response.processes.length}`,
           ...response.processes.map((process) => `---\n${formatManagedProcessRecord(process)}`),
@@ -835,10 +824,14 @@ export function createShellTools(params: {
           typeof toolCall.arguments?.max_bytes === "number"
             ? Math.floor(toolCall.arguments.max_bytes)
             : undefined;
-        const response = await invoke<ManagedProcessLogResponse>("managed_process_read_log", {
-          process_id: processId,
-          max_bytes: maxBytes,
-        } as any);
+        const response = await invokeWithAbort<ManagedProcessLogResponse>(
+          "managed_process_read_log",
+          {
+            process_id: processId,
+            max_bytes: maxBytes,
+          },
+          signal,
+        );
         return buildManagedProcessToolResult({
           toolCall,
           details: response,
@@ -852,9 +845,11 @@ export function createShellTools(params: {
         });
       }
 
-      const response = await invoke<ManagedProcessStopResponse>("managed_process_stop", {
-        process_id: processId,
-      } as any);
+      const response = await invokeWithAbort<ManagedProcessStopResponse>(
+        "managed_process_stop",
+        { process_id: processId },
+        signal,
+      );
       return buildManagedProcessToolResult({
         toolCall,
         details: response,
@@ -995,27 +990,25 @@ export function createShellTools(params: {
       };
     }
 
-    if (runtimePlatform !== "windows") {
-      try {
-        validateBashBackgroundStdio(command);
-      } catch (err) {
-        return {
-          role: "toolResult",
-          toolCallId: toolCall.id,
-          toolName: toolCall.name,
-          content: [{ type: "text", text: asErrorMessage(err) }],
-          details: {},
-          isError: true,
-          timestamp: now,
-        };
-      }
+    try {
+      validateBashBackgroundStdio(command);
+    } catch (err) {
+      return {
+        role: "toolResult",
+        toolCallId: toolCall.id,
+        toolName: toolCall.name,
+        content: [{ type: "text", text: asErrorMessage(err) }],
+        details: {},
+        isError: true,
+        timestamp: now,
+      };
     }
 
     const timeoutRaw = toolCall.arguments?.timeout_ms;
     const timeout_ms = normalizeBashTimeoutMs(timeoutRaw, timeoutPolicy);
     const run_id = createShellRunId(toolCall.id);
     const abortHandler = () => {
-      requestShellCancel(run_id);
+      requestRuntimeCancel(run_id);
     };
 
     try {
@@ -1073,6 +1066,7 @@ export function createShellTools(params: {
               command,
               stdout: res.stdout || "",
               stderr: res.stderr || "",
+              shellFamily: res.shell_family,
             })
           : "";
 

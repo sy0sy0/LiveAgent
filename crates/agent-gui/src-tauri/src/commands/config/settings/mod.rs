@@ -8,6 +8,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use uuid::Uuid;
 
 use crate::runtime::project_path::project_path_key as normalize_project_path_key;
 use crate::services::automation::AutomationScheduler;
@@ -37,6 +38,8 @@ const SYSTEM_SYSTEM_PROXY_KEY: &str = "systemProxy";
 const DEFAULT_WORKSPACE_PROJECT_ID: &str = "default-project";
 const DEFAULT_WORKSPACE_PROJECT_NAME: &str = "Default Project";
 pub(crate) const PROVIDER_API_KEY_UPDATES_FIELD: &str = "providerApiKeyUpdates";
+pub(crate) const PROVIDER_USAGE_QUERY_SECRET_UPDATES_FIELD: &str =
+    "providerUsageQuerySecretUpdates";
 pub(crate) const SYSTEM_PROXY_PASSWORD_UPDATE_FIELD: &str = "systemProxyPasswordUpdate";
 pub(crate) const SSH_SECRET_UPDATES_FIELD: &str = "sshSecretUpdates";
 pub(crate) const SSH_PATCH_FIELD: &str = "sshPatch";

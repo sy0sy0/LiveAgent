@@ -197,7 +197,7 @@ impl GatewayController {
     }
 
     /// Sweeps expired specs and pushes the full desired tunnel set to the
-    /// gateway. Called on gRPC connect and after every local mutation.
+    /// gateway. Called on WebSocket connect and after every local mutation.
     pub(crate) async fn publish_desired_tunnels(self: &Arc<Self>) -> Result<(), String> {
         let expired = self.tunnel_store().take_expired_specs()?;
         if !expired.is_empty() {
@@ -536,7 +536,9 @@ async fn probe_tunnel_target(target_url: &str) -> TunnelHealthPayload {
         checked_at,
         rtt_ms: 0,
     };
+    // 探活目标与转发目标一致（本机/内网）：同样忽略环境代理，见 proxy.rs。
     let client = match reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(TUNNEL_LOCAL_PROBE_TIMEOUT)
         .build()

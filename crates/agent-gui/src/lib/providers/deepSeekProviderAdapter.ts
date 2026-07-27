@@ -99,17 +99,26 @@ export function applyDeepSeekModelDefaults<T extends Model<Api>>(
 ): T {
   if (isDeepSeekCodexTarget(params) && model.api === "openai-completions") {
     const overrides = resolveDeepSeekOpenAICompletionsOverrides();
+    // wire 值只补到模型已支持的档位上（pi-ai 语义：base 档缺省=支持、null=不支持，
+    // xhigh/max 必须显式存在才支持）：可用性裁决完全归 modelThinking 目录，
+    // 此处不得复活目录裁掉的档。
+    const thinkingLevelMap = { ...(model.thinkingLevelMap ?? {}) };
+    for (const [level, wire] of Object.entries(overrides.thinkingLevelMap ?? {})) {
+      const key = level as keyof typeof thinkingLevelMap;
+      const existing = thinkingLevelMap[key];
+      const optIn = level === "xhigh" || level === "max";
+      const supported = optIn ? typeof existing === "string" : existing !== null;
+      if (supported && existing === undefined) {
+        thinkingLevelMap[key] = wire;
+      }
+    }
     return {
       ...model,
-      reasoning: true,
       compat: {
         ...(model.compat ?? {}),
         ...overrides.compat,
       },
-      thinkingLevelMap: {
-        ...(model.thinkingLevelMap ?? {}),
-        ...overrides.thinkingLevelMap,
-      },
+      thinkingLevelMap,
     } as T;
   }
 
@@ -125,7 +134,6 @@ export function applyDeepSeekModelDefaults<T extends Model<Api>>(
   ) {
     return {
       ...model,
-      reasoning: true,
       compat: {
         ...(model.compat ?? {}),
         allowEmptySignature: true,

@@ -1005,3 +1005,23 @@ export function getFileTypeIconSvg(path: string, kind: "file" | "dir"): string {
 }
 
 export type FileTypeIconComponent = IconSource;
+
+// Uploaded-attachment icon: extension wins; a bare name (no extension) falls
+// back through the upload pipeline's detected kind so a PDF picked without
+// ".pdf" still gets the PDF glyph. Structural param keeps this file identical
+// on both ends despite their different PendingUploadedFile import paths.
+const UPLOAD_KIND_FALLBACK_FILENAME: Record<string, string> = {
+  text: "file.txt",
+  image: "file.png",
+  pdf: "file.pdf",
+  notebook: "file.ipynb",
+  word: "file.docx",
+  spreadsheet: "file.xlsx",
+  archive: "file.zip",
+};
+
+export function getUploadedFileTypeIcon(file: { fileName: string; kind: string }): IconSource {
+  const name = file.fileName.trim();
+  if (/\.[^./\\]+$/.test(name)) return getFileTypeIcon(name, "file");
+  return getFileTypeIcon(UPLOAD_KIND_FALLBACK_FILENAME[file.kind] ?? "file.txt", "file");
+}

@@ -27,7 +27,10 @@ function TodoRow(props: { todo: TodoItem }) {
   const label = todo.status === "in_progress" ? todo.activeForm : todo.content;
 
   return (
-    <li className="flex items-start gap-2 py-1 text-[13px] leading-5">
+    <li
+      data-todo-incomplete={todo.status === "completed" ? undefined : ""}
+      className="flex items-start gap-2 py-1 text-[13px] leading-5"
+    >
       <span className="mt-0.5 shrink-0">
         {todo.status === "completed" ? (
           <CheckCircle2 className="h-3.5 w-3.5 text-[hsl(var(--chat-success))]" />

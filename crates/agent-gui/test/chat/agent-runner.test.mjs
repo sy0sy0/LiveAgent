@@ -242,16 +242,20 @@ const llmMock = {
   buildProviderRequestMetadata(_providerId, sessionId) {
     return sessionId ? { sessionId } : undefined;
   },
-  buildDualAuthHeaders(apiKey) {
+  buildAnthropicAuthHeaders(apiKey) {
     return {
-      Authorization: `Bearer ${apiKey}`,
       "x-api-key": apiKey,
     };
   },
-  buildProviderAuthHeaders(_providerId, apiKey) {
+  buildOpenAIAuthHeaders(apiKey) {
     return {
       Authorization: `Bearer ${apiKey}`,
-      "x-api-key": apiKey,
+    };
+  },
+  async prepareProviderRequest(_providerId, runtime) {
+    return {
+      baseUrl: runtime.baseUrl.trim(),
+      headers: { Authorization: `Bearer ${runtime.apiKey}`, "x-liveagent-test": "1" },
     };
   },
   createModelFromConfig(providerId, modelId, baseUrl) {
@@ -1773,6 +1777,268 @@ test("runAssistantWithTools silently bridges structured DSML web_search tool cal
   assert.match(
     beforeNextTurnSnapshots[0].toolResults[0].content[0].text,
     /LiveAgent DeepSeek structured DSML search/,
+  );
+  assert.deepEqual(
+    result.emittedMessages.map((message) => message.role),
+    ["assistant", "toolResult", "assistant"],
+  );
+});
+
+test("runAssistantWithTools ends the turn when a leaked web_fetch arrives after a completed answer", async () => {
+  const webFetchCall = createToolCall("toolu_bdrk_leak_fetch", "web_fetch", {
+    url: "https://example.com/article",
+  });
+  resetFakeStreams(
+    createAssistant(
+      [{ type: "text", text: "今天长沙的主要新闻整理如下：高温黄色预警，最高气温超35℃。" }, webFetchCall],
+      "stop",
+      {
+        api: "anthropic-messages",
+        provider: "anthropic",
+        model: "claude-sonnet-5",
+      },
+    ),
+  );
+  const toolEvents = createToolEventRecorder();
+  const { params, executedToolCalls } = createBaseParams({
+    providerId: "claude_code",
+    model: "claude-sonnet-5",
+    runtime: {
+      baseUrl: "https://relay.example.test/anthropic",
+      apiKey: "test-key",
+      requestFormat: "anthropic-messages",
+      nativeWebSearchEnabled: true,
+    },
+    nativeWebSearch: true,
+    ...toolEvents.handlers,
+  });
+
+  const result = await runAssistantWithTools(params);
+
+  assert.equal(executedToolCalls.length, 0);
+  toolEvents.assertSilent();
+  // The answer was already delivered in the same message; no second model turn.
+  assert.equal(observedStreamContexts.length, 1);
+  assert.deepEqual(
+    result.emittedMessages.map((message) => message.role),
+    ["assistant", "toolResult"],
+  );
+  assert.equal(result.emittedMessages[1].isError, false);
+  assert.match(
+    result.emittedMessages[1].content[0].text,
+    /did not execute the provider-native web_fetch request/,
+  );
+});
+
+test("runAssistantWithTools keeps the follow-up turn for leaked web_search without hosted results", async () => {
+  const webSearchCall = createToolCall("toolu_bdrk_leak_search", "web_search", {
+    query: "changsha news",
+  });
+  resetFakeStreams(
+    createAssistant(
+      [{ type: "text", text: "我先联网搜索一下长沙今天的新闻。" }, webSearchCall],
+      "stop",
+      {
+        api: "anthropic-messages",
+        provider: "anthropic",
+        model: "claude-sonnet-5",
+      },
+    ),
+    createTextAssistant("final answer"),
+  );
+  const { params, executedToolCalls } = createBaseParams({
+    providerId: "claude_code",
+    model: "claude-sonnet-5",
+    runtime: {
+      baseUrl: "https://relay.example.test/anthropic",
+      apiKey: "test-key",
+      requestFormat: "anthropic-messages",
+      nativeWebSearchEnabled: true,
+    },
+    nativeWebSearch: true,
+  });
+
+  const result = await runAssistantWithTools(params);
+
+  assert.equal(executedToolCalls.length, 0);
+  // No hosted-search results were captured in-round, so the model may still be
+  // waiting for sources — the follow-up turn must survive.
+  assert.equal(observedStreamContexts.length, 2);
+  assert.deepEqual(
+    result.emittedMessages.map((message) => message.role),
+    ["assistant", "toolResult", "assistant"],
+  );
+});
+
+test("runAssistantWithTools ends the turn for leaked web_search covered by in-round hosted results", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(
+            encoder.encode(
+              sse({
+                type: "content_block_start",
+                index: 0,
+                content_block: {
+                  type: "server_tool_use",
+                  id: "srvtoolu_news",
+                  name: "web_search",
+                  input: { query: "changsha news" },
+                },
+              }),
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              sse({
+                type: "content_block_start",
+                index: 1,
+                content_block: {
+                  type: "web_search_tool_result",
+                  tool_use_id: "srvtoolu_news",
+                  content: [
+                    {
+                      type: "web_search_result",
+                      url: "https://example.com/changsha-news",
+                      title: "Changsha News",
+                    },
+                  ],
+                },
+              }),
+            ),
+          );
+          controller.close();
+        },
+      }),
+      { headers: { "content-type": "text/event-stream; charset=utf-8" } },
+    );
+
+  try {
+    const webSearchCall = createToolCall("toolu_bdrk_leak_search_covered", "web_search", {
+      query: "changsha news",
+    });
+    resetFakeStreams(
+      createAssistant(
+        [
+          { type: "text", text: "今天长沙的主要新闻整理如下：高温黄色预警与楼市新政落地。" },
+          webSearchCall,
+        ],
+        "stop",
+        {
+          api: "anthropic-messages",
+          provider: "anthropic",
+          model: "claude-sonnet-5",
+        },
+      ),
+    );
+    // Feed the hosted-search probe before the fake stream yields any event, so
+    // the completed search sources are aggregated ahead of tool execution.
+    queueStreamSideEffect(async (options) => {
+      await fetch("http://127.0.0.1:18080/proxy/claude_code/v1/messages", {
+        method: "POST",
+        headers: options?.headers,
+        body: JSON.stringify({ metadata: { user_id: "session-1" } }),
+      });
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    });
+    const { params, executedToolCalls } = createBaseParams({
+      providerId: "claude_code",
+      model: "claude-sonnet-5",
+      runtime: {
+        baseUrl: "https://relay.example.test/anthropic",
+        apiKey: "test-key",
+        requestFormat: "anthropic-messages",
+        nativeWebSearchEnabled: true,
+      },
+      nativeWebSearch: true,
+    });
+
+    const result = await runAssistantWithTools(params);
+
+    assert.equal(executedToolCalls.length, 0);
+    // The relay already executed the search in-band and the model answered
+    // after seeing the results — a second model turn would re-answer.
+    assert.equal(observedStreamContexts.length, 1);
+    assert.deepEqual(
+      result.emittedMessages.map((message) => message.role),
+      ["assistant", "toolResult"],
+    );
+    assert.equal(result.emittedMessages[1].isError, false);
+    assert.match(result.emittedMessages[1].content[0].text, /example\.com\/changsha-news/);
+
+    // The hosted-search card must still be folded into the persisted assistant
+    // message even though the run terminated without a follow-up turn.
+    const hostedSearches = result.assistant.content.filter(
+      (block) => block?.type === "hostedSearch",
+    );
+    assert.equal(hostedSearches.length, 1);
+    assert.equal(hostedSearches[0].status, "completed");
+    assert.deepEqual(
+      hostedSearches[0].sources.map((source) => source.url),
+      ["https://example.com/changsha-news"],
+    );
+  } finally {
+    await Promise.resolve();
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("runAssistantWithTools silently bridges leaked provider-native web_fetch tool calls", async () => {
+  const webFetchCall = createToolCall("toolu_bdrk_0115gvv1UH91P7VUq87KBrNW", "web_fetch", {
+    url: "https://www.weather.com.cn/weather1d/101250101.shtml",
+    mode: "truncated",
+  });
+  resetFakeStreams(
+    createAssistant(
+      [{ type: "text", text: "Fetching the page" }, webFetchCall],
+      "toolUse",
+      {
+        api: "anthropic-messages",
+        provider: "anthropic",
+        model: "claude-sonnet-5",
+      },
+    ),
+    createTextAssistant("final answer"),
+  );
+  const beforeNextTurnSnapshots = [];
+  const toolEvents = createToolEventRecorder();
+  const { params, executedToolCalls } = createBaseParams({
+    providerId: "claude_code",
+    model: "claude-sonnet-5",
+    runtime: {
+      baseUrl: "https://relay.example.test/anthropic",
+      apiKey: "test-key",
+      requestFormat: "anthropic-messages",
+      nativeWebSearchEnabled: true,
+    },
+    nativeWebSearch: true,
+    ...toolEvents.handlers,
+    onBeforeNextTurn: async (snapshot) => {
+      beforeNextTurnSnapshots.push(snapshot);
+      return null;
+    },
+  });
+
+  const result = await runAssistantWithTools(params);
+
+  assert.equal(executedToolCalls.length, 0);
+  assert.equal(observedStreamContexts[0].tools.some((tool) => tool.name === "web_fetch"), false);
+  assert.equal(observedStreamContexts[0].tools.some((tool) => tool.name === "WebFetch"), false);
+  toolEvents.assertSilent();
+  assert.equal(beforeNextTurnSnapshots.length, 1);
+  const bridgedResult = beforeNextTurnSnapshots[0].toolResults[0];
+  assert.equal(bridgedResult.toolCallId, webFetchCall.id);
+  assert.equal(bridgedResult.isError, false);
+  assert.match(
+    bridgedResult.content[0].text,
+    /did not execute the provider-native web_fetch request/,
+  );
+  assert.match(
+    bridgedResult.content[0].text,
+    /https:\/\/www\.weather\.com\.cn\/weather1d\/101250101\.shtml/,
   );
   assert.deepEqual(
     result.emittedMessages.map((message) => message.role),

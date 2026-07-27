@@ -1,28 +1,62 @@
-import { type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 import { GlassPanel, HubBackdrop, HubHeader } from "../../components/hub/HubChrome";
 import {
   AlertTriangle,
   Blend,
   BookOpen,
+  Bot,
+  Brain,
+  Cable,
   Check,
+  CircleHelp,
   Cloud,
   Copy,
+  Cpu,
   Download,
   ExternalLink,
   FileText,
   Folder,
+  GitBranch,
+  Globe,
+  ImageIcon,
+  Key,
+  LayoutGrid,
+  Lightbulb,
+  Link2,
   ListChecks,
   Loader2,
   Lock,
   MessageSquare,
   Plug,
+  Radio,
   RefreshCw,
+  ScanText,
+  ScrollText,
   Search,
+  Send,
   Server,
+  Settings,
+  Shield,
   SkillIcon,
+  Sparkles,
+  Terminal,
+  Timer,
   Trash2,
+  Waypoints,
+  Wifi,
+  Wrench,
   X,
+  Zap,
 } from "../../components/icons";
 import { Markdown } from "../../components/Markdown";
 import { Button } from "../../components/ui/button";
@@ -36,6 +70,7 @@ import { cn } from "../../lib/shared/utils";
 import {
   cancelSkillInstallJob,
   discoverSkills,
+  type ExternalSkillEntry,
   type ExternalToolScan,
   getSkillInstallJobStatus,
   isAlwaysEnabledSkillName,
@@ -60,6 +95,23 @@ import {
   resolveClawHubSkillOwner,
   searchClawHubSkills,
 } from "../../lib/skills/clawHub";
+import { type ClawHubCategorySlug, classifyClawHubSkill } from "../../lib/skills/clawHubCategories";
+import {
+  DEFAULT_INSTALLED_SKILL_SORT,
+  type InstalledSkillSort,
+  isInstalledSkillSort,
+  sortInstalledSkillItems,
+} from "../../lib/skills/installedSort";
+import {
+  getInstalledSkillCardIdentity,
+  type InstalledSkillCardIconName,
+} from "../../lib/skills/skillCardIdentity";
+import {
+  getInstalledSkillCardSource,
+  getRelativeInstalledAt,
+  truncateLocalSkillCardDescription,
+} from "../../lib/skills/skillCardMetadata";
+import { getSkillTriggerHint } from "../../lib/skills/skillTriggerHint";
 
 type SkillsHubView = "installed" | "store" | "import";
 
@@ -72,6 +124,7 @@ const EXTERNAL_TOOL_LABELS: Record<string, string> = {
 const STORE_PAGE_LIMIT = 24;
 const INSTALLED_SKILL_PREVIEW_LINES = 10_000;
 const COPY_FEEDBACK_MS = 1600;
+const EMPTY_SKILLS: SkillSummary[] = [];
 const TERMINAL_INSTALL_PHASES = new Set(["done", "error", "cancelled"]);
 const STORE_SORT_OPTIONS: Array<{ value: ClawHubSort; labelKey: string }> = [
   { value: "downloads", labelKey: "settings.skillsStoreSortMostDownloaded" },
@@ -80,6 +133,117 @@ const STORE_SORT_OPTIONS: Array<{ value: ClawHubSort; labelKey: string }> = [
   { value: "updated", labelKey: "settings.skillsStoreSortRecentlyUpdated" },
   { value: "newest", labelKey: "settings.skillsStoreSortNewest" },
 ];
+
+const INSTALLED_SORT_OPTIONS: Array<{ value: InstalledSkillSort; labelKey: string }> = [
+  { value: "name-asc", labelKey: "settings.skillsInstalledSortNameAsc" },
+  { value: "name-desc", labelKey: "settings.skillsInstalledSortNameDesc" },
+  { value: "installed-desc", labelKey: "settings.skillsInstalledSortNewest" },
+];
+
+const INSTALLED_SKILL_ICON_TONES = [
+  "border-sky-500/30 bg-sky-500/12 text-sky-700 dark:border-sky-400/30 dark:bg-sky-400/15 dark:text-sky-200",
+  "border-indigo-500/30 bg-indigo-500/12 text-indigo-700 dark:border-indigo-400/30 dark:bg-indigo-400/15 dark:text-indigo-200",
+  "border-violet-500/30 bg-violet-500/12 text-violet-700 dark:border-violet-400/30 dark:bg-violet-400/15 dark:text-violet-200",
+  "border-fuchsia-500/30 bg-fuchsia-500/12 text-fuchsia-700 dark:border-fuchsia-400/30 dark:bg-fuchsia-400/15 dark:text-fuchsia-200",
+  "border-rose-500/30 bg-rose-500/12 text-rose-700 dark:border-rose-400/30 dark:bg-rose-400/15 dark:text-rose-200",
+  "border-orange-500/30 bg-orange-500/12 text-orange-700 dark:border-orange-400/30 dark:bg-orange-400/15 dark:text-orange-200",
+  "border-amber-500/30 bg-amber-500/12 text-amber-800 dark:border-amber-400/30 dark:bg-amber-400/15 dark:text-amber-200",
+  "border-emerald-500/30 bg-emerald-500/12 text-emerald-700 dark:border-emerald-400/30 dark:bg-emerald-400/15 dark:text-emerald-200",
+  "border-cyan-500/30 bg-cyan-500/12 text-cyan-700 dark:border-cyan-400/30 dark:bg-cyan-400/15 dark:text-cyan-200",
+] as const;
+
+const INSTALLED_SKILL_CARD_ICONS: Record<InstalledSkillCardIconName, typeof BookOpen> = {
+  bookOpen: BookOpen,
+  bot: Bot,
+  brain: Brain,
+  cable: Cable,
+  circleHelp: CircleHelp,
+  cloud: Cloud,
+  cpu: Cpu,
+  fileText: FileText,
+  folder: Folder,
+  gitBranch: GitBranch,
+  globe: Globe,
+  imageIcon: ImageIcon,
+  key: Key,
+  layoutGrid: LayoutGrid,
+  lightbulb: Lightbulb,
+  link2: Link2,
+  listChecks: ListChecks,
+  lock: Lock,
+  messageSquare: MessageSquare,
+  plug: Plug,
+  radio: Radio,
+  refreshCw: RefreshCw,
+  scanText: ScanText,
+  scrollText: ScrollText,
+  search: Search,
+  send: Send,
+  server: Server,
+  settings: Settings,
+  shield: Shield,
+  sparkles: Sparkles,
+  terminal: Terminal,
+  timer: Timer,
+  waypoints: Waypoints,
+  wifi: Wifi,
+  wrench: Wrench,
+  zap: Zap,
+};
+
+function installedSkillCategoryLabelKey(value: ClawHubCategorySlug): string {
+  return `settings.skillsStoreCategory${value.charAt(0).toUpperCase()}${value.slice(1)}`;
+}
+
+function classifyInstalledSkill(skill: SkillSummary): ClawHubCategorySlug[] {
+  return classifyClawHubSkill({
+    slug: skill.name,
+    displayName: skill.name,
+    summary: skill.description,
+    topics: [],
+  });
+}
+
+// Intl 格式化器构造开销可观且配置固定（跟随系统 locale），做模块级懒缓存，
+// 避免技能多时逐卡重复 new。
+let cachedCompactNumberFormat: Intl.NumberFormat | null = null;
+let cachedShortDateFormat: Intl.DateTimeFormat | null = null;
+let cachedFullDateFormat: Intl.DateTimeFormat | null = null;
+
+function getFullDateFormat() {
+  cachedFullDateFormat ??= new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+  return cachedFullDateFormat;
+}
+
+function formatInstalledSkillMetadata(skill: SkillSummary, t: (key: string) => string): string {
+  const source = getInstalledSkillCardSource(skill);
+  const sourceLabel =
+    source === "built-in"
+      ? t("settings.skillsInstalledCardSourceBuiltIn")
+      : source === "clawhub"
+        ? t("settings.skillsInstalledCardSourceClawHub")
+        : t("settings.skillsInstalledCardSourceLocal");
+  if (source === "built-in") return sourceLabel;
+
+  const relativeInstalledAt = getRelativeInstalledAt(skill.installedAt);
+  if (!relativeInstalledAt) return sourceLabel;
+  if (relativeInstalledAt.kind === "today") {
+    return `${sourceLabel} · ${t("settings.skillsInstalledCardInstalledToday")}`;
+  }
+  if (relativeInstalledAt.kind === "days-ago") {
+    return `${sourceLabel} · ${t("settings.skillsInstalledCardInstalledDaysAgo").replace(
+      "{count}",
+      String(relativeInstalledAt.days),
+    )}`;
+  }
+
+  const date = getFullDateFormat().format(new Date(relativeInstalledAt.timestamp));
+  return `${sourceLabel} · ${date}`;
+}
 
 type StoreSkillInstallState = {
   done: boolean;
@@ -305,13 +469,62 @@ function ScanActivityDots() {
   );
 }
 
+const FROST_SPINNER_SEGMENTS = [
+  "01",
+  "02",
+  "03",
+  "04",
+  "05",
+  "06",
+  "07",
+  "08",
+  "09",
+  "10",
+  "11",
+  "12",
+] as const;
+
 function FrostSpinner() {
   return (
     <span className="hub-frost-spinner shrink-0" aria-hidden="true">
-      {Array.from({ length: 12 }).map((_, i) => (
-        <i key={i} />
+      {FROST_SPINNER_SEGMENTS.map((segment) => (
+        <i key={segment} />
       ))}
     </span>
+  );
+}
+
+function SkillsContentLoadingState(props: { title: string; description: string }) {
+  const { title, description } = props;
+  return (
+    <div className="flex flex-col gap-3" role="status" aria-live="polite" aria-busy="true">
+      <div className="hub-frost-hero hub-panel-enter px-4 py-3.5">
+        <div className="flex items-center gap-3.5">
+          <FrostSpinner />
+          <div className="min-w-0 flex-1">
+            <div className="text-[13px] font-medium tracking-tight text-foreground">{title}</div>
+            <div className="mt-0.5 truncate text-[11px] text-muted-foreground/80">
+              {description}
+            </div>
+          </div>
+        </div>
+        <div className="hub-frost-track mt-3.5" />
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+        {[1, 2, 3, 4, 5, 6].map((item) => (
+          <div key={item} className="hub-frost-skeleton skill-card-enter p-3.5">
+            <div className="flex items-center gap-3">
+              <div className="skills-skeleton-shimmer h-9 w-9 shrink-0 rounded-lg" />
+              <div className="flex-1 space-y-2">
+                <div className="skills-skeleton-shimmer h-3.5 w-28 rounded" />
+                <div className="skills-skeleton-shimmer h-3 w-full max-w-[12rem] rounded" />
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -324,14 +537,606 @@ function buildSkillDiscoverySignature(rootDir: string, skills: SkillSummary[]) {
           skill.name,
           skill.baseDir,
           skill.skillFile,
+          skill.description,
+          skill.builtIn ? "1" : "0",
+          skill.inlineContent?.length ?? -1,
           skill.source?.registry ?? "",
           skill.source?.slug ?? "",
+          skill.installedAt ?? "",
           skill.source?.version ?? "",
         ].join("\0"),
       )
       .sort(),
   ].join("\n");
 }
+
+const INSTALLED_SORT_STORAGE_KEY = "skillsHub.installedSort";
+const FLIP_HERO_DURATION_MS = 380;
+const FLIP_BATCH_HERO_DELAY_MS = 90;
+const FLIP_BATCH_STAGGER_LIMIT = 8;
+const FLIP_WAVE_DURATION_MS = 280;
+const FLIP_WAVE_DELAY_MS = 30;
+const FLIP_WAVE_MAX_DELAY_MS = 400;
+const FLIP_HERO_TRANSITION = `translate ${FLIP_HERO_DURATION_MS}ms cubic-bezier(0.34, 1.3, 0.64, 1)`;
+const FLIP_WAVE_TRANSITION = `translate ${FLIP_WAVE_DURATION_MS}ms cubic-bezier(0.16, 1, 0.3, 1)`;
+
+type FlipMode = "single" | "wave" | "batch";
+type FlipPosition = { left: number; top: number };
+type FlipRequest = {
+  mode: FlipMode;
+  heroKeys: ReadonlySet<string>;
+  followKeys: ReadonlySet<string>;
+};
+
+function readInstalledSortPreference(): InstalledSkillSort {
+  if (typeof window === "undefined") return DEFAULT_INSTALLED_SKILL_SORT;
+  try {
+    const stored = window.localStorage.getItem(INSTALLED_SORT_STORAGE_KEY);
+    return isInstalledSkillSort(stored) ? stored : DEFAULT_INSTALLED_SKILL_SORT;
+  } catch {
+    return DEFAULT_INSTALLED_SKILL_SORT;
+  }
+}
+
+function resetFlipStyles(element: HTMLElement) {
+  element.style.transition = "";
+  element.style.translate = "";
+  element.style.willChange = "";
+  element.style.zIndex = "";
+}
+
+function measureFlipRects(grid: HTMLElement, elements: readonly HTMLElement[]) {
+  const gridRect = grid.getBoundingClientRect();
+  const rects = new Map<string, FlipPosition>();
+  for (const element of elements) {
+    const key = element.dataset.flipKey;
+    if (!key) continue;
+    const rect = element.getBoundingClientRect();
+    rects.set(key, {
+      left: rect.left - gridRect.left,
+      top: rect.top - gridRect.top,
+    });
+  }
+  return rects;
+}
+
+function useFlipGrid() {
+  const gridRef = useRef<HTMLDivElement>(null);
+  const previousRectsRef = useRef<Map<string, FlipPosition>>(new Map());
+  const previousOrderRef = useRef<string[]>([]);
+  const pendingRequestRef = useRef<FlipRequest | null>(null);
+  const frameRef = useRef<number | null>(null);
+  const phaseTimerRef = useRef<number | null>(null);
+  const cleanupTimerRef = useRef<number | null>(null);
+  const activeElementsRef = useRef<HTMLElement[]>([]);
+
+  const requestFlip = useCallback(
+    (mode: FlipMode, heroKeys: readonly string[], followKeys: readonly string[] = heroKeys) => {
+      // 契约：必须在触发重排的 setState 之前调用。此处同步捕获「变更前」布局，
+      // 主 effect 只在存在 pending 请求的那次渲染里测量「变更后」布局并做 FLIP —
+      // 其余渲染完全不碰 getBoundingClientRect（技能多时曾是主要强制回流来源）。
+      const grid = gridRef.current;
+      if (grid) {
+        const elements = Array.from(grid.querySelectorAll<HTMLElement>("[data-flip-key]"));
+        previousRectsRef.current = measureFlipRects(grid, elements);
+        previousOrderRef.current = elements.map((element) => element.dataset.flipKey ?? "");
+      } else {
+        previousRectsRef.current = new Map();
+        previousOrderRef.current = [];
+      }
+      pendingRequestRef.current = {
+        mode,
+        heroKeys: new Set(heroKeys),
+        followKeys: new Set(followKeys),
+      };
+    },
+    [],
+  );
+
+  const captureVisibleKey = useCallback(() => {
+    const grid = gridRef.current;
+    if (!grid) return null;
+    let scrollParent = grid.parentElement;
+    while (scrollParent) {
+      const overflowY = window.getComputedStyle(scrollParent).overflowY;
+      if (/auto|scroll|overlay/.test(overflowY)) break;
+      scrollParent = scrollParent.parentElement;
+    }
+    const viewport = scrollParent?.getBoundingClientRect();
+    const viewportTop = viewport?.top ?? 0;
+    const viewportBottom = viewport?.bottom ?? window.innerHeight;
+    const elements = grid.querySelectorAll<HTMLElement>("[data-flip-key]");
+    for (const element of elements) {
+      const rect = element.getBoundingClientRect();
+      if (rect.bottom > viewportTop && rect.top < viewportBottom) {
+        return element.dataset.flipKey ?? null;
+      }
+    }
+    return null;
+  }, []);
+
+  const clearAnimation = useCallback(() => {
+    if (frameRef.current !== null) {
+      window.cancelAnimationFrame(frameRef.current);
+      frameRef.current = null;
+    }
+    if (phaseTimerRef.current !== null) {
+      window.clearTimeout(phaseTimerRef.current);
+      phaseTimerRef.current = null;
+    }
+    if (cleanupTimerRef.current !== null) {
+      window.clearTimeout(cleanupTimerRef.current);
+      cleanupTimerRef.current = null;
+    }
+    for (const element of activeElementsRef.current) {
+      resetFlipStyles(element);
+    }
+    activeElementsRef.current = [];
+  }, []);
+
+  useLayoutEffect(() => {
+    // 无 pending 请求的渲染不做任何测量/清理：变更前布局已在 requestFlip 时捕获，
+    // 进行中的动画也不因无关重渲被打断。
+    const request = pendingRequestRef.current;
+    if (!request) return;
+    pendingRequestRef.current = null;
+    clearAnimation();
+    const grid = gridRef.current;
+    if (!grid) {
+      previousRectsRef.current.clear();
+      previousOrderRef.current = [];
+      return;
+    }
+
+    const elements = Array.from(grid.querySelectorAll<HTMLElement>("[data-flip-key]"));
+    const nextOrder = elements.map((element) => element.dataset.flipKey ?? "");
+    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+    const followElement = elements.find((element) => {
+      const key = element.dataset.flipKey;
+      return key ? request.followKeys.has(key) : false;
+    });
+
+    followElement?.scrollIntoView({
+      block: "nearest",
+      inline: "nearest",
+      behavior: reducedMotion ? "auto" : "smooth",
+    });
+
+    const nextRects = measureFlipRects(grid, elements);
+
+    const previousRects = previousRectsRef.current;
+    const previousOrder = previousOrderRef.current;
+    const orderChanged =
+      previousOrder.length !== nextOrder.length ||
+      nextOrder.some((key, index) => key !== previousOrder[index]);
+    previousRectsRef.current = nextRects;
+    previousOrderRef.current = nextOrder;
+
+    if (previousRects.size === 0 || previousOrder.length === 0 || !orderChanged || reducedMotion) {
+      return;
+    }
+
+    const movedElements: Array<{ element: HTMLElement; hero: boolean }> = [];
+    for (const element of elements) {
+      const key = element.dataset.flipKey;
+      const previousRect = key ? previousRects.get(key) : undefined;
+      const nextRect = key ? nextRects.get(key) : undefined;
+      if (!previousRect || !nextRect) continue;
+      const deltaX = previousRect.left - nextRect.left;
+      const deltaY = previousRect.top - nextRect.top;
+      if (Math.abs(deltaX) < 0.5 && Math.abs(deltaY) < 0.5) continue;
+      element.style.transition = "none";
+      element.style.translate = `${deltaX}px ${deltaY}px`;
+      element.style.willChange = "translate";
+      const hero = key ? (request?.heroKeys.has(key) ?? false) : false;
+      if (hero) element.style.zIndex = "30";
+      movedElements.push({ element, hero });
+    }
+
+    if (movedElements.length === 0) return;
+    activeElementsRef.current = movedElements.map(({ element }) => element);
+    void grid.offsetWidth;
+    frameRef.current = window.requestAnimationFrame(() => {
+      frameRef.current = null;
+      const mode = request?.mode ?? "wave";
+      const heroElements = movedElements.filter(({ hero }) => hero);
+      const waveElements = movedElements.filter(({ hero }) => !hero);
+      const maxWaveDelay = Math.min(
+        Math.max(0, waveElements.length - 1) * FLIP_WAVE_DELAY_MS,
+        FLIP_WAVE_MAX_DELAY_MS,
+      );
+      const startWave = () => {
+        waveElements.forEach(({ element }, index) => {
+          const delay = Math.min(index * FLIP_WAVE_DELAY_MS, FLIP_WAVE_MAX_DELAY_MS);
+          element.style.transition = `${FLIP_WAVE_TRANSITION} ${delay}ms`;
+          element.style.translate = "0 0";
+        });
+      };
+      const scheduleCleanup = (delay: number) => {
+        cleanupTimerRef.current = window.setTimeout(() => {
+          for (const { element } of movedElements) {
+            resetFlipStyles(element);
+          }
+          activeElementsRef.current = [];
+          cleanupTimerRef.current = null;
+        }, delay + 40);
+      };
+
+      if (mode === "batch") {
+        const staggerHeroes = (request?.heroKeys.size ?? 0) <= FLIP_BATCH_STAGGER_LIMIT;
+        heroElements.forEach(({ element }, index) => {
+          const delay = staggerHeroes ? index * FLIP_BATCH_HERO_DELAY_MS : 0;
+          element.style.transition = `${FLIP_HERO_TRANSITION} ${delay}ms`;
+          element.style.translate = "0 0";
+        });
+        const lastHeroDelay =
+          staggerHeroes && heroElements.length > 0
+            ? (heroElements.length - 1) * FLIP_BATCH_HERO_DELAY_MS
+            : 0;
+        const heroPhaseDuration =
+          heroElements.length > 0 ? lastHeroDelay + FLIP_HERO_DURATION_MS : 0;
+        if (waveElements.length > 0) {
+          if (heroPhaseDuration > 0) {
+            phaseTimerRef.current = window.setTimeout(() => {
+              phaseTimerRef.current = null;
+              startWave();
+            }, heroPhaseDuration);
+          } else {
+            startWave();
+          }
+        }
+        const wavePhaseDuration =
+          waveElements.length > 0 ? FLIP_WAVE_DURATION_MS + maxWaveDelay : 0;
+        scheduleCleanup(heroPhaseDuration + wavePhaseDuration);
+        return;
+      }
+
+      heroElements.forEach(({ element }) => {
+        element.style.transition = FLIP_HERO_TRANSITION;
+        element.style.translate = "0 0";
+      });
+      startWave();
+      const heroDuration = heroElements.length > 0 ? FLIP_HERO_DURATION_MS : 0;
+      const waveDuration = waveElements.length > 0 ? FLIP_WAVE_DURATION_MS + maxWaveDelay : 0;
+      scheduleCleanup(Math.max(heroDuration, waveDuration));
+    });
+  });
+
+  useLayoutEffect(
+    () => () => {
+      clearAnimation();
+      previousRectsRef.current.clear();
+      previousOrderRef.current = [];
+      pendingRequestRef.current = null;
+    },
+    [clearAnimation],
+  );
+
+  return { captureVisibleKey, gridRef, requestFlip };
+}
+
+type InstalledSkillCardProps = {
+  skill: SkillSummary;
+  flipKey: string;
+  primaryCategory: ClawHubCategorySlug;
+  alwaysEnabled: boolean;
+  checked: boolean;
+  bulkMode: boolean;
+  bulkSelected: boolean;
+  deleting: boolean;
+  deleteDisabled: boolean;
+  onToggle: (name: string, on: boolean) => void;
+  onEnterBulkMode: (name: string) => void;
+  onToggleBulkSelection: (name: string) => void;
+  onBulkCardClick: (name: string, shiftKey: boolean) => void;
+  onOpenPreview: (skill: SkillSummary) => void;
+  onDelete: (skill: SkillSummary) => void;
+};
+
+// 安装卡片抽成 memo 组件：props 只传标量与稳定引用（布尔代替 Set 成员判断、
+// primaryCategory 代替数组、latest-ref 回调），父组件的无关状态更新（搜索、
+// store 轮询、抽屉开关等）不再重渲整片网格；triggerHint/identity/metadata
+// 等派生计算也随之只在自身输入变化时重算。技能数量大时这是主要的卡顿来源。
+const InstalledSkillCard = memo(function InstalledSkillCard(props: InstalledSkillCardProps) {
+  const {
+    skill,
+    flipKey,
+    primaryCategory,
+    alwaysEnabled,
+    checked,
+    bulkMode,
+    bulkSelected,
+    deleting,
+    deleteDisabled,
+    onToggle,
+    onEnterBulkMode,
+    onToggleBulkSelection,
+    onBulkCardClick,
+    onOpenPreview,
+    onDelete,
+  } = props;
+  const { t } = useLocale();
+  const triggerHint = useMemo(() => getSkillTriggerHint(skill.description), [skill.description]);
+  const cardIdentity = useMemo(
+    () => (alwaysEnabled ? null : getInstalledSkillCardIdentity(skill.name, primaryCategory)),
+    [alwaysEnabled, primaryCategory, skill.name],
+  );
+  const CardIcon = alwaysEnabled
+    ? SkillIcon
+    : INSTALLED_SKILL_CARD_ICONS[cardIdentity?.iconName ?? "circleHelp"];
+  const iconTone = cardIdentity ? INSTALLED_SKILL_ICON_TONES[cardIdentity.colorIndex] : null;
+  const metadataSource = getInstalledSkillCardSource(skill);
+  const MetadataIcon =
+    metadataSource === "built-in" ? Lock : metadataSource === "clawhub" ? Cloud : Folder;
+  const metadataLabel = useMemo(() => formatInstalledSkillMetadata(skill, t), [skill, t]);
+  const card = (
+    <>
+      <div className="flex items-start justify-between gap-2">
+        <div
+          className={cn(
+            "flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border transition-all",
+            alwaysEnabled
+              ? "border-border/55 bg-background/80 text-foreground/85 shadow-[0_1px_0_rgba(255,255,255,0.55)_inset] dark:border-white/[0.09] dark:bg-white/[0.06] dark:shadow-[0_1px_0_rgba(255,255,255,0.06)_inset]"
+              : cn(
+                  iconTone,
+                  checked
+                    ? "shadow-[0_1px_0_rgba(255,255,255,0.45)_inset]"
+                    : "opacity-70 group-hover:opacity-100",
+                ),
+          )}
+        >
+          <CardIcon className="h-5 w-5" />
+        </div>
+
+        {alwaysEnabled && !bulkMode ? (
+          <div
+            className="inline-flex shrink-0 items-center gap-1 rounded-full bg-foreground/[0.06] px-2 py-0.5 text-[10px] font-medium text-foreground/75 ring-1 ring-border/45"
+            title={t("settings.skillsAlwaysOn")}
+          >
+            <Lock className="h-2.5 w-2.5" />
+            <span>{t("settings.skillsAlwaysOn")}</span>
+          </div>
+        ) : bulkMode ? (
+          alwaysEnabled ? (
+            <div
+              className="flex shrink-0 items-center"
+              title={t("settings.skillsBulkAlwaysOnDisabled")}
+            >
+              <span
+                aria-hidden="true"
+                className="pointer-events-none flex h-5 w-5 items-center justify-center rounded-full border border-border/50 bg-muted/40 text-muted-foreground/50 opacity-60"
+              >
+                <Lock className="h-2.5 w-2.5" />
+              </span>
+            </div>
+          ) : (
+            <div className="flex shrink-0 items-center">
+              <label
+                className="relative flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center"
+                title={t("settings.skillsHubBulkSelectLabel")}
+              >
+                <input
+                  type="checkbox"
+                  checked={bulkSelected}
+                  aria-label={`${t("settings.skillsHubBulkSelectLabel")}: ${skill.name}`}
+                  onClick={(event) => event.stopPropagation()}
+                  onKeyDown={(event) => event.stopPropagation()}
+                  onChange={(event) => {
+                    event.stopPropagation();
+                    onToggleBulkSelection(skill.name);
+                  }}
+                  className="peer sr-only"
+                />
+                <span
+                  aria-hidden="true"
+                  className={cn(
+                    "pointer-events-none flex h-5 w-5 items-center justify-center rounded-full border transition-all",
+                    bulkSelected
+                      ? "border-primary bg-primary text-primary-foreground"
+                      : "border-border bg-background group-hover:border-foreground/40",
+                  )}
+                >
+                  {bulkSelected ? <Check className="h-3 w-3" /> : null}
+                </span>
+              </label>
+            </div>
+          )
+        ) : (
+          <div className="flex shrink-0 items-center gap-1.5">
+            <button
+              type="button"
+              aria-label={`${t("settings.skillsHubBulkSelectLabel")}: ${skill.name}`}
+              title={t("settings.skillsHubBulkSelect")}
+              onClick={(event) => {
+                event.stopPropagation();
+                onEnterBulkMode(skill.name);
+              }}
+              onKeyDown={(event) => event.stopPropagation()}
+              className={cn(
+                // Google Photos-style bulk entry: hover-faint, touch semi-visible.
+                "relative flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-border/60 bg-background/90 text-muted-foreground shadow-sm transition-all hover:border-primary/50 hover:text-foreground",
+                "opacity-0 group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-70",
+              )}
+            >
+              <span className="h-2 w-2 rounded-full border border-current opacity-40" />
+            </button>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={checked}
+              aria-label={`${t("skills.select")}: ${skill.name}`}
+              title={
+                checked ? t("settings.skillsHubToggleDisable") : t("settings.skillsHubToggleEnable")
+              }
+              onClick={(event) => {
+                event.stopPropagation();
+                onToggle(skill.name, !checked);
+              }}
+              onKeyDown={(event) => event.stopPropagation()}
+              className={cn(
+                "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full ring-1 transition-all",
+                checked
+                  ? "bg-emerald-500 ring-emerald-400/45"
+                  : "bg-muted-foreground/25 ring-border/40",
+              )}
+            >
+              <span
+                className={cn(
+                  "pointer-events-none inline-block h-3.5 w-3.5 rounded-full bg-white shadow-sm transition-transform",
+                  checked ? "translate-x-[1.05rem]" : "translate-x-[0.15rem]",
+                )}
+              />
+            </button>
+          </div>
+        )}
+      </div>
+
+      <div className="mt-2.5 min-w-0 flex-1">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <div className="truncate text-[13px] font-semibold leading-tight text-foreground">
+            {skill.name}
+          </div>
+          {checked ? (
+            <span className="inline-flex shrink-0 items-center rounded-full bg-emerald-500/12 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-emerald-500/25 dark:bg-emerald-400/12 dark:text-emerald-300 dark:ring-emerald-400/25">
+              {t("settings.skillsHubEnabledBadge")}
+            </span>
+          ) : null}
+        </div>
+        {triggerHint ? (
+          <p className="mt-1 flex min-w-0 items-center gap-1 text-[11px] font-medium leading-[1.35] text-primary/90 dark:text-primary">
+            <MessageSquare className="h-3 w-3 shrink-0" />
+            <span className="shrink-0">{t("settings.skillsInstalledCardTrigger")}</span>
+            <span className="truncate">{triggerHint}</span>
+          </p>
+        ) : null}
+        {skill.description ? (
+          <p
+            className={cn(
+              "mt-1 text-[11.5px] leading-[1.4] text-muted-foreground",
+              triggerHint ? "line-clamp-1" : "line-clamp-2",
+            )}
+          >
+            {skill.description}
+          </p>
+        ) : null}
+        {!alwaysEnabled ? (
+          <div className="mt-2">
+            <InstalledSkillCategoryChip category={primaryCategory} />
+          </div>
+        ) : null}
+      </div>
+
+      <div className="mt-2.5 flex min-h-8 items-center gap-1 border-t border-border/30 pt-2 text-[10.5px] text-muted-foreground/70">
+        <MetadataIcon className="h-3 w-3 shrink-0" />
+        <span className="truncate">{metadataLabel}</span>
+        {!alwaysEnabled && !bulkMode ? (
+          <div className="ml-auto shrink-0">
+            <ConfirmDeletePopover name={skill.name} onConfirm={() => onDelete(skill)}>
+              {(open) => (
+                <button
+                  type="button"
+                  disabled={deleteDisabled}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    open();
+                  }}
+                  onKeyDown={(event) => event.stopPropagation()}
+                  className={cn(
+                    "flex h-6 w-6 items-center justify-center rounded-md border border-border/35 bg-background/65 text-muted-foreground transition-all",
+                    "hover:border-destructive/40 hover:bg-destructive/10 hover:text-destructive",
+                    "disabled:cursor-not-allowed",
+                    // Hover-revealed on pointer devices; keyboard focus and
+                    // touch (no hover — webui mobile) keep it reachable.
+                    deleting
+                      ? "pointer-events-auto opacity-100"
+                      : cn(
+                          "pointer-events-none opacity-0 group-hover:pointer-events-auto focus-visible:pointer-events-auto [@media(hover:none)]:pointer-events-auto",
+                          deleteDisabled
+                            ? "group-hover:opacity-60 focus-visible:opacity-60 [@media(hover:none)]:opacity-60"
+                            : "group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100",
+                        ),
+                  )}
+                  title={t("settings.skillsHubDeleteSkill")}
+                >
+                  {deleting ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Trash2 className="h-3.5 w-3.5" />
+                  )}
+                </button>
+              )}
+            </ConfirmDeletePopover>
+          </div>
+        ) : null}
+      </div>
+    </>
+  );
+
+  const key = flipKey;
+  if (alwaysEnabled) {
+    return (
+      <button
+        data-flip-key={key}
+        type="button"
+        aria-label={`${t("settings.skillsInstalledPreviewOpen")}: ${skill.name}`}
+        onClick={() => {
+          if (bulkMode) return;
+          onOpenPreview(skill);
+        }}
+        className={cn(
+          "hub-skill-card skill-card-enter group flex h-full min-h-[13rem] w-full cursor-pointer flex-col rounded-2xl border border-border/50 bg-background/75 p-3.5 text-left shadow-[0_1px_0_rgba(255,255,255,0.55)_inset,0_4px_18px_-12px_rgba(15,23,42,0.16)] transition-all hover:-translate-y-0.5 hover:border-border/60 hover:bg-background/85 hover:shadow-[0_4px_16px_-10px_rgba(15,23,42,0.18)] dark:border-white/[0.08] dark:bg-white/[0.05] dark:shadow-[0_1px_0_rgba(255,255,255,0.05)_inset,0_4px_18px_-12px_rgba(0,0,0,0.5)] dark:hover:border-white/[0.12] dark:hover:bg-white/[0.07] dark:hover:shadow-[0_4px_16px_-10px_rgba(0,0,0,0.55)] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-foreground/15",
+          "[content-visibility:auto] [contain-intrinsic-size:auto_13rem]",
+          bulkMode ? "cursor-default hover:translate-y-0" : null,
+        )}
+      >
+        {card}
+      </button>
+    );
+  }
+
+  return (
+    // biome-ignore lint/a11y/useSemanticElements: The card contains nested controls and cannot be a native button.
+    <div
+      data-flip-key={key}
+      role="button"
+      tabIndex={0}
+      aria-label={`${t("settings.skillsInstalledPreviewOpen")}: ${skill.name}`}
+      onClick={(event) => {
+        if (bulkMode) {
+          onBulkCardClick(skill.name, event.shiftKey);
+          return;
+        }
+        onOpenPreview(skill);
+      }}
+      onMouseDown={(event) => {
+        // Shift+点击做区间选择时避免浏览器拖出文本选区
+        if (bulkMode && event.shiftKey) event.preventDefault();
+      }}
+      onKeyDown={(event) => {
+        if (bulkMode && (event.key === "Enter" || event.key === " ")) {
+          event.preventDefault();
+          onBulkCardClick(skill.name, event.shiftKey);
+          return;
+        }
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        onOpenPreview(skill);
+      }}
+      className={cn(
+        "hub-skill-card skill-card-enter group relative flex h-full min-h-[13rem] w-full flex-col rounded-2xl border p-3.5 text-left transition-all",
+        "cursor-pointer focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-foreground/15",
+        "[content-visibility:auto] [contain-intrinsic-size:auto_13rem]",
+        // Enabled style always visible; bulk selection overlays primary ring.
+        checked
+          ? "border-emerald-500/35 bg-emerald-50/90 shadow-[0_1px_0_rgba(255,255,255,0.55)_inset,0_4px_14px_-12px_rgba(16,185,129,0.28)] dark:border-emerald-400/30 dark:bg-emerald-500/12 dark:shadow-[0_1px_0_rgba(255,255,255,0.05)_inset,0_4px_14px_-12px_rgba(16,185,129,0.22)]"
+          : "border-border/40 bg-muted/45 text-muted-foreground shadow-none hover:-translate-y-0.5 hover:border-border/55 hover:bg-muted/55 dark:border-white/[0.06] dark:bg-white/[0.025] dark:hover:border-white/[0.10] dark:hover:bg-white/[0.04]",
+        bulkSelected ? "ring-2 ring-primary/50 ring-offset-1 ring-offset-background" : null,
+      )}
+    >
+      {card}
+    </div>
+  );
+});
 
 type SkillsHubPageProps = {
   settings: AppSettings;
@@ -357,11 +1162,20 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
   const lockedByChatMode = !isAgentMode;
 
   const [skills, setSkills] = useState<SkillSummary[]>(initialSkills ?? []);
+  const [hasPresentedInstalledSkills, setHasPresentedInstalledSkills] = useState(false);
+  const {
+    captureVisibleKey: captureInstalledFlipKey,
+    gridRef: installedGridRef,
+    requestFlip: requestInstalledFlip,
+  } = useFlipGrid();
   const [rootDir, setRootDir] = useState(initialRootDir ?? "");
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [view, setView] = useState<SkillsHubView>("installed");
+  const [installedSort, setInstalledSort] = useState<InstalledSkillSort>(
+    readInstalledSortPreference,
+  );
   const [storeQuery, setStoreQuery] = useState("");
   const [storeSort, setStoreSort] = useState<ClawHubSort>("downloads");
   const [storeItems, setStoreItems] = useState<ClawHubSkillCard[]>([]);
@@ -392,6 +1206,7 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
   const [importErrors, setImportErrors] = useState<
     Array<{ baseDir: string; name: string; message: string }>
   >([]);
+  const [importingExternalBaseDir, setImportingExternalBaseDir] = useState<string | null>(null);
   const [importedCount, setImportedCount] = useState<number | null>(null);
   const [importToast, setImportToast] = useState<string | null>(null);
   const importToastTimerRef = useRef<number | null>(null);
@@ -399,9 +1214,20 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
   const [installedPreviewState, setInstalledPreviewState] = useState<InstalledSkillPreviewState>(
     () => emptyInstalledSkillPreviewState(),
   );
-  const discoverySignatureRef = useRef(
-    buildSkillDiscoverySignature(initialRootDir ?? "", initialSkills ?? []),
-  );
+  const discoverySignatureRef = useRef<string | null>(null);
+
+  // 唯一写入点：setState 与 discoverySignatureRef 必须同步更新，防止签名与状态漂移。
+  // 签名未变时跳过 setState，保持 skills 数组引用稳定（下游 memo 链与 store 轮询零重渲）。
+  const applyDiscovery = useCallback((nextRootDir: string, nextSkills: SkillSummary[]) => {
+    const signature = buildSkillDiscoverySignature(nextRootDir, nextSkills);
+    const changed = discoverySignatureRef.current !== signature;
+    discoverySignatureRef.current = signature;
+    if (changed) {
+      setSkills(nextSkills);
+      setRootDir(nextRootDir);
+    }
+    return changed;
+  }, []);
 
   const refresh = useCallback(
     async (options?: { silent?: boolean }) => {
@@ -420,17 +1246,16 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
       setLoadError(null);
       try {
         const discovery = await discoverSkills({ force: true });
-        const signature = buildSkillDiscoverySignature(discovery.rootDir, discovery.skills);
-        const changed = discoverySignatureRef.current !== signature;
-        discoverySignatureRef.current = signature;
-        setSkills(discovery.skills);
-        setRootDir(discovery.rootDir);
+        const changed = applyDiscovery(discovery.rootDir, discovery.skills);
         if (changed) {
           notifySkillsDiscoveryUpdated();
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setSkills([]);
+        // 失败清空列表后必须同步重置签名，否则下一次成功刷新若内容与
+        // 失败前相同会被 applyDiscovery 视为“未变化”而跳过 setState。
+        discoverySignatureRef.current = buildSkillDiscoverySignature("", []);
         setLoadError(msg || t("settings.skillsHubLoadFailed"));
       } finally {
         if (!silent) {
@@ -438,14 +1263,18 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
         }
       }
     },
-    [lockedByChatMode, t],
+    [applyDiscovery, lockedByChatMode, t],
   );
 
   useEffect(() => {
     if (initialSkills && initialSkills.length > 0) {
       setSkills(initialSkills);
+      discoverySignatureRef.current = buildSkillDiscoverySignature(
+        initialRootDir ?? "",
+        initialSkills,
+      );
     }
-  }, [initialSkills]);
+  }, [initialRootDir, initialSkills]);
 
   useEffect(() => {
     if (initialRootDir) {
@@ -463,22 +1292,64 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
     () => new Set(mergeAlwaysEnabledSkillNames(settings.skills.selected)),
     [settings.skills.selected],
   );
+  // React 19 的 initialValue 让 Hub 外壳先独立提交；大量卡片在可中断的后台
+  // render 中准备，全部完成后再原子替换加载态，避免页面切换被首屏列表挂载阻塞。
+  const deferredSkills = useDeferredValue(skills, EMPTY_SKILLS);
+  const installedContentPending = deferredSkills !== skills;
+  useEffect(() => {
+    if (!installedContentPending && deferredSkills.length > 0) {
+      setHasPresentedInstalledSkills(true);
+    }
+  }, [deferredSkills, installedContentPending]);
   const selectableSkills = useMemo(() => skills.filter(isUserSelectableSkill), [skills]);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(INSTALLED_SORT_STORAGE_KEY, installedSort);
+    } catch {
+      // The preference is non-critical when storage is unavailable.
+    }
+  }, [installedSort]);
   const selectedCount = selectableSkills.filter((skill) => selected.has(skill.name)).length;
   const installedSkillNames = useMemo(() => new Set(skills.map((skill) => skill.name)), [skills]);
+  const requestInstalledSkillFlip = useCallback(
+    (mode: FlipMode, names: readonly string[], followNames: readonly string[] = names) => {
+      const keys = names.map((name) => `${name}-${rootDir}`);
+      const followKeys = followNames.map((name) => `${name}-${rootDir}`);
+      requestInstalledFlip(mode, keys, followKeys);
+    },
+    [requestInstalledFlip, rootDir],
+  );
 
+  // 过滤走 deferred 值：技能多时每击键的 filter→classify→sort 链在低优先级
+  // 渲染中执行，输入框本身保持即时响应（输入框与空态提示仍绑同步 filter）。
+  const deferredFilter = useDeferredValue(filter);
   const filtered = useMemo(() => {
-    const text = filter.trim().toLowerCase();
-    if (!text) return skills;
-    return skills.filter(
-      (skill) =>
-        skill.name.toLowerCase().includes(text) || skill.description.toLowerCase().includes(text),
-    );
-  }, [filter, skills]);
+    const text = deferredFilter.trim().toLowerCase();
+    const matchedSkills = !text
+      ? deferredSkills
+      : deferredSkills.filter(
+          (skill) =>
+            skill.name.toLowerCase().includes(text) ||
+            skill.description.toLowerCase().includes(text),
+        );
+    return matchedSkills.map((skill) => ({
+      skill,
+      categories: isAlwaysEnabledSkillName(skill.name)
+        ? (["other"] as ClawHubCategorySlug[])
+        : classifyInstalledSkill(skill),
+    }));
+  }, [deferredFilter, deferredSkills]);
 
+  const sortedFiltered = useMemo(
+    () => sortInstalledSkillItems(filtered, installedSort, selected, ({ skill }) => skill),
+    [filtered, installedSort, selected],
+  );
   const filteredSelectableInstalledNames = useMemo(
-    () => filtered.map((skill) => skill.name).filter((name) => !isAlwaysEnabledSkillName(name)),
-    [filtered],
+    () =>
+      sortedFiltered
+        .map(({ skill }) => skill.name)
+        .filter((name) => !isAlwaysEnabledSkillName(name)),
+    [sortedFiltered],
   );
 
   useEffect(() => {
@@ -591,54 +1462,61 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
     };
   }, []);
 
-  const importSelectedExternalSkills = useCallback(async () => {
-    if (importProgress) return;
-    const selectedSkills = (externalScans ?? [])
-      .flatMap((scan) => scan.skills)
-      .filter((skill) => selectedExternal.has(skill.baseDir));
-    const alreadyInstalledSelected = selectedSkills.filter((skill) =>
-      installedSkillNames.has(skill.name),
-    );
-    const targets = selectedSkills.filter((skill) => !installedSkillNames.has(skill.name));
-    if (targets.length === 0) {
-      if (alreadyInstalledSelected.length > 0) {
-        showImportToast(t("settings.skillsImportAlreadyInstalled"));
+  const importSelectedExternalSkills = useCallback(
+    async (skill?: ExternalSkillEntry) => {
+      if (importProgress) return;
+      const selectedSkills = skill
+        ? [skill]
+        : (externalScans ?? [])
+            .flatMap((scan) => scan.skills)
+            .filter((item) => selectedExternal.has(item.baseDir));
+      const alreadyInstalledSelected = selectedSkills.filter((skill) =>
+        installedSkillNames.has(skill.name),
+      );
+      const targets = selectedSkills.filter((skill) => !installedSkillNames.has(skill.name));
+      if (targets.length === 0) {
+        if (alreadyInstalledSelected.length > 0) {
+          showImportToast(t("settings.skillsImportAlreadyInstalled"));
+        }
+        return;
       }
-      return;
-    }
-    setImportErrors([]);
-    setImportedCount(null);
-    const failures: Array<{ baseDir: string; name: string; message: string }> = [];
-    for (let index = 0; index < targets.length; index += 1) {
-      setImportProgress({ done: index, total: targets.length });
-      try {
-        await manageSkill({
-          action: "install",
-          source: targets[index].baseDir,
-          conflict: "backup",
-        });
-      } catch (err) {
-        failures.push({
-          baseDir: targets[index].baseDir,
-          name: targets[index].name,
-          message: err instanceof Error ? err.message : String(err),
-        });
+      setImportErrors([]);
+      setImportedCount(null);
+      const failures: Array<{ baseDir: string; name: string; message: string }> = [];
+      for (let index = 0; index < targets.length; index += 1) {
+        setImportingExternalBaseDir(targets[index].baseDir);
+        setImportProgress({ done: index, total: targets.length });
+        try {
+          await manageSkill({
+            action: "install",
+            source: targets[index].baseDir,
+            conflict: "backup",
+          });
+        } catch (err) {
+          failures.push({
+            baseDir: targets[index].baseDir,
+            name: targets[index].name,
+            message: err instanceof Error ? err.message : String(err),
+          });
+        }
       }
-    }
-    setImportProgress(null);
-    setImportErrors(failures);
-    setImportedCount(targets.length - failures.length);
-    setSelectedExternal(new Set());
-    await refresh({ silent: true });
-  }, [
-    externalScans,
-    selectedExternal,
-    importProgress,
-    refresh,
-    installedSkillNames,
-    showImportToast,
-    t,
-  ]);
+      setImportingExternalBaseDir(null);
+      setImportProgress(null);
+      setImportErrors(failures);
+      setImportedCount(targets.length - failures.length);
+      if (!skill) setSelectedExternal(new Set());
+      await refresh({ silent: true });
+    },
+    [
+      externalScans,
+      selectedExternal,
+      importProgress,
+      refresh,
+      installedSkillNames,
+      showImportToast,
+      t,
+    ],
+  );
 
   // Drop installed skills from import selection (cannot re-import).
   useEffect(() => {
@@ -1040,6 +1918,7 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
     const next = new Set(settings.skills.selected);
     if (on) next.add(name);
     else next.delete(name);
+    requestInstalledSkillFlip("single", [name], on ? [name] : []);
     setSettings((prev) => updateSkills(prev, { selected: Array.from(next) }));
   }
 
@@ -1056,38 +1935,53 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
     bulkAnchorRef.current = null;
   }, []);
 
-  const enterBulkMode = useCallback((initialName?: string) => {
-    setBulkMode(true);
-    setPreviewInstalledSkill(null);
-    if (initialName && !isAlwaysEnabledSkillName(initialName)) {
-      setBulkSelection(new Set([initialName]));
-      bulkAnchorRef.current = initialName;
-    }
-  }, []);
-
-  const toggleBulkSelectionName = useCallback((name: string) => {
-    if (isAlwaysEnabledSkillName(name)) return;
-    setBulkSelection((prev) => {
-      const next = new Set(prev);
-      if (next.has(name)) next.delete(name);
-      else next.add(name);
-      return next;
-    });
-    bulkAnchorRef.current = name;
-  }, []);
-
-  const setBulkSelectionRange = useCallback((names: readonly string[], select: boolean) => {
-    const selectable = names.filter((name) => !isAlwaysEnabledSkillName(name));
-    if (selectable.length === 0) return;
-    setBulkSelection((prev) => {
-      const next = new Set(prev);
-      for (const name of selectable) {
-        if (select) next.add(name);
-        else next.delete(name);
+  const enterBulkMode = useCallback(
+    (initialName?: string) => {
+      setBulkMode(true);
+      setPreviewInstalledSkill(null);
+      if (initialName && !isAlwaysEnabledSkillName(initialName)) {
+        clearBulkUndoTimer();
+        setBulkUndo(null);
+        setBulkSelection(new Set([initialName]));
+        bulkAnchorRef.current = initialName;
       }
-      return next;
-    });
-  }, []);
+    },
+    [clearBulkUndoTimer],
+  );
+
+  const toggleBulkSelectionName = useCallback(
+    (name: string) => {
+      if (isAlwaysEnabledSkillName(name)) return;
+      clearBulkUndoTimer();
+      setBulkUndo(null);
+      setBulkSelection((prev) => {
+        const next = new Set(prev);
+        if (next.has(name)) next.delete(name);
+        else next.add(name);
+        return next;
+      });
+      bulkAnchorRef.current = name;
+    },
+    [clearBulkUndoTimer],
+  );
+
+  const setBulkSelectionRange = useCallback(
+    (names: readonly string[], select: boolean) => {
+      const selectable = names.filter((name) => !isAlwaysEnabledSkillName(name));
+      if (selectable.length === 0) return;
+      clearBulkUndoTimer();
+      setBulkUndo(null);
+      setBulkSelection((prev) => {
+        const next = new Set(prev);
+        for (const name of selectable) {
+          if (select) next.add(name);
+          else next.delete(name);
+        }
+        return next;
+      });
+    },
+    [clearBulkUndoTimer],
+  );
 
   function handleBulkInstalledCardClick(name: string, orderedNames: string[], shiftKey: boolean) {
     if (isAlwaysEnabledSkillName(name)) return;
@@ -1116,11 +2010,13 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
 
       const before = settings.skills.selected;
       const current = new Set(before);
-      const changed = names.filter((name) =>
+      const changedNames = names.filter((name) =>
         target ? !current.has(name) : current.has(name),
-      ).length;
+      );
+      const changed = changedNames.length;
       if (changed === 0) return;
 
+      requestInstalledSkillFlip("batch", changedNames, target ? changedNames : []);
       clearBulkUndoTimer();
       setBulkUndo({ selected: before, count: changed });
       bulkUndoTimerRef.current = window.setTimeout(() => {
@@ -1141,17 +2037,36 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
         });
       });
     },
-    [bulkSelection, clearBulkUndoTimer, setSettings, settings.skills.selected],
+    [
+      bulkSelection,
+      clearBulkUndoTimer,
+      requestInstalledSkillFlip,
+      setSettings,
+      settings.skills.selected,
+    ],
   );
 
   const undoBulkSelection = useCallback(() => {
     clearBulkUndoTimer();
     if (bulkUndo) {
       const restore = bulkUndo.selected;
+      const current = new Set(settings.skills.selected);
+      const restoreSet = new Set(restore);
+      const changedNames = [...new Set([...current, ...restoreSet])].filter(
+        (name) => !isAlwaysEnabledSkillName(name) && current.has(name) !== restoreSet.has(name),
+      );
+      const followNames = changedNames.filter((name) => restoreSet.has(name) && !current.has(name));
+      requestInstalledSkillFlip("batch", changedNames, followNames);
       setSettings((prev) => updateSkills(prev, { selected: restore }));
     }
     setBulkUndo(null);
-  }, [bulkUndo, clearBulkUndoTimer, setSettings]);
+  }, [
+    bulkUndo,
+    clearBulkUndoTimer,
+    requestInstalledSkillFlip,
+    setSettings,
+    settings.skills.selected,
+  ]);
 
   async function deleteBulkSelectedInstalledSkills() {
     if (lockedByChatMode || deletingSkillName || !bulkMode) return;
@@ -1313,20 +2228,52 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
     setPreviewInstalledSkill(skill);
   }
 
-  function handleInstalledSkillCardKeyDown(
-    event: KeyboardEvent<HTMLDivElement>,
-    skill: SkillSummary,
-  ) {
-    if (event.key !== "Enter" && event.key !== " ") return;
-    event.preventDefault();
-    openInstalledSkillPreview(skill);
-  }
+  // memo 卡片的回调走 latest-ref（先例 file-tree）：引用恒定使 memo 不失效，
+  // 实现经 ref 每渲染更新到最新闭包。
+  const sortedInstalledNames = useMemo(
+    () => sortedFiltered.map(({ skill }) => skill.name),
+    [sortedFiltered],
+  );
+  const cardHandlersRef = useRef({
+    toggleSkill,
+    deleteSkill,
+    openInstalledSkillPreview,
+    handleBulkInstalledCardClick,
+    sortedNames: [] as string[],
+  });
+  useEffect(() => {
+    cardHandlersRef.current = {
+      toggleSkill,
+      deleteSkill,
+      openInstalledSkillPreview,
+      handleBulkInstalledCardClick,
+      sortedNames: sortedInstalledNames,
+    };
+  });
+  const handleCardToggle = useCallback(
+    (name: string, on: boolean) => cardHandlersRef.current.toggleSkill(name, on),
+    [],
+  );
+  const handleCardDelete = useCallback(
+    (skill: SkillSummary) => void cardHandlersRef.current.deleteSkill(skill),
+    [],
+  );
+  const handleCardOpenPreview = useCallback(
+    (skill: SkillSummary) => cardHandlersRef.current.openInstalledSkillPreview(skill),
+    [],
+  );
+  const handleCardBulkClick = useCallback((name: string, shiftKey: boolean) => {
+    const { handleBulkInstalledCardClick, sortedNames } = cardHandlersRef.current;
+    handleBulkInstalledCardClick(name, sortedNames, shiftKey);
+  }, []);
 
   function setSkillsEnabled(enabled: boolean) {
     setSettings((prev) => updateSkills(prev, { enabled }));
   }
 
   const skillsEnabled = settings.skills.enabled;
+  const showInitialInstalledContentLoading =
+    skills.length > 0 && !hasPresentedInstalledSkills && installedContentPending;
   const skillsStatusHint = lockedByChatMode
     ? t("settings.skillsDisabledInChatMode")
     : skillsEnabled
@@ -1465,8 +2412,8 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
               </div>
             </div>
 
-            <div className="hub-panel-enter flex items-center justify-between gap-3">
-              <div className="inline-flex shrink-0 rounded-2xl border border-border/40 bg-background/60 p-1 backdrop-blur-xl shadow-[0_1px_0_rgba(255,255,255,0.5)_inset] dark:border-white/[0.06] dark:bg-white/[0.04] dark:shadow-[0_1px_0_rgba(255,255,255,0.04)_inset]">
+            <div className="hub-panel-enter flex items-center justify-between gap-3 max-sm:flex-col max-sm:items-stretch max-sm:gap-2">
+              <div className="inline-flex shrink-0 rounded-2xl border border-border/40 bg-background/60 p-1 backdrop-blur-xl shadow-[0_1px_0_rgba(255,255,255,0.5)_inset] max-sm:max-w-full max-sm:overflow-x-auto max-sm:[scrollbar-width:none] max-sm:[&::-webkit-scrollbar]:hidden dark:border-white/[0.06] dark:bg-white/[0.04] dark:shadow-[0_1px_0_rgba(255,255,255,0.04)_inset]">
                 {[
                   {
                     value: "installed" as const,
@@ -1495,7 +2442,7 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
                       type="button"
                       onClick={() => setView(item.value)}
                       className={cn(
-                        "relative inline-flex h-9 items-center justify-center gap-2 rounded-xl px-4 text-[12.5px] font-medium transition-all",
+                        "relative inline-flex h-9 items-center justify-center gap-2 rounded-xl px-4 text-[12.5px] font-medium transition-all max-sm:shrink-0",
                         active
                           ? "bg-background/85 text-foreground shadow-[0_1px_0_rgba(255,255,255,0.6)_inset,0_4px_12px_-8px_rgba(15,23,42,0.18)] ring-1 ring-border/45 dark:bg-white/[0.08] dark:ring-white/[0.09] dark:shadow-[0_1px_0_rgba(255,255,255,0.07)_inset,0_4px_12px_-8px_rgba(0,0,0,0.55)]"
                           : "text-muted-foreground hover:bg-background/70 hover:text-foreground",
@@ -1536,7 +2483,7 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
                           : t("settings.skillsBulkImportHint")
                       }
                       className={cn(
-                        "inline-flex h-10 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border px-3.5 text-[12.5px] font-medium backdrop-blur-xl transition-all",
+                        "inline-flex h-10 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border px-3.5 text-[12.5px] font-medium backdrop-blur-xl transition-all max-sm:px-2.5",
                         bulkMode
                           ? "border-primary/50 bg-primary/10 text-foreground shadow-[0_1px_0_rgba(255,255,255,0.6)_inset,0_4px_12px_-8px_rgba(15,23,42,0.18)] ring-1 ring-primary/30 dark:border-primary/40 dark:bg-primary/15"
                           : "border-border/40 bg-background/60 text-muted-foreground hover:bg-background/80 hover:text-foreground dark:border-white/[0.06] dark:bg-white/[0.04]",
@@ -1548,7 +2495,32 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
                       </span>
                     </button>
                   ) : null}
-                  <div className="relative w-full min-w-0 max-w-md">
+                  {view === "installed" ? (
+                    <select
+                      value={installedSort}
+                      onChange={(event) => {
+                        const value = event.currentTarget.value;
+                        if (!isInstalledSkillSort(value) || value === installedSort) return;
+                        const followKey = captureInstalledFlipKey();
+                        requestInstalledFlip("wave", [], followKey ? [followKey] : []);
+                        setInstalledSort(value);
+                      }}
+                      aria-label={t("settings.skillsInstalledSortLabel")}
+                      title={t("settings.skillsInstalledSortLabel")}
+                      className="h-10 max-w-[11rem] shrink-0 cursor-pointer rounded-xl border border-border/40 bg-background/95 px-3 text-[12.5px] font-medium text-foreground outline-hidden [color-scheme:light] transition-all hover:bg-background focus:border-border/60 focus:ring-2 focus:ring-foreground/10 max-sm:max-w-[7.5rem] max-sm:px-2 dark:border-white/[0.06] dark:bg-popover/95 dark:[color-scheme:dark]"
+                    >
+                      {INSTALLED_SORT_OPTIONS.map((option) => (
+                        <option
+                          key={option.value}
+                          value={option.value}
+                          className="bg-background text-foreground"
+                        >
+                          {t(option.labelKey)}
+                        </option>
+                      ))}
+                    </select>
+                  ) : null}
+                  <div className="relative w-full min-w-0 max-w-md max-sm:flex-1">
                     <Search className="absolute left-3.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
                     <input
                       type="text"
@@ -1572,7 +2544,7 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
                             ? t("settings.skillsStoreSearch")
                             : t("settings.skillsImportSearchPlaceholder")
                       }
-                      className="h-10 w-full rounded-xl border border-border/40 bg-background/60 pl-10 pr-3 text-[13px] outline-hidden backdrop-blur-xl transition-all placeholder:text-muted-foreground/60 focus:border-border/60 focus:bg-background/85 focus:ring-2 focus:ring-foreground/10"
+                      className="h-10 w-full rounded-xl border border-border/40 bg-background/95 pl-10 pr-3 text-[13px] outline-hidden transition-all placeholder:text-muted-foreground/60 focus:border-border/60 focus:bg-background focus:ring-2 focus:ring-foreground/10 dark:bg-popover/95"
                     />
                   </div>
                 </div>
@@ -1591,442 +2563,167 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
                     </div>
                   </GlassPanel>
                 </div>
-              ) : (
-                <>
-                  {view === "installed" ? (
-                    <div
-                      className={cn(
-                        "h-full min-h-0 overflow-y-auto px-0.5 pr-1 pt-1.5",
-                        bulkMode ? "pb-24" : "pb-4",
-                      )}
-                    >
-                      <div className="flex flex-col gap-5">
-                        {loadError ? (
-                          <GlassPanel tone="error" className="hub-panel-enter">
-                            <div className="flex items-center gap-2">
-                              <AlertTriangle className="h-4 w-4 shrink-0 text-destructive" />
-                              <span className="text-xs text-destructive">{loadError}</span>
-                            </div>
-                          </GlassPanel>
-                        ) : null}
+              ) : view === "installed" ? (
+                <div
+                  aria-busy={loading || showInitialInstalledContentLoading}
+                  className={cn(
+                    "h-full min-h-0 overflow-y-auto px-0.5 pr-1 pt-1.5 [overflow-anchor:none]",
+                    bulkMode ? "pb-[calc(10rem+env(safe-area-inset-bottom))] sm:pb-24" : "pb-4",
+                  )}
+                >
+                  <div className="flex flex-col gap-5">
+                    {loadError ? (
+                      <GlassPanel tone="error" className="hub-panel-enter">
+                        <div className="flex items-center gap-2">
+                          <AlertTriangle className="h-4 w-4 shrink-0 text-destructive" />
+                          <span className="text-xs text-destructive">{loadError}</span>
+                        </div>
+                      </GlassPanel>
+                    ) : null}
 
-                        {!skillsEnabled ? (
-                          <GlassPanel tone="muted" className="hub-panel-enter">
-                            <div className="flex items-center gap-2">
-                              <BookOpen className="h-4 w-4 shrink-0 text-muted-foreground" />
-                              <span className="text-xs text-muted-foreground">
-                                {t("settings.skillsDisabledHint")}
-                              </span>
-                            </div>
-                          </GlassPanel>
-                        ) : null}
+                    {!skillsEnabled ? (
+                      <GlassPanel tone="muted" className="hub-panel-enter">
+                        <div className="flex items-center gap-2">
+                          <BookOpen className="h-4 w-4 shrink-0 text-muted-foreground" />
+                          <span className="text-xs text-muted-foreground">
+                            {t("settings.skillsDisabledHint")}
+                          </span>
+                        </div>
+                      </GlassPanel>
+                    ) : null}
 
-                        {!loading && skills.length === 0 && !loadError ? (
-                          <GlassPanel className="hub-panel-enter">
-                            <div className="flex flex-col items-center gap-3 py-8 text-center">
-                              <div className="flex h-12 w-12 items-center justify-center rounded-full bg-muted/60">
-                                <BookOpen className="h-5 w-5 text-muted-foreground" />
-                              </div>
-                              <div className="space-y-1">
-                                <p className="text-sm font-medium text-muted-foreground">
-                                  {t("settings.skillsNotFound")}
-                                </p>
-                                <p className="text-xs text-muted-foreground/70">
-                                  {t("settings.skillsNotFoundHint")}
-                                </p>
-                              </div>
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                className="mt-1 gap-1.5 rounded-full"
-                                onClick={() => void refresh()}
-                              >
-                                <RefreshCw className="h-3.5 w-3.5" />
-                                {t("settings.skillsRescan")}
-                              </Button>
-                            </div>
-                          </GlassPanel>
-                        ) : null}
+                    {!loading && skills.length === 0 && !loadError ? (
+                      <GlassPanel className="hub-panel-enter">
+                        <div className="flex flex-col items-center gap-3 py-8 text-center">
+                          <div className="flex h-12 w-12 items-center justify-center rounded-full bg-muted/60">
+                            <BookOpen className="h-5 w-5 text-muted-foreground" />
+                          </div>
+                          <div className="space-y-1">
+                            <p className="text-sm font-medium text-muted-foreground">
+                              {t("settings.skillsNotFound")}
+                            </p>
+                            <p className="text-xs text-muted-foreground/70">
+                              {t("settings.skillsNotFoundHint")}
+                            </p>
+                          </div>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="mt-1 gap-1.5 rounded-full"
+                            onClick={() => void refresh()}
+                          >
+                            <RefreshCw className="h-3.5 w-3.5" />
+                            {t("settings.skillsRescan")}
+                          </Button>
+                        </div>
+                      </GlassPanel>
+                    ) : null}
 
-                        {loading && skills.length === 0 ? (
-                          <>
-                            <div className="hub-frost-hero hub-panel-enter px-4 py-3.5">
-                              <div className="flex items-center gap-3.5">
-                                <FrostSpinner />
-                                <div className="min-w-0 flex-1">
-                                  <div className="text-[13px] font-medium tracking-tight text-foreground">
-                                    {t("settings.skillsScanning")}
-                                  </div>
-                                  <div className="mt-0.5 truncate text-[11px] text-muted-foreground/80">
-                                    {t("settings.skillsHubScanning")}
-                                  </div>
-                                </div>
-                              </div>
-                              <div className="hub-frost-track mt-3.5" />
-                            </div>
+                    {loading && skills.length === 0 ? (
+                      <SkillsContentLoadingState
+                        title={t("settings.skillsScanning")}
+                        description={t("settings.skillsHubScanning")}
+                      />
+                    ) : showInitialInstalledContentLoading ? (
+                      <SkillsContentLoadingState
+                        title={t("settings.skillsHubPreparing")}
+                        description={t("settings.skillsHubPreparingDesc")}
+                      />
+                    ) : null}
 
-                            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-                              {[1, 2, 3, 4, 5, 6].map((item) => (
-                                <div
-                                  key={item}
-                                  className="hub-frost-skeleton skill-card-enter p-3.5"
-                                >
-                                  <div className="flex items-center gap-3">
-                                    <div className="skills-skeleton-shimmer h-9 w-9 shrink-0 rounded-lg" />
-                                    <div className="flex-1 space-y-2">
-                                      <div className="skills-skeleton-shimmer h-3.5 w-28 rounded" />
-                                      <div className="skills-skeleton-shimmer h-3 w-full max-w-[12rem] rounded" />
-                                    </div>
-                                  </div>
-                                </div>
-                              ))}
-                            </div>
-                          </>
-                        ) : null}
-
-                        {filtered.length > 0 ? (
-                          <div className="flex flex-col gap-3">
-                            {bulkMode ? (
-                              <div className="hub-panel-enter flex items-center gap-2 text-[11px] text-muted-foreground/80">
-                                <ListChecks className="h-3.5 w-3.5 shrink-0" />
-                                <span>{t("settings.skillsBulkHint")}</span>
-                              </div>
-                            ) : null}
-                            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-                              {filtered.map((skill) => {
-                                const alwaysEnabled = isAlwaysEnabledSkillName(skill.name);
-                                const checked = alwaysEnabled || selected.has(skill.name);
-                                const bulkSelected = bulkSelection.has(skill.name);
-                                const deleting = deletingSkillName === skill.name;
-                                const deleteDisabled = deletingSkillName !== null;
-                                const card = (
-                                  <>
-                                    <div className="flex items-start justify-between gap-2">
-                                      <div
-                                        className={cn(
-                                          "flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border transition-all",
-                                          checked
-                                            ? "border-border/55 bg-background/80 text-foreground/85 shadow-[0_1px_0_rgba(255,255,255,0.55)_inset] dark:border-white/[0.09] dark:bg-white/[0.06] dark:shadow-[0_1px_0_rgba(255,255,255,0.06)_inset]"
-                                            : "border-border/30 bg-muted/50 text-muted-foreground group-hover:border-border/50 group-hover:bg-background/70 group-hover:text-foreground/85",
-                                        )}
-                                      >
-                                        <SkillIcon className="h-6 w-6" />
-                                      </div>
-
-                                      {alwaysEnabled && !bulkMode ? (
-                                        <div
-                                          className="inline-flex shrink-0 items-center gap-1 rounded-full bg-foreground/[0.06] px-2 py-0.5 text-[10px] font-medium text-foreground/75 ring-1 ring-border/45"
-                                          title={t("settings.skillsAlwaysOn")}
-                                        >
-                                          <Lock className="h-2.5 w-2.5" />
-                                          <span>{t("settings.skillsAlwaysOn")}</span>
-                                        </div>
-                                      ) : bulkMode ? (
-                                        alwaysEnabled ? (
-                                          <div
-                                            className="flex shrink-0 items-center"
-                                            title={t("settings.skillsBulkAlwaysOnDisabled")}
-                                          >
-                                            <span
-                                              aria-hidden="true"
-                                              className="pointer-events-none flex h-5 w-5 items-center justify-center rounded-full border border-border/50 bg-muted/40 text-muted-foreground/50 opacity-60"
-                                            >
-                                              <Lock className="h-2.5 w-2.5" />
-                                            </span>
-                                          </div>
-                                        ) : (
-                                          <div
-                                            className="flex shrink-0 items-center"
-                                            onClick={(event) => event.stopPropagation()}
-                                            onKeyDown={(event) => event.stopPropagation()}
-                                          >
-                                            <label
-                                              className="relative flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center"
-                                              title={t("settings.skillsHubBulkSelectLabel")}
-                                            >
-                                              <input
-                                                type="checkbox"
-                                                checked={bulkSelection.has(skill.name)}
-                                                aria-label={`${t("settings.skillsHubBulkSelectLabel")}: ${skill.name}`}
-                                                onClick={(event) => event.stopPropagation()}
-                                                onChange={(event) => {
-                                                  event.stopPropagation();
-                                                  toggleBulkSelectionName(skill.name);
-                                                }}
-                                                className="peer sr-only"
-                                              />
-                                              <span
-                                                aria-hidden="true"
-                                                className={cn(
-                                                  "pointer-events-none flex h-5 w-5 items-center justify-center rounded-full border transition-all",
-                                                  bulkSelection.has(skill.name)
-                                                    ? "border-primary bg-primary text-primary-foreground"
-                                                    : "border-border bg-background group-hover:border-foreground/40",
-                                                )}
-                                              >
-                                                {bulkSelection.has(skill.name) ? (
-                                                  <Check className="h-3 w-3" />
-                                                ) : null}
-                                              </span>
-                                            </label>
-                                          </div>
-                                        )
-                                      ) : (
-                                        <div
-                                          className="flex shrink-0 items-center gap-1.5"
-                                          onClick={(event) => event.stopPropagation()}
-                                          onKeyDown={(event) => event.stopPropagation()}
-                                        >
-                                          <button
-                                            type="button"
-                                            aria-label={`${t("settings.skillsHubBulkSelectLabel")}: ${skill.name}`}
-                                            title={t("settings.skillsHubBulkSelect")}
-                                            onClick={(event) => {
-                                              event.stopPropagation();
-                                              enterBulkMode(skill.name);
-                                            }}
-                                            className={cn(
-                                              // Google Photos-style bulk entry: hover-faint, touch semi-visible.
-                                              "relative flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-border/60 bg-background/90 text-muted-foreground shadow-sm transition-all hover:border-primary/50 hover:text-foreground",
-                                              "opacity-0 group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-70",
-                                            )}
-                                          >
-                                            <span className="h-2 w-2 rounded-full border border-current opacity-40" />
-                                          </button>
-                                          <button
-                                            type="button"
-                                            role="switch"
-                                            aria-checked={checked}
-                                            aria-label={`${t("skills.select")}: ${skill.name}`}
-                                            title={
-                                              checked
-                                                ? t("settings.skillsHubToggleDisable")
-                                                : t("settings.skillsHubToggleEnable")
-                                            }
-                                            onClick={(event) => {
-                                              event.stopPropagation();
-                                              toggleSkill(skill.name, !checked);
-                                            }}
-                                            className={cn(
-                                              "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full ring-1 transition-all",
-                                              checked
-                                                ? "bg-emerald-500 ring-emerald-400/45"
-                                                : "bg-muted-foreground/25 ring-border/40",
-                                            )}
-                                          >
-                                            <span
-                                              className={cn(
-                                                "pointer-events-none inline-block h-3.5 w-3.5 rounded-full bg-white shadow-sm transition-transform",
-                                                checked
-                                                  ? "translate-x-[1.05rem]"
-                                                  : "translate-x-[0.15rem]",
-                                              )}
-                                            />
-                                          </button>
-                                        </div>
-                                      )}
-                                    </div>
-
-                                    <div className="mt-2.5 min-w-0 flex-1">
-                                      <div className="flex min-w-0 items-center gap-1.5">
-                                        <div className="truncate text-[13px] font-semibold leading-tight text-foreground">
-                                          {skill.name}
-                                        </div>
-                                        {checked ? (
-                                          <span className="inline-flex shrink-0 items-center rounded-full bg-emerald-500/12 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-emerald-500/25 dark:bg-emerald-400/12 dark:text-emerald-300 dark:ring-emerald-400/25">
-                                            {t("settings.skillsHubEnabledBadge")}
-                                          </span>
-                                        ) : null}
-                                      </div>
-                                      {skill.description ? (
-                                        <p className="mt-1 line-clamp-2 text-[11.5px] leading-[1.4] text-muted-foreground">
-                                          {skill.description}
-                                        </p>
-                                      ) : null}
-                                    </div>
-
-                                    <div className="mt-2.5 flex min-h-8 items-center gap-1 border-t border-border/30 pt-2 text-[10.5px] text-muted-foreground/70">
-                                      <FileText className="h-3 w-3 shrink-0" />
-                                      <span className="truncate">{skill.skillFile}</span>
-                                      {!alwaysEnabled && !bulkMode ? (
-                                        <div
-                                          className="ml-auto shrink-0"
-                                          onClick={(event) => event.stopPropagation()}
-                                          onKeyDown={(event) => event.stopPropagation()}
-                                        >
-                                          <ConfirmDeletePopover
-                                            name={skill.name}
-                                            onConfirm={() => void deleteSkill(skill)}
-                                          >
-                                            {(open) => (
-                                              <button
-                                                type="button"
-                                                disabled={deleteDisabled}
-                                                onClick={(event) => {
-                                                  event.stopPropagation();
-                                                  open();
-                                                }}
-                                                className={cn(
-                                                  "flex h-6 w-6 items-center justify-center rounded-md border border-border/35 bg-background/65 text-muted-foreground transition-all",
-                                                  "hover:border-destructive/40 hover:bg-destructive/10 hover:text-destructive",
-                                                  "disabled:cursor-not-allowed",
-                                                  // Hover-revealed on pointer devices; keyboard focus and
-                                                  // touch (no hover — webui mobile) keep it reachable.
-                                                  deleting
-                                                    ? "pointer-events-auto opacity-100"
-                                                    : cn(
-                                                        "pointer-events-none opacity-0 group-hover:pointer-events-auto focus-visible:pointer-events-auto [@media(hover:none)]:pointer-events-auto",
-                                                        deleteDisabled
-                                                          ? "group-hover:opacity-60 focus-visible:opacity-60 [@media(hover:none)]:opacity-60"
-                                                          : "group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100",
-                                                      ),
-                                                )}
-                                                title={t("settings.skillsHubDeleteSkill")}
-                                              >
-                                                {deleting ? (
-                                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                                                ) : (
-                                                  <Trash2 className="h-3.5 w-3.5" />
-                                                )}
-                                              </button>
-                                            )}
-                                          </ConfirmDeletePopover>
-                                        </div>
-                                      ) : null}
-                                    </div>
-                                  </>
-                                );
-
-                                const key = `${skill.name}-${rootDir}`;
-                                if (alwaysEnabled) {
-                                  return (
-                                    <button
-                                      key={key}
-                                      type="button"
-                                      aria-label={`${t("settings.skillsInstalledPreviewOpen")}: ${skill.name}`}
-                                      onClick={() => {
-                                        if (bulkMode) return;
-                                        openInstalledSkillPreview(skill);
-                                      }}
-                                      className={cn(
-                                        "hub-skill-card skill-card-enter group flex h-full w-full cursor-pointer flex-col rounded-2xl border border-border/50 bg-background/75 p-3.5 text-left backdrop-blur-xl shadow-[0_1px_0_rgba(255,255,255,0.55)_inset,0_4px_18px_-12px_rgba(15,23,42,0.16)] transition-all hover:-translate-y-0.5 hover:border-border/60 hover:bg-background/85 hover:shadow-[0_4px_16px_-10px_rgba(15,23,42,0.18)] dark:border-white/[0.08] dark:bg-white/[0.05] dark:shadow-[0_1px_0_rgba(255,255,255,0.05)_inset,0_4px_18px_-12px_rgba(0,0,0,0.5)] dark:hover:border-white/[0.12] dark:hover:bg-white/[0.07] dark:hover:shadow-[0_4px_16px_-10px_rgba(0,0,0,0.55)] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-foreground/15",
-                                        bulkMode ? "cursor-default hover:translate-y-0" : null,
-                                      )}
-                                    >
-                                      {card}
-                                    </button>
-                                  );
-                                }
-
-                                return (
-                                  // biome-ignore lint/a11y/useSemanticElements: The card contains nested controls and cannot be a native button.
-                                  <div
-                                    key={key}
-                                    role="button"
-                                    tabIndex={0}
-                                    aria-label={`${t("settings.skillsInstalledPreviewOpen")}: ${skill.name}`}
-                                    onClick={(event) => {
-                                      if (bulkMode) {
-                                        handleBulkInstalledCardClick(
-                                          skill.name,
-                                          filtered.map((item) => item.name),
-                                          event.shiftKey,
-                                        );
-                                        return;
-                                      }
-                                      openInstalledSkillPreview(skill);
-                                    }}
-                                    onMouseDown={(event) => {
-                                      if (bulkMode && event.shiftKey) event.preventDefault();
-                                    }}
-                                    onKeyDown={(event) => {
-                                      if (
-                                        bulkMode &&
-                                        (event.key === "Enter" || event.key === " ")
-                                      ) {
-                                        event.preventDefault();
-                                        handleBulkInstalledCardClick(
-                                          skill.name,
-                                          filtered.map((item) => item.name),
-                                          event.shiftKey,
-                                        );
-                                        return;
-                                      }
-                                      handleInstalledSkillCardKeyDown(event, skill);
-                                    }}
-                                    className={cn(
-                                      "hub-skill-card skill-card-enter group relative flex h-full w-full flex-col rounded-2xl border p-3.5 text-left transition-all",
-                                      "cursor-pointer backdrop-blur-xl focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-foreground/15",
-                                      checked
-                                        ? "border-emerald-500/35 bg-emerald-50/90 shadow-[0_1px_0_rgba(255,255,255,0.55)_inset,0_4px_14px_-12px_rgba(16,185,129,0.28)] dark:border-emerald-400/30 dark:bg-emerald-500/12 dark:shadow-[0_1px_0_rgba(255,255,255,0.05)_inset,0_4px_14px_-12px_rgba(16,185,129,0.22)]"
-                                        : "border-border/40 bg-muted/45 text-muted-foreground shadow-none hover:-translate-y-0.5 hover:border-border/55 hover:bg-muted/55 dark:border-white/[0.06] dark:bg-white/[0.025] dark:hover:border-white/[0.10] dark:hover:bg-white/[0.04]",
-                                      bulkSelected
-                                        ? "ring-2 ring-primary/50 ring-offset-1 ring-offset-background"
-                                        : null,
-                                    )}
-                                  >
-                                    {card}
-                                  </div>
-                                );
-                              })}
-                            </div>
+                    {sortedFiltered.length > 0 ? (
+                      <div className="flex flex-col gap-3">
+                        {bulkMode ? (
+                          <div className="hub-panel-enter flex items-center gap-2 text-[11px] text-muted-foreground/80">
+                            <ListChecks className="h-3.5 w-3.5 shrink-0" />
+                            <span>{t("settings.skillsBulkHint")}</span>
                           </div>
                         ) : null}
-
-                        {filter.trim() && filtered.length === 0 && skills.length > 0 ? (
-                          <GlassPanel tone="muted" className="hub-panel-enter">
-                            <p className="py-2 text-center text-sm text-muted-foreground">
-                              {t("settings.skillsNoMatch").replace("{filter}", filter)}
-                            </p>
-                          </GlassPanel>
-                        ) : null}
+                        <div
+                          ref={installedGridRef}
+                          className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
+                        >
+                          {sortedFiltered.map(({ skill, categories }) => {
+                            const alwaysEnabled = isAlwaysEnabledSkillName(skill.name);
+                            const key = `${skill.name}-${rootDir}`;
+                            return (
+                              <InstalledSkillCard
+                                key={key}
+                                flipKey={key}
+                                skill={skill}
+                                primaryCategory={categories[0] ?? "other"}
+                                alwaysEnabled={alwaysEnabled}
+                                checked={alwaysEnabled || selected.has(skill.name)}
+                                bulkMode={bulkMode}
+                                bulkSelected={bulkSelection.has(skill.name)}
+                                deleting={deletingSkillName === skill.name}
+                                deleteDisabled={deletingSkillName !== null}
+                                onToggle={handleCardToggle}
+                                onEnterBulkMode={enterBulkMode}
+                                onToggleBulkSelection={toggleBulkSelectionName}
+                                onBulkCardClick={handleCardBulkClick}
+                                onOpenPreview={handleCardOpenPreview}
+                                onDelete={handleCardDelete}
+                              />
+                            );
+                          })}
+                        </div>
                       </div>
-                    </div>
-                  ) : view === "store" ? (
-                    <SkillsStoreView
-                      items={storeItems}
-                      query={storeQuery}
-                      sort={storeSort}
-                      loading={storeLoading}
-                      loadingMore={storeLoadingMore}
-                      error={storeError}
-                      cursor={storeCursor}
-                      installedKeys={installedStoreKeys}
-                      installedSlugs={installedStoreSlugs}
-                      pendingInstallKeys={pendingInstallKeys}
-                      installingByStoreKey={installingByStoreKey}
-                      installJobs={installJobs}
-                      onSortChange={setStoreSort}
-                      onLoadMore={() => void loadMoreStore()}
-                      onInstall={(skill) => void installStoreSkill(skill)}
-                    />
-                  ) : (
-                    <SkillsImportView
-                      scans={externalScans ?? []}
-                      loading={externalLoading}
-                      error={externalError}
-                      query={importQuery}
-                      selected={selectedExternal}
-                      installedNames={installedSkillNames}
-                      importProgress={importProgress}
-                      importErrors={importErrors}
-                      importedCount={importedCount}
-                      importToast={importToast}
-                      onDismissImportToast={() => {
-                        if (importToastTimerRef.current !== null) {
-                          window.clearTimeout(importToastTimerRef.current);
-                          importToastTimerRef.current = null;
-                        }
-                        setImportToast(null);
-                      }}
-                      bulkMode={bulkMode}
-                      onToggle={toggleExternalSkill}
-                      onBatchToggle={setExternalSkillsSelected}
-                      onRescan={() => void rescanExternalSkills()}
-                      onImport={() => void importSelectedExternalSkills()}
-                    />
-                  )}
-                </>
+                    ) : null}
+
+                    {filter.trim() && sortedFiltered.length === 0 && skills.length > 0 ? (
+                      <GlassPanel tone="muted" className="hub-panel-enter">
+                        <p className="py-2 text-center text-sm text-muted-foreground">
+                          {t("settings.skillsNoMatch").replace("{filter}", filter)}
+                        </p>
+                      </GlassPanel>
+                    ) : null}
+                  </div>
+                </div>
+              ) : view === "store" ? (
+                <SkillsStoreView
+                  items={storeItems}
+                  query={storeQuery}
+                  sort={storeSort}
+                  loading={storeLoading}
+                  loadingMore={storeLoadingMore}
+                  error={storeError}
+                  cursor={storeCursor}
+                  installedKeys={installedStoreKeys}
+                  installedSlugs={installedStoreSlugs}
+                  pendingInstallKeys={pendingInstallKeys}
+                  installingByStoreKey={installingByStoreKey}
+                  installJobs={installJobs}
+                  onSortChange={setStoreSort}
+                  onLoadMore={() => void loadMoreStore()}
+                  onInstall={(skill) => void installStoreSkill(skill)}
+                />
+              ) : (
+                <SkillsImportView
+                  scans={externalScans ?? []}
+                  loading={externalLoading}
+                  error={externalError}
+                  query={importQuery}
+                  selected={selectedExternal}
+                  installedNames={installedSkillNames}
+                  importProgress={importProgress}
+                  importErrors={importErrors}
+                  importedCount={importedCount}
+                  importToast={importToast}
+                  onDismissImportToast={() => {
+                    if (importToastTimerRef.current !== null) {
+                      window.clearTimeout(importToastTimerRef.current);
+                      importToastTimerRef.current = null;
+                    }
+                    setImportToast(null);
+                  }}
+                  bulkMode={bulkMode}
+                  onToggle={toggleExternalSkill}
+                  onBatchToggle={setExternalSkillsSelected}
+                  onRescan={() => void rescanExternalSkills()}
+                  importingExternalBaseDir={importingExternalBaseDir}
+                  onImport={(skill) => void importSelectedExternalSkills(skill)}
+                />
               )}
             </div>
           </div>
@@ -2045,9 +2742,12 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
         />
       ) : null}
 
-      {bulkMode && view === "installed" && !lockedByChatMode && !bulkUndo ? (
-        <div className="pointer-events-none absolute inset-x-0 bottom-4 z-20 flex justify-center px-3">
-          <div className="hub-panel-enter pointer-events-auto flex max-w-full flex-wrap items-center gap-2 rounded-full border border-border/50 bg-background/90 py-2 pl-4 pr-2 text-[12.5px] shadow-[0_8px_24px_-12px_rgba(15,23,42,0.35)] backdrop-blur-xl dark:border-white/[0.1] dark:bg-white/[0.08]">
+      {bulkMode &&
+      view === "installed" &&
+      !lockedByChatMode &&
+      (!bulkUndo || bulkSelection.size > 0) ? (
+        <div className="pointer-events-none absolute inset-x-0 bottom-4 z-20 flex justify-center px-3 max-sm:bottom-[calc(1rem+env(safe-area-inset-bottom))]">
+          <div className="hub-panel-enter pointer-events-auto flex max-w-full flex-wrap items-center gap-2 rounded-full border border-border/50 bg-background/95 py-2 pl-4 pr-2 text-[12.5px] shadow-[0_8px_24px_-12px_rgba(15,23,42,0.35)] max-sm:justify-center max-sm:rounded-3xl max-sm:whitespace-nowrap dark:border-white/[0.1] dark:bg-popover/95">
             {bulkSelection.size > 0 ? (
               <>
                 <span className="whitespace-nowrap text-foreground/85">
@@ -2059,7 +2759,7 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
                     ? ` ${t("settings.skillsBulkNotInFilter").replace("{count}", String(bulkSelectedHiddenCount))}`
                     : ""}
                 </span>
-                <span className="text-muted-foreground/50" aria-hidden="true">
+                <span className="hidden text-muted-foreground/50 sm:inline" aria-hidden="true">
                   │
                 </span>
                 <button
@@ -2079,7 +2779,7 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
                 >
                   {t("settings.skillsBulkClear")}
                 </button>
-                <span className="text-muted-foreground/50" aria-hidden="true">
+                <span className="hidden text-muted-foreground/50 sm:inline" aria-hidden="true">
                   │
                 </span>
                 <button
@@ -2143,9 +2843,9 @@ export function SkillsHubPage(props: SkillsHubPageProps) {
         </div>
       ) : null}
 
-      {bulkUndo ? (
-        <div className="pointer-events-none absolute inset-x-0 bottom-4 z-20 flex justify-center">
-          <div className="hub-panel-enter pointer-events-auto flex items-center gap-3 rounded-full border border-border/50 bg-background/90 py-2 pl-4 pr-2 text-[12.5px] shadow-[0_8px_24px_-12px_rgba(15,23,42,0.35)] backdrop-blur-xl dark:border-white/[0.1] dark:bg-white/[0.08]">
+      {bulkUndo && bulkSelection.size === 0 ? (
+        <div className="pointer-events-none absolute inset-x-0 bottom-4 z-20 flex justify-center px-3 max-sm:bottom-[calc(1rem+env(safe-area-inset-bottom))]">
+          <div className="hub-panel-enter pointer-events-auto flex max-w-full flex-wrap items-center justify-center gap-3 rounded-full border border-border/50 bg-background/95 py-2 pl-4 pr-2 text-[12.5px] shadow-[0_8px_24px_-12px_rgba(15,23,42,0.35)] dark:border-white/[0.1] dark:bg-popover/95">
             <span className="text-foreground/85">
               {t("settings.skillsBulkUpdated").replace("{count}", String(bulkUndo.count))}
             </span>
@@ -2171,6 +2871,7 @@ function SkillsImportView(props: {
   selected: ReadonlySet<string>;
   installedNames: ReadonlySet<string>;
   importProgress: { done: number; total: number } | null;
+  importingExternalBaseDir: string | null;
   importErrors: Array<{ baseDir: string; name: string; message: string }>;
   importedCount: number | null;
   importToast: string | null;
@@ -2179,7 +2880,7 @@ function SkillsImportView(props: {
   onToggle: (baseDir: string) => void;
   onBatchToggle: (baseDirs: readonly string[], select: boolean) => void;
   onRescan: () => void;
-  onImport: () => void;
+  onImport: (skill?: ExternalSkillEntry) => void;
 }) {
   const {
     scans,
@@ -2189,6 +2890,7 @@ function SkillsImportView(props: {
     selected,
     installedNames,
     importProgress,
+    importingExternalBaseDir,
     importErrors,
     importedCount,
     importToast,
@@ -2265,12 +2967,12 @@ function SkillsImportView(props: {
     <div
       className={cn(
         "relative h-full min-h-0 overflow-y-auto px-0.5 pr-1 pt-1.5",
-        bulkMode ? "pb-24" : "pb-4",
+        bulkMode ? "pb-[calc(8rem+env(safe-area-inset-bottom))] sm:pb-24" : "pb-4",
       )}
     >
       {importToast ? (
         <div className="pointer-events-none sticky top-2 z-[80] flex justify-end px-1">
-          <div className="notify-toast-enter pointer-events-auto flex max-w-sm items-start gap-2.5 rounded-lg border border-amber-500/30 bg-amber-50/95 px-3 py-2.5 text-sm shadow-lg backdrop-blur-xl dark:border-amber-500/25 dark:bg-amber-950/80">
+          <div className="notify-toast-enter pointer-events-auto flex max-w-sm items-start gap-2.5 rounded-lg border border-amber-500/30 bg-amber-50 px-3 py-2.5 text-sm shadow-lg dark:border-amber-500/25 dark:bg-amber-950">
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
             <p className="min-w-0 flex-1 leading-relaxed text-amber-800 dark:text-amber-200">
               {importToast}
@@ -2397,7 +3099,7 @@ function SkillsImportView(props: {
                     size="sm"
                     className="gap-1.5 rounded-full"
                     disabled={selected.size === 0 || importing || loading}
-                    onClick={onImport}
+                    onClick={() => onImport()}
                   >
                     {importing ? (
                       <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -2492,21 +3194,25 @@ function SkillsImportView(props: {
                           : t("settings.skillsImportSelectAll")}
                       </Button>
                     </div>
-                    <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
                       {activeScan.skills.map((skill) => {
                         const alreadyInstalled = installedNames.has(skill.name);
                         const checked = !alreadyInstalled && selected.has(skill.baseDir);
                         const locked = alreadyInstalled || importing;
+                        const installing = importing && skill.baseDir === importingExternalBaseDir;
                         return (
-                          <button
+                          // biome-ignore lint/a11y/useSemanticElements: The card contains a separate import control.
+                          <div
                             key={skill.baseDir}
-                            type="button"
-                            disabled={locked}
+                            role="button"
+                            tabIndex={locked ? -1 : 0}
+                            aria-disabled={locked}
+                            aria-pressed={checked}
                             onMouseDown={(event) => {
                               if (bulkMode && event.shiftKey) event.preventDefault();
                             }}
                             onClick={(event) => {
-                              if (alreadyInstalled) return;
+                              if (locked) return;
                               const orderedBaseDirs = activeScan.skills
                                 .filter((item) => !installedNames.has(item.name))
                                 .map((item) => item.baseDir);
@@ -2528,44 +3234,96 @@ function SkillsImportView(props: {
                               onToggle(skill.baseDir);
                               bulkAnchorRef.current = skill.baseDir;
                             }}
+                            onKeyDown={(event) => {
+                              if (
+                                event.target !== event.currentTarget ||
+                                (event.key !== "Enter" && event.key !== " ")
+                              ) {
+                                return;
+                              }
+                              event.preventDefault();
+                              event.currentTarget.click();
+                            }}
                             className={cn(
-                              "group flex items-start gap-2.5 rounded-xl border p-3 text-left transition-all disabled:cursor-not-allowed",
+                              "skill-card-enter group flex h-full min-h-[13rem] w-full flex-col rounded-2xl border p-3.5 text-left transition-all focus:outline-none focus:ring-2 focus:ring-foreground/10",
                               alreadyInstalled
-                                ? "border-border/50 bg-muted/30 opacity-90"
+                                ? "border-border/55 bg-background/80 shadow-[0_1px_0_rgba(255,255,255,0.6)_inset,0_4px_18px_-12px_rgba(15,23,42,0.18)] dark:border-white/[0.10] dark:bg-white/[0.07] dark:shadow-[0_1px_0_rgba(255,255,255,0.07)_inset,0_4px_18px_-12px_rgba(0,0,0,0.55)]"
                                 : checked
                                   ? "border-primary/60 bg-primary/5 shadow-sm shadow-primary/10"
-                                  : "border-border/40 bg-background/60 hover:border-border/70 hover:bg-background/85",
+                                  : "border-border/40 bg-background/60 hover:-translate-y-0.5 hover:border-border/55 hover:bg-background/75 hover:shadow-[0_4px_16px_-10px_rgba(15,23,42,0.18)] dark:border-white/[0.05] dark:bg-white/[0.03] dark:hover:border-white/[0.10] dark:hover:bg-white/[0.06] dark:hover:shadow-[0_4px_16px_-10px_rgba(0,0,0,0.55)]",
                               importing && !alreadyInstalled ? "opacity-60" : null,
                             )}
                           >
-                            <span
-                              className={cn(
-                                "mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors",
-                                alreadyInstalled
-                                  ? "border-border/50 bg-muted/40 opacity-50"
-                                  : checked
-                                    ? "border-primary bg-primary text-primary-foreground"
-                                    : "border-border/70 bg-background",
-                              )}
-                            >
-                              {!alreadyInstalled && checked ? <Check className="h-3 w-3" /> : null}
-                            </span>
-                            <span className="min-w-0 flex-1">
-                              <span className="flex items-center gap-1.5">
-                                <span className="truncate text-[13px] font-medium text-foreground">
-                                  {skill.name}
+                            <div className="flex h-full flex-col gap-3">
+                              <div className="flex items-start gap-3">
+                                <span
+                                  className={cn(
+                                    "mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-colors",
+                                    alreadyInstalled
+                                      ? "border-border/50 bg-muted/40 opacity-50"
+                                      : checked
+                                        ? "border-primary bg-primary text-primary-foreground"
+                                        : "border-border/70 bg-background",
+                                  )}
+                                >
+                                  {!alreadyInstalled && checked ? (
+                                    <Check className="h-3 w-3" />
+                                  ) : null}
                                 </span>
-                                {alreadyInstalled ? (
-                                  <span className="shrink-0 rounded-full bg-muted/70 px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                                    {t("settings.skillsImportInstalledBadge")}
-                                  </span>
-                                ) : null}
-                              </span>
-                              <span className="mt-0.5 line-clamp-2 block text-[11px] leading-relaxed text-muted-foreground">
-                                {skill.description}
-                              </span>
-                            </span>
-                          </button>
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="truncate text-[13px] font-semibold leading-tight text-foreground">
+                                      {skill.name}
+                                    </span>
+                                    {alreadyInstalled ? (
+                                      <span className="shrink-0 rounded-full bg-muted/70 px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                                        {t("settings.skillsImportInstalledBadge")}
+                                      </span>
+                                    ) : null}
+                                  </div>
+                                </div>
+                              </div>
+                              <p
+                                className="line-clamp-3 min-h-[3rem] text-[11.5px] leading-[1.45] text-muted-foreground"
+                                title={skill.description}
+                              >
+                                {truncateLocalSkillCardDescription(skill.description)}
+                              </p>
+                              <div className="mt-auto space-y-2.5">
+                                <span
+                                  className="block truncate px-0.5 text-[10.5px] text-muted-foreground/75"
+                                  title={skill.baseDir}
+                                >
+                                  {skill.baseDir}
+                                </span>
+                                <Button
+                                  type="button"
+                                  variant={alreadyInstalled ? "outline" : "default"}
+                                  size="sm"
+                                  className="h-10 w-full gap-1.5 rounded-xl"
+                                  disabled={locked}
+                                  aria-busy={installing}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    onImport(skill);
+                                  }}
+                                >
+                                  {installing ? (
+                                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                  ) : alreadyInstalled ? (
+                                    <Check className="h-3.5 w-3.5" />
+                                  ) : (
+                                    <Download className="h-3.5 w-3.5" />
+                                  )}
+                                  {installing
+                                    ? t("settings.skillsImportProgress")
+                                    : alreadyInstalled
+                                      ? t("settings.skillsImportInstalledBadge")
+                                      : t("settings.skillsBulkImportAction")}
+                                </Button>
+                              </div>
+                            </div>
+                          </div>
                         );
                       })}
                     </div>
@@ -2578,8 +3336,8 @@ function SkillsImportView(props: {
       </div>
 
       {bulkMode ? (
-        <div className="pointer-events-none sticky bottom-3 z-20 flex justify-center px-1 pt-2">
-          <div className="hub-panel-enter pointer-events-auto flex max-w-full flex-wrap items-center gap-2 rounded-full border border-border/50 bg-background/90 py-2 pl-4 pr-2 text-[12.5px] shadow-[0_8px_24px_-12px_rgba(15,23,42,0.35)] backdrop-blur-xl dark:border-white/[0.1] dark:bg-white/[0.08]">
+        <div className="pointer-events-none sticky bottom-3 z-20 flex justify-center px-1 pt-2 max-sm:bottom-[calc(0.75rem+env(safe-area-inset-bottom))]">
+          <div className="hub-panel-enter pointer-events-auto flex max-w-full flex-wrap items-center gap-2 rounded-full border border-border/50 bg-background/95 py-2 pl-4 pr-2 text-[12.5px] shadow-[0_8px_24px_-12px_rgba(15,23,42,0.35)] max-sm:justify-center max-sm:rounded-3xl max-sm:whitespace-nowrap dark:border-white/[0.1] dark:bg-popover/95">
             {importableSelectedCount > 0 || importing ? (
               <>
                 <span className="whitespace-nowrap text-foreground/85">
@@ -2588,14 +3346,14 @@ function SkillsImportView(props: {
                     String(importableSelectedCount),
                   )}
                 </span>
-                <span className="text-muted-foreground/50" aria-hidden="true">
+                <span className="hidden text-muted-foreground/50 sm:inline" aria-hidden="true">
                   │
                 </span>
                 <button
                   type="button"
                   disabled={importing || loading}
                   className="inline-flex h-7 items-center rounded-full bg-foreground px-3 text-[12px] font-medium text-background transition-colors hover:bg-foreground/90 disabled:cursor-not-allowed disabled:opacity-40"
-                  onClick={onImport}
+                  onClick={() => onImport()}
                 >
                   {importing && importProgress ? (
                     <>
@@ -2660,7 +3418,7 @@ function InstalledSkillPreviewDrawer(props: {
   return createPortal(
     <div
       className={cn(
-        "fixed inset-0 z-50 flex justify-end bg-background/35 backdrop-blur-[2px]",
+        "fixed inset-0 z-50 flex justify-end bg-background/55",
         closing ? "skills-drawer-backdrop-closing" : "skills-drawer-backdrop",
       )}
       role="dialog"
@@ -2673,7 +3431,7 @@ function InstalledSkillPreviewDrawer(props: {
     >
       <aside
         className={cn(
-          "flex h-full w-full flex-col border-l border-border/45 bg-background/95 shadow-[-18px_0_45px_-28px_rgba(15,23,42,0.45)] dark:border-white/[0.08] dark:bg-popover/95 dark:shadow-[-18px_0_45px_-28px_rgba(0,0,0,0.7)] backdrop-blur-xl md:w-2/5 md:max-w-[34rem]",
+          "flex h-full w-full flex-col border-l border-border/45 bg-background shadow-[-18px_0_45px_-28px_rgba(15,23,42,0.45)] dark:border-white/[0.08] dark:bg-popover dark:shadow-[-18px_0_45px_-28px_rgba(0,0,0,0.7)] md:w-2/5 md:max-w-[34rem]",
           closing ? "skills-drawer-panel-closing" : "skills-drawer-panel",
         )}
       >
@@ -2922,6 +3680,15 @@ function InstalledPreviewSkeleton() {
   );
 }
 
+function InstalledSkillCategoryChip(props: { category: ClawHubCategorySlug }) {
+  const { t } = useLocale();
+  return (
+    <span className="inline-flex shrink-0 items-center rounded-full bg-foreground/[0.06] px-2 py-0.5 text-[10px] font-medium text-foreground/75 ring-1 ring-border/45">
+      {t(installedSkillCategoryLabelKey(props.category))}
+    </span>
+  );
+}
+
 function SkillsStoreView(props: {
   items: ClawHubSkillCard[];
   query: string;
@@ -3156,7 +3923,7 @@ function SkillsStoreView(props: {
                       }
                     }}
                     className={cn(
-                      "skill-card-enter group flex h-full cursor-pointer flex-col rounded-2xl border p-3.5 text-left backdrop-blur-xl transition-all focus:outline-none focus:ring-2 focus:ring-foreground/10",
+                      "skill-card-enter group flex h-full cursor-pointer flex-col rounded-2xl border p-3.5 text-left transition-all focus:outline-none focus:ring-2 focus:ring-foreground/10",
                       done
                         ? "border-border/55 bg-background/80 shadow-[0_1px_0_rgba(255,255,255,0.6)_inset,0_4px_18px_-12px_rgba(15,23,42,0.18)] dark:border-white/[0.10] dark:bg-white/[0.07] dark:shadow-[0_1px_0_rgba(255,255,255,0.07)_inset,0_4px_18px_-12px_rgba(0,0,0,0.55)]"
                         : "border-border/40 bg-background/60 hover:-translate-y-0.5 hover:border-border/55 hover:bg-background/75 hover:shadow-[0_4px_16px_-10px_rgba(15,23,42,0.18)] dark:border-white/[0.05] dark:bg-white/[0.03] dark:hover:border-white/[0.10] dark:hover:bg-white/[0.06] dark:hover:shadow-[0_4px_16px_-10px_rgba(0,0,0,0.55)]",
@@ -3392,7 +4159,7 @@ function SkillsStorePreviewDrawer(props: {
   return createPortal(
     <div
       className={cn(
-        "fixed inset-0 z-50 flex justify-end bg-background/35 backdrop-blur-[2px]",
+        "fixed inset-0 z-50 flex justify-end bg-background/55",
         closing ? "skills-drawer-backdrop-closing" : "skills-drawer-backdrop",
       )}
       role="dialog"
@@ -3405,7 +4172,7 @@ function SkillsStorePreviewDrawer(props: {
     >
       <aside
         className={cn(
-          "flex h-full w-full flex-col border-l border-border/45 bg-background/95 shadow-[-18px_0_45px_-28px_rgba(15,23,42,0.45)] dark:border-white/[0.08] dark:bg-popover/95 dark:shadow-[-18px_0_45px_-28px_rgba(0,0,0,0.7)] backdrop-blur-xl md:w-2/5 md:max-w-[34rem]",
+          "flex h-full w-full flex-col border-l border-border/45 bg-background shadow-[-18px_0_45px_-28px_rgba(15,23,42,0.45)] dark:border-white/[0.08] dark:bg-popover dark:shadow-[-18px_0_45px_-28px_rgba(0,0,0,0.7)] md:w-2/5 md:max-w-[34rem]",
           closing ? "skills-drawer-panel-closing" : "skills-drawer-panel",
         )}
       >
@@ -3585,13 +4352,13 @@ function SkillsStorePreviewDrawer(props: {
               variant="outline"
               size="sm"
               className="h-9 flex-1 gap-1.5 rounded-xl border-border/50 bg-background/70"
-              asChild
-            >
-              <a href={link} target="_blank" rel="noreferrer">
-                <ExternalLink className="h-3.5 w-3.5" />
-                {t("settings.skillsStoreOpenInClawHub")}
-              </a>
-            </Button>
+              render={
+                <a href={link} target="_blank" rel="noreferrer">
+                  <ExternalLink className="h-3.5 w-3.5" />
+                  {t("settings.skillsStoreOpenInClawHub")}
+                </a>
+              }
+            />
           ) : null}
           <Button
             type="button"
@@ -3646,8 +4413,11 @@ function StorePreviewSkeleton() {
       <div className="rounded-2xl border border-border/40 bg-background/60 p-3">
         <div className="skills-skeleton-pulse mb-3 h-2.5 w-12 rounded-full" />
         <div className="divide-y divide-border/30">
-          {STORE_PREVIEW_FIELD_WIDTHS.map((width, i) => (
-            <div key={i} className="grid grid-cols-[7rem_minmax(0,1fr)] items-center gap-3 py-2.5">
+          {STORE_PREVIEW_FIELD_WIDTHS.map((width) => (
+            <div
+              key={width}
+              className="grid grid-cols-[7rem_minmax(0,1fr)] items-center gap-3 py-2.5"
+            >
               <div className="skills-skeleton-pulse h-2.5 w-14 rounded-full" />
               <div className={cn("skills-skeleton-pulse h-2.5 rounded-full", width)} />
             </div>
@@ -3692,25 +4462,23 @@ function buildClawHubSkillUrl(skill: ClawHubSkillCard) {
 }
 
 function formatCompactNumber(value: number) {
-  return new Intl.NumberFormat(undefined, {
+  cachedCompactNumberFormat ??= new Intl.NumberFormat(undefined, {
     notation: "compact",
     maximumFractionDigits: 1,
-  }).format(value);
+  });
+  return cachedCompactNumberFormat.format(value);
 }
 
 function formatStoreDate(value: number) {
-  return new Intl.DateTimeFormat(undefined, {
+  cachedShortDateFormat ??= new Intl.DateTimeFormat(undefined, {
     month: "short",
     day: "numeric",
-  }).format(new Date(value));
+  });
+  return cachedShortDateFormat.format(new Date(value));
 }
 
 function formatFullStoreDate(value: number) {
-  return new Intl.DateTimeFormat(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-  }).format(new Date(value));
+  return getFullDateFormat().format(new Date(value));
 }
 
 function getInstallProgressPercent(job: SkillInstallJobSnapshot) {

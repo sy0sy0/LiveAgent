@@ -1,5 +1,6 @@
 import {
   type AppSettings,
+  DEFAULT_CHAT_TRANSCRIPT_WIDTH,
   getDefaultSystemProxyConfig,
   normalizeChatRuntimeControls,
   normalizeRightDockSettings,
@@ -8,6 +9,14 @@ import {
 } from "./index";
 
 export type GatewayProviderApiKeyUpdates = Record<string, string>;
+export type GatewayProviderUsageQuerySecretUpdates = Record<
+  string,
+  {
+    apiKey?: string;
+    accessToken?: string;
+    secretAccessKey?: string;
+  }
+>;
 export type GatewaySshSecretUpdates = Record<
   string,
   {
@@ -57,6 +66,7 @@ export type GatewaySettingsSyncPayload = {
   locale: AppSettings["locale"];
   sshPatch?: GatewaySshSyncPatch;
   providerApiKeyUpdates?: GatewayProviderApiKeyUpdates;
+  providerUsageQuerySecretUpdates?: GatewayProviderUsageQuerySecretUpdates;
   sshSecretUpdates?: GatewaySshSecretUpdates;
   // systemProxy 密码回传 sidecar（仿 providerApiKeyUpdates 的简化范式）：
   // system 字段本身出口必被脱敏，明文密码只经此通道回到桌面端落库。
@@ -90,6 +100,49 @@ function apiKeyConfiguredForProvider(provider: AppSettings["customProviders"][nu
   return provider.apiKey.trim().length > 0 || provider.apiKeyConfigured === true;
 }
 
+const DEFAULT_USAGE_QUERY_CONFIG: AppSettings["customProviders"][number]["usageQuery"] = {
+  enabled: false,
+  mode: "newapi",
+  script: "",
+  scripts: {},
+  baseUrl: "",
+  apiKey: "",
+  apiKeyConfigured: false,
+  accessToken: "",
+  accessTokenConfigured: false,
+  userId: "",
+  accessKeyId: "",
+  secretAccessKey: "",
+  secretAccessKeyConfigured: false,
+  codingPlanProvider: "",
+  teamOrganizationId: "",
+  teamProjectId: "",
+  timeoutSecs: 10,
+};
+
+function usageQueryConfig(
+  provider: AppSettings["customProviders"][number],
+): AppSettings["customProviders"][number]["usageQuery"] {
+  return provider.usageQuery ?? DEFAULT_USAGE_QUERY_CONFIG;
+}
+
+function redactUsageQueryConfig(
+  usageQuery: AppSettings["customProviders"][number]["usageQuery"] | undefined,
+) {
+  const config = usageQuery ?? DEFAULT_USAGE_QUERY_CONFIG;
+  return {
+    ...config,
+    apiKey: "",
+    apiKeyConfigured: config.apiKey.trim().length > 0 || config.apiKeyConfigured === true,
+    accessToken: "",
+    accessTokenConfigured:
+      config.accessToken.trim().length > 0 || config.accessTokenConfigured === true,
+    secretAccessKey: "",
+    secretAccessKeyConfigured:
+      config.secretAccessKey.trim().length > 0 || config.secretAccessKeyConfigured === true,
+  };
+}
+
 export function redactCustomProvidersForGateway(
   customProviders: AppSettings["customProviders"],
 ): GatewaySettingsSyncProvider[] {
@@ -97,6 +150,7 @@ export function redactCustomProvidersForGateway(
     const { apiKey: _apiKey, ...rest } = provider;
     return {
       ...rest,
+      usageQuery: redactUsageQueryConfig(provider.usageQuery),
       apiKeyConfigured: apiKeyConfiguredForProvider(provider),
     };
   });
@@ -108,6 +162,7 @@ export function redactCustomProvidersForWebStorage(
   return customProviders.map((provider) => ({
     ...provider,
     apiKey: "",
+    usageQuery: redactUsageQueryConfig(provider.usageQuery),
     apiKeyConfigured: apiKeyConfiguredForProvider(provider),
   }));
 }
@@ -176,6 +231,69 @@ function collectProviderApiKeyUpdates(
     if (provider.id.trim() && apiKey) {
       updates[provider.id] = apiKey;
     }
+  }
+  return Object.keys(updates).length > 0 ? updates : undefined;
+}
+
+function collectProviderUsageQuerySecretUpdates(
+  customProviders: AppSettings["customProviders"],
+): GatewayProviderUsageQuerySecretUpdates | undefined {
+  const updates: GatewayProviderUsageQuerySecretUpdates = {};
+  for (const provider of customProviders) {
+    const id = provider.id.trim();
+    if (!id) continue;
+    const update: GatewayProviderUsageQuerySecretUpdates[string] = {};
+    const usageQuery = usageQueryConfig(provider);
+    if (usageQuery.apiKey.trim()) {
+      update.apiKey = usageQuery.apiKey.trim();
+    }
+    if (usageQuery.accessToken.trim()) {
+      update.accessToken = usageQuery.accessToken.trim();
+    }
+    if (usageQuery.secretAccessKey.trim()) {
+      update.secretAccessKey = usageQuery.secretAccessKey.trim();
+    }
+    if (Object.keys(update).length > 0) updates[id] = update;
+  }
+  return Object.keys(updates).length > 0 ? updates : undefined;
+}
+
+function collectChangedProviderUsageQuerySecretUpdates(
+  previous: AppSettings["customProviders"],
+  next: AppSettings["customProviders"],
+): GatewayProviderUsageQuerySecretUpdates | undefined {
+  const previousById = new Map(previous.map((provider) => [provider.id, provider]));
+  const updates: GatewayProviderUsageQuerySecretUpdates = {};
+  for (const provider of next) {
+    const id = provider.id.trim();
+    if (!id) continue;
+    const previousProvider = previousById.get(id);
+    const previousUsageQuery = previousProvider ? usageQueryConfig(previousProvider) : undefined;
+    const usageQuery = usageQueryConfig(provider);
+    const update: GatewayProviderUsageQuerySecretUpdates[string] = {};
+    // WebUI 侧秘密恒被脱敏为空串,值比较发现不了"删除已配置密钥";
+    // Configured true→false 是显式清除信号(对齐 SSH passwordConfiguredCleared)。
+    const apiKeyCleared =
+      previousUsageQuery?.apiKeyConfigured === true && usageQuery.apiKeyConfigured === false;
+    if (usageQuery.apiKey !== previousUsageQuery?.apiKey || apiKeyCleared) {
+      update.apiKey = usageQuery.apiKey.trim();
+    }
+    const accessTokenCleared =
+      previousUsageQuery?.accessTokenConfigured === true &&
+      usageQuery.accessTokenConfigured === false;
+    if (usageQuery.accessToken !== previousUsageQuery?.accessToken || accessTokenCleared) {
+      update.accessToken = usageQuery.accessToken.trim();
+    }
+    const secretAccessKeyCleared =
+      previousUsageQuery?.secretAccessKeyConfigured === true &&
+      usageQuery.secretAccessKeyConfigured === false;
+    if (
+      usageQuery.secretAccessKey !== previousUsageQuery?.secretAccessKey ||
+      secretAccessKeyCleared
+    ) {
+      update.secretAccessKey = usageQuery.secretAccessKey.trim();
+    }
+    if (Object.keys(update).length > 0) updates[id] = update;
   }
   return Object.keys(updates).length > 0 ? updates : undefined;
 }
@@ -350,7 +468,12 @@ function syncableCustomSettings(
       projectsCollapsed: false,
       recentCollapsed: false,
     },
-    // fontScale 是本机 UI 偏好：固定为默认值，避免本地调整触发网关广播
+    // Typography, scale, and transcript width are local UI preferences; fixed
+    // defaults prevent visual preferences from being broadcast through the gateway.
+    interfaceFontFamily: "",
+    chatFontFamily: "",
+    codeFontFamily: "",
+    chatTranscript: { width: DEFAULT_CHAT_TRANSCRIPT_WIDTH },
     fontScale: { sidebar: 1, chat: 1, rightDock: 1 },
   };
 }
@@ -512,6 +635,79 @@ function normalizeProviderApiKeyUpdates(value: unknown): GatewayProviderApiKeyUp
   return updates;
 }
 
+function normalizeProviderUsageQuerySecretUpdates(
+  value: unknown,
+): GatewayProviderUsageQuerySecretUpdates {
+  const source = asObject(value);
+  const updates: GatewayProviderUsageQuerySecretUpdates = {};
+  for (const [id, rawUpdate] of Object.entries(source)) {
+    const normalizedId = id.trim();
+    if (!normalizedId) continue;
+    const updateSource = asObject(rawUpdate);
+    const update: GatewayProviderUsageQuerySecretUpdates[string] = {};
+    if (Object.hasOwn(updateSource, "apiKey") && typeof updateSource.apiKey === "string") {
+      update.apiKey = updateSource.apiKey.trim();
+    }
+    if (
+      Object.hasOwn(updateSource, "accessToken") &&
+      typeof updateSource.accessToken === "string"
+    ) {
+      update.accessToken = updateSource.accessToken.trim();
+    }
+    if (
+      Object.hasOwn(updateSource, "secretAccessKey") &&
+      typeof updateSource.secretAccessKey === "string"
+    ) {
+      update.secretAccessKey = updateSource.secretAccessKey.trim();
+    }
+    if (Object.keys(update).length > 0) updates[normalizedId] = update;
+  }
+  return updates;
+}
+
+function mergeSyncedUsageQuery(
+  current: AppSettings["customProviders"][number]["usageQuery"] | undefined,
+  incoming: unknown,
+  update: GatewayProviderUsageQuerySecretUpdates[string] | undefined,
+) {
+  const source = asObject(incoming);
+  const apiKey =
+    (update && Object.hasOwn(update, "apiKey") ? update.apiKey : undefined) ??
+    (typeof source.apiKey === "string" && source.apiKey.trim()
+      ? source.apiKey.trim()
+      : (current?.apiKey ?? ""));
+  const accessToken =
+    (update && Object.hasOwn(update, "accessToken") ? update.accessToken : undefined) ??
+    (typeof source.accessToken === "string" && source.accessToken.trim()
+      ? source.accessToken.trim()
+      : (current?.accessToken ?? ""));
+  const secretAccessKey =
+    (update && Object.hasOwn(update, "secretAccessKey") ? update.secretAccessKey : undefined) ??
+    (typeof source.secretAccessKey === "string" && source.secretAccessKey.trim()
+      ? source.secretAccessKey.trim()
+      : (current?.secretAccessKey ?? ""));
+
+  return {
+    ...source,
+    apiKey,
+    apiKeyConfigured:
+      apiKey.length > 0 ||
+      source.apiKeyConfigured === true ||
+      (!Object.hasOwn(source, "apiKeyConfigured") && current?.apiKeyConfigured === true),
+    accessToken,
+    accessTokenConfigured:
+      accessToken.length > 0 ||
+      source.accessTokenConfigured === true ||
+      (!Object.hasOwn(source, "accessTokenConfigured") && current?.accessTokenConfigured === true),
+    secretAccessKey,
+    secretAccessKeyConfigured:
+      secretAccessKey.length > 0 ||
+      source.secretAccessKeyConfigured === true ||
+      (!Object.hasOwn(source, "secretAccessKeyConfigured") &&
+        current?.secretAccessKeyConfigured === true),
+  };
+}
+
 function normalizeSshSecretUpdates(value: unknown): GatewaySshSecretUpdates {
   const source = asObject(value);
   const updates: GatewaySshSecretUpdates = {};
@@ -549,6 +745,7 @@ function mergeSyncedCustomProviders(
   current: AppSettings["customProviders"],
   incoming: unknown,
   apiKeyUpdates: GatewayProviderApiKeyUpdates,
+  usageQuerySecretUpdates: GatewayProviderUsageQuerySecretUpdates,
 ): AppSettings["customProviders"] {
   if (!Array.isArray(incoming)) {
     return current;
@@ -563,6 +760,13 @@ function mergeSyncedCustomProviders(
     const sourceApiKey = typeof source.apiKey === "string" ? source.apiKey.trim() : "";
     const apiKey = (apiKeyUpdate ?? sourceApiKey) || currentProvider?.apiKey || "";
     const sourceHasConfiguredFlag = Object.hasOwn(source, "apiKeyConfigured");
+    const usageQuery = Object.hasOwn(source, "usageQuery")
+      ? mergeSyncedUsageQuery(
+          currentProvider?.usageQuery,
+          source.usageQuery,
+          id ? usageQuerySecretUpdates[id] : undefined,
+        )
+      : currentProvider && usageQueryConfig(currentProvider);
 
     return {
       ...source,
@@ -571,6 +775,7 @@ function mergeSyncedCustomProviders(
         apiKey.length > 0 ||
         source.apiKeyConfigured === true ||
         (!sourceHasConfiguredFlag && currentProvider?.apiKeyConfigured === true),
+      ...(usageQuery ? { usageQuery } : {}),
     };
   }) as AppSettings["customProviders"];
 }
@@ -875,6 +1080,12 @@ export function buildGatewaySettingsSyncPayload(
   if (providerApiKeyUpdates) {
     payload.providerApiKeyUpdates = providerApiKeyUpdates;
   }
+  const providerUsageQuerySecretUpdates = options.includeProviderApiKeyUpdates
+    ? collectProviderUsageQuerySecretUpdates(settings.customProviders)
+    : undefined;
+  if (providerUsageQuerySecretUpdates) {
+    payload.providerUsageQuerySecretUpdates = providerUsageQuerySecretUpdates;
+  }
   const sshSecretUpdates = options.includeProviderApiKeyUpdates
     ? collectSshSecretUpdates(settings.ssh)
     : undefined;
@@ -919,6 +1130,13 @@ export function buildGatewaySettingsSyncUpdatePayload(
     update.customProviders ??= nextPayload.customProviders;
     update.providerApiKeyUpdates = providerApiKeyUpdates;
   }
+  const providerUsageQuerySecretUpdates = options.includeProviderApiKeyUpdates
+    ? collectChangedProviderUsageQuerySecretUpdates(prev.customProviders, next.customProviders)
+    : undefined;
+  if (providerUsageQuerySecretUpdates) {
+    update.customProviders ??= nextPayload.customProviders;
+    update.providerUsageQuerySecretUpdates = providerUsageQuerySecretUpdates;
+  }
   const sshSecretUpdates = options.includeProviderApiKeyUpdates
     ? collectChangedSshSecretUpdates(prev.ssh, next.ssh)
     : undefined;
@@ -944,6 +1162,9 @@ export function applyGatewaySettingsSyncPayload(
 ): AppSettings {
   const source = asObject(payload);
   const providerApiKeyUpdates = normalizeProviderApiKeyUpdates(source.providerApiKeyUpdates);
+  const providerUsageQuerySecretUpdates = normalizeProviderUsageQuerySecretUpdates(
+    source.providerUsageQuerySecretUpdates,
+  );
   const sshSecretUpdates = normalizeSshSecretUpdates(source.sshSecretUpdates);
   const systemProxyPasswordUpdate =
     typeof source.systemProxyPasswordUpdate === "string" && source.systemProxyPasswordUpdate.trim()
@@ -971,6 +1192,7 @@ export function applyGatewaySettingsSyncPayload(
       current.customProviders,
       source.customProviders,
       providerApiKeyUpdates,
+      providerUsageQuerySecretUpdates,
     ),
     mcp: (source.mcp as AppSettings["mcp"] | undefined) ?? current.mcp,
     agents: (source.agents as AppSettings["agents"] | undefined) ?? current.agents,
@@ -982,6 +1204,8 @@ export function applyGatewaySettingsSyncPayload(
     memory: memory as AppSettings["memory"],
     customSettings: {
       ...incomingCustomSettings,
+      providerIdentities:
+        incomingCustomSettings.providerIdentities ?? current.customSettings.providerIdentities,
       rightDock: Object.hasOwn(incomingCustomSettings, "rightDock")
         ? mergeSyncedRightDockSettings(
             current.customSettings.rightDock,
@@ -989,7 +1213,11 @@ export function applyGatewaySettingsSyncPayload(
           )
         : current.customSettings.rightDock,
       chatSidebar: current.customSettings.chatSidebar,
-      // fontScale 是本机 UI 偏好，不参与网关同步
+      // Typography, scale, and transcript width are local UI preferences, never gateway-synced.
+      interfaceFontFamily: current.customSettings.interfaceFontFamily,
+      chatFontFamily: current.customSettings.chatFontFamily,
+      codeFontFamily: current.customSettings.codeFontFamily,
+      chatTranscript: current.customSettings.chatTranscript,
       fontScale: current.customSettings.fontScale,
     },
     skills: (source.skills as AppSettings["skills"] | undefined) ?? current.skills,

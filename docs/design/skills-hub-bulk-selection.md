@@ -75,3 +75,30 @@
 3. 触屏（webui 移动端）无 hover：复选框常驻可点，浮动栏不遮挡最后一行卡片（列表底部留 padding）。
 4. lockedByChatMode 时批量入口整体隐藏（保留现状）。
 5. agent-gui 与 agent-gateway/web 两份 SkillsHubPage 行为、样式、i18n 全部对齐。
+
+## 8. WebView2 渲染规约
+
+Skills Hub 在 Windows WebView2 中必须遵守以下合成约束：
+
+1. **禁止对悬浮或覆盖在可滚动、可动画内容之上的元素使用 backdrop-filter。**
+   这包括 fixed、sticky、absolute 浮层，以及位于 FLIP 网格上方的操作栏、提示条、
+   搜索和排序控件、抽屉遮罩与抽屉面板。Tailwind 的 backdrop-blur-* 同样属于禁用范围。
+2. **上述元素统一使用高不透明度实色背景模拟毛玻璃层次。**
+   亮色模式优先使用 bg-background/95，暗色模式使用 dark:bg-popover/95，并保留原有
+   border 与 shadow；遮罩层使用不带模糊的实色半透明背景。
+3. **backdrop-filter 仅允许用于背后内容完全静态的场景。**
+   例如页面顶部 HubHeader 或仅覆盖静态 HubBackdrop 的面板。若调用方可能覆盖列表、
+   滚动区域或动画内容，应默认不用 backdrop-filter。
+4. **两端必须同步。**任何相关样式调整都要同时检查 agent-gui 与
+   agent-gateway/web，避免一个端重新引入独立合成层。
+
+案例依据：
+
+- **技能卡 hover 光斑：**已安装页和商店页曾在每张卡片上使用 backdrop-blur-xl，
+  同时卡片 hover 会触发 translate 提层。60+ 卡片叠加 HubBackdrop 光晕后，部分
+  WebView2/GPU 组合会留下竖向绿色过期采样残带。修复方式是移除动态卡片根节点的
+  backdrop-filter，保留背景、边框、阴影、hover 位移与入场动画。
+- **FLIP 与底部浮动栏光斑：**排序功能让技能卡在底部多选操作栏或 Undo 条背后高频
+  重排，WebView2 的 backdrop-filter 采样缓存可能失效并在浮动栏上方形成残带。
+  修复方式是让操作栏、Undo、搜索、排序和覆盖动态页面的抽屉使用高不透明度实色背景，
+  不再采样其后的动画内容。

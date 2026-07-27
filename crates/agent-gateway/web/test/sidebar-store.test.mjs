@@ -277,6 +277,31 @@ test("rename is blocked for a running conversation without a backend call", asyn
   store.stop();
 });
 
+test("idle tombstone rejects stale running snapshots", () => {
+  const fake = createFakeBackend();
+  const store = createSidebarStore(fake.backend, { now: () => 999 });
+
+  store.applyRunningPatch({
+    conversationId: "one",
+    running: true,
+    workdir: "/tmp/a",
+    updatedAt: 100,
+  });
+  store.applyRunningPatch({ conversationId: "one", running: false, updatedAt: 200 });
+
+  for (const updatedAt of [150, 200, undefined]) {
+    store.hydrateRunning([{ conversationId: "one", workdir: "/tmp/a", updatedAt }]);
+    assert.equal(
+      store.getSnapshot().runningConversationIds.has("one"),
+      false,
+      "an older, equal, or unversioned snapshot must not revive a terminal run",
+    );
+  }
+
+  store.hydrateRunning([{ conversationId: "one", workdir: "/tmp/a", updatedAt: 201 }]);
+  assert.equal(store.getSnapshot().runningConversationIds.has("one"), true);
+});
+
 test("mutations are tracked per row, not globally", async () => {
   const fake = createFakeBackend();
   fake.state.pages.set("cwd:/tmp/a", [

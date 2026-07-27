@@ -34,6 +34,7 @@ import {
 } from "../../lib/chat/messages/mentionReferences";
 import { createUuid } from "../../lib/shared/id";
 import { cn } from "../../lib/shared/utils";
+import { readClipboardText } from "../../lib/system/clipboardText";
 import { invokeFs } from "../../lib/tools/fsBackend";
 import { Blend, ClipboardPaste, Copy, ScanText, Scissors, SKILL_ICON_SVG_MARKUP } from "../icons";
 import { getFileTypeIcon, getFileTypeIconSvg } from "./fileTypeIcons";
@@ -114,7 +115,7 @@ type ComposerContextMenuState = {
   hasContent: boolean;
 };
 
-/** Where the @/$ trigger lives inside a text node */
+/** Where the @ or / trigger lives inside a text node */
 interface MentionContext {
   trigger: "file" | "skill";
   query: string;
@@ -199,6 +200,7 @@ export interface MentionComposerProps {
 
 const MAX_SUGGESTIONS = 30;
 const MENTION_INDEX_MAX_RESULTS = 5000;
+const MENTION_REFETCH_DEBOUNCE_MS = 150;
 const MENTION_TAG_ATTR = "data-mention-path";
 const MENTION_KIND_ATTR = "data-mention-kind";
 const SKILL_MENTION_NAME_ATTR = "data-skill-name";
@@ -252,7 +254,7 @@ const GITHUB_ICON_SVG =
 /* ------------------------------------------------------------------ */
 
 function formatSkillMentionToken(skill: Pick<MentionComposerSkillMention, "name">) {
-  return `$${skill.name}`;
+  return `/${skill.name}`;
 }
 
 function formatCommitMentionToken(
@@ -602,6 +604,28 @@ function clampComposerContextMenuPosition(x: number, y: number) {
 
 function normalizeMentionQuery(query: string) {
   return removeCaretAnchors(query).trim().replace(/\\/g, "/").toLowerCase();
+}
+
+type MentionFetchSnapshot = {
+  trigger: MentionContext["trigger"];
+  query: string;
+  truncated: boolean;
+};
+
+// A cached snapshot answers narrower queries client-side only when the backend
+// returned every match for the query it was fetched with. A truncated snapshot
+// can be missing matches for any other query, so extending the query must go
+// back to the backend instead of narrowing locally.
+export function mentionSnapshotCoversQuery(
+  fetched: MentionFetchSnapshot | null,
+  trigger: MentionContext["trigger"],
+  normalizedQuery: string,
+): boolean {
+  if (!fetched) return true;
+  if (fetched.trigger !== trigger) return false;
+  if (!normalizedQuery.startsWith(fetched.query)) return false;
+  if (!fetched.truncated) return true;
+  return normalizedQuery === fetched.query;
 }
 
 function normalizeLargePastePreview(text: string) {
@@ -1098,7 +1122,7 @@ function selectionTextPosition(root: HTMLElement): { textNode: Text; offset: num
   return null;
 }
 
-/** Detect an in-progress @file or $skill mention at the cursor position. */
+/** Detect an in-progress @file or /skill mention at the cursor position. */
 function detectMention(root: HTMLElement, skillsEnabled: boolean): MentionContext | null {
   const position = selectionTextPosition(root);
   if (!position) return null;
@@ -1115,7 +1139,9 @@ function detectMention(root: HTMLElement, skillsEnabled: boolean): MentionContex
       trigger = "file";
       break;
     }
-    if (before[i] === "$" && skillsEnabled) {
+    // "/" only triggers a skill mention at a word boundary; slashes inside an
+    // @file query (e.g. "@docs/foo") must keep scanning back toward the "@".
+    if (before[i] === "/" && skillsEnabled && (i === 0 || isMentionBoundaryChar(before[i - 1]))) {
       triggerIdx = i;
       trigger = "skill";
       break;
@@ -1123,6 +1149,11 @@ function detectMention(root: HTMLElement, skillsEnabled: boolean): MentionContex
     if (isMentionBoundaryChar(before[i])) break;
   }
   if (triggerIdx < 0 || !trigger) return null;
+
+  // Typing a filesystem path ("/usr/bin") reaches a second "/", which can
+  // never appear in a skill name — drop the skill context instead of keeping
+  // an unmatchable popup query around.
+  if (trigger === "skill" && before.slice(triggerIdx + 1).includes("/")) return null;
 
   // Trigger must be preceded by whitespace or be the very first character.
   if (triggerIdx > 0) {
@@ -1328,24 +1359,102 @@ function createLargePasteChip(paste: MentionComposerLargePaste) {
   return chip;
 }
 
-function insertNodeAtCursor(root: HTMLElement, node: Node) {
-  const anchor = createCaretAnchorText("");
-  const afterNode = document.createTextNode(anchor.text);
+function insertNodeAtCursor(root: HTMLElement, node: HTMLElement) {
   const sel = window.getSelection();
   if (sel && sel.rangeCount > 0) {
     const range = sel.getRangeAt(0);
-    if (root.contains(range.commonAncestorContainer)) {
-      range.deleteContents();
-      range.insertNode(afterNode);
+    if (editorRangeIsInsideRoot(root, range)) {
+      // A restored selection can carry boundaries inside a non-editable chip
+      // (clicks and double-clicks land there); hop them outside so the new
+      // chip never nests into an existing chip and never guts its label.
+      const startChip = closestComposerChipFromNode(root, range.startContainer);
+      if (startChip) {
+        range.setStartAfter(startChip);
+      }
+      const endChip = closestComposerChipFromNode(root, range.endContainer);
+      if (endChip) {
+        range.setEndBefore(endChip);
+      }
+      if (!range.collapsed) {
+        range.deleteContents();
+      }
       range.insertNode(node);
-      placeCaretInTextNode(afterNode, anchor.caretOffset);
+      // Reuse the split-off text node as the caret anchor instead of minting
+      // a fresh one, so mid-text inserts leave no empty text-node leftovers.
+      const anchor = ensureCaretAnchorAfterChip(node);
+      if (anchor) {
+        placeCaretInTextNode(anchor.textNode, anchor.offset);
+      }
       return;
     }
   }
 
   root.appendChild(node);
-  root.appendChild(afterNode);
-  placeCaretInTextNode(afterNode, anchor.caretOffset);
+  const anchor = ensureCaretAnchorAfterChip(node);
+  if (anchor) {
+    placeCaretInTextNode(anchor.textNode, anchor.offset);
+  }
+}
+
+/** Measure the caret rect without corrupting the selection.
+ *
+ *  Range.getClientRects() covers most caret positions but is empty at line
+ *  boundaries (e.g. right after a Shift+Enter line break). The old fallback
+ *  used Range.insertNode() at the caret, which splits the underlying text
+ *  node; the caret then ended up inside the degenerate empty text node left
+ *  by the split, and WebKit stops painting a caret there entirely — the
+ *  cursor visibly vanished after every Shift+Enter. Instead, insert the
+ *  probe at the nearest node boundary (never splitting text nodes) and put
+ *  the selection back exactly where it was afterwards. */
+function measureComposerCaretRect(range: Range): DOMRect | null {
+  const rects = range.getClientRects();
+  if (rects.length > 0) {
+    return rects[0];
+  }
+
+  const { startContainer, startOffset } = range;
+  let parent: Node | null;
+  let before: Node | null;
+  if (startContainer.nodeType === Node.TEXT_NODE) {
+    const textNode = startContainer as Text;
+    parent = textNode.parentNode;
+    if (startOffset <= 0) {
+      before = textNode;
+    } else if (startOffset >= textNode.length) {
+      before = textNode.nextSibling;
+    } else {
+      // Mid-text carets always produce client rects; never risk a split.
+      return null;
+    }
+  } else {
+    parent = startContainer;
+    before = startContainer.childNodes[startOffset] ?? null;
+  }
+  if (!parent) {
+    return null;
+  }
+
+  const marker = document.createElement("span");
+  marker.textContent = "\u200B";
+  marker.style.display = "inline-block";
+  marker.style.width = "0";
+  marker.style.height = "1em";
+  marker.style.overflow = "hidden";
+  parent.insertBefore(marker, before);
+  const markerRect = marker.getBoundingClientRect();
+  marker.remove();
+
+  // Even a non-splitting insert/remove can drop or shift a WebKit selection;
+  // restore the caret to the exact position that was measured.
+  const sel = window.getSelection();
+  if (sel) {
+    try {
+      sel.collapse(startContainer, startOffset);
+    } catch {
+      // The container vanished mid-frame; leave the selection untouched.
+    }
+  }
+  return markerRect;
 }
 
 function scrollSelectionIntoComposerView(root: HTMLElement) {
@@ -1360,29 +1469,21 @@ function scrollSelectionIntoComposerView(root: HTMLElement) {
     return;
   }
 
-  const marker = document.createElement("span");
-  marker.textContent = "\u200B";
-  marker.style.display = "inline-block";
-  marker.style.width = "0";
-  marker.style.height = "1em";
-  marker.style.overflow = "hidden";
+  const caretRect = measureComposerCaretRect(range);
+  if (!caretRect) {
+    return;
+  }
 
-  const markerRange = range.cloneRange();
-  markerRange.insertNode(marker);
-
-  const markerRect = marker.getBoundingClientRect();
   const rootRect = root.getBoundingClientRect();
   const margin = 4;
-  const bottomOverflow = markerRect.bottom - (rootRect.bottom - margin);
-  const topOverflow = rootRect.top + margin - markerRect.top;
+  const bottomOverflow = caretRect.bottom - (rootRect.bottom - margin);
+  const topOverflow = rootRect.top + margin - caretRect.top;
 
   if (bottomOverflow > 0) {
     root.scrollTop += bottomOverflow;
   } else if (topOverflow > 0) {
     root.scrollTop -= topOverflow;
   }
-
-  marker.remove();
 }
 
 function scheduleComposerSelectionScroll(root: HTMLElement | null) {
@@ -2033,6 +2134,32 @@ export const MentionComposer = memo(
       setComposerContextMenu(null);
     }, []);
 
+    const lastEditorSelectionRef = useRef<Range | null>(null);
+    const rememberEditorSelection = useCallback(() => {
+      const editor = editorRef.current;
+      if (!editor) return;
+      const range = editorSelectionRange(editor);
+      if (range) {
+        lastEditorSelectionRef.current = range.cloneRange();
+      }
+    }, []);
+    const focusEditorAtSavedSelection = useCallback(() => {
+      const editor = editorRef.current;
+      if (!editor) return;
+      const range = lastEditorSelectionRef.current;
+      editor.focus({ preventScroll: true });
+      if (!range || !editorRangeIsInsideRoot(editor, range)) return;
+      const selection = window.getSelection();
+      if (!selection) return;
+      selection.removeAllRanges();
+      selection.addRange(range.cloneRange());
+    }, []);
+
+    useEffect(() => {
+      document.addEventListener("selectionchange", rememberEditorSelection);
+      return () => document.removeEventListener("selectionchange", rememberEditorSelection);
+    }, [rememberEditorSelection]);
+
     const setBusy = useCallback(
       (nextBusy: boolean) => {
         if (isBusyRef.current === nextBusy) return;
@@ -2060,22 +2187,31 @@ export const MentionComposer = memo(
     const mentionSessionRequestSeqRef = useRef(0);
     const mentionActiveRef = useRef(false);
     const mentionSessionQueryRef = useRef("");
-    const mentionFetchRef = useRef<{ trigger: MentionContext["trigger"]; query: string } | null>(
-      null,
-    );
+    const mentionFetchRef = useRef<MentionFetchSnapshot | null>(null);
+    const mentionRefetchTimerRef = useRef<number | null>(null);
+    const [mentionRefetchPending, setMentionRefetchPending] = useState(false);
 
     // ---- Mention state ----
     const [mentionCtx, setMentionCtx] = useState<MentionContext | null>(null);
     const [highlightIdx, setHighlightIdx] = useState(0);
 
+    const cancelMentionRefetch = useCallback(() => {
+      if (mentionRefetchTimerRef.current !== null) {
+        window.clearTimeout(mentionRefetchTimerRef.current);
+        mentionRefetchTimerRef.current = null;
+      }
+      setMentionRefetchPending(false);
+    }, []);
+
     const resetMentionSession = useCallback(() => {
       mentionSessionRequestSeqRef.current += 1;
       mentionSessionQueryRef.current = "";
       mentionFetchRef.current = null;
+      cancelMentionRefetch();
       setMentionSessionEntries([]);
       setMentionSessionLoading(false);
       setMentionSessionError(null);
-    }, []);
+    }, [cancelMentionRefetch]);
 
     const closeMentionSession = useCallback(() => {
       mentionActiveRef.current = false;
@@ -2085,12 +2221,23 @@ export const MentionComposer = memo(
     }, [resetMentionSession]);
 
     const startMentionSession = useCallback(
-      (ctx: MentionContext) => {
+      (ctx: MentionContext, opts?: { keepEntries?: boolean }) => {
+        cancelMentionRefetch();
         const requestSeq = ++mentionSessionRequestSeqRef.current;
+        const isFileFetch = ctx.trigger === "file" && Boolean(normalizedWorkdir);
         mentionSessionQueryRef.current = ctx.query;
-        mentionFetchRef.current = { trigger: ctx.trigger, query: normalizeMentionQuery(ctx.query) };
-        setMentionSessionEntries([]);
-        setMentionSessionLoading(ctx.trigger === "file" && Boolean(normalizedWorkdir));
+        mentionFetchRef.current = {
+          trigger: ctx.trigger,
+          query: normalizeMentionQuery(ctx.query),
+          // Pessimistic while the fetch is in flight so keystrokes racing the
+          // response keep refetching; the response corrects it. Skill and
+          // workdir-less sessions never fetch, so their snapshot is complete.
+          truncated: isFileFetch,
+        };
+        if (!opts?.keepEntries) {
+          setMentionSessionEntries([]);
+        }
+        setMentionSessionLoading(isFileFetch);
         setMentionSessionError(null);
 
         if (ctx.trigger === "skill") {
@@ -2108,6 +2255,9 @@ export const MentionComposer = memo(
           .then((resp) => {
             if (requestSeq !== mentionSessionRequestSeqRef.current) return;
             setMentionSessionEntries(resp.entries);
+            if (mentionFetchRef.current) {
+              mentionFetchRef.current = { ...mentionFetchRef.current, truncated: resp.truncated };
+            }
           })
           .catch(() => {
             if (requestSeq !== mentionSessionRequestSeqRef.current) return;
@@ -2119,7 +2269,22 @@ export const MentionComposer = memo(
             setMentionSessionLoading(false);
           });
       },
-      [normalizedWorkdir],
+      [cancelMentionRefetch, normalizedWorkdir],
+    );
+
+    const scheduleMentionRefetch = useCallback(
+      (ctx: MentionContext) => {
+        if (mentionRefetchTimerRef.current !== null) {
+          window.clearTimeout(mentionRefetchTimerRef.current);
+        }
+        setMentionRefetchPending(true);
+        mentionRefetchTimerRef.current = window.setTimeout(() => {
+          mentionRefetchTimerRef.current = null;
+          setMentionRefetchPending(false);
+          startMentionSession(ctx, { keepEntries: true });
+        }, MENTION_REFETCH_DEBOUNCE_MS);
+      },
+      [startMentionSession],
     );
 
     const mentionSessionSearchIndex = useMemo<MentionSearchEntry[]>(
@@ -2138,6 +2303,9 @@ export const MentionComposer = memo(
     useEffect(() => {
       return () => {
         mentionSessionRequestSeqRef.current += 1;
+        if (mentionRefetchTimerRef.current !== null) {
+          window.clearTimeout(mentionRefetchTimerRef.current);
+        }
         if (busyReleaseTimerRef.current !== null) {
           window.clearTimeout(busyReleaseTimerRef.current);
         }
@@ -2232,7 +2400,7 @@ export const MentionComposer = memo(
       });
     }, [suggestions.length]);
 
-    const popupLoading = mentionSessionLoading;
+    const popupLoading = mentionSessionLoading || mentionRefetchPending;
     const popupError = suggestions.length === 0 ? mentionSessionError : null;
     const popupEmptyLabel =
       mentionCtx?.trigger === "skill"
@@ -2438,14 +2606,16 @@ export const MentionComposer = memo(
         if (ctx.query === mentionSessionQueryRef.current) return;
         mentionSessionQueryRef.current = ctx.query;
         setHighlightIdx(0);
-        // The backend filters entries by the query used at fetch time, so the
-        // cached snapshot only narrows further; refetch once that breaks.
+        // The cached snapshot only answers the new query when it was complete
+        // for the fetched one; anything else goes back to the backend. File
+        // refetches are debounced so fast typing does not walk a large
+        // workspace once per keystroke.
         const fetched = mentionFetchRef.current;
-        if (
-          fetched &&
-          (fetched.trigger !== ctx.trigger ||
-            !normalizeMentionQuery(ctx.query).startsWith(fetched.query))
-        ) {
+        if (mentionSnapshotCoversQuery(fetched, ctx.trigger, normalizeMentionQuery(ctx.query))) {
+          cancelMentionRefetch();
+        } else if (fetched?.trigger === "file" && ctx.trigger === "file") {
+          scheduleMentionRefetch(ctx);
+        } else {
           startMentionSession(ctx);
         }
       };
@@ -2456,7 +2626,13 @@ export const MentionComposer = memo(
         if (!nextEl || document.activeElement !== nextEl) return;
         applyContext(detectMention(nextEl, enabledSkills.length > 0));
       });
-    }, [closeMentionSession, enabledSkills.length, startMentionSession]);
+    }, [
+      cancelMentionRefetch,
+      closeMentionSession,
+      enabledSkills.length,
+      scheduleMentionRefetch,
+      startMentionSession,
+    ]);
 
     useImperativeHandle(
       ref,
@@ -2538,7 +2714,7 @@ export const MentionComposer = memo(
           if (!el) return;
           finishTypewriter();
           resetPromptHistoryRecall();
-          el.focus();
+          focusEditorAtSavedSelection();
           const chip = createFileMentionChip(path, kind);
           if (!chip) return;
           insertNodeAtCursor(el, chip);
@@ -2550,7 +2726,7 @@ export const MentionComposer = memo(
           if (!el) return;
           finishTypewriter();
           resetPromptHistoryRecall();
-          el.focus();
+          focusEditorAtSavedSelection();
           insertNodeAtCursor(el, createSkillMentionChip(skill));
           closeMentionSession();
           refreshEmptyState();
@@ -2560,7 +2736,7 @@ export const MentionComposer = memo(
           if (!el) return;
           finishTypewriter();
           resetPromptHistoryRecall();
-          el.focus();
+          focusEditorAtSavedSelection();
           insertNodeAtCursor(el, createCommitMentionChip(commit));
           closeMentionSession();
           refreshEmptyState();
@@ -2570,7 +2746,7 @@ export const MentionComposer = memo(
           if (!el) return;
           finishTypewriter();
           resetPromptHistoryRecall();
-          el.focus();
+          focusEditorAtSavedSelection();
           insertNodeAtCursor(el, createGitFileMentionChip(file));
           closeMentionSession();
           refreshEmptyState();
@@ -2580,7 +2756,7 @@ export const MentionComposer = memo(
           if (!el) return;
           finishTypewriter();
           resetPromptHistoryRecall();
-          el.focus();
+          focusEditorAtSavedSelection();
           const chip = createCodeMentionChip(reference);
           if (!chip) return;
           insertNodeAtCursor(el, chip);
@@ -2691,6 +2867,7 @@ export const MentionComposer = memo(
         closeComposerContextMenu,
         closeMentionSession,
         finishTypewriter,
+        focusEditorAtSavedSelection,
         insertLargePaste,
         placeCaretAtEditorEnd,
         refreshEmptyState,
@@ -2796,12 +2973,9 @@ export const MentionComposer = memo(
       resetPromptHistoryRecall();
       el.focus({ preventScroll: true });
 
-      let text: string | null = null;
-      try {
-        text = (await navigator.clipboard?.readText?.()) ?? "";
-      } catch {
-        text = null;
-      }
+      // Native-first read: the webview clipboard API pops WebKit's paste
+      // confirmation for externally-copied content (see readClipboardText).
+      const text = await readClipboardText();
 
       restoreComposerContextSelection();
 
@@ -3360,6 +3534,7 @@ export const MentionComposer = memo(
     }, [refreshEmptyState, refreshMention, scheduleBusyRelease]);
 
     const handleBlur = useCallback(() => {
+      rememberEditorSelection();
       isComposingRef.current = false;
       compositionEnterKeyRef.current = false;
       lastCompositionEndAtRef.current = 0;
@@ -3378,6 +3553,7 @@ export const MentionComposer = memo(
       closeCommitTooltip,
       closeComposerContextMenu,
       closeMentionSession,
+      rememberEditorSelection,
       setBusy,
     ]);
 

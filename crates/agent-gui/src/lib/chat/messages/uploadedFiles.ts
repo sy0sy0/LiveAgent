@@ -113,11 +113,15 @@ export function parsePastedTextDisplayReferences(text: string): PastedTextDispla
 }
 
 export function buildUploadedFilesInstruction(files: PendingUploadedFile[]) {
-  if (files.length === 0) return "";
-  const lines = files.map((file) => `- ${file.relativePath} (${file.kind})`);
+  // 模型读取路径只认导入时返回的绝对路径（工作区内原地引用、工作区外落
+  // 暂存区）。旧版本仅持久化相对路径的附件不再列出——新方案下无法定位。
+  const lines = files
+    .filter((file) => typeof file.absolutePath === "string" && file.absolutePath.trim())
+    .map((file) => `- ${file.absolutePath} (${file.kind})`);
+  if (lines.length === 0) return "";
   return [
-    "Selected files are available in the workspace at these relative paths.",
-    "Use Read with the paths below before analyzing or modifying them:",
+    "The user attached the files below to this message.",
+    "Use Read with these exact paths before analyzing or modifying them:",
     ...lines,
   ].join("\n");
 }
@@ -127,6 +131,7 @@ export function buildUserMessageContentWithUploads(userText: string, files: Pend
   if (files.length === 0) return normalizedText;
 
   const instruction = buildUploadedFilesInstruction(files);
+  if (!instruction) return normalizedText;
   if (!normalizedText) {
     return `Please inspect the selected files first.\n\n${instruction}`;
   }

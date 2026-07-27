@@ -5,12 +5,11 @@ import type { CompletePromptRunInput, PromptRunRequest } from "../../lib/automat
 import { backend } from "../../lib/automation/backend";
 import { runAssistantWithTools } from "../../lib/chat/runner/agentRunner";
 import { createStreamDebugLogger } from "../../lib/debug/agentDebug";
-import { assistantMessageToText } from "../../lib/providers/llm";
+import { assistantMessageToText, createProviderRuntimeConfig } from "../../lib/providers/llm";
 import { resolveRuntimePlatform } from "../../lib/runtimePlatform";
 import {
   type AppSettings,
   DEFAULT_CHAT_RUNTIME_CONTROLS,
-  findProviderModelConfig,
   isAgentDevMode,
   isAgentExecutionMode,
   type ReasoningLevel,
@@ -208,14 +207,18 @@ async function executeCronPromptRun(
     providerId: provider.type,
     model: request.model,
     runtime: {
-      baseUrl: provider.baseUrl,
-      apiKey: provider.apiKey,
-      requestFormat: provider.requestFormat,
-      reasoning: resolveCronReasoning(request.reasoning),
+      ...createProviderRuntimeConfig(
+        provider,
+        request.model,
+        {
+          ...DEFAULT_CHAT_RUNTIME_CONTROLS,
+          reasoning: resolveCronReasoning(request.reasoning),
+        },
+        settings.customSettings.providerIdentities,
+      ),
+      // 后台定时任务恒开提示词缓存：与前台会话共享同一前缀，命中率远高于按
+      // 供应商开关逐个判断。
       promptCachingEnabled: true,
-      nativeWebSearchEnabled: DEFAULT_CHAT_RUNTIME_CONTROLS.nativeWebSearchEnabled,
-      useSystemProxy: provider.useSystemProxy,
-      modelConfig: findProviderModelConfig(provider, request.model),
     },
     runtimePlatform,
     context,

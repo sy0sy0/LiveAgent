@@ -134,6 +134,9 @@ test("gateway bridge listener keeps one worker across renders and handles native
     const sendActionRef = { current: async () => true };
     let firstAbortCalls = 0;
     let secondAbortCalls = 0;
+    const stopRequestIds = [];
+    const activeStopCalls = [];
+    const consumedStopIds = [];
     const baseParams = {
       currentConversationIdRef,
       conversationRuntimeCacheRef: { current: new Map() },
@@ -151,6 +154,17 @@ test("gateway bridge listener keeps one worker across renders and handles native
       },
       getConversationAbortController() {
         return { abort: () => firstAbortCalls++ };
+      },
+      requestConversationStop(conversationId) {
+        stopRequestIds.push(conversationId);
+      },
+      requestActiveConversationStop(conversationId, options) {
+        activeStopCalls.push({ conversationId, options });
+        return true;
+      },
+      consumeConversationStop(conversationId) {
+        consumedStopIds.push(conversationId);
+        return true;
       },
     };
 
@@ -211,6 +225,35 @@ test("gateway bridge listener keeps one worker across renders and handles native
     });
     assert.equal(firstAbortCalls, 0);
     assert.equal(secondAbortCalls, 1, "listeners must dispatch through the latest callback refs");
+    assert.deepEqual(stopRequestIds, ["conversation-1"]);
+    assert.deepEqual(activeStopCalls, [
+      { conversationId: "conversation-1", options: { force: false } },
+    ]);
+    assert.deepEqual(
+      consumedStopIds,
+      [],
+      "a cancel with a live controller must keep the stop intent for the run to consume",
+    );
+
+    // A cancel that finds nothing to stop must consume its own stop intent —
+    // a leftover flag would silently swallow the conversation's next send.
+    hookHarness.render(() =>
+      useGatewayBridgeListeners({
+        ...baseParams,
+        getConversationAbortController() {
+          return null;
+        },
+        requestActiveConversationStop(conversationId, options) {
+          activeStopCalls.push({ conversationId, options });
+          return false;
+        },
+      }),
+    );
+    registrations.find((entry) => entry.name === "gateway:chat-cancel").handler({
+      payload: { requestId: "request-9", conversationId: "conversation-9" },
+    });
+    assert.deepEqual(stopRequestIds, ["conversation-1", "conversation-9"]);
+    assert.deepEqual(consumedStopIds, ["conversation-9"]);
 
     const runtimeWorkerIds = invokeCalls
       .filter((call) => call.command === "gateway_chat_runtime_heartbeat")

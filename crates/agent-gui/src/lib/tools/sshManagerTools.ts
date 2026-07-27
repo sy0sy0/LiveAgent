@@ -4,6 +4,12 @@ import { Type } from "typebox";
 
 import type { SshHostConfig } from "../settings";
 import { type BuiltinToolBundle, createBuiltinMetadataMap } from "./builtinTypes";
+import {
+  createToolRunId,
+  invokeWithAbort,
+  requestRuntimeCancel,
+  throwIfToolInvocationAborted,
+} from "./invokeWithAbort";
 import { ToolPathResolver } from "./pathUtils";
 
 type SSHManagerAction =
@@ -388,10 +394,12 @@ function errorResult(
   };
 }
 
-async function listProjectSessions(projectPathKey: string) {
-  const response = await invoke<RawTerminalListResponse>("terminal_list", {
-    project_path_key: projectPathKey,
-  });
+async function listProjectSessions(projectPathKey: string, signal?: AbortSignal) {
+  const response = await invokeWithAbort<RawTerminalListResponse>(
+    "terminal_list",
+    { project_path_key: projectPathKey },
+    signal,
+  );
   return (response.sessions ?? [])
     .map(normalizeSession)
     .filter((session): session is SshManagerSessionSummary => Boolean(session));
@@ -409,8 +417,9 @@ async function validateSession(params: {
   projectPathKey: string;
   allowedHostIds: Set<string>;
   needsSftp?: boolean;
+  signal?: AbortSignal;
 }) {
-  const session = (await listProjectSessions(params.projectPathKey)).find(
+  const session = (await listProjectSessions(params.projectPathKey, params.signal)).find(
     (candidate) => candidate.session_id === params.sessionId,
   );
   if (!session) {
@@ -457,16 +466,21 @@ async function createSession(params: {
   cols?: number;
   rows?: number;
   sftpEnabled?: boolean;
+  signal?: AbortSignal;
 }) {
-  const response = await invoke<RawTerminalSnapshotResponse>("terminal_create_ssh", {
-    cwd: params.workdir,
-    project_path_key: params.projectPathKey,
-    ssh_host_id: params.host.id,
-    title: params.title,
-    cols: params.cols,
-    rows: params.rows,
-    sftp_enabled: params.sftpEnabled ?? true,
-  });
+  const response = await invokeWithAbort<RawTerminalSnapshotResponse>(
+    "terminal_create_ssh",
+    {
+      cwd: params.workdir,
+      project_path_key: params.projectPathKey,
+      ssh_host_id: params.host.id,
+      title: params.title,
+      cols: params.cols,
+      rows: params.rows,
+      sftp_enabled: params.sftpEnabled ?? true,
+    },
+    params.signal,
+  );
   if (response.sshPrompt || response.ssh_prompt) {
     throw new Error(promptErrorMessage());
   }
@@ -488,6 +502,7 @@ async function resolveSession(params: {
   allowedHostIds: Set<string>;
   needsSftp?: boolean;
   onNewConnectionStarted?: () => void | Promise<void>;
+  signal?: AbortSignal;
 }): Promise<ResolvedSshSession> {
   const sessionId = normalizeOptionalString(params.args.session_id);
   const strategy = normalizeSessionStrategy(params.args.session_strategy);
@@ -500,6 +515,7 @@ async function resolveSession(params: {
       projectPathKey: params.projectPathKey,
       allowedHostIds: params.allowedHostIds,
       needsSftp: params.needsSftp === true,
+      signal: params.signal,
     });
     return { session, reused: true, created: false, strategy: "session_id" };
   }
@@ -510,7 +526,7 @@ async function resolveSession(params: {
   }
   if (strategy !== "new") {
     const reusable = findReusableSession({
-      sessions: await listProjectSessions(params.projectPathKey),
+      sessions: await listProjectSessions(params.projectPathKey, params.signal),
       hostId,
       needsSftp: params.needsSftp === true,
     });
@@ -528,6 +544,7 @@ async function resolveSession(params: {
     throw new Error(keyboardInteractiveConnectErrorMessage());
   }
   await params.onNewConnectionStarted?.();
+  throwIfToolInvocationAborted(params.signal);
   const session = await createSession({
     host,
     workdir: params.workdir,
@@ -536,6 +553,7 @@ async function resolveSession(params: {
       normalizeOptionalString(params.args.title) ||
       `SSHManager: ${host.name || host.host || host.id}`,
     sftpEnabled: true,
+    signal: params.signal,
   });
   return { session, reused: false, created: true, strategy };
 }
@@ -553,6 +571,8 @@ async function executeSSHManager(
   signal?: AbortSignal,
 ): Promise<ToolResultMessage> {
   const args = asArgs(toolCall.arguments);
+  const invokeTool = <T = unknown>(command: string, input: Record<string, unknown>) =>
+    invokeWithAbort<T>(command, input, signal);
   let action: SSHManagerAction = "list_hosts";
   try {
     const resolveLocalTransferPath = async (
@@ -565,6 +585,7 @@ async function executeSSHManager(
         intent,
         required: true,
       });
+      throwIfToolInvocationAborted(signal);
       if (resolved.scope !== "workspace") {
         throw new Error(
           `${label} must resolve inside the workspace (workspace root: ${params.workdir}). Got: ${String(input)}. Use a workspace-relative path.`,
@@ -608,7 +629,7 @@ async function executeSSHManager(
       if (hostId && !allowedHostIds.has(hostId)) {
         throw new Error("SSH host is not associated with the current project.");
       }
-      const sessions = (await listProjectSessions(params.projectPathKey)).filter(
+      const sessions = (await listProjectSessions(params.projectPathKey, signal)).filter(
         (session) => allowedHostIds.has(session.host_id) && (!hostId || session.host_id === hostId),
       );
       return okResult({
@@ -646,6 +667,7 @@ async function executeSSHManager(
         cols,
         rows,
         sftpEnabled,
+        signal,
       });
       return okResult({
         toolCall,
@@ -665,8 +687,9 @@ async function executeSSHManager(
         sessionId: requireString(args, "session_id"),
         projectPathKey: params.projectPathKey,
         allowedHostIds,
+        signal,
       });
-      const response = await invoke<RawTerminalSnapshotResponse>("terminal_stream_attach", {
+      const response = await invokeTool<RawTerminalSnapshotResponse>("terminal_stream_attach", {
         session_id: session.session_id,
         max_bytes: normalizePositiveInt(args.max_bytes, 32 * 1024, 4 * 1024, 128 * 1024),
       });
@@ -697,12 +720,13 @@ async function executeSSHManager(
         sessionId: requireString(args, "session_id"),
         projectPathKey: params.projectPathKey,
         allowedHostIds,
+        signal,
       });
       const data = typeof args.data === "string" ? args.data : "";
       if (data.length === 0) {
         throw new Error("SSHManager.data is required.");
       }
-      await invoke("terminal_stream_input", {
+      await invokeTool("terminal_stream_input", {
         session_id: session.session_id,
         bytes: Array.from(new TextEncoder().encode(data)),
       });
@@ -719,10 +743,11 @@ async function executeSSHManager(
         sessionId: requireString(args, "session_id"),
         projectPathKey: params.projectPathKey,
         allowedHostIds,
+        signal,
       });
       const cols = normalizePositiveInt(args.cols, 80, 20, 400);
       const rows = normalizePositiveInt(args.rows, 24, 6, 200);
-      await invoke("terminal_stream_resize", { session_id: session.session_id, cols, rows });
+      await invokeTool("terminal_stream_resize", { session_id: session.session_id, cols, rows });
       return okResult({
         toolCall,
         action,
@@ -736,8 +761,9 @@ async function executeSSHManager(
         sessionId: requireString(args, "session_id"),
         projectPathKey: params.projectPathKey,
         allowedHostIds,
+        signal,
       });
-      await invoke("terminal_close", { session_id: session.session_id });
+      await invokeTool("terminal_close", { session_id: session.session_id });
       return okResult({
         toolCall,
         action,
@@ -758,16 +784,24 @@ async function executeSSHManager(
             action: "create",
             projectPathKey: params.projectPathKey,
           }),
+        signal,
       });
       const { session } = resolvedSession;
       const command = requireString(args, "command");
-      const result = await invoke<Record<string, unknown>>("terminal_ssh_exec", {
-        session_id: session.session_id,
-        command,
-        cwd: normalizeOptionalString(args.cwd) || undefined,
-        timeout_ms: normalizeOptionalPositiveInt(args.timeout_ms, 1_000, 300_000),
-        max_bytes: normalizeOptionalPositiveInt(args.max_bytes, 4 * 1024, 256 * 1024),
-      });
+      const runId = createToolRunId("ssh-exec", toolCall.id);
+      const result = await invokeWithAbort<Record<string, unknown>>(
+        "terminal_ssh_exec",
+        {
+          session_id: session.session_id,
+          command,
+          cwd: normalizeOptionalString(args.cwd) || undefined,
+          timeout_ms: normalizeOptionalPositiveInt(args.timeout_ms, 1_000, 300_000),
+          max_bytes: normalizeOptionalPositiveInt(args.max_bytes, 4 * 1024, 256 * 1024),
+          run_id: runId,
+        },
+        signal,
+        { onAbort: () => requestRuntimeCancel(runId) },
+      );
       return okResult({
         toolCall,
         action,
@@ -800,8 +834,9 @@ async function executeSSHManager(
         sessionId: requireString(args, "session_id"),
         projectPathKey: params.projectPathKey,
         allowedHostIds,
+        signal,
       });
-      const result = await invoke("sftp_transfer_status", {
+      const result = await invokeTool("sftp_transfer_status", {
         session_id: session.session_id,
         transfer_id: requireString(args, "transfer_id"),
       });
@@ -818,9 +853,10 @@ async function executeSSHManager(
         sessionId: requireString(args, "session_id"),
         projectPathKey: params.projectPathKey,
         allowedHostIds,
+        signal,
       });
       const transferId = requireString(args, "transfer_id");
-      await invoke("sftp_cancel_transfer", {
+      await invokeTool("sftp_cancel_transfer", {
         session_id: session.session_id,
         transfer_id: transferId,
       });
@@ -844,12 +880,13 @@ async function executeSSHManager(
           action: "create",
           projectPathKey: params.projectPathKey,
         }),
+      signal,
     });
     const { session } = resolvedSession;
 
     if (action === "sftp_list" || action === "sftp_stat") {
       const command = action === "sftp_list" ? "sftp_list" : "sftp_stat";
-      const result = await invoke(command, {
+      const result = await invokeTool(command, {
         session_id: session.session_id,
         project_path_key: params.projectPathKey,
         workdir: params.workdir,
@@ -872,7 +909,7 @@ async function executeSSHManager(
 
     if (action === "sftp_mkdir" || action === "sftp_delete") {
       const command = action === "sftp_mkdir" ? "sftp_mkdir" : "sftp_delete";
-      const result = await invoke(command, {
+      const result = await invokeTool(command, {
         session_id: session.session_id,
         project_path_key: params.projectPathKey,
         workdir: params.workdir,
@@ -895,7 +932,7 @@ async function executeSSHManager(
     }
 
     if (action === "sftp_rename") {
-      const result = await invoke("sftp_rename", {
+      const result = await invokeTool("sftp_rename", {
         session_id: session.session_id,
         project_path_key: params.projectPathKey,
         workdir: params.workdir,
@@ -924,16 +961,39 @@ async function executeSSHManager(
           ? await resolveLocalTransferPath(args.local_path, "read", "SSHManager.local_path")
           : await resolveLocalTransferPath(args.local_path, "write", "SSHManager.local_path");
       const remotePath = requireString(args, "remote_path");
-      const result = await invoke("sftp_transfer", {
-        session_id: session.session_id,
-        project_path_key: params.projectPathKey,
-        workdir: params.workdir,
-        direction,
-        source_path: direction === "upload" ? localPath : remotePath,
-        target_path: direction === "upload" ? remotePath : localPath,
-        recursive: normalizeBool(args.recursive, false),
-        overwrite: normalizeBool(args.overwrite, false),
-      });
+      const cancelTransferById = (transferId: string) => {
+        void invoke("sftp_cancel_transfer", {
+          session_id: session.session_id,
+          transfer_id: transferId,
+        }).catch(() => undefined);
+      };
+      const result = await invokeWithAbort<{ transfer?: { id?: string } }>(
+        "sftp_transfer",
+        {
+          session_id: session.session_id,
+          project_path_key: params.projectPathKey,
+          workdir: params.workdir,
+          direction,
+          source_path: direction === "upload" ? localPath : remotePath,
+          target_path: direction === "upload" ? remotePath : localPath,
+          recursive: normalizeBool(args.recursive, false),
+          overwrite: normalizeBool(args.overwrite, false),
+        },
+        signal,
+        {
+          // An abort during the start call releases the caller before the
+          // transfer id is known; cancel it as soon as the late result
+          // surfaces the id — the Rust-side transfer keeps running otherwise.
+          onLateResult: (lateResult) => {
+            const lateTransferId = lateResult?.transfer?.id?.trim();
+            if (lateTransferId) cancelTransferById(lateTransferId);
+          },
+        },
+      );
+      const transferId = result.transfer?.id?.trim() ?? "";
+      if (signal?.aborted && transferId) {
+        cancelTransferById(transferId);
+      }
       return okResult({
         toolCall,
         action,
@@ -949,7 +1009,7 @@ async function executeSSHManager(
     }
 
     if (action === "sftp_read_text") {
-      const result = await invoke("sftp_read_text", {
+      const result = await invokeTool("sftp_read_text", {
         session_id: session.session_id,
         project_path_key: params.projectPathKey,
         path: requireString(args, "path"),
@@ -975,7 +1035,7 @@ async function executeSSHManager(
     }
 
     if (action === "sftp_write_text") {
-      const result = await invoke("sftp_write_text", {
+      const result = await invokeTool("sftp_write_text", {
         session_id: session.session_id,
         project_path_key: params.projectPathKey,
         path: requireString(args, "path"),

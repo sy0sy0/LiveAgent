@@ -1,10 +1,13 @@
 import type { Model } from "@earendil-works/pi-ai";
 import type { ProviderId } from "../../settings";
 import {
+  hasAnthropicWebFetchTool,
   hasAnthropicWebSearchTool,
   hasOpenAIResponsesWebSearchTool,
   providerSupportsNativeWebSearch,
+  resolveAnthropicWebFetchToolType,
   resolveAnthropicWebSearchToolType,
+  supportsAnthropicNativeWebFetch,
 } from "../nativeWebSearch";
 import { isRecord } from "./common";
 import { appendGeminiGoogleSearchToolToPayload } from "./geminiToolPayload";
@@ -165,7 +168,7 @@ export function attachProviderNativeWebSearch(
         return nextPayload;
       }
 
-      if (providerId === "codex") {
+      if (providerId === "codex" || providerId === "xai") {
         if (model.api === "openai-completions") {
           return appendOpenAIChatCompletionsNativeWebSearch(nextPayload, {
             baseUrl: params?.baseUrl,
@@ -181,11 +184,30 @@ export function attachProviderNativeWebSearch(
       }
 
       if (providerId === "claude_code") {
-        return appendUniqueTool(
+        let anthropicPayload = appendUniqueTool(
           nextPayload,
           { type: resolveAnthropicWebSearchToolType(model), name: "web_search" },
           hasAnthropicWebSearchTool,
         );
+        // Claude models trained with the web_fetch server tool call it whenever
+        // native search is on; declaring it lets compliant endpoints execute the
+        // fetch server-side instead of leaking a client tool_use. Gated to the
+        // modern catalog so legacy/relay-only models keep their payload as-is.
+        // max_content_tokens bounds runaway page/PDF fetches (a 500 KB PDF is
+        // ~125K tokens without it); the limit only applies to text content.
+        if (supportsAnthropicNativeWebFetch(model)) {
+          anthropicPayload = appendUniqueTool(
+            anthropicPayload,
+            {
+              type: resolveAnthropicWebFetchToolType(model),
+              name: "web_fetch",
+              max_uses: 10,
+              max_content_tokens: 50_000,
+            },
+            hasAnthropicWebFetchTool,
+          );
+        }
+        return anthropicPayload;
       }
 
       if (providerId === "gemini") {

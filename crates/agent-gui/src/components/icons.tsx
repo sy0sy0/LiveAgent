@@ -2,10 +2,12 @@ import { type ComponentType, type SVGProps, useId } from "react";
 import McpLogoSource from "~icons/gravity-ui/logo-mcp";
 import ConnectionIconSource from "~icons/gravity-ui/plug-connection";
 import ClaudeSource from "~icons/logos/claude-icon";
+import GrokSource from "~icons/logos/grok-icon";
 import OpenAISource from "~icons/logos/openai-icon";
 import ActivitySource from "~icons/lucide/activity";
 import ArchiveSource from "~icons/lucide/archive";
 import ArchiveRestoreSource from "~icons/lucide/archive-restore";
+import ArrowDownAZSource from "~icons/lucide/arrow-down-a-z";
 import ArrowLeftSource from "~icons/lucide/arrow-left";
 import BanSource from "~icons/lucide/ban";
 import BlendSource from "~icons/lucide/blend";
@@ -20,6 +22,7 @@ import ChevronRightSource from "~icons/lucide/chevron-right";
 import ChevronUpSource from "~icons/lucide/chevron-up";
 import CircleSource from "~icons/lucide/circle";
 import CheckCircle2Source from "~icons/lucide/circle-check";
+import CircleHelpSource from "~icons/lucide/circle-help";
 import CirclePlusSource from "~icons/lucide/circle-plus";
 import XCircleSource from "~icons/lucide/circle-x";
 import ClipboardPasteSource from "~icons/lucide/clipboard-paste";
@@ -54,6 +57,7 @@ import ImageIconSource from "~icons/lucide/image";
 import ImageOffSource from "~icons/lucide/image-off";
 import InfoSource from "~icons/lucide/info";
 import KeySource from "~icons/lucide/key";
+import KeyboardSource from "~icons/lucide/keyboard";
 import LayersSource from "~icons/lucide/layers";
 import LayoutGridSource from "~icons/lucide/layout-grid";
 import LightbulbSource from "~icons/lucide/lightbulb";
@@ -453,8 +457,17 @@ function GeminiIconSource({ title, ...props }: SVGProps<SVGSVGElement> & { title
 export const AlertTriangle = createIcon(AlertTriangleSource);
 export const ClaudeIcon = createIcon(ClaudeSource);
 export const GeminiIcon = createIcon(GeminiIconSource);
+/**
+ * Grok brand mark from the Iconify `logos` set (`logos:grok-icon`).
+ * The set ships it unfilled, so pin currentColor to track light/dark chrome.
+ */
+function GrokIconSource(props: SVGProps<SVGSVGElement> & { title?: string }) {
+  return <GrokSource fill="currentColor" {...props} />;
+}
+export const GrokIcon = createIcon(GrokIconSource);
 export const Archive = createIcon(ArchiveSource);
 export const ArchiveRestore = createIcon(ArchiveRestoreSource);
+export const ArrowDownAZ = createIcon(ArrowDownAZSource);
 export const ArrowLeft = createIcon(ArrowLeftSource);
 export const Activity = createIcon(ActivitySource);
 export const Ban = createIcon(BanSource);
@@ -470,6 +483,7 @@ export const ChevronDown = createIcon(ChevronDownSource);
 export const ChevronRight = createIcon(ChevronRightSource);
 export const ChevronUp = createIcon(ChevronUpSource);
 export const Circle = createIcon(CircleSource);
+export const CircleHelp = createIcon(CircleHelpSource);
 export const CirclePlus = createIcon(CirclePlusSource);
 export const ClipboardPaste = createIcon(ClipboardPasteSource);
 export const Clock3 = createIcon(Clock3Source);
@@ -503,6 +517,7 @@ export const ImageIcon = createIcon(ImageIconSource);
 export const ImageOff = createIcon(ImageOffSource);
 export const Info = createIcon(InfoSource);
 export const Key = createIcon(KeySource);
+export const Keyboard = createIcon(KeyboardSource);
 export const Layers = createIcon(LayersSource);
 export const LayoutGrid = createIcon(LayoutGridSource);
 export const Link2 = createIcon(Link2Source);

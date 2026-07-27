@@ -1,3 +1,4 @@
+import { hubFetch } from "../hubFetch";
 import type { McpServerConfig } from "../settings";
 
 export type McpRegistrySource = "official" | "smithery" | "glama";
@@ -125,10 +126,8 @@ async function fetchJson(
   url: string,
   params: { fetchImpl?: typeof fetch; headers?: Record<string, string> } = {},
 ): Promise<unknown> {
-  const fetchImpl = params.fetchImpl ?? globalThis.fetch;
-  if (typeof fetchImpl !== "function") {
-    throw new Error("fetch is not available");
-  }
+  // 默认经 hubFetch 出网（桌面端走本地反代+应用代理，WebUI 直连）；测试注入 fetchImpl。
+  const fetchImpl = params.fetchImpl ?? hubFetch;
   const response = await fetchImpl(url, {
     headers: {
       Accept: "application/json",
@@ -136,7 +135,15 @@ async function fetchJson(
     },
   });
   if (!response.ok) {
-    throw new Error(`MCP registry request failed with HTTP ${response.status}`);
+    // 反代/代理类失败的可行动信息在响应体里（如 502 “App proxy unavailable”），
+    // 截断回显，与 clawHub 的错误回显策略一致。typeof 兜底兼容只实现 json 的测试桩。
+    const detail =
+      typeof response.text === "function" ? (await response.text().catch(() => "")).trim() : "";
+    throw new Error(
+      `MCP registry request failed with HTTP ${response.status}${
+        detail ? `: ${detail.slice(0, 256)}` : ""
+      }`,
+    );
   }
   return response.json();
 }

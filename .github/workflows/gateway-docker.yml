@@ -61,3 +61,32 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
+
+      # Guard against mislabeled variants: v0.1.0 through v1.1.8 advertised
+      # arm64 while shipping an x86-64 binary (TARGETARCH defaults in the
+      # Dockerfile shadowed the values buildx injects).
+      - name: Verify per-arch binaries
+        run: |
+          set -euo pipefail
+          repo="$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')"
+          index="$repo@${{ steps.push.outputs.digest }}"
+          for arch in amd64 arm64; do
+            case "$arch" in
+              amd64) want="x86-64" ;;
+              arm64) want="aarch64" ;;
+            esac
+            # Pull each variant by its own manifest digest. Pulling the shared
+            # index digest with --platform binds repo@digest to one platform,
+            # so the second arch fails with "cannot overwrite digest".
+            digest="$(docker buildx imagetools inspect --raw "$index" \
+              | jq -r --arg arch "$arch" '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest')"
+            test -n "$digest" || { echo "::error::pushed index has no linux/$arch manifest"; exit 1; }
+            docker pull "$repo@$digest" >/dev/null
+            docker rm -f "verify-$arch" >/dev/null 2>&1 || true
+            docker create --name "verify-$arch" "$repo@$digest" >/dev/null
+            docker cp "verify-$arch:/usr/local/bin/liveagent-gateway" "/tmp/gateway-$arch"
+            docker rm -f "verify-$arch" >/dev/null
+            info="$(file -b "/tmp/gateway-$arch")"
+            echo "linux/$arch: $info"
+            echo "$info" | grep -q "$want" || { echo "::error::linux/$arch image contains a non-$arch gateway binary"; exit 1; }
+          done

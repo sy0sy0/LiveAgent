@@ -21,6 +21,7 @@ import type {
   GitCommitFile,
   GitCommitSummary,
   GitDiffResponse,
+  GitDiscoveredRepository,
   GitOperationResponse,
   GitRepositoryState,
 } from "../../../lib/git/types";
@@ -33,6 +34,7 @@ import {
   basename,
   compactGitOperationMessage,
   EMPTY_GIT_HISTORY_GRAPH_STATE,
+  type GitBranchSwitchConflictState,
   type GitHistoryGraphState,
   type GitOperationNotice,
   type GitOperationNoticeAction,
@@ -44,6 +46,7 @@ import {
   gitHistoryGraphStateFromResponse,
   gitHistorySignature,
   gitRepositoryStateSignature,
+  isCheckoutOverwriteError,
   isMissingRemoteSetupError,
   isRemoteSetupAction,
   operationFailureTitleKey,
@@ -57,6 +60,8 @@ const GIT_HISTORY_LOAD_MORE_SCROLL_THRESHOLD_PX = 96;
 // environment): a deliberately low-frequency safety net, not a data channel.
 const GIT_REVIEW_FALLBACK_POLL_INTERVAL_MS = 10_000;
 
+const EMPTY_GIT_REPOSITORIES: GitDiscoveredRepository[] = [];
+
 export type UseGitReviewDataOptions = {
   active: boolean;
 };
@@ -64,12 +69,38 @@ export type UseGitReviewDataOptions = {
 export function useGitReviewData(options: UseGitReviewDataOptions) {
   const { active } = options;
   const context = useRightDockToolContext();
-  const cwd = context.cwd;
+  const workspaceCwd = context.cwd;
   const gitClient = (context.clients.git ?? null) as GitReviewClient | null;
   const workspaceActivityClient = context.clients.workspaceActivity ?? null;
   const canWrite = context.capabilities.gitWriteEnabled;
   const disabledMessage = context.capabilities.gitDisabledMessage;
   const { t } = useLocale();
+
+  // Subdirectory repository support (modeled on VSCode's workspace-folder
+  // scanning): when the workspace folder is not itself a repository, git
+  // repositories found in its subdirectories can be reviewed instead. Both
+  // the discovered list and the picked root are keyed by workspace so a
+  // workspace switch resets them during render, before any effect runs.
+  const [repoPick, setRepoPick] = useState<{ workspace: string; root: string }>(() => ({
+    workspace: workspaceCwd,
+    root: "",
+  }));
+  const [discoveredRepos, setDiscoveredRepos] = useState<{
+    workspace: string;
+    list: GitDiscoveredRepository[];
+  }>(() => ({ workspace: workspaceCwd, list: EMPTY_GIT_REPOSITORIES }));
+  if (repoPick.workspace !== workspaceCwd) {
+    setRepoPick({ workspace: workspaceCwd, root: "" });
+  }
+  if (discoveredRepos.workspace !== workspaceCwd) {
+    setDiscoveredRepos({ workspace: workspaceCwd, list: EMPTY_GIT_REPOSITORIES });
+  }
+  const selectedRepoRoot = repoPick.workspace === workspaceCwd ? repoPick.root : "";
+  const repositories =
+    discoveredRepos.workspace === workspaceCwd ? discoveredRepos.list : EMPTY_GIT_REPOSITORIES;
+  // Every git request below runs against the picked repository; the workspace
+  // folder itself is the default when no subdirectory repository is picked.
+  const cwd = selectedRepoRoot || workspaceCwd;
 
   const [state, setState] = useState<GitRepositoryState>(() => emptyGitRepositoryState(cwd));
   const [branchDiff, setBranchDiff] = useState<GitDiffResponse | null>(null);
@@ -180,29 +211,28 @@ export function useGitReviewData(options: UseGitReviewDataOptions) {
   useEffect(() => {
     if (committedCwdKeyRef.current === cwdKey) return;
     committedCwdKeyRef.current = cwdKey;
-    setState(emptyGitRepositoryState(cwd));
-    setBranchDiff(null);
-    setWorktreeDiff(null);
+    // Repository switch (the panel remounts per workspace, so only the repo
+    // pick or client availability changes mid-mount): keep the previously
+    // rendered data on screen and let the freshly-issued loads swap it in a
+    // single repaint. Resetting content to the empty state here flashed the
+    // whole panel — header card unmounting, lists collapsing — before the
+    // new repository's data landed. The render-phase epoch above already
+    // invalidated every in-flight response, signature and selection ref, so
+    // stale responses land as no-ops and the loads below reconcile the
+    // visible selection; only errors and transient flags are cleared (their
+    // owning requests were orphaned by the epoch bump and would otherwise
+    // leave spinners stuck on).
     setBranchError("");
     setError("");
     setLoading(false);
     setDiffLoading(false);
-    setSelectedPath("");
-    setHistoryCommits([]);
-    setHistoryGraphState(EMPTY_GIT_HISTORY_GRAPH_STATE);
     setHistoryLoading(false);
     setHistoryLoadingMore(false);
     setHistoryHasMore(false);
     setHistoryLoadMoreError("");
     setHistoryError("");
-    setSelectedCommitSha("");
-    setSelectedCommitFilePath("");
-    setExpandedCommitShas(new Set());
-    setCommitDiff(null);
     setCommitDiffLoading(false);
-    setHistoryDiffTitle("");
-    setHistoryDiffSubtitle("");
-  }, [cwd, cwdKey]);
+  }, [cwdKey]);
 
   const beginGitOperation = useCallback((name: string) => {
     if (busyRef.current) {
@@ -256,6 +286,56 @@ export function useGitReviewData(options: UseGitReviewDataOptions) {
     expandedCommitShasRef.current = expandedCommitShas;
   }, [expandedCommitShas]);
 
+  const repoDiscoveryRequestIdRef = useRef(0);
+  const discoverRepositories = useCallback(async () => {
+    const requestId = ++repoDiscoveryRequestIdRef.current;
+    const workspace = workspaceCwd;
+    if (!gitClient?.discoverRepositories || !workspace.trim()) {
+      return;
+    }
+    try {
+      const response = await gitClient.discoverRepositories(workspace);
+      if (repoDiscoveryRequestIdRef.current !== requestId) return;
+      setDiscoveredRepos({ workspace, list: response.repositories });
+      // When the workspace folder itself is not a repository, fall back to
+      // the first discovered subdirectory repository so the panel still has
+      // something to review; an explicit pick that is still listed is kept.
+      setRepoPick((current) => {
+        if (current.workspace !== workspace) return current;
+        const hasWorkspaceRootRepo = response.repositories.some((repo) => repo.isWorkspaceRoot);
+        if (
+          current.root !== "" &&
+          response.repositories.some((repo) => !repo.isWorkspaceRoot && repo.root === current.root)
+        ) {
+          return current;
+        }
+        const fallbackRoot = hasWorkspaceRootRepo
+          ? ""
+          : (response.repositories.find((repo) => !repo.isWorkspaceRoot)?.root ?? "");
+        return current.root === fallbackRoot ? current : { workspace, root: fallbackRoot };
+      });
+    } catch {
+      if (repoDiscoveryRequestIdRef.current === requestId) {
+        setDiscoveredRepos({ workspace, list: EMPTY_GIT_REPOSITORIES });
+      }
+    }
+  }, [gitClient, workspaceCwd]);
+
+  const selectRepository = useCallback(
+    (root: string) => {
+      setRepoPick({ workspace: workspaceCwd, root });
+    },
+    [workspaceCwd],
+  );
+
+  // Discovery runs on activation and whenever the workspace changes; the
+  // toolbar refresh button re-runs it explicitly to pick up newly created
+  // repositories mid-session.
+  useEffect(() => {
+    if (!active) return;
+    void discoverRepositories();
+  }, [active, discoverRepositories]);
+
   const clearDiffs = useCallback(() => {
     diffRequestIdRef.current += 1;
     diffInFlightRequestIdRef.current = 0;
@@ -293,10 +373,14 @@ export function useGitReviewData(options: UseGitReviewDataOptions) {
         return;
       }
       if (diffPathRef.current !== cleanPath) {
+        // Selection moved: reset the signatures so the incoming responses
+        // always apply, but keep the previous diff rendered while they load.
+        // Clearing it here blanked the pane on every selection/branch/repo
+        // change; DiffView only shows its loading placeholder when no diff is
+        // mounted, so keeping the old one makes the swap land in one repaint
+        // (the card header spinner still signals the load).
         branchDiffSignatureRef.current = "";
         worktreeDiffSignatureRef.current = "";
-        setBranchDiff(null);
-        setWorktreeDiff(null);
       }
       diffPathRef.current = cleanPath;
       if (!options.silent) {
@@ -407,7 +491,12 @@ export function useGitReviewData(options: UseGitReviewDataOptions) {
           }
           return;
         }
-        setState(nextState);
+        // Identity guard even on forced reloads: post-operation refreshes run
+        // with force to re-reconcile selection, but swapping in an identical
+        // state object would repaint the whole panel for no visual delta.
+        if (stateChanged) {
+          setState(nextState);
+        }
         if (nextState.status !== "ready") {
           selectedPathRef.current = "";
           setSelectedPath("");
@@ -589,7 +678,9 @@ export function useGitReviewData(options: UseGitReviewDataOptions) {
         statusSignatureRef.current = nextStatusSignature;
 
         if (append) {
-          setState(response.state);
+          if (statusChanged) {
+            setState(response.state);
+          }
           if (response.state.status !== "ready") {
             historySignatureRef.current = "";
             historyCommitsRef.current = [];
@@ -626,14 +717,18 @@ export function useGitReviewData(options: UseGitReviewDataOptions) {
         if (historyChanged) {
           commitDetailsCacheRef.current.clear();
         }
-        if (force || statusChanged) {
+        if (statusChanged) {
           setState(response.state);
         }
         setHistoryHasMoreValue(
           !force && !historyChanged && !historyHasMoreRef.current ? false : pageHasMore,
         );
         setHistoryLoadMoreError("");
-        if (!force && !historyChanged) {
+        // Identity guard (mirrors refresh): even a forced reload keeps the
+        // commit list, graph state and selection untouched when the history
+        // signature is unchanged — replacing them with identical-but-new
+        // objects repainted every row and flashed the view after operations.
+        if (!historyChanged) {
           return;
         }
         historyCommitsRef.current = response.commits;
@@ -776,9 +871,15 @@ export function useGitReviewData(options: UseGitReviewDataOptions) {
     handleWorkspaceInvalidate(pending);
   }, [handleWorkspaceInvalidate]);
 
+  // Invalidation stays keyed to the workspace folder: activity events cover
+  // subdirectory repositories because they live inside the workspace tree,
+  // and the desktop watcher additionally covers the git metadata (index,
+  // HEAD, refs) of a repository that contains the workspace folder as a
+  // subfolder or links it as a worktree (services/workspace_watch). Worktree
+  // file edits outside the workspace subtree still need a manual refresh.
   useWorkspaceInvalidation({
     client: workspaceActivityClient,
-    workdir: cwd,
+    workdir: workspaceCwd,
     active,
     onInvalidate: handleWorkspaceInvalidate,
   });
@@ -888,6 +989,98 @@ export function useGitReviewData(options: UseGitReviewDataOptions) {
     ],
   );
 
+  const [branchSwitchConflict, setBranchSwitchConflict] =
+    useState<GitBranchSwitchConflictState | null>(null);
+
+  const dismissBranchSwitchConflict = useCallback(() => {
+    if (busyRef.current) return;
+    setBranchSwitchConflict(null);
+  }, []);
+
+  // Dedicated switch flow (not runOperation): a checkout aborted because it
+  // would clobber uncommitted changes surfaces as an actionable stash-and-
+  // switch prompt instead of a raw git error.
+  const switchBranch = useCallback(
+    async (branch: string, kind?: string) => {
+      const operationName = "switch_branch";
+      if (!gitClient || !cwd.trim() || !canWrite || !beginGitOperation(operationName)) return false;
+      setError("");
+      try {
+        const result = await gitClient.switchBranch(cwd, branch, kind);
+        assertGitOperationResult(result, t("projectTools.gitReview.operationFailed"));
+        await refresh();
+        if (reviewModeRef.current === "history") {
+          await loadHistory();
+        }
+        return true;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (isCheckoutOverwriteError(message)) {
+          setBranchSwitchConflict({ branch, kind: kind ?? "" });
+        } else {
+          setError(message);
+        }
+        return false;
+      } finally {
+        finishGitOperation(operationName);
+        flushPendingBusyInvalidation();
+      }
+    },
+    [
+      beginGitOperation,
+      canWrite,
+      cwd,
+      finishGitOperation,
+      flushPendingBusyInvalidation,
+      gitClient,
+      loadHistory,
+      refresh,
+      t,
+    ],
+  );
+
+  const stashAndSwitchBranch = useCallback(async () => {
+    const conflict = branchSwitchConflict;
+    const operationName = "switch_branch";
+    if (!conflict || !gitClient || !cwd.trim() || !canWrite || !beginGitOperation(operationName))
+      return false;
+    setError("");
+    try {
+      const stashed = await gitClient.stashPush(cwd);
+      assertGitOperationResult(stashed, t("projectTools.gitReview.operationFailed"));
+      const switched = await gitClient.switchBranch(
+        cwd,
+        conflict.branch,
+        conflict.kind || undefined,
+      );
+      assertGitOperationResult(switched, t("projectTools.gitReview.operationFailed"));
+      setBranchSwitchConflict(null);
+      await refresh();
+      if (reviewModeRef.current === "history") {
+        await loadHistory();
+      }
+      return true;
+    } catch (err) {
+      setBranchSwitchConflict(null);
+      setError(err instanceof Error ? err.message : String(err));
+      return false;
+    } finally {
+      finishGitOperation(operationName);
+      flushPendingBusyInvalidation();
+    }
+  }, [
+    beginGitOperation,
+    branchSwitchConflict,
+    canWrite,
+    cwd,
+    finishGitOperation,
+    flushPendingBusyInvalidation,
+    gitClient,
+    loadHistory,
+    refresh,
+    t,
+  ]);
+
   const closeRemoteSetup = useCallback(() => {
     if (busyRef.current) return;
     setRemoteSetupOpen(false);
@@ -956,6 +1149,23 @@ export function useGitReviewData(options: UseGitReviewDataOptions) {
     },
     [loadDiffForPath],
   );
+
+  // Chat-layer focus requests (reply-footer changed-files card): once the
+  // panel is active and the repository status is ready, jump to the changes
+  // view and select the requested file's diff. The handled callback retires
+  // the request so it never replays on a later remount.
+  const gitFocusRequest = context.git.focusRequest ?? null;
+  const onGitFocusRequestHandled = context.git.onFocusRequestHandled;
+  useEffect(() => {
+    if (!active || !gitFocusRequest) return;
+    if (state.status !== "ready") return;
+    setReviewMode("changes");
+    const path = gitFocusRequest.path.trim();
+    if (path) {
+      selectPath(path);
+    }
+    onGitFocusRequestHandled?.(gitFocusRequest.nonce);
+  }, [active, gitFocusRequest, onGitFocusRequestHandled, selectPath, state.status]);
 
   const selectCommitRow = useCallback(
     (commit: GitCommitSummary) => {
@@ -1069,6 +1279,7 @@ export function useGitReviewData(options: UseGitReviewDataOptions) {
   return {
     branchDiff,
     branchError,
+    branchSwitchConflict,
     busy,
     canWrite,
     closeRemoteSetup,
@@ -1078,6 +1289,8 @@ export function useGitReviewData(options: UseGitReviewDataOptions) {
     cwd,
     diffLoading,
     disabledMessage,
+    discoverRepositories,
+    dismissBranchSwitchConflict,
     dismissOperationNotice,
     error,
     expandedCommitShas,
@@ -1104,20 +1317,26 @@ export function useGitReviewData(options: UseGitReviewDataOptions) {
     remoteSetupError,
     remoteSetupOpen,
     remoteSetupUrl,
+    repositories,
     reviewMode,
     runOperation,
     saveRemoteAndContinue,
     selectCommitFileData,
     selectCommitRow,
     selectPath,
+    selectRepository,
     selectedCommitFilePath,
     selectedCommitSha,
     selectedPath,
+    selectedRepoRoot,
     setError,
     setHistoryError,
     setRemoteSetupUrl,
     setReviewMode,
+    stashAndSwitchBranch,
     state,
+    switchBranch,
+    workspaceCwd,
     worktreeDiff,
   };
 }

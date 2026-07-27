@@ -303,6 +303,20 @@ fn is_clawhub_download_source(source: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Reads a query parameter from a ClawHub download URL, so installs driven by
+/// a bare `/api/v1/download` source (no explicit payload slug) still resolve
+/// their registry identity.
+pub(crate) fn clawhub_download_query_param(source: &str, name: &str) -> Option<String> {
+    if !is_clawhub_download_source(source) {
+        return None;
+    }
+    let url = reqwest::Url::parse(source).ok()?;
+    url.query_pairs().find_map(|(key, value)| {
+        let value = value.trim();
+        (key == name && !value.is_empty()).then(|| value.to_string())
+    })
+}
+
 fn registry_skill_slug(value: &str) -> &str {
     value
         .trim()
@@ -373,9 +387,16 @@ fn rewrite_skill_metadata_name(metadata_file: &Path, normalized_name: &str) -> R
         .map_err(|e| format!("Failed to update {}: {e}", metadata_file.display()))
 }
 
+/// ClawHub keeps the routable slug and the catalog display name separate, so
+/// registry packages legally carry human-readable frontmatter names (for
+/// example "Self-Improving + Proactive Agent") that violate the Agent Skills
+/// naming rule and have no derivation relationship with the slug. For a
+/// single-skill ClawHub download we repair the staged copy instead of
+/// rejecting it: prefer the registry slug as the portable name, and fall back
+/// to the normalized frontmatter name when no usable slug is available.
 pub(crate) fn normalize_clawhub_candidate_name(
     candidate: &Path,
-    slug: &str,
+    slug: Option<&str>,
 ) -> Result<Option<SkillNameCompatibilityTransform>, String> {
     let metadata_file = metadata_file_for(candidate).ok_or_else(|| {
         format!(
@@ -391,31 +412,44 @@ pub(crate) fn normalize_clawhub_candidate_name(
         return Ok(None);
     }
 
-    let normalized_name = normalize_skill_name(&original_name);
-    let expected_name = registry_skill_slug(slug);
-    if normalized_name != expected_name || sanitize_skill_name(expected_name).is_err() {
+    let normalized_from_name = normalize_skill_name(&original_name);
+    let target_name = slug
+        .map(registry_skill_slug)
+        .filter(|value| sanitize_skill_name(value).is_ok())
+        .or_else(|| {
+            sanitize_skill_name(&normalized_from_name)
+                .is_ok()
+                .then_some(normalized_from_name.as_str())
+        });
+    let Some(target_name) = target_name else {
         return Ok(None);
-    }
+    };
 
-    rewrite_skill_metadata_name(&metadata_file, expected_name)?;
+    rewrite_skill_metadata_name(&metadata_file, target_name)?;
     Ok(Some(SkillNameCompatibilityTransform {
         original_name,
-        normalized_name,
+        normalized_name: target_name.to_string(),
     }))
 }
 
 fn build_skill_source_metadata(
     payload: &serde_json::Map<String, Value>,
+    registry_slug: Option<&str>,
     compatibility: Option<&SkillNameCompatibilityTransform>,
 ) -> Result<Option<Vec<u8>>, String> {
-    let Some(slug) = object_string(payload, "slug") else {
+    let Some(slug) = registry_slug else {
         return Ok(None);
     };
     let metadata = serde_json::json!({
         "registry": "clawhub",
         "slug": slug,
         "ownerHandle": object_string(payload, "ownerHandle")
-            .or_else(|| object_string(payload, "owner")),
+            .map(ToOwned::to_owned)
+            .or_else(|| object_string(payload, "owner").map(ToOwned::to_owned))
+            .or_else(|| {
+                object_string(payload, "source")
+                    .and_then(|source| clawhub_download_query_param(source, "ownerHandle"))
+            }),
         "version": object_string(payload, "version"),
         "publishedAt": payload.get("publishedAt").and_then(Value::as_u64),
         "originalName": compatibility.map(|value| value.original_name.as_str()),
@@ -498,7 +532,11 @@ where
         return Err("name can only be used when exactly one skill is installed".to_string());
     }
     let normalize_clawhub_name = candidates.len() == 1 && is_clawhub_download_source(source);
-    let registry_slug = object_string(payload, "slug").map(ToOwned::to_owned);
+    // Payload slug first (clawhub_install / store install path), then the
+    // download URL query, so bare `source`-only installs keep the same repair.
+    let registry_slug = object_string(payload, "slug")
+        .map(ToOwned::to_owned)
+        .or_else(|| clawhub_download_query_param(source, "slug"));
 
     let mut results = Vec::new();
     for candidate in candidates {
@@ -506,11 +544,7 @@ where
             return Err(INSTALL_CANCELLED_ERROR.to_string());
         }
         let compatibility = if normalize_clawhub_name {
-            registry_slug
-                .as_deref()
-                .map(|slug| normalize_clawhub_candidate_name(&candidate, slug))
-                .transpose()?
-                .flatten()
+            normalize_clawhub_candidate_name(&candidate, registry_slug.as_deref())?
         } else {
             None
         };
@@ -527,7 +561,8 @@ where
         }
         let metadata = read_skill_metadata_from_dir(&candidate)?;
         let skill_name = name_override.as_deref().unwrap_or(&metadata.name);
-        let source_meta = build_skill_source_metadata(payload, compatibility.as_ref())?;
+        let source_meta =
+            build_skill_source_metadata(payload, registry_slug.as_deref(), compatibility.as_ref())?;
         ensure_not_builtin_skill_management_target(root, skill_name, "install")?;
         on_progress(SkillInstallProgressUpdate {
             phase: "installing",

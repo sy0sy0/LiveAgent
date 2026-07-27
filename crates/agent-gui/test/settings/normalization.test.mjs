@@ -18,6 +18,25 @@ test("basic provider field normalizers trim values and remove duplicate models",
   );
 });
 
+test("custom provider normalization defaults and filters ordered custom headers", () => {
+  assert.deepEqual(settings.normalizeCustomProvider({}).customHeaders, []);
+
+  const provider = settings.normalizeCustomProvider({
+    customHeaders: [
+      { key: " X-Request-ID ", value: " request-123 " },
+      { key: "", value: "ignored" },
+      { key: "   ", value: "ignored" },
+      { key: "anthropic-beta", value: "feature-flag" },
+      null,
+    ],
+  });
+
+  assert.deepEqual(provider.customHeaders, [
+    { key: "X-Request-ID", value: " request-123 " },
+    { key: "anthropic-beta", value: "feature-flag" },
+  ]);
+});
+
 test("codex provider normalization strips route suffixes and keeps only configured active models", () => {
   const provider = settings.normalizeCustomProvider({
     id: "codex-1",
@@ -37,7 +56,8 @@ test("codex provider normalization strips route suffixes and keeps only configur
   assert.equal(provider.baseUrl, "https://api.openai.com/v1");
   assert.equal(provider.apiKey, "key");
   assert.equal(provider.requestFormat, "openai-responses");
-  assert.equal(provider.promptCachingEnabled, false);
+  // OpenAI 缓存（稳定 prompt_cache_key）默认开启，可显式关闭。
+  assert.equal(provider.promptCachingEnabled, true);
   assert.equal(provider.nativeWebSearchEnabled, false);
   assert.deepEqual(provider.activeModels, ["gpt-5"]);
   assert.deepEqual(
@@ -66,6 +86,66 @@ test("claude provider normalization defaults routing, caching, and model limits"
   assert.equal(provider.nativeWebSearchEnabled, true);
   assert.equal(provider.models[0].contextWindow, 200_000);
   assert.equal(provider.models[0].maxOutputToken, 32_000);
+});
+
+test("codex provider normalization can disable prompt caching explicitly", () => {
+  const provider = settings.normalizeCustomProvider({
+    id: "codex-2",
+    type: "codex",
+    baseUrl: "https://relay.example/v1",
+    promptCachingEnabled: false,
+  });
+  assert.equal(provider.promptCachingEnabled, false);
+  assert.equal(provider.promptCacheRetention, undefined);
+});
+
+test("claude provider normalization keeps the long cache retention preference", () => {
+  const provider = settings.normalizeCustomProvider({
+    id: "claude-long",
+    type: "claude_code",
+    baseUrl: "https://api.anthropic.com/v1",
+    promptCacheRetention: "long",
+  });
+  assert.equal(provider.promptCacheRetention, "long");
+
+  const invalid = settings.normalizeCustomProvider({
+    id: "claude-invalid",
+    type: "claude_code",
+    baseUrl: "https://api.anthropic.com/v1",
+    promptCacheRetention: "forever",
+  });
+  assert.equal(invalid.promptCacheRetention, undefined);
+
+  const codex = settings.normalizeCustomProvider({
+    id: "codex-long",
+    type: "codex",
+    baseUrl: "https://api.openai.com/v1",
+    promptCacheRetention: "long",
+  });
+  assert.equal(codex.promptCacheRetention, undefined, "retention is Anthropic-only");
+});
+
+test("model config normalization drops legacy persisted pricing", () => {
+  // 计费功能已移除：旧设置里持久化的 cost 键在读侧归一时被丢弃。
+  const provider = settings.normalizeCustomProvider({
+    id: "relay-1",
+    type: "codex",
+    baseUrl: "https://relay.example/v1",
+    models: [
+      {
+        id: "relay-model",
+        contextWindow: 128_000,
+        maxOutputToken: 8_192,
+        cost: { input: 1.5, output: 6, cacheRead: 0.15, cacheWrite: 3 },
+      },
+      { id: "no-cost-model", contextWindow: 128_000, maxOutputToken: 8_192 },
+    ],
+  });
+
+  assert.equal("cost" in provider.models[0], false);
+  assert.equal("cost" in provider.models[1], false);
+  assert.equal(provider.models[0].contextWindow, 128_000);
+  assert.equal(provider.models[0].maxOutputToken, 8_192);
 });
 
 test("gemini provider normalization keeps native routing and model limits", () => {
@@ -118,6 +198,34 @@ test("settings normalization drops stale selected models and preserves valid sel
     selectedModel: { customProviderId: "provider-1", model: "gpt-5" },
   });
   assert.deepEqual(valid.selectedModel, { customProviderId: "provider-1", model: "gpt-5" });
+});
+
+test("custom settings migrate the legacy font family and normalize each typography role", () => {
+  const defaults = settings.normalizeSettings({}).customSettings;
+  assert.equal(defaults.interfaceFontFamily, "");
+  assert.equal(defaults.chatFontFamily, "");
+  assert.equal(defaults.codeFontFamily, "");
+
+  const migrated = settings.normalizeSettings({ customSettings: { fontFamily: "Inter" } });
+  assert.equal(migrated.customSettings.interfaceFontFamily, "Inter");
+  assert.equal(Object.hasOwn(migrated.customSettings, "fontFamily"), false);
+
+  const normalized = settings.normalizeSettings({
+    customSettings: {
+      interfaceFontFamily: 'Inter, "PingFang SC", sans-serif',
+      chatFontFamily: "serif",
+      codeFontFamily: "Menlo",
+    },
+  });
+  assert.equal(normalized.customSettings.interfaceFontFamily, 'Inter, "PingFang SC", sans-serif');
+  assert.equal(normalized.customSettings.chatFontFamily, "serif");
+  assert.equal(normalized.customSettings.codeFontFamily, "Menlo");
+  assert.equal(
+    settings.normalizeSettings({
+      customSettings: { codeFontFamily: "url(https://evil.example/font.woff2)" },
+    }).customSettings.codeFontFamily,
+    "",
+  );
 });
 
 test("settings normalization canonicalizes project keyed maps with Windows path compatibility", () => {
@@ -255,39 +363,37 @@ test("chat runtime controls default and follow provider model reasoning support"
       codex_openai_responses: "high",
       codex_openai_completions: "high",
       gemini: "high",
+      xai: "high",
     },
   });
 
   // 没有 modelId 就无法解析目录，拿不到任何档位。
   assert.deepEqual(settings.getChatRuntimeReasoningLevelsForProvider({}), []);
 
-  // claude-opus-4-5：pi-ai 目录没有 thinkingLevelMap，标准四档，无 xhigh/max。
+  // claude-opus-4-5：目录（models.dev）三档 low/medium/high，无 minimal/xhigh/max。
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
       providerId: "claude_code",
       modelId: "claude-opus-4-5",
-      baseUrl: "https://api.anthropic.com",
     }),
-    ["minimal", "low", "medium", "high"],
+    ["low", "medium", "high"],
   );
-  // claude-sonnet-5：目录显式声明 xhigh/max。
+  // claude-sonnet-5：目录声明 xhigh/max（adaptive 世代无 minimal）。
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
       providerId: "claude_code",
       modelId: "claude-sonnet-5",
-      baseUrl: "https://api.anthropic.com",
     }),
-    ["minimal", "low", "medium", "high", "xhigh", "max"],
+    ["low", "medium", "high", "xhigh", "max"],
   );
-  // gpt-5.1（openai-responses）：目录只覆盖 off，标准四档。
+  // gpt-5.1：目录 none/low/medium/high → off + 三档。
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
       providerId: "codex",
       requestFormat: "openai-responses",
       modelId: "gpt-5.1",
-      baseUrl: "https://api.openai.com/v1",
     }),
-    ["minimal", "low", "medium", "high"],
+    ["low", "medium", "high"],
   );
   // gpt-5.2：目录额外声明 xhigh，仍无 max。
   assert.deepEqual(
@@ -295,65 +401,58 @@ test("chat runtime controls default and follow provider model reasoning support"
       providerId: "codex",
       requestFormat: "openai-responses",
       modelId: "gpt-5.2",
-      baseUrl: "https://api.openai.com/v1",
     }),
-    ["minimal", "low", "medium", "high", "xhigh"],
+    ["low", "medium", "high", "xhigh"],
   );
-  // Groq qwen/qwen3-32b（openai-completions 兼容端点）：目录覆盖到 xhigh，仍无 max。
+  // 目录外的聚合命名（qwen/qwen3-32b 带斜杠，生成期跳过）：标准四档兜底。
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
       providerId: "codex",
       requestFormat: "openai-completions",
       modelId: "qwen/qwen3-32b",
-      baseUrl: "https://api.groq.com/openai/v1",
     }),
-    ["minimal", "low", "medium", "high", "xhigh"],
+    ["minimal", "low", "medium", "high"],
   );
-  // gemini-2.5-flash：预算档字段驱动，标准四档，无 xhigh/max。
+  // gemini-2.5-flash：预算式（budget_tokens）→ 标准四档，无 xhigh/max。
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
       providerId: "gemini",
       modelId: "gemini-2.5-flash",
-      baseUrl: "https://generativelanguage.googleapis.com/v1beta",
     }),
     ["minimal", "low", "medium", "high"],
   );
-  // gemini-3-pro-preview：目录把 minimal/medium 显式置空，只剩两档（3.0/3.1 同档）。
+  // gemini-3-pro-preview：目录只有两档 low/high。
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
       providerId: "gemini",
       modelId: "gemini-3-pro-preview",
-      baseUrl: "https://generativelanguage.googleapis.com/v1beta",
     }),
     ["low", "high"],
   );
-  // 目录之外的自定义模型（glm/kimi 等三方聚合）按可推理处理：标准四档，
-  // 不因 id 猜不中而禁用思考。
+  // 中转挂载的国产厂商模型走跨供应商回查命中真实档位：glm-4.7 是纯 toggle
+  // 形态（单 "high" 档 + 可关），不再吃标准四档兜底。
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
       providerId: "codex",
       requestFormat: "openai-completions",
       modelId: "glm-4.7",
-      baseUrl: "https://api.z.ai/api/coding/paas/v4",
     }),
-    ["minimal", "low", "medium", "high"],
+    ["high"],
   );
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
       providerId: "claude_code",
       modelId: "glm-4.7",
-      baseUrl: "https://api.z.ai/api/anthropic",
     }),
-    ["minimal", "low", "medium", "high"],
+    ["high"],
   );
-  // DeepSeek 走 codex：适配层 thinkingLevelMap 额外开出 xhigh。
+  // deepseek-chat：目录声明非思考模型，无档位（思考控件整组隐藏）。
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
       providerId: "codex",
       modelId: "deepseek-chat",
-      baseUrl: "https://api.deepseek.com",
     }),
-    ["minimal", "low", "medium", "high", "xhigh"],
+    [],
   );
 
   assert.deepEqual(
@@ -381,6 +480,7 @@ test("chat runtime controls default and follow provider model reasoning support"
         codex_openai_responses: "xhigh",
         codex_openai_completions: "xhigh",
         gemini: "high",
+        xai: "xhigh",
       },
     },
   );
@@ -398,20 +498,21 @@ test("chat runtime controls default and follow provider model reasoning support"
         providerId: "codex",
         requestFormat: "openai-completions",
         modelId: "qwen/qwen3-32b",
-        baseUrl: "https://api.groq.com/openai/v1",
       },
     ),
     {
       thinkingEnabled: true,
       nativeWebSearchEnabled: true,
-      reasoning: "xhigh",
+      // 目录未命中（聚合命名）走标准四档兜底：存量 xhigh 钳回默认 high。
+      reasoning: "high",
       reasoningByProvider: {
         claude_code: "xhigh",
         codex_openai_responses: "xhigh",
-        codex_openai_completions: "xhigh",
-        // gemini 未在 reasoningByProvider 输入里显式给出，也未参与本次调用
+        codex_openai_completions: "high",
+        // gemini / xai 未在 reasoningByProvider 输入里显式给出，也未参与本次调用
         // 的当前 provider key，因此只继承顶层 reasoning 原值，不做钳制。
         gemini: "xhigh",
+        xai: "xhigh",
       },
     },
   );
@@ -436,6 +537,7 @@ test("chat runtime controls default and follow provider model reasoning support"
         codex_openai_responses: "xhigh",
         codex_openai_completions: "high",
         gemini: "high",
+        xai: "high",
       },
     },
   );
@@ -492,6 +594,7 @@ test("chat runtime controls default and follow provider model reasoning support"
       codex_openai_responses: "high",
       codex_openai_completions: "high",
       gemini: "high",
+      xai: "high",
     },
   });
 });
@@ -1245,6 +1348,7 @@ test("settings reload uses persisted right dock state only", () => {
 test("gateway settings sync keeps right dock width local and syncs project state", () => {
   const current = settings.normalizeSettings({
     customSettings: {
+      chatTranscript: { width: 920 },
       rightDock: {
         width: 612,
         projects: {
@@ -1290,6 +1394,7 @@ test("gateway settings sync keeps right dock width local and syncs project state
   });
   const incoming = settings.normalizeSettings({
     customSettings: {
+      chatTranscript: { width: 1100 },
       rightDock: {
         width: 360,
         projects: {
@@ -1336,6 +1441,8 @@ test("gateway settings sync keeps right dock width local and syncs project state
   const payload = sync.buildGatewaySettingsSyncPayload(incoming);
   const synced = sync.applyGatewaySettingsSyncPayload(current, payload);
 
+  assert.equal(payload.customSettings.chatTranscript.width, 768);
+  assert.equal(synced.customSettings.chatTranscript.width, 920);
   assert.equal(synced.customSettings.rightDock.width, 612);
   assert.deepEqual(Object.keys(synced.customSettings.rightDock.projects).sort(), [
     "/desktop/project",
@@ -2032,26 +2139,26 @@ test("mcp and remote settings normalize transport, selection, ports, and tokens"
   const remote = settings.normalizeRemoteSettings({
     enabled: true,
     gatewayUrl: " http:/127.0.0.1:8787/ ",
-    grpcPort: "0",
-    grpcEndpoint: " tcp.proxy.rlwy.net:12345/ ",
+    gatewayPort: "0",
     token: " secret ",
+    agentId: " agent-550e8400-e29b-41d4-a716-446655440000 ",
     autoReconnect: false,
     heartbeatInterval: "15.8",
     enableWebSshTerminal: true,
   });
 
   assert.equal(remote.gatewayUrl, "http://127.0.0.1:8787");
-  assert.equal(remote.grpcPort, 443);
-  assert.equal(remote.grpcEndpoint, "tcp.proxy.rlwy.net:12345");
+  assert.equal(remote.gatewayPort, 443);
   assert.equal(remote.token, "secret");
+  assert.equal(remote.agentId, "agent-550e8400-e29b-41d4-a716-446655440000");
   assert.equal(remote.autoReconnect, false);
   assert.equal(remote.heartbeatInterval, 15);
   assert.equal(remote.enableWebSshTerminal, true);
 
   const remoteWithOversizedPort = settings.normalizeRemoteSettings({
-    grpcPort: "70000",
+    gatewayPort: "70000",
   });
-  assert.equal(remoteWithOversizedPort.grpcPort, 65_535);
+  assert.equal(remoteWithOversizedPort.gatewayPort, 65_535);
 });
 
 test("font scale settings normalize invalid values to 1 and clamp out-of-range values", () => {
@@ -2070,6 +2177,18 @@ test("font scale settings normalize invalid values to 1 and clamp out-of-range v
 
   const custom = settings.normalizeCustomSettings({ fontScale: { chat: 1.2 } }, []);
   assert.deepEqual(custom.fontScale, { sidebar: 1, chat: 1.2, rightDock: 1 });
+});
+
+test("chat transcript width defaults, clamps, and updates locally", () => {
+  assert.deepEqual(settings.normalizeChatTranscriptSettings(undefined), { width: 768 });
+  assert.deepEqual(settings.normalizeChatTranscriptSettings({ width: 400 }), { width: 560 });
+  assert.deepEqual(settings.normalizeChatTranscriptSettings({ width: 1400 }), { width: 1200 });
+  assert.deepEqual(settings.normalizeChatTranscriptSettings({ width: 920.4 }), { width: 920 });
+
+  const current = settings.normalizeSettings({ customSettings: { chatTranscript: { width: 768 } } });
+  const updated = settings.updateChatTranscriptWidth(current, 960);
+  assert.equal(updated.customSettings.chatTranscript.width, 960);
+  assert.equal(settings.updateChatTranscriptWidth(updated, 960), updated);
 });
 
 test("close window behavior defaults to minimize and only accepts exit", () => {
@@ -2237,4 +2356,258 @@ test("gateway sync merge keeps system proxy password against redacted payloads",
   assert.equal(mergedHost.system.systemProxy.host, "proxy2.local");
   assert.equal(mergedHost.system.systemProxy.port, 1080);
   assert.equal(mergedHost.system.systemProxy.password, "secret");
+});
+
+test("xai provider model defaults come from the generated model catalog", () => {
+  assert.equal(settings.getProviderModelDefaults("xai", "grok-4.5").contextWindow, 500_000);
+  // 上游（models.dev）已下架的旧模型与目录未收录的模型一样吃供应商兜底值。
+  assert.equal(settings.getProviderModelDefaults("xai", "grok-3").contextWindow, 258_000);
+  assert.equal(settings.getProviderModelDefaults("xai", "grok-unknown").contextWindow, 258_000);
+});
+
+test("gateway sync keeps all desktop font families local", () => {
+  const current = settings.normalizeSettings({
+    customSettings: {
+      interfaceFontFamily: "Inter",
+      chatFontFamily: "Charter",
+      codeFontFamily: "Menlo",
+    },
+  });
+  const incoming = sync.buildGatewaySettingsSyncPayload(
+    settings.normalizeSettings({
+      customSettings: {
+        interfaceFontFamily: "Arial",
+        chatFontFamily: "Georgia",
+        codeFontFamily: "Monaco",
+      },
+    }),
+  );
+
+  assert.equal(incoming.customSettings.interfaceFontFamily, "");
+  assert.equal(incoming.customSettings.chatFontFamily, "");
+  assert.equal(incoming.customSettings.codeFontFamily, "");
+  const merged = sync.applyGatewaySettingsSyncPayload(current, incoming).customSettings;
+  assert.equal(merged.interfaceFontFamily, "Inter");
+  assert.equal(merged.chatFontFamily, "Charter");
+  assert.equal(merged.codeFontFamily, "Menlo");
+});
+
+test("degenerate catalog limits (output == context window) are clamped in the snapshot", () => {
+  // 社区目录对不公布输出上限的供应商记"输出=窗口"（grok-4.5 上游 500K/500K），
+  // 照单全收会把压缩阈值挤到下限。生成期统一钳到 min(32K, 窗口/4)。
+  const grok45 = settings.getProviderModelDefaults("xai", "grok-4.5");
+  assert.equal(grok45.contextWindow, 500_000);
+  assert.equal(grok45.maxOutputToken, 32_000);
+  const grokBuild = settings.getProviderModelDefaults("xai", "grok-build-0.1");
+  assert.equal(grokBuild.contextWindow, 256_000);
+  assert.equal(grokBuild.maxOutputToken, 32_000);
+  // 非退化条目原样透传（grok-4.3 = 1M/30K）。
+  const grok43 = settings.getProviderModelDefaults("xai", "grok-4.3");
+  assert.equal(grok43.contextWindow, 1_000_000);
+  assert.equal(grok43.maxOutputToken, 30_000);
+});
+
+test("cross-provider models resolve real catalog limits instead of provider fallback", () => {
+  // 中转聚合把别家模型挂在本供应商类型下：grok-4.5 配在 anthropic 下也要
+  // 显示真实限额（500K/32K），而不是 claude_code 兜底 200K/32K。
+  const grokUnderAnthropic = settings.getProviderModelDefaults("claude_code", "grok-4.5");
+  assert.equal(grokUnderAnthropic.contextWindow, 500_000);
+  assert.equal(grokUnderAnthropic.maxOutputToken, 32_000);
+  // 反向同理：claude 模型挂在 OpenAI 兼容供应商下读 anthropic 目录。
+  const claudeUnderCodex = settings.getProviderModelDefaults("codex", "claude-opus-4-5");
+  assert.equal(claudeUnderCodex.contextWindow, 200_000);
+  assert.equal(claudeUnderCodex.maxOutputToken, 64_000);
+  const geminiUnderXai = settings.getProviderModelDefaults("xai", "gemini-2.5-pro");
+  assert.equal(geminiUnderXai.contextWindow, 1_048_576);
+  assert.equal(geminiUnderXai.maxOutputToken, 65_536);
+  // 装饰 id 的候选链对跨供应商回查同样生效。
+  assert.equal(
+    settings.getProviderModelDefaults("claude_code", "GROK-4.5@prod").contextWindow,
+    500_000,
+  );
+  // 国内厂商模型（deepseek/glm/qwen/kimi/MiniMax 等分区）没有自己的应用供应商
+  // 类型，配在任一类型下都经跨供应商回查取真实限额。
+  const deepseekUnderClaude = settings.getProviderModelDefaults("claude_code", "deepseek-chat");
+  assert.equal(deepseekUnderClaude.contextWindow, 1_000_000);
+  assert.equal(deepseekUnderClaude.maxOutputToken, 384_000);
+  const glmUnderCodex = settings.getProviderModelDefaults("codex", "glm-4.7");
+  assert.equal(glmUnderCodex.contextWindow, 204_800);
+  assert.equal(glmUnderCodex.maxOutputToken, 131_072);
+  // 混合大小写目录 id（MiniMax-M2.1）：小写配置经索引小写别名命中。
+  assert.equal(settings.getProviderModelDefaults("codex", "minimax-m2.1").contextWindow, 204_800);
+  // 全目录未收录的模型仍吃本供应商兜底值。
+  assert.equal(
+    settings.getProviderModelDefaults("claude_code", "some-custom-model").contextWindow,
+    200_000,
+  );
+  // Anthropic 形态的未知 id（[1m]/adaptive 启发式）优先级高于跨供应商回查：
+  // [1m] 是用户对部署窗口的显式声明。
+  assert.equal(
+    settings.getProviderModelDefaults("claude_code", "grok-4.5[1m]").contextWindow,
+    1_000_000,
+  );
+});
+
+test("stale fallback limits persisted for cross-provider models are repaired on read", () => {
+  // 跨供应商回查上线前，grok-4.5 挂 anthropic 下会以 200K/32K 兜底对落库：
+  // 读侧识别并替换为目录真实限额，不需要用户删除重加。
+  const repaired = settings.normalizeProviderModelConfig(
+    { id: "grok-4.5", contextWindow: 200_000, maxOutputToken: 32_000 },
+    "claude_code",
+  );
+  assert.equal(repaired.contextWindow, 500_000);
+  assert.equal(repaired.maxOutputToken, 32_000);
+  // 任一值偏离兜底对 = 用户显式配置，原样保留。
+  const custom = settings.normalizeProviderModelConfig(
+    { id: "grok-4.5", contextWindow: 200_000, maxOutputToken: 30_000 },
+    "claude_code",
+  );
+  assert.equal(custom.contextWindow, 200_000);
+  assert.equal(custom.maxOutputToken, 30_000);
+  // 本供应商目录内的模型不受存量修复影响（claude-opus-4-1 真实限额恰为兜底对）。
+  const native = settings.normalizeProviderModelConfig(
+    { id: "claude-opus-4-1", contextWindow: 200_000, maxOutputToken: 32_000 },
+    "claude_code",
+  );
+  assert.equal(native.contextWindow, 200_000);
+  assert.equal(native.maxOutputToken, 32_000);
+  // 新增（无存量限额）直接拿跨供应商默认值。
+  const fresh = settings.normalizeProviderModelConfig("grok-4.5", "claude_code");
+  assert.equal(fresh.contextWindow, 500_000);
+  assert.equal(fresh.maxOutputToken, 32_000);
+});
+
+test("persisted degenerate limits are repaired at normalize time for every provider", () => {
+  // 坏目录数据落库期间加入的模型：读侧修复，不需要用户重新添加。
+  const repaired = settings.normalizeProviderModelConfig(
+    { id: "grok-4.5", contextWindow: 500_000, maxOutputToken: 500_000 },
+    "xai",
+  );
+  assert.equal(repaired.contextWindow, 500_000);
+  assert.equal(repaired.maxOutputToken, 32_000);
+  // 用户显式配置的合法输出上限保持不动。
+  const custom = settings.normalizeProviderModelConfig(
+    { id: "grok-4.5", contextWindow: 500_000, maxOutputToken: 64_000 },
+    "xai",
+  );
+  assert.equal(custom.maxOutputToken, 64_000);
+  // 小窗口退化条目按窗口 1/4 保底留输入预算。
+  const tiny = settings.normalizeProviderModelConfig(
+    { id: "relay-grok", contextWindow: 8_192, maxOutputToken: 8_192 },
+    "xai",
+  );
+  assert.equal(tiny.contextWindow, 8_192);
+  assert.equal(tiny.maxOutputToken, 2_048);
+  // 修复规则对所有供应商统一生效（不是 xai 特例）。
+  const codex = settings.normalizeProviderModelConfig(
+    { id: "custom-model", contextWindow: 128_000, maxOutputToken: 128_000 },
+    "codex",
+  );
+  assert.equal(codex.maxOutputToken, 32_000);
+});
+
+test("usage query defaults disabled and redacts query credentials", () => {
+  const provider = settings.normalizeCustomProvider({
+    usageQuery: {
+      mode: "newapi",
+      accessToken: "access-token",
+      secretAccessKey: "secret-access-key",
+    },
+  });
+
+  assert.equal(provider.usageQuery.enabled, false);
+  assert.equal(provider.usageQuery.mode, "newapi");
+  assert.equal(provider.usageQuery.timeoutSecs, 10);
+
+  // balance(官方余额适配器)是合法模式;未知值统一回退自定义脚本。
+  const balance = settings.normalizeCustomProvider({ usageQuery: { mode: "balance" } });
+  assert.equal(balance.usageQuery.mode, "balance");
+  const unknown = settings.normalizeCustomProvider({ usageQuery: { mode: "mystery" } });
+  assert.equal(unknown.usageQuery.mode, "newapi");
+  // 默认查询方式是 NewAPI 模板;显式保存过的 custom 保持不变。
+  assert.equal(settings.getDefaultUsageQueryConfig().mode, "newapi");
+  const explicitCustom = settings.normalizeCustomProvider({ usageQuery: { mode: "custom" } });
+  assert.equal(explicitCustom.usageQuery.mode, "custom");
+
+  // 每模式独立脚本:逐项 trim、空槽位与未知键丢弃。
+  const withScripts = settings.normalizeCustomProvider({
+    usageQuery: { scripts: { custom: "  (a)  ", general: "   ", bogus: "(x)" } },
+  });
+  assert.deepEqual(withScripts.usageQuery.scripts, { custom: "(a)" });
+
+  // 超时 clamp:2-30 秒。
+  const clamped = settings.normalizeCustomProvider({ usageQuery: { timeoutSecs: 500 } });
+  assert.equal(clamped.usageQuery.timeoutSecs, 30);
+
+  const withApiKey = settings.normalizeCustomProvider({
+    usageQuery: { mode: "general", apiKey: "usage-key" },
+  });
+  const redacted = sync.redactCustomProvidersForGateway([provider, withApiKey]);
+  assert.equal(redacted[0].usageQuery.accessToken, "");
+  assert.equal(redacted[0].usageQuery.secretAccessKey, "");
+  assert.equal(redacted[0].usageQuery.accessTokenConfigured, true);
+  assert.equal(redacted[0].usageQuery.secretAccessKeyConfigured, true);
+  assert.equal(redacted[1].usageQuery.apiKey, "");
+  assert.equal(redacted[1].usageQuery.apiKeyConfigured, true);
+});
+
+test("usage query secret updates are emitted and applied without exposing the values", () => {
+  const previous = settings.normalizeSettings({
+    customProviders: [{ id: "provider-1", usageQuery: { accessToken: "old-token" } }],
+  });
+  const next = settings.normalizeSettings({
+    customProviders: [
+      {
+        id: "provider-1",
+        usageQuery: { apiKey: "new-key", accessToken: "new-token", secretAccessKey: "new-secret" },
+      },
+    ],
+  });
+
+  const update = sync.buildGatewaySettingsSyncUpdatePayload(previous, next, {
+    includeProviderApiKeyUpdates: true,
+  });
+  assert.deepEqual(update.providerUsageQuerySecretUpdates, {
+    "provider-1": { apiKey: "new-key", accessToken: "new-token", secretAccessKey: "new-secret" },
+  });
+  assert.equal(update.customProviders[0].usageQuery.apiKey, "");
+  assert.equal(update.customProviders[0].usageQuery.accessToken, "");
+  assert.equal(update.customProviders[0].usageQuery.secretAccessKey, "");
+
+  const applied = sync.applyGatewaySettingsSyncPayload(previous, {
+    customProviders: update.customProviders,
+    providerUsageQuerySecretUpdates: update.providerUsageQuerySecretUpdates,
+  });
+  assert.equal(applied.customProviders[0].usageQuery.apiKey, "new-key");
+  assert.equal(applied.customProviders[0].usageQuery.accessToken, "new-token");
+  assert.equal(applied.customProviders[0].usageQuery.secretAccessKey, "new-secret");
+});
+
+test("clearing a configured usage query secret emits an explicit empty update", () => {
+  // WebUI 侧秘密恒被脱敏为空串,值比较发现不了"删除已配置密钥"——
+  // Configured true→false 是显式清除信号,必须产出空串 sidecar 条目。
+  const previous = settings.normalizeSettings({
+    customProviders: [
+      { id: "provider-1", usageQuery: { apiKey: "", apiKeyConfigured: true } },
+    ],
+  });
+  const next = settings.normalizeSettings({
+    customProviders: [
+      { id: "provider-1", usageQuery: { apiKey: "", apiKeyConfigured: false } },
+    ],
+  });
+
+  const update = sync.buildGatewaySettingsSyncUpdatePayload(previous, next, {
+    includeProviderApiKeyUpdates: true,
+  });
+  assert.deepEqual(update.providerUsageQuerySecretUpdates, {
+    "provider-1": { apiKey: "" },
+  });
+
+  const applied = sync.applyGatewaySettingsSyncPayload(previous, {
+    customProviders: update.customProviders,
+    providerUsageQuerySecretUpdates: update.providerUsageQuerySecretUpdates,
+  });
+  assert.equal(applied.customProviders[0].usageQuery.apiKey, "");
+  assert.equal(applied.customProviders[0].usageQuery.apiKeyConfigured, false);
 });

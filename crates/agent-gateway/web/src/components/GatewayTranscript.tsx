@@ -1,6 +1,7 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   type Dispatch,
+  type MutableRefObject,
   memo,
   type SetStateAction,
   useCallback,
@@ -34,10 +35,14 @@ import {
   UserMessageContent,
 } from "@/lib/chat/userMessageContent";
 import type { GitClient } from "@/lib/git/types";
+import { DEFAULT_CHAT_TRANSCRIPT_WIDTH } from "@/lib/settings";
 import { cn } from "@/lib/shared/utils";
 import { extractLiveRange } from "@/lib/transcript-virtual/liveRangeExtractor";
 import { createLiveRowScrollAdjustPolicy } from "@/lib/transcript-virtual/liveScrollAdjustPolicy";
-import { createTranscriptMeasurementsLru } from "@/lib/transcript-virtual/measurementsLru";
+import {
+  buildTranscriptLayoutKey,
+  createTranscriptMeasurementsLru,
+} from "@/lib/transcript-virtual/measurementsLru";
 import {
   CHECKPOINT_ROW_ESTIMATE_PX,
   estimateAssistantRowHeight,
@@ -49,20 +54,20 @@ import {
   AssistantBubble,
   AssistantStatus,
   CompactingText,
+  RetryDetailsBlock,
   VibingText,
 } from "@/pages/chat/AssistantBubble";
-import type { TranscriptRow } from "../lib/chat/transcript/types";
+import type { RetryAttemptRecord, TranscriptRow } from "../lib/chat/transcript/types";
 
 import type { GatewayTranscriptRound } from "../lib/chatUi";
 import type { SectionId } from "../pages/settings/types";
 import { ChatEmptyState } from "./chat/ChatEmptyState";
+import { getUploadedFileTypeIcon } from "./chat/fileTypeIcons";
 import {
   Check,
   CheckCircle2,
   ChevronDown,
   Copy,
-  File,
-  FileText,
   GitBranch,
   Loader2,
   Pencil,
@@ -82,12 +87,20 @@ type GatewayTranscriptProps = {
   liveStartIndex?: number;
   // Key of the actively streaming turn (caret / live structural state).
   activeTurnKey?: string | null;
+  contentWidth?: number;
   // Whether the scroll-follow engine is attached to the bottom; gates the
   // virtualizer's resize-compensation carve-out for live-row growth.
   isViewportFollowing?: () => boolean;
+  // Imperative jump handle for the floor navigation rail.
+  navRef?: MutableRefObject<GatewayTranscriptNavHandle | null>;
+  // Reports the user row at the viewport's top edge (the "current floor").
+  onAnchorUserRowChange?: (rowKey: string | null) => void;
   error?: string | null;
   toolStatus?: string | null;
   toolStatusIsCompaction?: boolean;
+  // Live run's stream-retry history; renders as an expandable details block
+  // under the live status (mirrors the desktop app).
+  retryAttempts?: readonly RetryAttemptRecord[];
   isStreaming?: boolean;
   isLoading?: boolean;
   loadingTitle?: string;
@@ -95,7 +108,7 @@ type GatewayTranscriptProps = {
   onOpenSettings?: (section?: SectionId) => void;
   hasMoreHistory?: boolean;
   isLoadingMoreHistory?: boolean;
-  onLoadFullHistory?: () => void;
+  onLoadEarlierHistory?: () => void;
   isAgentMode?: boolean;
   showUsage?: boolean;
   usageContextWindow?: number;
@@ -125,6 +138,13 @@ function rowRenderMode(row: Extract<TranscriptRow, { kind: "assistant" }>) {
   return row.origin === "stream" ? ("streaming" as const) : ("static" as const);
 }
 
+export type GatewayTranscriptNavHandle = {
+  // Aligns the row to the viewport top and keeps re-aligning for a few
+  // frames while dynamic measurements land (convergent, cancelled by user
+  // scroll input).
+  scrollToRowKey: (rowKey: string) => void;
+};
+
 const TRANSCRIPT_ROW_ESTIMATED_HEIGHT = 260;
 const TRANSCRIPT_ROW_GAP = 18;
 const TRANSCRIPT_ROW_OVERSCAN_COUNT = 5;
@@ -140,7 +160,7 @@ type GatewayTranscriptVirtualItem =
   | { key: string; kind: "pendingBubble" };
 
 function resolveNearestScrollViewport(element: HTMLElement | null) {
-  return element?.closest("[data-radix-scroll-area-viewport]") as HTMLDivElement | null;
+  return element?.closest("[data-scroll-viewport]") as HTMLDivElement | null;
 }
 
 function LiveStatusFooter(props: { status: string; isCompaction?: boolean }) {
@@ -264,11 +284,7 @@ function CheckpointCard(props: {
 
           {isExpanded ? (
             <div className="checkpoint-expand border-t border-black/[0.05] px-3.5 py-3 dark:border-white/[0.06]">
-              <Markdown
-                content={item.content}
-                className="font-openai-chat text-sm"
-                readOnly={readOnly}
-              />
+              <Markdown content={item.content} className="font-chat text-sm" readOnly={readOnly} />
             </div>
           ) : null}
         </div>
@@ -284,7 +300,6 @@ function useGatewayUploadedImagePreview(
 ) {
   const normalizedWorkspaceRoot = typeof workspaceRoot === "string" ? workspaceRoot.trim() : "";
   const absolutePath = typeof file?.absolutePath === "string" ? file.absolutePath.trim() : "";
-  const relativePath = typeof file?.relativePath === "string" ? file.relativePath.trim() : "";
   const cacheKey = file ? getUploadedImagePreviewCacheKey(normalizedWorkspaceRoot, file) : "";
   const [imageSrc, setImageSrc] = useState<string | null | undefined>(() => {
     if (!file || !normalizedWorkspaceRoot) return null;
@@ -321,7 +336,7 @@ function useGatewayUploadedImagePreview(
     return () => {
       cancelled = true;
     };
-  }, [absolutePath, cacheKey, file, loader, normalizedWorkspaceRoot, relativePath]);
+  }, [absolutePath, cacheKey, file, loader, normalizedWorkspaceRoot]);
 
   return {
     imageSrc: imageSrc ?? null,
@@ -351,6 +366,7 @@ function GatewayUserImageAttachmentCard(props: {
   } = props;
   const [previewOpen, setPreviewOpen] = useState(false);
   const labeledPreview = `${previewLabel}: ${file.fileName}`;
+  const FallbackIcon = getUploadedFileTypeIcon(file);
   const previewSlides = useMemo<ImagePreviewSlide[]>(
     () =>
       imageSrc
@@ -424,7 +440,7 @@ function GatewayUserImageAttachmentCard(props: {
                 : "flex h-10 w-10 items-center justify-center rounded-xl bg-black/[0.03] dark:bg-white/10"
             }
           >
-            {isLoading ? null : <File className="h-5 w-5 opacity-40" />}
+            {isLoading ? null : <FallbackIcon className="h-5 w-5" />}
           </div>
         </div>
       )}
@@ -449,6 +465,7 @@ function GatewayUserFileAttachmentCard(props: {
   compact: boolean;
 }) {
   const { file, onRemove, removeLabel, compact } = props;
+  const TypeIcon = getUploadedFileTypeIcon(file);
   return (
     <div
       title={file.relativePath}
@@ -458,7 +475,7 @@ function GatewayUserFileAttachmentCard(props: {
       )}
     >
       <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gradient-to-b from-black/[0.03] to-black/[0.06] dark:from-white/[0.06] dark:to-white/[0.1]">
-        <FileText className="h-4 w-4 text-[hsl(var(--chat-user-fg)/0.45)]" />
+        <TypeIcon className="h-4.5 w-4.5" />
       </div>
       <div className="min-w-0 flex-1">
         <div className="truncate text-[calc(11px*var(--zone-font-scale,1))] font-medium leading-tight text-[hsl(var(--chat-user-fg)/0.85)]">
@@ -655,7 +672,7 @@ function GatewayUserMessageBubbleBody(props: {
   const { visibleFiles, pastedTextFiles } = splitUserAttachmentsForDisplay(attachments, text);
 
   return (
-    <div className="chat-user-bubble ml-auto w-fit max-w-full rounded-2xl rounded-br-md bg-[hsl(var(--chat-user-bg))] px-4 py-2.5 font-openai-chat text-[calc(14.5px*var(--zone-font-scale,1))] leading-relaxed text-[hsl(var(--chat-user-fg))]">
+    <div className="chat-user-bubble ml-auto w-fit max-w-full rounded-2xl rounded-br-md bg-[hsl(var(--chat-user-bg))] px-4 py-2.5 font-chat text-[calc(14.5px*var(--zone-font-scale,1))] leading-relaxed text-[hsl(var(--chat-user-fg))]">
       <GatewayUserAttachmentCards
         files={visibleFiles}
         workspaceRoot={workspaceRoot}
@@ -721,12 +738,26 @@ const EditableUserMessageBubble = memo(function EditableUserMessageBubble(props:
     resizeEditableTextarea(textareaRef.current);
   }, [draftText]);
 
+  // A large paste is stored as an uploaded text file *plus* a
+  // "[Pasted text N: path]" marker inlined into the message text (rendered
+  // as a chip once sent, see GatewayUserMessageBubbleBody above). Editing
+  // must hide that same file's attachment card while its marker is still
+  // present in the text, otherwise the paste shows up twice: once as a
+  // card, once as raw marker text in the textarea below. The full
+  // (unfiltered) list — including pasted-text files — is still what gets
+  // submitted, so nothing is lost on resend; only the card list is
+  // narrowed for display.
+  const visibleAttachments = useMemo(
+    () => splitUserAttachmentsForDisplay(draftAttachments, draftText).visibleFiles,
+    [draftAttachments, draftText],
+  );
+
   const canSubmit = draftText.trim().length > 0 || draftAttachments.length > 0;
 
   return (
     <div className="chat-user-bubble-editor w-full max-w-[min(85%,calc(50em+2.5rem))] rounded-2xl border border-border bg-[hsl(var(--chat-user-bg))] p-3">
       <GatewayUserAttachmentCards
-        files={draftAttachments}
+        files={visibleAttachments}
         workspaceRoot={workspaceRoot}
         onLoadUploadedImagePreview={onLoadUploadedImagePreview}
         onRemove={(relativePath) => {
@@ -738,7 +769,7 @@ const EditableUserMessageBubble = memo(function EditableUserMessageBubble(props:
       />
       <textarea
         ref={textareaRef}
-        className="chat-user-bubble-editor-textarea w-full resize-none overflow-hidden rounded-lg bg-transparent p-2 font-openai-chat text-[calc(14.5px*var(--zone-font-scale,1))] leading-relaxed text-[hsl(var(--chat-user-fg))] outline-none"
+        className="chat-user-bubble-editor-textarea w-full resize-none overflow-hidden rounded-lg bg-transparent p-2 font-chat text-[calc(14.5px*var(--zone-font-scale,1))] leading-relaxed text-[hsl(var(--chat-user-fg))] outline-none"
         value={draftText}
         onChange={(event) => setDraftText(event.target.value)}
         rows={1}
@@ -899,7 +930,7 @@ const GatewayUserMessageRowBody = memo(function GatewayUserMessageRowBody(props:
       />
       <div className="chat-user-bubble-actions mt-1 flex items-center justify-end gap-1.5">
         {!readOnly ? (
-          <div className="flex gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+          <div className="flex gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 [@media(hover:none)]:opacity-100">
             <button
               type="button"
               className="chat-user-bubble-action rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
@@ -1009,7 +1040,7 @@ const GatewayAssistantMessageActions = memo(function GatewayAssistantMessageActi
           {formatMessageTimestamp(row.timestamp)}
         </span>
         <div
-          className={`flex gap-0.5 transition-opacity group-focus-within/assistant:opacity-100 group-hover/assistant:opacity-100 ${isRowBranchPending ? "opacity-100" : "opacity-0"}`}
+          className={`flex gap-0.5 transition-opacity group-focus-within/assistant:opacity-100 group-hover/assistant:opacity-100 [@media(hover:none)]:opacity-100 ${isRowBranchPending ? "opacity-100" : "opacity-0"}`}
         >
           <button
             type="button"
@@ -1148,11 +1179,14 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
   rows: readonly TranscriptRow[];
   liveStartIndex: number;
   activeTurnKey?: string | null;
+  contentWidth: number;
   scrollViewport: HTMLDivElement | null;
   isViewportFollowing?: () => boolean;
+  navRef?: MutableRefObject<GatewayTranscriptNavHandle | null>;
+  onAnchorUserRowChange?: (rowKey: string | null) => void;
   hasMoreHistory?: boolean;
   isLoadingMoreHistory?: boolean;
-  onLoadFullHistory?: () => void;
+  onLoadEarlierHistory?: () => void;
   isStreaming: boolean;
   isAgentMode: boolean;
   showUsage: boolean;
@@ -1169,6 +1203,7 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
   branchPendingMessageId?: string | null;
   toolStatus?: string | null;
   toolStatusIsCompaction: boolean;
+  retryAttempts?: readonly RetryAttemptRecord[];
   readOnly?: boolean;
   redactToolContent?: boolean;
 }) {
@@ -1177,11 +1212,14 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
     rows,
     liveStartIndex,
     activeTurnKey,
+    contentWidth,
     scrollViewport,
     isViewportFollowing,
+    navRef,
+    onAnchorUserRowChange,
     hasMoreHistory,
     isLoadingMoreHistory,
-    onLoadFullHistory,
+    onLoadEarlierHistory,
     isStreaming,
     isAgentMode,
     showUsage,
@@ -1194,6 +1232,7 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
     branchPendingMessageId,
     toolStatus,
     toolStatusIsCompaction,
+    retryAttempts,
     readOnly = false,
     redactToolContent = false,
   } = props;
@@ -1300,7 +1339,10 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
   const [initialMeasurementsCache] = useState(
     () =>
       (conversationId && scrollViewport
-        ? transcriptMeasurementsLru.restore(conversationId, scrollViewport.clientWidth)
+        ? transcriptMeasurementsLru.restore(
+            conversationId,
+            buildTranscriptLayoutKey(scrollViewport.clientWidth, contentWidth),
+          )
         : null) ?? [],
   );
 
@@ -1340,6 +1382,173 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
       isFollowing: () => isViewportFollowing?.() ?? false,
     });
 
+  // Every mounted row is already tracked by the virtualizer's ResizeObserver,
+  // which updates its measured height as the centered transcript reflows.
+  // Do not call measure() on width commits: it clears those fresh measurements
+  // after the DOM has already resized, so estimate-based row positions can
+  // overlap without another resize event to repopulate the cache.
+
+  // 楼层跳转：scrollToIndex(align:"start") 后连续几帧重对齐——目标行远处的
+  // 估高行在滚动后被真实测量，落点会漂移；对准同一 index 是收敛操作，不会
+  // 震荡。收敛期间用户的滚轮/触摸/按键立即取消收敛；新跳转替换旧收敛。
+  const virtualItemsRef = useRef(virtualItems);
+  virtualItemsRef.current = virtualItems;
+  const cancelJumpSettleRef = useRef<() => void>(() => {});
+  useLayoutEffect(() => {
+    if (!navRef) return;
+    const handle: GatewayTranscriptNavHandle = {
+      scrollToRowKey: (rowKey) => {
+        cancelJumpSettleRef.current();
+        const alignToRow = () => {
+          const index = virtualItemsRef.current.findIndex((item) => item.key === rowKey);
+          if (index < 0) return false;
+          transcriptVirtualizer.scrollToIndex(index, { align: "start" });
+          return true;
+        };
+        if (!alignToRow()) return;
+        let rafId: number | null = null;
+        const stopSettle = () => {
+          if (rafId !== null) {
+            cancelAnimationFrame(rafId);
+            rafId = null;
+          }
+          scrollViewport?.removeEventListener("wheel", stopSettle);
+          scrollViewport?.removeEventListener("touchstart", stopSettle);
+          scrollViewport?.removeEventListener("keydown", stopSettle);
+          if (cancelJumpSettleRef.current === stopSettle) {
+            cancelJumpSettleRef.current = () => {};
+          }
+        };
+        cancelJumpSettleRef.current = stopSettle;
+        scrollViewport?.addEventListener("wheel", stopSettle, { passive: true });
+        scrollViewport?.addEventListener("touchstart", stopSettle, { passive: true });
+        scrollViewport?.addEventListener("keydown", stopSettle);
+        let remainingFrames = 6;
+        const settle = () => {
+          rafId = null;
+          if (!alignToRow()) {
+            stopSettle();
+            return;
+          }
+          remainingFrames -= 1;
+          if (remainingFrames > 0) {
+            rafId = requestAnimationFrame(settle);
+          } else {
+            stopSettle();
+          }
+        };
+        rafId = requestAnimationFrame(settle);
+      },
+    };
+    navRef.current = handle;
+    return () => {
+      cancelJumpSettleRef.current();
+      if (navRef.current === handle) {
+        navRef.current = null;
+      }
+    };
+  }, [navRef, transcriptVirtualizer, scrollViewport]);
+
+  // 楼层导航当前楼层：以「视口顶缘（+8px 容差）」所落在的用户消息为准——与
+  // 跳转的 align:"start" 落位一致，跳转后高亮的必然是刚点的楼层；视口贴近
+  // 内容底部时直接取最后一层（否则短对话拼满一屏时底部楼层永远无法成为当前
+  // 层）。贴底判定用 scrollHeight（与 scrollTop/clientHeight 同一坐标系，
+  // 含底部保留区），避免与 getTotalSize 的列表局部坐标错位。
+  const lastAnchorRef = useRef<string | null>(null);
+  const onAnchorUserRowChangeRef = useRef(onAnchorUserRowChange);
+  onAnchorUserRowChangeRef.current = onAnchorUserRowChange;
+  const reportAnchorRef = useRef(() => {});
+  reportAnchorRef.current = () => {
+    const callback = onAnchorUserRowChangeRef.current;
+    if (!callback || !scrollViewport) return;
+    const itemList = virtualItemsRef.current;
+    let anchorKey: string | null = null;
+    if (itemList.length > 0) {
+      const scrollTop = scrollViewport.scrollTop;
+      const viewportHeight = scrollViewport.clientHeight;
+      const nearBottom = scrollTop + viewportHeight >= scrollViewport.scrollHeight - 32;
+      let anchorIndex = -1;
+      if (nearBottom) {
+        anchorIndex = itemList.length - 1;
+      } else {
+        const anchorLine = scrollTop + 8;
+        const items = transcriptVirtualizer.getVirtualItems();
+        for (const item of items) {
+          if (item.start > anchorLine) break;
+          anchorIndex = item.index;
+        }
+        if (anchorIndex === -1) anchorIndex = items[0]?.index ?? -1;
+      }
+      for (let i = Math.min(anchorIndex, itemList.length - 1); i >= 0; i--) {
+        const item = itemList[i];
+        if (item?.kind === "row" && item.row.kind === "user") {
+          anchorKey = item.row.key;
+          break;
+        }
+      }
+    }
+    if (anchorKey !== lastAnchorRef.current) {
+      lastAnchorRef.current = anchorKey;
+      callback(anchorKey);
+    }
+  };
+
+  useEffect(() => {
+    if (!scrollViewport) return;
+    const handler = () => reportAnchorRef.current();
+    handler();
+    scrollViewport.addEventListener("scroll", handler, { passive: true });
+    return () => scrollViewport.removeEventListener("scroll", handler);
+  }, [scrollViewport]);
+
+  // 行集合变化（消息追加、流式落定）后兜底重算一次；依赖 virtualItems 而不是
+  // 每次渲染都跑，避免「上报 → 父级重渲染 → 再上报」的空转循环。
+  useEffect(() => {
+    virtualItemsRef.current = virtualItems;
+    reportAnchorRef.current();
+  }, [virtualItems]);
+
+  // Infinite upward paging: scrolling within one viewport of the top requests
+  // the previous page through the same handler as the "load earlier history"
+  // button (which stays as the visible affordance and loading indicator).
+  // Only scroll events trigger it — opening a conversation lands at the
+  // bottom and never auto-fetches — and after a page lands the keyed
+  // anchoring parks the viewport about a page below the top, so walking
+  // further back keeps paging one request at a time: readers load exactly as
+  // far as they scroll, servers transfer only the pages actually walked to,
+  // and a failed fetch retries only on the next user scroll (no hammering).
+  const autoLoadEarlierInFlightRef = useRef(false);
+  const maybeAutoLoadEarlierRef = useRef(() => {});
+  maybeAutoLoadEarlierRef.current = () => {
+    if (
+      readOnly ||
+      isStreaming ||
+      !hasMoreHistory ||
+      !onLoadEarlierHistory ||
+      isLoadingMoreHistory ||
+      autoLoadEarlierInFlightRef.current ||
+      !scrollViewport ||
+      scrollViewport.scrollTop > scrollViewport.clientHeight
+    ) {
+      return;
+    }
+    autoLoadEarlierInFlightRef.current = true;
+    onLoadEarlierHistory();
+  };
+  useEffect(() => {
+    if (!scrollViewport || readOnly) return;
+    const handler = () => maybeAutoLoadEarlierRef.current();
+    scrollViewport.addEventListener("scroll", handler, { passive: true });
+    return () => scrollViewport.removeEventListener("scroll", handler);
+  }, [scrollViewport, readOnly]);
+  useEffect(() => {
+    // The latch guards the gap between firing and the loading flag landing;
+    // it releases whenever a load cycle is not (or no longer) running.
+    if (!isLoadingMoreHistory) {
+      autoLoadEarlierInFlightRef.current = false;
+    }
+  }, [isLoadingMoreHistory]);
+
   // First paint of a conversation lands at the bottom before the user sees
   // anything: scrollToEnd re-targets as dynamic measurements land. The region
   // remounts per conversation (keyed by the parent), so this runs once per
@@ -1364,7 +1573,7 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
     if (!conversationId || !scrollViewport) return;
     transcriptMeasurementsLru.save(
       conversationId,
-      scrollViewport.clientWidth,
+      buildTranscriptLayoutKey(scrollViewport.clientWidth, contentWidth),
       transcriptVirtualizer.takeSnapshot(),
     );
   };
@@ -1389,8 +1598,8 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
             >
               <button
                 type="button"
-                onClick={onLoadFullHistory}
-                disabled={isLoadingMoreHistory || !onLoadFullHistory}
+                onClick={onLoadEarlierHistory}
+                disabled={isLoadingMoreHistory || !onLoadEarlierHistory}
                 className="rounded-full border border-border/60 bg-background/80 px-4 py-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {isLoadingMoreHistory
@@ -1416,7 +1625,7 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
             >
               <div className="flex w-full max-w-full items-start gap-3">
                 <AssistantAvatar />
-                <div className="min-w-0 flex-1 pt-1">
+                <div className="min-w-0 flex-1 space-y-2 pt-1">
                   {displayedToolStatusIsCompaction ? (
                     <div className="flex items-center py-1">
                       <CompactingText />
@@ -1448,6 +1657,9 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
                       <VibingText />
                     </div>
                   )}
+                  {retryAttempts && retryAttempts.length > 0 ? (
+                    <RetryDetailsBlock attempts={retryAttempts} />
+                  ) : null}
                 </div>
               </div>
             </article>
@@ -1511,6 +1723,14 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
                   redactToolContent={redactToolContent}
                 />
                 {shouldShowLiveStatus ? <LiveStatusFooter status={liveStatusText} /> : null}
+                {isLatestLiveStreaming &&
+                !shouldShowPendingLiveBubble &&
+                retryAttempts &&
+                retryAttempts.length > 0 ? (
+                  <div className="ml-9 pt-1">
+                    <RetryDetailsBlock attempts={retryAttempts} />
+                  </div>
+                ) : null}
                 {!readOnly && !isLatestLiveStreaming ? (
                   <GatewayAssistantMessageActions
                     row={row}
@@ -1568,10 +1788,14 @@ export function GatewayTranscript({
   rows,
   liveStartIndex = -1,
   activeTurnKey = null,
+  contentWidth = DEFAULT_CHAT_TRANSCRIPT_WIDTH,
   isViewportFollowing,
+  navRef,
+  onAnchorUserRowChange,
   error,
   toolStatus,
   toolStatusIsCompaction = false,
+  retryAttempts,
   isStreaming = false,
   isLoading = false,
   loadingTitle,
@@ -1579,7 +1803,7 @@ export function GatewayTranscript({
   onOpenSettings,
   hasMoreHistory = false,
   isLoadingMoreHistory = false,
-  onLoadFullHistory,
+  onLoadEarlierHistory,
   isAgentMode = true,
   showUsage = false,
   usageContextWindow,
@@ -1650,11 +1874,14 @@ export function GatewayTranscript({
           rows={rows}
           liveStartIndex={liveStartIndex}
           activeTurnKey={activeTurnKey}
+          contentWidth={contentWidth}
           scrollViewport={transcriptScrollViewport}
           isViewportFollowing={isViewportFollowing}
+          navRef={navRef}
+          onAnchorUserRowChange={onAnchorUserRowChange}
           hasMoreHistory={hasMoreHistory}
           isLoadingMoreHistory={isLoadingMoreHistory}
-          onLoadFullHistory={onLoadFullHistory}
+          onLoadEarlierHistory={onLoadEarlierHistory}
           isStreaming={isStreaming}
           isAgentMode={isAgentMode}
           showUsage={showUsage}
@@ -1667,6 +1894,7 @@ export function GatewayTranscript({
           branchPendingMessageId={branchPendingMessageId}
           toolStatus={toolStatus}
           toolStatusIsCompaction={toolStatusIsCompaction}
+          retryAttempts={retryAttempts}
           readOnly={readOnly}
           redactToolContent={redactToolContent}
         />

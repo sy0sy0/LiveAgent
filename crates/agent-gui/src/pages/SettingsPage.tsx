@@ -8,6 +8,7 @@ import {
   Cpu,
   Info,
   Key,
+  Keyboard,
   Settings2,
   Wrench,
   Zap,
@@ -18,6 +19,7 @@ import { useLocale } from "../i18n";
 import { AboutSection } from "./settings/AboutSection";
 import { AgentsSection } from "./settings/AgentsSection";
 import { CronSection } from "./settings/CronSection";
+import { GlobalShortcutsSection } from "./settings/GlobalShortcutsSection";
 import { HooksSection } from "./settings/HooksSection";
 import { MemoryPanel } from "./settings/memory/MemoryPanel";
 import { ProvidersSection } from "./settings/ProvidersSection";
@@ -121,7 +123,10 @@ const NAV_GROUPS: NavGroup[] = [
   },
   {
     labelKey: "settings.groupOther",
-    items: [{ id: "about", icon: <Info className="h-3.5 w-3.5" /> }],
+    items: [
+      { id: "shortcuts", icon: <Keyboard className="h-3.5 w-3.5" /> },
+      { id: "about", icon: <Info className="h-3.5 w-3.5" /> },
+    ],
   },
 ];
 
@@ -140,6 +145,7 @@ export function SettingsPage(props: SettingsPageProps) {
 
   const sectionLabels: Record<SectionId, string> = {
     system: t("settings.navSystem"),
+    shortcuts: t("settings.navShortcuts"),
     systemTools: t("settings.navSystemTools"),
     providers: t("settings.navProviders"),
     agents: t("settings.navAgents"),
@@ -182,6 +188,8 @@ export function SettingsPage(props: SettingsPageProps) {
         return <ProvidersSection settings={settings} setSettings={setSettings} />;
       case "system":
         return <SystemSettingsForm settings={settings} setSettings={setSettings} />;
+      case "shortcuts":
+        return <GlobalShortcutsSection />;
       case "systemTools":
         return <SystemToolsSection settings={settings} setSettings={setSettings} />;
       case "hooks":
@@ -191,7 +199,7 @@ export function SettingsPage(props: SettingsPageProps) {
       case "agents":
         return <AgentsSection settings={settings} setSettings={setSettings} />;
       case "ssh":
-        return <SshSection settings={settings} setSettings={setSettings} />;
+        return <SshSection settings={settings} setSettings={setSettings} saveState={saveState} />;
       case "remote":
         return <RemoteSection settings={settings} setSettings={setSettings} />;
       case "memory":

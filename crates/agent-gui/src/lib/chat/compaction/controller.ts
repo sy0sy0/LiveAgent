@@ -85,6 +85,11 @@ export type CompactionTurnBinding = {
   presend?: CompactionPreSendBinding;
 };
 
+export type CompactionDuringRunResult = {
+  context: Context | null;
+  shouldDisableProtection: boolean;
+};
+
 type RollbackSnapshot = {
   state: ConversationViewState;
   composerText?: string;
@@ -128,9 +133,11 @@ export class CompactionController {
   }
 
   // O(1)：账本读数 + 流式增量估算 + 纯决策，无状态构建、无序列化。
-  shouldProtectMidStream(pendingChars: number): boolean {
+  // pendingTokenUnits 由调用方按流式 delta 用 estimateTextTokenUnits 累加。
+  shouldProtectMidStream(pendingTokenUnits: number): boolean {
     if (!this.binding || this.inFlight) return false;
-    return this.decide("protection", this.ledger.totalWithPendingText(pendingChars)).shouldCompact;
+    return this.decide("protection", this.ledger.totalWithPendingTokens(pendingTokenUnits))
+      .shouldCompact;
   }
 
   async maybeCompactPreSend(params: {
@@ -242,9 +249,11 @@ export class CompactionController {
     tools?: Context["tools"];
     includeAbortedMessages?: boolean;
     includeUploadedFilesMetadata?: boolean;
-  }): Promise<Context | null> {
+  }): Promise<CompactionDuringRunResult> {
     const binding = this.binding;
-    if (!binding) return null;
+    if (!binding) {
+      return { context: null, shouldDisableProtection: false };
+    }
     // 覆盖"mid-stream abort 后、summarizer 启动前"用户恰好点停止的间隙。
     if (binding.cancellation.userStop.signal.aborted) {
       throw createCompactionAbortError();
@@ -253,6 +262,19 @@ export class CompactionController {
     const buildOptions: ContextBuildOptions = {
       includeAbortedMessages: params.includeAbortedMessages,
       includeUploadedFilesMetadata: params.includeUploadedFilesMetadata,
+    };
+    const buildFallbackContext = (state: ConversationViewState): Context => {
+      if (params.trigger !== "mid-stream") {
+        return binding.buildPreparedContext(state, params.tools, buildOptions);
+      }
+      const messages = getActiveSegment(state)?.messages ?? [];
+      const lastTimestamp = messages[messages.length - 1]?.timestamp;
+      const resumeMessage = createSyntheticContinueUserMessage(
+        typeof lastTimestamp === "number" ? lastTimestamp + 1 : now,
+      );
+      return binding.buildResumeContext(state, resumeMessage, params.tools, {
+        includeUploadedFilesMetadata: params.includeUploadedFilesMetadata,
+      });
     };
 
     let workingState = params.state;
@@ -277,9 +299,17 @@ export class CompactionController {
     if (!decision.shouldCompact) {
       if (pruned) {
         binding.sinks.applyStateMidRun?.(pruned.state);
-        return binding.buildPreparedContext(pruned.state, params.tools, buildOptions);
+        return {
+          context: buildFallbackContext(pruned.state),
+          shouldDisableProtection: false,
+        };
       }
-      return null;
+      return params.trigger === "mid-stream"
+        ? {
+            context: buildFallbackContext(workingState),
+            shouldDisableProtection: true,
+          }
+        : { context: null, shouldDisableProtection: false };
     }
 
     this.rollbackSnapshot = { state: params.state, persistOnRollback: true };
@@ -314,7 +344,7 @@ export class CompactionController {
         includeUploadedFilesMetadata: params.includeUploadedFilesMetadata,
       });
       this.notePostCompactionPressure(resumeContext, outcome.state, decision.threshold);
-      return resumeContext;
+      return { context: resumeContext, shouldDisableProtection: false };
     } catch (error) {
       if (this.isAbortOutcome(scope.controller.signal, error)) {
         throw error;
@@ -326,13 +356,21 @@ export class CompactionController {
         binding.sinks.applyStateMidRun?.(fallback.state);
         this.settleFailed(params.trigger, PRUNE_FALLBACK_NOTICE);
         binding.sinks.setBridgeToolStatus?.(buildPruneFallbackStatus(fallback.prunedMessageCount));
-        return binding.buildPreparedContext(fallback.state, params.tools, buildOptions);
+        return {
+          context: buildFallbackContext(fallback.state),
+          shouldDisableProtection: false,
+        };
       }
       this.settleFailed(
         params.trigger,
         (error instanceof Error ? error.message : String(error)) || "压缩失败",
       );
-      return null;
+      return params.trigger === "mid-stream"
+        ? {
+            context: buildFallbackContext(workingState),
+            shouldDisableProtection: true,
+          }
+        : { context: null, shouldDisableProtection: false };
     } finally {
       scope.release();
       this.inFlight = false;

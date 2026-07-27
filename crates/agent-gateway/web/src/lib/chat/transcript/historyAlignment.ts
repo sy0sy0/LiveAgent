@@ -60,6 +60,43 @@ function historyTurnHasAssistantContent(turn: HistoryTurn): boolean {
   return turn.entries.some((entry) => entry.kind !== "checkpoint");
 }
 
+function stableUserMessageId(user: UserChatEntry): string {
+  return user.messageId?.trim() || user.messageRef?.messageId.trim() || "";
+}
+
+// The desktop assigns the user message id before persistence and mirrors that
+// same id through user_message/runtime snapshots. History exposes it through
+// messageRef, so matching is exact even when prompts and replies repeat. The
+// timestamp/user-only fallbacks cover only identity-less malformed data and
+// can never consume a completed historical exchange by content similarity.
+function historyTurnMatchesActiveTurn(historyTurn: HistoryTurn, activeTurn: Turn): boolean {
+  if (!historyTurn.user || !activeTurn.user) {
+    return false;
+  }
+  const historyMessageId = stableUserMessageId(historyTurn.user);
+  const activeMessageId = stableUserMessageId(activeTurn.user);
+  if (historyMessageId || activeMessageId) {
+    return (
+      historyMessageId !== "" && activeMessageId !== "" && historyMessageId === activeMessageId
+    );
+  }
+
+  const historyTimestamp = historyTurn.user.timestamp;
+  const activeTimestamp = activeTurn.user.timestamp;
+  if (
+    typeof historyTimestamp === "number" &&
+    typeof activeTimestamp === "number" &&
+    historyTimestamp === activeTimestamp
+  ) {
+    return true;
+  }
+
+  if (!historyTurnHasAssistantContent(historyTurn)) {
+    return historyTurn.user.text.trim() === activeTurn.user.text.trim();
+  }
+  return false;
+}
+
 function isLocalTurn(turn: Turn): boolean {
   return turn.key.startsWith("local:");
 }
@@ -102,7 +139,12 @@ function enrichTurnFromHistory(turn: Turn, historyTurn: HistoryTurn): Turn {
     historyTurn.entries.length > 0 &&
     next.phase === "settled"
   ) {
-    return { ...next, entries: historyTurn.entries, contentStale: false };
+    return {
+      ...next,
+      entries: historyTurn.entries,
+      contentStale: false,
+      inferredLossErrorEntryId: undefined,
+    };
   }
 
   const historyToolCalls = historyTurn.entries.filter(
@@ -293,7 +335,11 @@ function replaceAll(entries: ChatEntry[], turns: Turn[], historyTurns: HistoryTu
 // "Covered" requires the reply, not just the prompt: a settled turn whose
 // window twin is still user-only (the desktop's post-run flush races the
 // fetch) keeps rendering its streamed content (protectLaggedSettledTurns).
-function alignReplace(params: { turns: Turn[]; entries: ChatEntry[] }): AlignResult {
+function alignReplace(params: {
+  turns: Turn[];
+  entries: ChatEntry[];
+  rebaseReconcile?: boolean;
+}): AlignResult {
   let historyTurns = groupHistoryEntriesIntoTurns(params.entries);
 
   // Trim persisted echoes of active exchanges. Ref-anchored first (covers
@@ -311,32 +357,40 @@ function alignReplace(params: { turns: Turn[]; entries: ChatEntry[] }): AlignRes
     );
   }
 
-  // …then trailing user-only turns pair positionally with the remaining
-  // ref-less active prompts (the agent persists the prompt before the reply).
+  // …then pair the remaining ref-less active prompts with the trailing
+  // persisted turns. History may already contain a partial assistant reply:
+  // opening a running conversation races history.get against chat.subscribe,
+  // so limiting this match to user-only turns leaves two copies when history
+  // wins that race. Stable message ids disambiguate repeated prompts and
+  // repeated replies; the live turn remains authoritative only after proof.
   const reflessActive = activeWithUser.filter((turn) => !turn.user?.messageRef);
-  let trailingUserOnly = 0;
-  while (trailingUserOnly < historyTurns.length) {
-    const candidate = historyTurns[historyTurns.length - 1 - trailingUserOnly];
-    if (!candidate || !candidate.user || historyTurnHasAssistantContent(candidate)) {
+  const enrichedActive = new Map<Turn, Turn>();
+  const matchedHistoryIndexes = new Set<number>();
+  let historyCursor = historyTurns.length - 1;
+  for (let activeCursor = reflessActive.length - 1; activeCursor >= 0; activeCursor -= 1) {
+    const historyTurn = historyTurns[historyCursor];
+    const keptTurn = reflessActive[activeCursor];
+    const historyUser = historyTurn?.user;
+    const keptUser = keptTurn?.user;
+    if (
+      !historyTurn ||
+      !keptTurn ||
+      !historyUser ||
+      !keptUser ||
+      !historyTurnMatchesActiveTurn(historyTurn, keptTurn)
+    ) {
       break;
     }
-    trailingUserOnly += 1;
-  }
-  const trimCount = Math.min(trailingUserOnly, reflessActive.length);
-  // messageRef adoption only when the pairing is unambiguous: exactly as
-  // many persisted echoes as active prompts.
-  const enrichPairs = trailingUserOnly === reflessActive.length ? trimCount : 0;
-  const enrichedActive = new Map<Turn, Turn>();
-  for (let pair = 0; pair < enrichPairs; pair += 1) {
-    const historyTurn = historyTurns[historyTurns.length - 1 - pair];
-    const keptTurn = reflessActive[reflessActive.length - 1 - pair];
-    if (!historyTurn?.user || !keptTurn?.user) continue;
-    const enrichedUser = enrichUserSlot(keptTurn.user, historyTurn.user);
-    if (enrichedUser !== keptTurn.user) {
+    const enrichedUser = enrichUserSlot(keptUser, historyUser);
+    if (enrichedUser !== keptUser) {
       enrichedActive.set(keptTurn, { ...keptTurn, user: enrichedUser });
     }
+    matchedHistoryIndexes.add(historyCursor);
+    historyCursor -= 1;
   }
-  historyTurns = historyTurns.slice(0, historyTurns.length - trimCount);
+  if (matchedHistoryIndexes.size > 0) {
+    historyTurns = historyTurns.filter((_, index) => !matchedHistoryIndexes.has(index));
+  }
 
   // Settled turns whose persisted echo reached the window without its reply
   // (post-run flush still in flight) survive with their echo trimmed.
@@ -369,7 +423,14 @@ function alignReplace(params: { turns: Turn[]; entries: ChatEntry[] }): AlignRes
     reflessSettled.length,
     Math.max(0, historyUserCount - refMatchedCount),
   );
-  const keptRefless = new Set(reflessSettled.slice(coveredRefless));
+  // Rebase reconciliation: the server authoritatively deleted a settled
+  // suffix (edit-resend truncation whose anchor this client missed), so
+  // uncovered ref-less settled turns are stale edit versions, not
+  // persistence-lagged exchanges — none survive. Genuinely lagged replies
+  // were already captured by protectLaggedSettledTurns above.
+  const keptRefless = new Set(
+    params.rebaseReconcile === true ? [] : reflessSettled.slice(coveredRefless),
+  );
 
   const turns = params.turns.flatMap((turn) => {
     const protectedTurn = protectedTurns.get(turn);
@@ -507,9 +568,18 @@ export function alignHistory(params: {
   turns: Turn[];
   entries: ChatEntry[];
   mode: HistoryApplyMode;
+  // Set after a rebased event whose truncation anchor was missing locally:
+  // the server deleted a settled suffix this client still renders, so the
+  // replace must not keep uncovered ref-less settled turns (only meaningful
+  // with mode "replace").
+  rebaseReconcile?: boolean;
 }): AlignResult {
   if (params.mode === "replace") {
-    return alignReplace({ turns: params.turns, entries: params.entries });
+    return alignReplace({
+      turns: params.turns,
+      entries: params.entries,
+      rebaseReconcile: params.rebaseReconcile,
+    });
   }
   return alignEnrich(params);
 }

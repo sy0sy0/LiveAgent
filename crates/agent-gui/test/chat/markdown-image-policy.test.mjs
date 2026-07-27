@@ -271,16 +271,17 @@ test("agent tool rules route installed Skill scripts through skill cwd", () => {
   assert.match(suffix, /Do not cd into ~\/\.liveagent\/skills or workspace skills\/ guesses/);
 });
 
-test("agent Bash rules are Windows-native when runtime platform is Windows", () => {
+test("agent Bash rules are Git Bash-first when runtime platform is Windows", () => {
   const suffix = agentRunnerModule.buildToolsSuffix(
     "/workspace",
     ["Bash", "ManagedProcess"],
     "windows",
   );
   assert.match(suffix, /Current platform: Windows/);
-  assert.match(suffix, /Use PowerShell syntax by default/);
-  assert.match(suffix, /avoid `export`, `nohup`, `\/dev\/null`/);
-  assert.match(suffix, /detached Windows process syntax/);
+  assert.match(suffix, /Git Bash with POSIX semantics/);
+  assert.match(suffix, /Write POSIX\/bash-compatible commands by default/);
+  assert.match(suffix, /shell_family: powershell/);
+  assert.match(suffix, /require `nohup` and log redirection/);
 });
 
 test("fs tool descriptions keep Image as the only display path for images", () => {

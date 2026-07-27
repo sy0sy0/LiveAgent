@@ -1,7 +1,8 @@
 import { useMemo, useState } from "react";
 
+import { getUploadedFileTypeIcon } from "../../../components/chat/fileTypeIcons";
 import { ImagePreview, type ImagePreviewSlide } from "../../../components/chat/ImagePreview";
-import { File, FileText, X } from "../../../components/icons";
+import { X } from "../../../components/icons";
 import { useLocale } from "../../../i18n";
 import {
   formatUploadedFileSize,
@@ -31,6 +32,7 @@ function UserImageAttachmentCard({
 }) {
   const [previewOpen, setPreviewOpen] = useState(false);
   const labeledPreview = `${previewLabel}: ${file.fileName}`;
+  const FallbackIcon = getUploadedFileTypeIcon(file);
   const previewSlides = useMemo<ImagePreviewSlide[]>(
     () =>
       imageSrc
@@ -104,7 +106,7 @@ function UserImageAttachmentCard({
                 : "flex h-10 w-10 items-center justify-center rounded-xl bg-black/[0.03] dark:bg-white/10"
             }
           >
-            {isLoading ? null : <File className="h-5 w-5 opacity-40" />}
+            {isLoading ? null : <FallbackIcon className="h-5 w-5" />}
           </div>
         </div>
       )}
@@ -133,6 +135,7 @@ function UserFileAttachmentCard({
   removeLabel?: string;
   compact: boolean;
 }) {
+  const TypeIcon = getUploadedFileTypeIcon(file);
   return (
     <div
       title={file.relativePath}
@@ -142,7 +145,7 @@ function UserFileAttachmentCard({
       )}
     >
       <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gradient-to-b from-black/[0.03] to-black/[0.06] dark:from-white/[0.06] dark:to-white/[0.1]">
-        <FileText className="h-4 w-4 text-[hsl(var(--chat-user-fg)/0.45)]" />
+        <TypeIcon className="h-4.5 w-4.5" />
       </div>
       <div className="min-w-0 flex-1">
         <div className="truncate text-[calc(11px*var(--zone-font-scale,1))] font-medium leading-tight text-[hsl(var(--chat-user-fg)/0.85)]">

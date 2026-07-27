@@ -17,6 +17,7 @@ pub use crate::services::skills::{
 
 const UPLOADED_IMAGE_PREVIEW_MAX_BYTES: usize = 5 * 1024 * 1024; // 5MB
 const UPLOADED_NATIVE_ATTACHMENT_MAX_BYTES: u64 = 25 * 1024 * 1024; // 25MB
+const UPLOADED_TEXT_TRANSCODE_MAX_BYTES: u64 = 64 * 1024 * 1024; // 64MB，超出则原样落盘不转码
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -292,52 +293,136 @@ fn probe_file_prefix(path: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
     Ok(buffer)
 }
 
-fn is_probably_utf8_text_file(path: &Path) -> Result<bool, String> {
-    let buffer = probe_file_prefix(path, 32 * 1024)?;
-    if buffer.is_empty() {
-        return Ok(true);
-    }
-    if buffer.contains(&0) {
-        return Ok(false);
-    }
-    let bytes = buffer
-        .strip_prefix(&[0xEF, 0xBB, 0xBF])
-        .unwrap_or(buffer.as_slice());
-    Ok(std::str::from_utf8(bytes).is_ok())
+const UPLOAD_TEXT_PROBE_BYTES: usize = 32 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadTextClass {
+    /// 内容是合法 UTF-8（或空文件），可原样使用。
+    Utf8,
+    /// 内容是文本，但采用 GBK/Big5/Shift-JIS/UTF-16 等非 UTF-8 编码；
+    /// 暂存副本需要转码为 UTF-8，否则下游 Read/原生附件内联全是乱码。
+    NeedsTranscode,
+    /// 不是可解析的文本。
+    Binary,
 }
 
-fn is_probably_utf8_text_bytes(bytes: &[u8]) -> bool {
+/// 上传文本判定不能只做严格 UTF-8 校验：中文 Windows 上 .txt 常见 GBK/
+/// UTF-16（记事本"Unicode"），且探测只取前缀，UTF-8 多字节字符被截断
+/// 也会导致严格校验失败——这两类都不是二进制文件。
+fn classify_upload_text_bytes(bytes: &[u8], prefix_truncated: bool) -> UploadTextClass {
     if bytes.is_empty() {
-        return true;
+        return UploadTextClass::Utf8;
+    }
+    // UTF-16 BOM 要先于 NUL 检查：UTF-16 编码的 ASCII 字符必然带 0x00。
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        return UploadTextClass::NeedsTranscode;
     }
     if bytes.contains(&0) {
-        return false;
+        return UploadTextClass::Binary;
     }
-    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
-    std::str::from_utf8(bytes).is_ok()
+    let stripped = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    match std::str::from_utf8(stripped) {
+        Ok(_) => return UploadTextClass::Utf8,
+        Err(error) => {
+            // 探测前缀截断了末尾多字节字符（error_len() == None 表示序列
+            // 不完整而非非法），整个文件仍可能是合法 UTF-8。
+            if prefix_truncated
+                && error.error_len().is_none()
+                && stripped.len() - error.valid_up_to() < 4
+            {
+                return UploadTextClass::Utf8;
+            }
+        }
+    }
+    // 无 NUL 且非 UTF-8：按控制字符占比区分传统编码文本与二进制。
+    // GBK/Big5/Shift-JIS 的多字节序列全部落在 0x80 以上，正文控制字符
+    // 只应出现 \t \n \r（含少量 \x0C 换页、\x1B 转义）。
+    let suspicious = stripped
+        .iter()
+        .filter(|byte| matches!(**byte, 0x01..=0x08 | 0x0B | 0x0E..=0x1A | 0x1C..=0x1F | 0x7F))
+        .count();
+    if suspicious * 32 > stripped.len() {
+        UploadTextClass::Binary
+    } else {
+        UploadTextClass::NeedsTranscode
+    }
 }
 
-fn detect_upload_file_kind(path: &Path) -> Result<&'static str, String> {
+fn classify_upload_text_file(path: &Path) -> Result<UploadTextClass, String> {
+    let buffer = probe_file_prefix(path, UPLOAD_TEXT_PROBE_BYTES)?;
+    let prefix_truncated = buffer.len() == UPLOAD_TEXT_PROBE_BYTES;
+    Ok(classify_upload_text_bytes(&buffer, prefix_truncated))
+}
+
+/// 把非 UTF-8 编码的文本转码为 UTF-8。输入必须是完整文件内容（分类可能
+/// 基于截断前缀，这里先复查完整字节，合法 UTF-8 原样返回）。
+fn transcode_upload_text_to_utf8(bytes: &[u8]) -> Vec<u8> {
+    if bytes.is_empty() || std::str::from_utf8(bytes).is_ok() {
+        return bytes.to_vec();
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        let (text, _, _) = encoding_rs::UTF_16LE.decode(bytes);
+        return text.into_owned().into_bytes();
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        let (text, _, _) = encoding_rs::UTF_16BE.decode(bytes);
+        return text.into_owned().into_bytes();
+    }
+    let mut detector = chardetng::EncodingDetector::new();
+    detector.feed(bytes, true);
+    let encoding = detector.guess(None, true);
+    let (text, _, _) = encoding.decode(bytes);
+    text.into_owned().into_bytes()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DetectedUploadKind {
+    kind: &'static str,
+    /// 仅 kind == "text" 时可能为 true：暂存副本落盘前需转码为 UTF-8。
+    needs_utf8_transcode: bool,
+}
+
+impl DetectedUploadKind {
+    fn plain(kind: &'static str) -> Self {
+        Self {
+            kind,
+            needs_utf8_transcode: false,
+        }
+    }
+
+    fn from_text_class(class: UploadTextClass) -> Option<Self> {
+        match class {
+            UploadTextClass::Utf8 => Some(Self::plain("text")),
+            UploadTextClass::NeedsTranscode => Some(Self {
+                kind: "text",
+                needs_utf8_transcode: true,
+            }),
+            UploadTextClass::Binary => None,
+        }
+    }
+}
+
+fn detect_upload_file_kind(path: &Path) -> Result<DetectedUploadKind, String> {
     if let Some(kind) = infer_image_upload_kind(path) {
-        return Ok(kind);
+        return Ok(DetectedUploadKind::plain(kind));
     }
     if is_pdf_upload(path) {
-        return Ok("pdf");
+        return Ok(DetectedUploadKind::plain("pdf"));
     }
     if is_notebook_upload(path) {
-        return Ok("notebook");
+        return Ok(DetectedUploadKind::plain("notebook"));
     }
     if is_word_upload(path) {
-        return Ok("word");
+        return Ok(DetectedUploadKind::plain("word"));
     }
     if is_spreadsheet_upload(path) {
-        return Ok("spreadsheet");
+        return Ok(DetectedUploadKind::plain("spreadsheet"));
     }
     if is_archive_upload(path) {
-        return Ok("archive");
+        return Ok(DetectedUploadKind::plain("archive"));
     }
-    if is_probably_utf8_text_file(path)? {
-        return Ok("text");
+    if let Some(detected) = DetectedUploadKind::from_text_class(classify_upload_text_file(path)?) {
+        return Ok(detected);
     }
     Err(format!(
         "{} 不是当前 Read 支持解析的文本/图片/PDF/notebook/Word/Excel/压缩包文件",
@@ -349,7 +434,7 @@ fn detect_uploaded_bytes_kind(
     file_name: &str,
     mime_type: Option<&str>,
     bytes: &[u8],
-) -> Result<&'static str, String> {
+) -> Result<DetectedUploadKind, String> {
     let path = Path::new(file_name);
     let normalized_mime = mime_type
         .map(str::trim)
@@ -361,28 +446,30 @@ fn detect_uploaded_bytes_kind(
         .map(|value| value.starts_with("image/"))
         .unwrap_or(false)
     {
-        return Ok("image");
+        return Ok(DetectedUploadKind::plain("image"));
     }
     if let Some(kind) = infer_image_upload_kind(path) {
-        return Ok(kind);
+        return Ok(DetectedUploadKind::plain(kind));
     }
     if normalized_mime.as_deref() == Some("application/pdf") || is_pdf_upload(path) {
-        return Ok("pdf");
+        return Ok(DetectedUploadKind::plain("pdf"));
     }
     if is_notebook_upload(path) {
-        return Ok("notebook");
+        return Ok(DetectedUploadKind::plain("notebook"));
     }
     if is_word_upload(path) || is_word_upload_mime(mime_type) {
-        return Ok("word");
+        return Ok(DetectedUploadKind::plain("word"));
     }
     if is_spreadsheet_upload(path) || is_spreadsheet_upload_mime(mime_type) {
-        return Ok("spreadsheet");
+        return Ok(DetectedUploadKind::plain("spreadsheet"));
     }
     if is_archive_upload(path) || is_archive_upload_mime(mime_type) {
-        return Ok("archive");
+        return Ok(DetectedUploadKind::plain("archive"));
     }
-    if is_probably_utf8_text_bytes(bytes) {
-        return Ok("text");
+    if let Some(detected) =
+        DetectedUploadKind::from_text_class(classify_upload_text_bytes(bytes, false))
+    {
+        return Ok(detected);
     }
 
     Err(format!(
@@ -391,19 +478,23 @@ fn detect_uploaded_bytes_kind(
 }
 
 fn sanitize_uploaded_file_name(input: &str) -> String {
+    // 文件名只需是安全的单段路径组件：保留中文等非 ASCII 字符，仅替换
+    // 路径分隔符、Windows 保留符号与控制字符。曾经的 ASCII 白名单会把
+    // 全中文文件名磨成纯扩展名（"报告.pdf" → "pdf"）。
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
-            out.push(ch);
-        } else {
+        if ch.is_control() || matches!(ch, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*') {
             out.push('_');
+        } else {
+            out.push(ch);
         }
     }
-    let trimmed = out.trim_matches('_').trim_matches('.').to_string();
+    // 结尾空格/点在 Windows 上非法，隐藏文件前缀点一并修剪。
+    let trimmed = out.trim_matches(|ch: char| ch == '.' || ch.is_whitespace());
     let candidate = if trimmed.is_empty() {
         "file".to_string()
     } else {
-        trimmed
+        trimmed.to_string()
     };
     avoid_windows_reserved_file_name(candidate)
 }
@@ -483,14 +574,131 @@ fn rel_to_workdir_forward_slash(workdir: &Path, abs: &Path) -> Result<String, St
         .map_err(|_| format!("路径超出工作目录：{}", abs.display()))
 }
 
-fn upload_import_root(workdir: &Path) -> Result<PathBuf, String> {
+/// 上传暂存区基目录（`~/.liveagent/uploads`）。上传的附件是会话资产而非
+/// 工作区文件：落到应用存储域，避免污染工作区的 git 状态与文件树。
+///
+/// 返回的是逻辑路径（不 canonicalize）：落盘、展示与消息里持久化的
+/// absolute_path 都用它，避免 Windows 上把 `\\?\` verbatim 路径暴露给
+/// 用户与模型。授权比较一律走 [`canonical_upload_staging_base`]。
+fn upload_staging_base() -> Result<PathBuf, String> {
+    #[cfg(test)]
+    {
+        Ok(test_upload_staging_base().to_path_buf())
+    }
+    #[cfg(not(test))]
+    {
+        Ok(app_storage_dir()?.join("uploads"))
+    }
+}
+
+/// 单测进程专用暂存根：所有暂存相关测试都写进系统临时目录，绝不触碰
+/// 真实的 `~/.liveagent/uploads`。Unix 上刻意让暂存根经过一层 symlink，
+/// 使走完整命令链的测试必然覆盖"逻辑路径 ≠ canonical 路径"的比较场景
+/// （对应 Windows 的 `\\?\` verbatim 前缀与 symlink home 的发行版）。
+#[cfg(test)]
+fn test_upload_staging_base() -> &'static Path {
+    use std::sync::OnceLock;
+    static BASE: OnceLock<PathBuf> = OnceLock::new();
+    BASE.get_or_init(|| {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "liveagent-upload-staging-test-{}-{unique}",
+            std::process::id()
+        ));
+        let real = root.join("real");
+        fs::create_dir_all(&real).expect("create test staging dir");
+        #[cfg(unix)]
+        {
+            let link = root.join("staging");
+            std::os::unix::fs::symlink(&real, &link).expect("symlink test staging dir");
+            link
+        }
+        #[cfg(not(unix))]
+        {
+            real
+        }
+    })
+}
+
+/// 授权比较用的暂存区根。附件读取的 target 一律来自 `fs::canonicalize`
+/// （Windows 上是 `\\?\C:\...` verbatim 形式，symlink 也已被解析），逻辑
+/// 路径与它按组件比较永远不相等，必须把暂存根也 canonicalize 成同构形式
+/// 再比。目录不存在（从未落过暂存文件）时返回 None，此时暂存分支不放行。
+fn canonical_upload_staging_base() -> Option<PathBuf> {
+    let base = upload_staging_base().ok()?;
+    fs::canonicalize(base).ok()
+}
+
+/// 暂存文件保留天数：过期批次由启动 GC 清理。附件路径持久化在历史消息里，
+/// 因此不与单个会话的删除绑定，按时效回收是与"暂存区"语义一致的做法。
+const UPLOAD_STAGING_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+fn upload_import_root_in(base: &Path) -> Result<PathBuf, String> {
     let batch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let root = workdir.join("uploads").join(batch.to_string());
-    fs::create_dir_all(&root).map_err(|e| format!("创建上传目录失败 {}: {e}", root.display()))?;
-    Ok(root)
+    fs::create_dir_all(base).map_err(|e| format!("创建上传目录失败 {}: {e}", base.display()))?;
+    // 批次目录是"单次导入"的语义单位：同批文件共享目录，GC 与清理都按
+    // 目录整删。同一毫秒的并发导入撞名时追加序号拿独立目录，绝不共享
+    // （create_dir 而非 create_dir_all，已存在即视为撞名）。
+    for suffix in 0u32..1000 {
+        let name = if suffix == 0 {
+            batch.to_string()
+        } else {
+            format!("{batch}-{suffix}")
+        };
+        let root = base.join(name);
+        match fs::create_dir(&root) {
+            Ok(()) => return Ok(root),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("创建上传目录失败 {}: {e}", root.display())),
+        }
+    }
+    Err(format!(
+        "创建上传目录失败：{} 下批次名冲突过多",
+        base.display()
+    ))
+}
+
+fn upload_import_root() -> Result<PathBuf, String> {
+    upload_import_root_in(&upload_staging_base()?)
+}
+
+fn gc_upload_staging_in(base: &Path, now: SystemTime, retention: std::time::Duration) -> usize {
+    let Ok(entries) = fs::read_dir(base) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let expired = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > retention);
+        if expired && fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// 启动时清理过期的上传批次；失败只记录，绝不阻断启动。
+pub fn gc_upload_staging_on_startup() {
+    tauri::async_runtime::spawn_blocking(|| {
+        if let Ok(base) = upload_staging_base() {
+            gc_upload_staging_in(&base, SystemTime::now(), UPLOAD_STAGING_RETENTION);
+        }
+    });
 }
 
 fn build_readable_file_entry(
@@ -499,7 +707,24 @@ fn build_readable_file_entry(
     kind: &str,
     size_bytes: u64,
 ) -> Result<SystemReadableFileEntry, String> {
-    let relative_path = rel_to_workdir_forward_slash(workdir, destination)?;
+    // 工作区内的文件用真实相对路径；暂存区文件用 `uploads/<batch>/<name>`
+    // 形式的展示路径（UI 徽标、粘贴引用与去重 key 都吃这个字段），模型侧
+    // 的读取路径始终以 absolute_path 为准。调用方契约：暂存区 destination
+    // 由 upload_staging_base 的逻辑路径拼出（不 canonicalize），因此这里
+    // 用逻辑根 strip 即可对齐。
+    let relative_path = match rel_to_workdir_forward_slash(workdir, destination) {
+        Ok(relative) => relative,
+        Err(_) => {
+            let base = upload_staging_base()?;
+            let staged = destination.strip_prefix(&base).map_err(|_| {
+                format!(
+                    "路径既不在工作目录也不在上传暂存区：{}",
+                    destination.display()
+                )
+            })?;
+            format!("uploads/{}", staged.to_string_lossy().replace('\\', "/"))
+        }
+    };
     let file_name = destination
         .file_name()
         .and_then(|value| value.to_str())
@@ -535,42 +760,34 @@ fn canonicalize_uploaded_file_path(absolute_path: &str) -> Result<PathBuf, Strin
     fs::canonicalize(&path).map_err(|e| format!("无法解析图片路径：{e}"))
 }
 
+/// 附件读取的授权范围：当前工作目录，或应用上传暂存区。
+/// 调用方保证 `workdir` 与 `target` 都是 canonicalize 过的路径，
+/// 暂存分支因此必须用同样 canonicalize 过的根来比较。
+fn is_allowed_attachment_target(workdir: &Path, target: &Path) -> bool {
+    if target.starts_with(workdir) {
+        return true;
+    }
+    canonical_upload_staging_base().is_some_and(|base| target.starts_with(base))
+}
+
 fn canonicalize_uploaded_attachment_path(
     workdir: &Path,
     absolute_path: Option<&str>,
-    relative_path: Option<&str>,
 ) -> Result<PathBuf, String> {
-    let target = if let Some(raw_absolute_path) = absolute_path
+    // 附件读取只认 absolute_path：新方案下工作区内文件原地引用、暂存区
+    // 文件落 ~/.liveagent/uploads，两者的入口都是导入时返回的绝对路径。
+    // 旧版本仅持久化 workdir 相对路径的附件不再兼容，需重新上传。
+    let raw_absolute_path = absolute_path
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    {
-        canonicalize_uploaded_file_path(raw_absolute_path)?
-    } else {
-        let raw_relative_path = relative_path
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| "附件路径不能为空".to_string())?;
-        let rel = Path::new(raw_relative_path);
-        if rel.is_absolute()
-            || rel
-                .components()
-                .any(|component| !matches!(component, std::path::Component::Normal(_)))
-        {
-            return Err(format!(
-                "附件路径必须是工作目录内的相对路径：{raw_relative_path}"
-            ));
-        }
-        let candidate = workdir.join(rel);
-        let metadata = fs::metadata(&candidate)
-            .map_err(|_| format!("附件文件不存在或不可访问：{raw_relative_path}"))?;
-        if !metadata.is_file() {
-            return Err(format!("附件路径不是普通文件：{raw_relative_path}"));
-        }
-        fs::canonicalize(&candidate).map_err(|e| format!("无法解析附件路径：{e}"))?
-    };
+        .ok_or_else(|| "附件缺少绝对路径（旧版本导入的附件请重新上传）".to_string())?;
+    let target = canonicalize_uploaded_file_path(raw_absolute_path)?;
 
-    if !target.starts_with(workdir) {
-        return Err(format!("附件路径超出当前工作目录：{}", target.display()));
+    if !is_allowed_attachment_target(workdir, &target) {
+        return Err(format!(
+            "附件路径超出当前工作目录与上传暂存区：{}",
+            target.display()
+        ));
     }
     Ok(target)
 }
@@ -713,8 +930,8 @@ fn import_readable_file_paths_into_workdir(
             continue;
         }
 
-        let kind = match detect_upload_file_kind(&source) {
-            Ok(kind) => kind,
+        let detected = match detect_upload_file_kind(&source) {
+            Ok(detected) => detected,
             Err(message) => {
                 skipped.push(message);
                 continue;
@@ -722,13 +939,16 @@ fn import_readable_file_paths_into_workdir(
         };
 
         let canonical_source = fs::canonicalize(&source).unwrap_or_else(|_| source.clone());
+        let mut entry_size = metadata.len();
         let destination = if canonical_source.starts_with(workdir) {
+            // 工作区内文件保持原地引用（含非 UTF-8 文本，不改写用户文件）；
+            // 原生附件内联在读取侧转码，见 system_read_uploaded_native_attachment_sync。
             canonical_source
         } else {
             let import_root = match import_root.as_ref() {
                 Some(root) => root.clone(),
                 None => {
-                    let root = upload_import_root(workdir)?;
+                    let root = upload_import_root()?;
                     import_root = Some(root.clone());
                     root
                 }
@@ -739,21 +959,36 @@ fn import_readable_file_paths_into_workdir(
                 .unwrap_or("file");
             let sanitized_name = sanitize_uploaded_file_name(source_name);
             let target = unique_path_for_copy(import_root.join(sanitized_name));
-            fs::copy(&source, &target).map_err(|e| {
-                format!(
-                    "复制文件到工作区失败 {} -> {}: {e}",
-                    source.display(),
-                    target.display()
-                )
-            })?;
+            if detected.needs_utf8_transcode && metadata.len() <= UPLOADED_TEXT_TRANSCODE_MAX_BYTES
+            {
+                let bytes = fs::read(&source)
+                    .map_err(|e| format!("读取文件失败 {}: {e}", source.display()))?;
+                let utf8 = transcode_upload_text_to_utf8(&bytes);
+                entry_size = utf8.len() as u64;
+                fs::write(&target, &utf8).map_err(|e| {
+                    format!(
+                        "写入上传暂存文件失败 {} -> {}: {e}",
+                        source.display(),
+                        target.display()
+                    )
+                })?;
+            } else {
+                fs::copy(&source, &target).map_err(|e| {
+                    format!(
+                        "复制文件到上传暂存区失败 {} -> {}: {e}",
+                        source.display(),
+                        target.display()
+                    )
+                })?;
+            }
             target
         };
 
         files.push(build_readable_file_entry(
             workdir,
             &destination,
-            kind,
-            metadata.len(),
+            detected.kind,
+            entry_size,
         )?);
     }
 
@@ -790,12 +1025,12 @@ pub(crate) fn system_import_uploaded_readable_files_sync(
             continue;
         }
 
-        let kind = match detect_uploaded_bytes_kind(
+        let detected = match detect_uploaded_bytes_kind(
             source_name,
             upload.mime_type.as_deref(),
             &upload.content,
         ) {
-            Ok(kind) => kind,
+            Ok(detected) => detected,
             Err(message) => {
                 skipped.push(message);
                 continue;
@@ -805,22 +1040,30 @@ pub(crate) fn system_import_uploaded_readable_files_sync(
         let import_root = match import_root.as_ref() {
             Some(root) => root.clone(),
             None => {
-                let root = upload_import_root(&workdir)?;
+                let root = upload_import_root()?;
                 import_root = Some(root.clone());
                 root
             }
         };
 
+        let content = if detected.needs_utf8_transcode
+            && upload.content.len() as u64 <= UPLOADED_TEXT_TRANSCODE_MAX_BYTES
+        {
+            transcode_upload_text_to_utf8(&upload.content)
+        } else {
+            upload.content
+        };
+
         let sanitized_name = sanitize_uploaded_file_name(source_name);
         let target = unique_path_for_copy(import_root.join(sanitized_name));
-        fs::write(&target, &upload.content)
+        fs::write(&target, &content)
             .map_err(|e| format!("写入上传文件失败 {}: {e}", target.display()))?;
 
         files.push(build_readable_file_entry(
             &workdir,
             &target,
-            kind,
-            upload.content.len() as u64,
+            detected.kind,
+            content.len() as u64,
         )?);
     }
 
@@ -875,8 +1118,11 @@ pub(crate) fn system_read_uploaded_image_preview_sync(
 ) -> Result<SystemUploadedImagePreviewResponse, String> {
     let workdir = canonicalize_upload_workdir(&workdir)?;
     let target = canonicalize_uploaded_file_path(&absolute_path)?;
-    if !target.starts_with(&workdir) {
-        return Err(format!("图片路径超出当前工作目录：{}", target.display()));
+    if !is_allowed_attachment_target(&workdir, &target) {
+        return Err(format!(
+            "图片路径超出当前工作目录与上传暂存区：{}",
+            target.display()
+        ));
     }
     let mime_type = infer_image_upload_mime(&target)
         .ok_or_else(|| format!("{} 不是受支持的图片文件", target.display()))?;
@@ -897,15 +1143,10 @@ pub(crate) fn system_read_uploaded_image_preview_sync(
 pub(crate) fn system_read_uploaded_native_attachment_sync(
     workdir: String,
     absolute_path: Option<String>,
-    relative_path: Option<String>,
     kind: Option<String>,
 ) -> Result<SystemUploadedNativeAttachmentResponse, String> {
     let workdir = canonicalize_upload_workdir(&workdir)?;
-    let target = canonicalize_uploaded_attachment_path(
-        &workdir,
-        absolute_path.as_deref(),
-        relative_path.as_deref(),
-    )?;
+    let target = canonicalize_uploaded_attachment_path(&workdir, absolute_path.as_deref())?;
     let metadata = fs::metadata(&target)
         .map_err(|e| format!("读取附件元数据失败 {}: {e}", target.display()))?;
     if metadata.len() > UPLOADED_NATIVE_ATTACHMENT_MAX_BYTES {
@@ -916,11 +1157,20 @@ pub(crate) fn system_read_uploaded_native_attachment_sync(
         ));
     }
     let bytes = fs::read(&target).map_err(|e| format!("读取附件失败 {}: {e}", target.display()))?;
+    // 文本类附件必须以 UTF-8 内联：工作区内原地引用的文件可能是 GBK/UTF-16
+    // 等编码（导入时不改写用户文件），JS 侧 decodeBase64Utf8 与各家 API 都按
+    // UTF-8 解读 text/plain，这里在读取侧转码。
+    let bytes = if kind.as_deref() == Some("text") {
+        transcode_upload_text_to_utf8(&bytes)
+    } else {
+        bytes
+    };
+    let size_bytes = bytes.len() as u64;
 
     Ok(SystemUploadedNativeAttachmentResponse {
         mime_type: infer_native_attachment_mime(&target, kind.as_deref()),
         data: BASE64_STANDARD.encode(bytes),
-        size_bytes: metadata.len(),
+        size_bytes,
     })
 }
 
@@ -990,7 +1240,7 @@ fn is_windows_reserved_project_name(name: &str) -> bool {
                 .is_ok_and(|value| (1..=9).contains(&value)))
 }
 
-fn validate_project_folder_name(name: &str) -> Result<&str, String> {
+pub(crate) fn validate_project_folder_name(name: &str) -> Result<&str, String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err("项目名不能为空".to_string());
@@ -1099,6 +1349,30 @@ pub async fn system_pick_folder(initial_workdir: Option<String>) -> Result<Optio
 }
 
 #[tauri::command(rename_all = "snake_case")]
+pub async fn system_pick_file(
+    initial_workdir: Option<String>,
+    filter_name: Option<String>,
+    extensions: Option<Vec<String>>,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut dialog = FileDialog::new();
+        if let Some(initial_dir) = resolve_pick_folder_initial_dir(initial_workdir) {
+            dialog = dialog.set_directory(initial_dir);
+        }
+        if let Some(extensions) = extensions.filter(|list| !list.is_empty()) {
+            let extension_refs: Vec<&str> = extensions.iter().map(String::as_str).collect();
+            dialog = dialog.add_filter(filter_name.as_deref().unwrap_or("Files"), &extension_refs);
+        }
+
+        Ok(dialog
+            .pick_file()
+            .map(|path| path.to_string_lossy().into_owned()))
+    })
+    .await
+    .map_err(|e| format!("system_pick_file join 失败：{e}"))?
+}
+
+#[tauri::command(rename_all = "snake_case")]
 pub async fn system_create_project_folder(
     parent: String,
     name: String,
@@ -1182,11 +1456,10 @@ pub async fn system_read_uploaded_image_preview(
 pub async fn system_read_uploaded_native_attachment(
     workdir: String,
     absolute_path: Option<String>,
-    relative_path: Option<String>,
     kind: Option<String>,
 ) -> Result<SystemUploadedNativeAttachmentResponse, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        system_read_uploaded_native_attachment_sync(workdir, absolute_path, relative_path, kind)
+        system_read_uploaded_native_attachment_sync(workdir, absolute_path, kind)
     })
     .await
     .map_err(|e| format!("system_read_uploaded_native_attachment join failed: {e}"))?
@@ -1248,6 +1521,27 @@ pub async fn system_append_debug_jsonl(
     .map_err(|e| format!("system_append_debug_jsonl join 失败：{e}"))?
 }
 
+// 桌面端读系统剪贴板的唯一通道：WKWebView 的 navigator.clipboard.readText()
+// 对来自其他应用的剪贴板内容会弹出原生"粘贴"确认气泡（DOM paste access），
+// 自定义右键菜单的粘贴必须绕开 webview 直接读原生剪贴板。
+fn system_clipboard_read_text_sync() -> Result<String, String> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|e| format!("clipboard unavailable: {e}"))?;
+    match clipboard.get_text() {
+        Ok(text) => Ok(text),
+        // 剪贴板无文本内容（空/图片/文件）时按空文本处理，前端据此静默收起菜单。
+        Err(arboard::Error::ContentNotAvailable) => Ok(String::new()),
+        Err(e) => Err(format!("clipboard read failed: {e}")),
+    }
+}
+
+#[tauri::command]
+pub async fn system_clipboard_read_text() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(system_clipboard_read_text_sync)
+        .await
+        .map_err(|e| format!("system_clipboard_read_text join failed: {e}"))?
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub fn system_begin_power_activity(
     activity_id: String,
@@ -1293,7 +1587,7 @@ mod tests {
     fn sanitize_uploaded_file_name_avoids_windows_reserved_names() {
         assert_eq!(
             sanitize_uploaded_file_name("safe name.txt"),
-            "safe_name.txt"
+            "safe name.txt"
         );
         assert_eq!(sanitize_uploaded_file_name("CON.txt"), "CON_file.txt");
         assert_eq!(sanitize_uploaded_file_name("aux"), "aux_file");
@@ -1302,32 +1596,96 @@ mod tests {
     }
 
     #[test]
-    fn upload_import_root_uses_workdir_uploads_directory() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let workdir = std::env::temp_dir().join(format!(
-            "liveagent-upload-root-test-{}-{unique}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&workdir).expect("create test workdir");
-
-        let root = upload_import_root(&workdir).expect("create upload root");
-
-        assert!(
-            root.starts_with(workdir.join("uploads")),
-            "upload root should be under workdir/uploads: {}",
-            root.display()
+    fn sanitize_uploaded_file_name_preserves_unicode_names() {
+        assert_eq!(sanitize_uploaded_file_name("报告.pdf"), "报告.pdf");
+        assert_eq!(
+            sanitize_uploaded_file_name("第三季度 财务:报表.xlsx"),
+            "第三季度 财务_报表.xlsx"
         );
+        assert_eq!(
+            sanitize_uploaded_file_name("русский файл.txt"),
+            "русский файл.txt"
+        );
+        assert_eq!(
+            sanitize_uploaded_file_name("面试题（最终版）.docx"),
+            "面试题（最终版）.docx"
+        );
+        // 路径分隔符与遍历序列被压成单段组件；控制字符被替换。
+        assert_eq!(
+            sanitize_uploaded_file_name("../../秘密.txt"),
+            "_.._秘密.txt"
+        );
+        assert_eq!(
+            sanitize_uploaded_file_name("恶意\u{7}响铃.txt"),
+            "恶意_响铃.txt"
+        );
+        // 全部非法字符时回退到占位名。
+        assert_eq!(sanitize_uploaded_file_name("..."), "file");
+    }
+
+    #[test]
+    fn upload_import_root_stays_outside_the_workspace() {
+        let root = upload_import_root().expect("create upload root");
+
+        let staging_base = upload_staging_base().expect("resolve staging base");
         assert!(
-            !root.starts_with(workdir.join(".liveagent")),
-            "upload root must not use workdir/.liveagent: {}",
+            root.starts_with(&staging_base),
+            "upload root should live in the app staging area: {}",
             root.display()
         );
         assert!(root.exists(), "upload root should be created");
 
-        let _ = fs::remove_dir_all(&workdir);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gc_upload_staging_removes_only_expired_batches() {
+        let temp = tempdir().expect("create temp dir");
+        let base = temp.path().join("uploads");
+        let expired = base.join("100");
+        let fresh = base.join("200");
+        fs::create_dir_all(&expired).expect("create expired batch");
+        fs::create_dir_all(&fresh).expect("create fresh batch");
+        fs::write(expired.join("old.txt"), b"old").expect("write expired file");
+
+        let retention = std::time::Duration::from_secs(60);
+        let now = SystemTime::now() + std::time::Duration::from_secs(120);
+        let removed = gc_upload_staging_in(&base, now, retention);
+
+        assert_eq!(removed, 2, "both stale batches are collected");
+        assert!(!expired.exists());
+        assert!(!fresh.exists());
+
+        fs::create_dir_all(&fresh).expect("recreate fresh batch");
+        let kept = gc_upload_staging_in(&base, SystemTime::now(), retention);
+        assert_eq!(kept, 0, "batches inside the retention window survive");
+        assert!(fresh.exists());
+    }
+
+    #[test]
+    fn readable_file_entries_report_staging_display_paths() {
+        let temp = tempdir().expect("create temp dir");
+        let workdir = temp.path().join("workspace");
+        let staging = upload_staging_base().expect("resolve staging base");
+        let batch = staging.join("test-batch-entry");
+        fs::create_dir_all(&workdir).expect("create workdir");
+        fs::create_dir_all(&batch).expect("create staging batch");
+        let staged = batch.join("notes.txt");
+        fs::write(&staged, b"hello").expect("write staged file");
+
+        let entry =
+            build_readable_file_entry(&workdir, &staged, "text", 5).expect("build staged entry");
+        assert_eq!(entry.relative_path, "uploads/test-batch-entry/notes.txt");
+        assert_eq!(entry.absolute_path, staged.to_string_lossy());
+
+        let inside = workdir.join("src").join("main.rs");
+        fs::create_dir_all(inside.parent().expect("parent")).expect("create src dir");
+        fs::write(&inside, b"fn main() {}").expect("write workspace file");
+        let workspace_entry =
+            build_readable_file_entry(&workdir, &inside, "text", 12).expect("build entry");
+        assert_eq!(workspace_entry.relative_path, "src/main.rs");
+
+        let _ = fs::remove_dir_all(&batch);
     }
 
     #[test]
@@ -1360,8 +1718,10 @@ mod tests {
         .expect("reuse existing dir");
 
         assert_eq!(
-            PathBuf::from(response.path),
-            existing.canonicalize().expect("canonicalize existing dir")
+            response.path,
+            project_folder_display_path(
+                &existing.canonicalize().expect("canonicalize existing dir")
+            )
         );
     }
 
@@ -1451,7 +1811,13 @@ mod tests {
             first_parent, second_parent,
             "files selected in one upload should share a batch directory"
         );
+        assert!(
+            !first_parent.starts_with(&workdir),
+            "uploads must not land inside the workspace: {}",
+            first_parent.display()
+        );
 
+        let _ = fs::remove_dir_all(&first_parent);
         let _ = fs::remove_dir_all(&workdir);
     }
 
@@ -1500,7 +1866,49 @@ mod tests {
             "alpha"
         );
 
+        if let Some(parent) = Path::new(&response.files[0].absolute_path).parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
         let _ = fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn import_uploaded_readable_files_preserves_unicode_file_names() {
+        let temp = tempdir().expect("create temp dir");
+        let workdir = temp.path().join("workspace");
+        fs::create_dir_all(&workdir).expect("create workdir");
+
+        let response = system_import_uploaded_readable_files_sync(
+            workdir.to_string_lossy().into_owned(),
+            vec![SystemReadableFileUploadInput {
+                file_name: "季度报告.txt".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                content: "你好".as_bytes().to_vec(),
+            }],
+        )
+        .expect("import unicode-named upload");
+
+        assert!(
+            response.skipped.is_empty(),
+            "skipped = {:?}",
+            response.skipped
+        );
+        assert_eq!(response.files.len(), 1);
+        assert_eq!(response.files[0].file_name, "季度报告.txt");
+        assert!(
+            response.files[0].relative_path.ends_with("/季度报告.txt"),
+            "relative_path = {}",
+            response.files[0].relative_path
+        );
+        assert!(
+            response.files[0].absolute_path.ends_with("季度报告.txt"),
+            "absolute_path = {}",
+            response.files[0].absolute_path
+        );
+
+        if let Some(parent) = Path::new(&response.files[0].absolute_path).parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
     }
 
     #[test]
@@ -1514,8 +1922,7 @@ mod tests {
 
         let response = system_read_uploaded_native_attachment_sync(
             workdir.to_string_lossy().into_owned(),
-            None,
-            Some("uploads/batch/note.txt".to_string()),
+            Some(upload.to_string_lossy().into_owned()),
             Some("text".to_string()),
         )
         .expect("read native attachment");
@@ -1524,20 +1931,77 @@ mod tests {
         assert_eq!(response.data, BASE64_STANDARD.encode(b"hello"));
         assert_eq!(response.size_bytes, 5);
 
+        // 仅有 workdir 相对路径的旧附件不再兼容：绝对路径缺失直接拒绝。
+        let legacy = system_read_uploaded_native_attachment_sync(
+            workdir.to_string_lossy().into_owned(),
+            None,
+            Some("text".to_string()),
+        )
+        .expect_err("relative-only legacy attachments must be rejected");
+        assert!(legacy.contains("附件缺少绝对路径"), "error = {legacy}");
+
         let outside = temp.path().join("outside.txt");
         fs::write(&outside, b"outside").expect("write outside file");
         let error = system_read_uploaded_native_attachment_sync(
             workdir.to_string_lossy().into_owned(),
             Some(outside.to_string_lossy().into_owned()),
-            None,
             Some("text".to_string()),
         )
         .expect_err("outside file must be rejected");
 
         assert!(
-            error.contains("附件路径超出当前工作目录"),
+            error.contains("附件路径超出当前工作目录与上传暂存区"),
             "error = {error}"
         );
+    }
+
+    #[test]
+    fn read_uploaded_native_attachment_allows_staging_files() {
+        let temp = tempdir().expect("create temp dir");
+        let workdir = temp.path().join("workspace");
+        fs::create_dir_all(&workdir).expect("create workdir");
+        let staging = upload_staging_base().expect("resolve staging base");
+        let batch = staging.join("test-batch-native");
+        fs::create_dir_all(&batch).expect("create staging batch");
+        let staged = batch.join("note.txt");
+        fs::write(&staged, b"staged").expect("write staged file");
+
+        let response = system_read_uploaded_native_attachment_sync(
+            workdir.to_string_lossy().into_owned(),
+            Some(staged.to_string_lossy().into_owned()),
+            Some("text".to_string()),
+        )
+        .expect("staging attachment must be readable");
+
+        assert_eq!(response.data, BASE64_STANDARD.encode(b"staged"));
+
+        let _ = fs::remove_dir_all(&batch);
+    }
+
+    #[test]
+    fn attachment_authorization_compares_canonical_staging_base() {
+        // 复现线上 bug 形态：授权时 target 一律是 canonicalize 产物（Windows
+        // 为 `\\?\` verbatim，symlink 已解析），而逻辑暂存根不是。测试暂存根
+        // 在 Unix 上刻意经过 symlink，若比较未按 canonical 同构进行，
+        // canonical 化后的 target 不会命中逻辑根，这里立即失败。越界拒绝由
+        // read_uploaded_native_attachment_reads_workspace_file_and_rejects_escape 覆盖。
+        let staging = upload_staging_base().expect("resolve staging base");
+        let batch = staging.join("test-batch-auth");
+        fs::create_dir_all(&batch).expect("create staging batch");
+        let staged = batch.join("auth.txt");
+        fs::write(&staged, b"auth").expect("write staged file");
+        let canonical_target = fs::canonicalize(&staged).expect("canonicalize staged file");
+
+        let temp = tempdir().expect("create temp dir");
+        let workdir = fs::canonicalize(temp.path()).expect("canonicalize workdir");
+
+        assert!(
+            is_allowed_attachment_target(&workdir, &canonical_target),
+            "canonicalized staging target must stay authorized: {}",
+            canonical_target.display()
+        );
+
+        let _ = fs::remove_dir_all(&batch);
     }
 
     #[test]
@@ -1573,6 +2037,11 @@ mod tests {
         assert_eq!(response.files[0].file_name, "notes.txt");
         assert!(response.files[0].relative_path.starts_with("uploads/"));
         assert!(
+            !Path::new(&response.files[0].absolute_path).starts_with(&workdir),
+            "external uploads must be staged outside the workspace: {}",
+            response.files[0].absolute_path
+        );
+        assert!(
             response
                 .skipped
                 .iter()
@@ -1581,6 +2050,9 @@ mod tests {
             response.skipped
         );
 
+        if let Some(parent) = Path::new(&response.files[0].absolute_path).parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
         let _ = fs::remove_dir_all(&temp_root);
     }
 
@@ -1592,7 +2064,8 @@ mod tests {
                 Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
                 b"not validated here",
             )
-            .expect("docx should be accepted"),
+            .expect("docx should be accepted")
+            .kind,
             "word"
         );
         assert_eq!(
@@ -1601,18 +2074,207 @@ mod tests {
                 Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
                 b"not validated here",
             )
-            .expect("xlsx should be accepted"),
+            .expect("xlsx should be accepted")
+            .kind,
             "spreadsheet"
         );
         assert_eq!(
             detect_uploaded_bytes_kind("bundle.tar.gz", Some("application/gzip"), b"gzip")
-                .expect("tar.gz should be accepted"),
+                .expect("tar.gz should be accepted")
+                .kind,
             "archive"
         );
         assert_eq!(
             detect_uploaded_bytes_kind("assets.7z", Some("application/x-7z-compressed"), b"7z")
-                .expect("7z should be accepted"),
+                .expect("7z should be accepted")
+                .kind,
             "archive"
         );
+    }
+
+    /// "中文测试文本" 的 GBK 编码字节。
+    fn gbk_sample(repeat: usize) -> Vec<u8> {
+        let unit: &[u8] = &[
+            0xD6, 0xD0, 0xCE, 0xC4, 0xB2, 0xE2, 0xCA, 0xD4, 0xCE, 0xC4, 0xB1, 0xBE,
+        ];
+        unit.repeat(repeat)
+    }
+
+    #[test]
+    fn classify_upload_text_bytes_accepts_legacy_encodings() {
+        assert_eq!(
+            classify_upload_text_bytes("你好".as_bytes(), false),
+            UploadTextClass::Utf8
+        );
+        assert_eq!(
+            classify_upload_text_bytes(&[0xEF, 0xBB, 0xBF, b'h', b'i'], false),
+            UploadTextClass::Utf8
+        );
+        assert_eq!(
+            classify_upload_text_bytes(&gbk_sample(4), false),
+            UploadTextClass::NeedsTranscode
+        );
+        // UTF-16LE BOM + "你好"：ASCII 之外也不能被 NUL 检查误杀。
+        assert_eq!(
+            classify_upload_text_bytes(&[0xFF, 0xFE, 0x60, 0x4F, 0x7D, 0x59], false),
+            UploadTextClass::NeedsTranscode
+        );
+        assert_eq!(
+            classify_upload_text_bytes(&[0x00, 0x01, 0x02, 0x03], false),
+            UploadTextClass::Binary
+        );
+        // 非 UTF-8 且控制字符占比高：判二进制而不是待转码文本。
+        assert_eq!(
+            classify_upload_text_bytes(&[0x80, 0x01, 0x02, 0x81, 0x03, 0x04, 0x82, 0x05], false),
+            UploadTextClass::Binary
+        );
+    }
+
+    #[test]
+    fn classify_upload_text_bytes_tolerates_truncated_utf8_tail() {
+        // 模拟 32KiB 探测边界切断多字节字符：完整 UTF-8 文本在截断前缀上
+        // 也必须判为 UTF-8 文本，而不是二进制或待转码。
+        let mut prefix = vec![b'a'; 16];
+        prefix.extend_from_slice(&"界".as_bytes()[..2]);
+        assert_eq!(
+            classify_upload_text_bytes(&prefix, true),
+            UploadTextClass::Utf8
+        );
+        // 非截断场景下同样的字节仍是非法 UTF-8 → 走待转码分类。
+        assert_eq!(
+            classify_upload_text_bytes(&prefix, false),
+            UploadTextClass::NeedsTranscode
+        );
+    }
+
+    #[test]
+    fn classify_upload_text_file_tolerates_probe_boundary_split() {
+        let temp = tempdir().expect("create temp dir");
+        let path = temp.path().join("large-utf8.txt");
+        // 让一个三字节汉字恰好跨越 32KiB 探测边界。
+        let mut content = vec![b'a'; UPLOAD_TEXT_PROBE_BYTES - 1];
+        content.extend_from_slice("界界界".as_bytes());
+        fs::write(&path, &content).expect("write large utf8 file");
+
+        assert_eq!(
+            classify_upload_text_file(&path).expect("classify large utf8 file"),
+            UploadTextClass::Utf8
+        );
+        assert_eq!(
+            detect_upload_file_kind(&path)
+                .expect("large utf8 txt must stay text")
+                .kind,
+            "text"
+        );
+    }
+
+    #[test]
+    fn transcode_upload_text_handles_gbk_and_utf16() {
+        let gbk = gbk_sample(4);
+        let transcoded = transcode_upload_text_to_utf8(&gbk);
+        assert_eq!(
+            String::from_utf8(transcoded).expect("transcoded output must be utf8"),
+            "中文测试文本".repeat(4)
+        );
+
+        let utf16le = [0xFF, 0xFE, 0x60, 0x4F, 0x7D, 0x59];
+        assert_eq!(
+            String::from_utf8(transcode_upload_text_to_utf8(&utf16le)).expect("utf16 to utf8"),
+            "你好"
+        );
+
+        // 合法 UTF-8 原样返回（分类可能来自截断前缀的误报）。
+        let utf8 = "中文测试文本".as_bytes();
+        assert_eq!(transcode_upload_text_to_utf8(utf8), utf8);
+    }
+
+    #[test]
+    fn import_uploaded_gbk_text_is_transcoded_to_utf8() {
+        let temp = tempdir().expect("create temp dir");
+        let workdir = temp.path().join("workspace");
+        fs::create_dir_all(&workdir).expect("create workdir");
+
+        let response = system_import_uploaded_readable_files_sync(
+            workdir.to_string_lossy().into_owned(),
+            vec![SystemReadableFileUploadInput {
+                file_name: "gbk-notes.txt".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                content: gbk_sample(8),
+            }],
+        )
+        .expect("import gbk upload");
+
+        assert!(
+            response.skipped.is_empty(),
+            "skipped = {:?}",
+            response.skipped
+        );
+        assert_eq!(response.files.len(), 1);
+        assert_eq!(response.files[0].kind, "text");
+        let staged =
+            fs::read_to_string(&response.files[0].absolute_path).expect("staged copy must be utf8");
+        assert_eq!(staged, "中文测试文本".repeat(8));
+        assert_eq!(response.files[0].size_bytes, staged.len() as u64);
+
+        if let Some(parent) = Path::new(&response.files[0].absolute_path).parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn import_external_gbk_file_path_is_transcoded_to_utf8() {
+        let temp = tempdir().expect("create temp dir");
+        let workdir = temp.path().join("workspace");
+        let external = temp.path().join("external");
+        fs::create_dir_all(&workdir).expect("create workdir");
+        fs::create_dir_all(&external).expect("create external dir");
+        let source = external.join("gbk-notes.txt");
+        fs::write(&source, gbk_sample(8)).expect("write gbk source");
+
+        let response = system_import_readable_file_paths_sync(
+            workdir.to_string_lossy().into_owned(),
+            vec![source.to_string_lossy().into_owned()],
+            None,
+        )
+        .expect("import gbk file path");
+
+        assert!(
+            response.skipped.is_empty(),
+            "skipped = {:?}",
+            response.skipped
+        );
+        assert_eq!(response.files.len(), 1);
+        assert_eq!(response.files[0].kind, "text");
+        let staged =
+            fs::read_to_string(&response.files[0].absolute_path).expect("staged copy must be utf8");
+        assert_eq!(staged, "中文测试文本".repeat(8));
+        // 原始文件保持原样，不被改写。
+        assert_eq!(fs::read(&source).expect("read source"), gbk_sample(8));
+
+        if let Some(parent) = Path::new(&response.files[0].absolute_path).parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn read_uploaded_native_attachment_transcodes_legacy_text() {
+        let temp = tempdir().expect("create temp dir");
+        let workdir = temp.path().join("workspace");
+        fs::create_dir_all(&workdir).expect("create workdir");
+        // 工作区内原地引用的 GBK 文件：导入时不改写，内联读取时转码。
+        let inside = workdir.join("legacy.txt");
+        fs::write(&inside, gbk_sample(8)).expect("write gbk workspace file");
+
+        let response = system_read_uploaded_native_attachment_sync(
+            workdir.to_string_lossy().into_owned(),
+            Some(inside.to_string_lossy().into_owned()),
+            Some("text".to_string()),
+        )
+        .expect("read gbk native attachment");
+
+        assert_eq!(response.mime_type, "text/plain");
+        let expected = "中文测试文本".repeat(8);
+        assert_eq!(response.data, BASE64_STANDARD.encode(expected.as_bytes()));
+        assert_eq!(response.size_bytes, expected.len() as u64);
     }
 }

@@ -7,12 +7,11 @@
 import type { Context, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
 import { runAssistantWithTools } from "../../chat/runner/agentRunner";
 import { createStreamDebugLogger } from "../../debug/agentDebug";
-import { assistantMessageToText } from "../../providers/llm";
+import { assistantMessageToText, createProviderRuntimeConfig } from "../../providers/llm";
 import {
   type AppSettings,
   computeNextMemoryOrganizerRunAt,
   DEFAULT_CHAT_RUNTIME_CONTROLS,
-  findProviderModelConfig,
   isAgentDevMode,
 } from "../../settings";
 import { createMemoryTools } from "../../tools/memoryTools";
@@ -243,14 +242,15 @@ async function runOrganizerModelPrompt(params: {
     providerId: provider.type,
     model,
     runtime: {
-      baseUrl: provider.baseUrl,
-      apiKey: provider.apiKey,
-      requestFormat: provider.requestFormat,
-      reasoning: DEFAULT_CHAT_RUNTIME_CONTROLS.reasoning,
+      ...createProviderRuntimeConfig(
+        provider,
+        model,
+        DEFAULT_CHAT_RUNTIME_CONTROLS,
+        params.settings.customSettings.providerIdentities,
+      ),
+      // 后台整理恒开提示词缓存：多轮 prompt 共享同一前缀，命中率远高于按供应商
+      // 开关逐个判断。
       promptCachingEnabled: true,
-      nativeWebSearchEnabled: DEFAULT_CHAT_RUNTIME_CONTROLS.nativeWebSearchEnabled,
-      useSystemProxy: provider.useSystemProxy,
-      modelConfig: findProviderModelConfig(provider, model),
     },
     context,
     workdir: params.workdir,

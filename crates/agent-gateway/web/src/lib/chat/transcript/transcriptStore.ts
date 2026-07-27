@@ -5,7 +5,7 @@ import type {
   StreamRunActivity,
 } from "@/lib/chat/stream/streamTypes";
 import { readEventRunId, readEventSeq } from "@/lib/chat/stream/streamTypes";
-import { type ChatEntry, normalizeLiveUploadedFiles } from "@/lib/chatUi";
+import { type ChatEntry, normalizeLiveUploadedFiles, readHistoryMessageRef } from "@/lib/chatUi";
 import type { ChatEvent } from "@/lib/gatewayTypes";
 
 import { alignHistory } from "./historyAlignment";
@@ -24,6 +24,7 @@ import {
 } from "./turnReducer";
 import type {
   HistoryApplyMode,
+  RetryAttemptRecord,
   TranscriptRow,
   TranscriptSnapshot,
   Turn,
@@ -46,7 +47,7 @@ import type {
 // row keys, row objects and the DOM container are all unchanged, so the
 // fold is a pure data transition and nothing remounts.
 
-export type { TranscriptRow, TranscriptSnapshot, Turn } from "./types";
+export type { RetryAttemptRecord, TranscriptRow, TranscriptSnapshot, Turn } from "./types";
 
 export type TranscriptStore = {
   getSnapshot(): TranscriptSnapshot;
@@ -83,6 +84,8 @@ export type TranscriptStore = {
   flush(): void;
 };
 
+const EMPTY_RETRY_ATTEMPTS: readonly RetryAttemptRecord[] = [];
+
 const EMPTY_SNAPSHOT: TranscriptSnapshot = {
   rows: [],
   liveStartIndex: -1,
@@ -91,9 +94,37 @@ const EMPTY_SNAPSHOT: TranscriptSnapshot = {
   activeRun: null,
   toolStatus: null,
   toolStatusIsCompaction: false,
+  retryAttempts: EMPTY_RETRY_ATTEMPTS,
+  needsHistoryRefresh: false,
   foldRevision: 0,
   revision: 0,
 };
+
+// tool_status events without a retryAttempts array leave the current list
+// untouched (null result); an array — including an empty one — replaces it.
+function normalizeRetryAttempts(raw: unknown): RetryAttemptRecord[] | null {
+  if (!Array.isArray(raw)) {
+    return null;
+  }
+  const attempts: RetryAttemptRecord[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+    const value = entry as Record<string, unknown>;
+    const attempt = typeof value.attempt === "number" && Number.isFinite(value.attempt);
+    const maxAttempts = typeof value.maxAttempts === "number" && Number.isFinite(value.maxAttempts);
+    if (!attempt || !maxAttempts) {
+      continue;
+    }
+    attempts.push({
+      attempt: value.attempt as number,
+      maxAttempts: value.maxAttempts as number,
+      errorMessage: typeof value.errorMessage === "string" ? value.errorMessage : "",
+    });
+  }
+  return attempts;
+}
 
 // Streaming-delta commit cadence while the tab is hidden and rAF is frozen.
 const HIDDEN_COMMIT_DELAY_MS = 250;
@@ -105,6 +136,18 @@ function isDocumentHidden() {
 function readEventClientRequestId(event: ConversationStreamEvent): string {
   const value = (event as { client_request_id?: unknown }).client_request_id;
   return typeof value === "string" ? value.trim() : "";
+}
+
+// Terminals carrying these codes were inferred from missing liveness reports
+// (gateway reconcile / desktop ledger sweep) rather than produced by the run
+// itself — the run may still be streaming and the settled content incomplete.
+function isInferredRunLossErrorCode(errorCode: unknown): boolean {
+  return (
+    errorCode === "desktop_run_lost" ||
+    errorCode === "stale_run" ||
+    errorCode === "agent_offline" ||
+    errorCode === "desktop_runtime_lease_expired"
+  );
 }
 
 // Assistant-side content carriers (everything applyDelta folds into a turn's
@@ -148,6 +191,7 @@ export function createTranscriptStore(options?: {
   let activeRun: StreamRunActivity | null = null;
   let toolStatus: string | null = null;
   let toolStatusIsCompaction = false;
+  let retryAttempts: readonly RetryAttemptRecord[] = EMPTY_RETRY_ATTEMPTS;
   let foldRevision = 0;
   let localTurnSeq = 0;
   // Idempotency cursor: the highest log seq already applied. Re-subscribe
@@ -157,6 +201,15 @@ export function createTranscriptStore(options?: {
   // and never twice from the same stream position across syncs.
   let divergenceSignaled = false;
   let lastDivergenceSeq = -1;
+  // A rebased event whose truncation anchor was not found locally: the server
+  // authoritatively deleted a settled suffix this transcript still renders
+  // (the pre-message_ref pile-up bug, lost events, retention gaps). The next
+  // history snapshot applies as an authoritative replace (alignHistory
+  // rebaseReconcile) instead of a lag-protective enrich.
+  let rebaseDivergent = false;
+  // One resync nudge per unique missing anchor, ever — a replayed miss must
+  // not ping-pong resubscribes (each resync replays the same failing event).
+  const signaledRebaseAnchorMisses = new Set<string>();
 
   let snapshot = EMPTY_SNAPSHOT;
   let dirty = false;
@@ -303,6 +356,8 @@ export function createTranscriptStore(options?: {
       activeRun,
       toolStatus,
       toolStatusIsCompaction,
+      retryAttempts,
+      needsHistoryRefresh: rebaseDivergent || turns.some((turn) => turn.contentStale === true),
       foldRevision,
       revision: snapshot.revision + 1,
     };
@@ -399,13 +454,58 @@ export function createTranscriptStore(options?: {
     schedule(flush);
   };
 
+  const setRetryAttempts = (next: readonly RetryAttemptRecord[], flush?: boolean) => {
+    if (retryAttempts.length === 0 && next.length === 0) {
+      return;
+    }
+    retryAttempts = next.length === 0 ? EMPTY_RETRY_ATTEMPTS : next;
+    schedule(flush);
+  };
+
   const applyUserMessage = (event: ConversationStreamEvent, runId: string) => {
-    const payload = event as { message?: unknown; uploaded_files?: unknown };
+    const payload = event as {
+      message?: unknown;
+      message_id?: unknown;
+      messageId?: unknown;
+      uploaded_files?: unknown;
+      message_ref?: unknown;
+    };
     const clientRequestId = readEventClientRequestId(event);
     const text = typeof payload.message === "string" ? payload.message : "";
+    const messageIdRaw = payload.message_id ?? payload.messageId;
+    const messageId = typeof messageIdRaw === "string" ? messageIdRaw.trim() : "";
     const attachments = normalizeLiveUploadedFiles(payload.uploaded_files);
     if (!text.trim() && attachments.length === 0) {
       return;
+    }
+    // The message's persisted identity (desktop stamps it at persist time):
+    // the bare id aligns live turns with their history twins, the full ref
+    // additionally lets a follow-up edit-resend anchor its rebase on this
+    // turn without waiting for the post-run history refresh.
+    const messageRef = readHistoryMessageRef(payload.message_ref);
+    const bindUserIdentity = (user: UserChatEntry): UserChatEntry => {
+      let next = user;
+      if (messageId && next.messageId !== messageId) {
+        next = { ...next, messageId };
+      }
+      if (messageRef && next.messageRef?.messageId !== messageRef.messageId) {
+        next = { ...next, messageRef };
+      }
+      return next;
+    };
+    if (messageRef) {
+      // Fresh-open overlap: the fetched history may already render this very
+      // message's persisted echo while its run replays into a live turn. The
+      // exchange now belongs to the turn — truncate the region at the echo so
+      // the prompt renders once. Log eviction is prefix-based, so a replay
+      // containing this user_message also contains the rest of its run.
+      const echoIndex = historyEntries.findIndex(
+        (entry) => entry.kind === "user" && entry.messageRef?.messageId === messageRef.messageId,
+      );
+      if (echoIndex >= 0) {
+        historyEntries = historyEntries.slice(0, echoIndex);
+        schedule(true);
+      }
     }
 
     // (1) Our own submission: bind the optimistic turn to its run. The user
@@ -421,9 +521,16 @@ export function createTranscriptStore(options?: {
             kind: "user",
             text,
             attachments,
+            messageId: messageId || undefined,
+            messageRef,
             timestamp: Date.now(),
           },
         };
+      } else {
+        const boundUser = bindUserIdentity(next.user);
+        if (boundUser !== next.user) {
+          next = { ...next, user: boundUser };
+        }
       }
       if (next !== ownTurn) {
         replaceTurn(ownTurn, next);
@@ -443,10 +550,18 @@ export function createTranscriptStore(options?: {
             kind: "user",
             text,
             attachments,
+            messageId: messageId || undefined,
+            messageRef,
             timestamp: Date.now(),
           },
         });
         schedule(true);
+      } else {
+        const boundUser = bindUserIdentity(runTurn.user);
+        if (boundUser !== runTurn.user) {
+          replaceTurn(runTurn, { ...runTurn, user: boundUser });
+          schedule(true);
+        }
       }
       return;
     }
@@ -467,6 +582,8 @@ export function createTranscriptStore(options?: {
           kind: "user",
           text,
           attachments,
+          messageId: messageId || undefined,
+          messageRef,
           timestamp: Date.now(),
         },
       },
@@ -519,6 +636,9 @@ export function createTranscriptStore(options?: {
     }
     let next = adoptRun(turn, runId);
     next = rebuildTurnFromSnapshot(next, parsed);
+    if (next.inferredLossErrorEntryId) {
+      next = { ...next, inferredLossErrorEntryId: undefined };
+    }
     if (next.phase !== "streaming" || next.folded) {
       next = { ...next, phase: "streaming", folded: false };
     }
@@ -548,34 +668,75 @@ export function createTranscriptStore(options?: {
       }
       return;
     }
-    const payload = event as { status?: string; message?: string; reason?: string };
+    const payload = event as {
+      status?: string;
+      message?: string;
+      reason?: string;
+      error_code?: string;
+    };
+    const inferredLoss =
+      payload.status === "failed" && isInferredRunLossErrorCode(payload.error_code);
     let turn = findTurnByRunId(runId) ?? findStreamingTurn();
+    if (turn && !inferredLoss && turn.inferredLossErrorEntryId) {
+      const previousTurn = turn;
+      const correctedTurn = {
+        ...previousTurn,
+        entries: previousTurn.entries.filter(
+          (entry) => entry.id !== previousTurn.inferredLossErrorEntryId,
+        ),
+        inferredLossErrorEntryId: undefined,
+      };
+      replaceTurn(previousTurn, correctedTurn);
+      turn = correctedTurn;
+    }
     if (payload.status === "failed" && payload.message && payload.reason !== "superseded") {
       if (!turn) {
         turn = createTurn({ key: `run:${runId || `finished-${readEventSeq(event)}`}`, runId });
         turns = [...turns, turn];
       }
-      const withError = applyEventToTurn(turn, {
+      const previousEntryIds = new Set(turn.entries.map((entry) => entry.id));
+      let withError = applyEventToTurn(turn, {
         type: "error",
         message: payload.message,
       } as ChatEvent);
+      if (inferredLoss) {
+        const inferredErrorEntry = withError.entries.find(
+          (entry) => !previousEntryIds.has(entry.id),
+        );
+        if (inferredErrorEntry) {
+          withError = {
+            ...withError,
+            inferredLossErrorEntryId: inferredErrorEntry.id,
+          };
+        }
+      }
       replaceTurn(turn, withError);
       turn = withError;
     }
-    if (turn && turn.phase !== "settled") {
-      replaceTurn(turn, { ...turn, phase: "settled" });
+    // A failure inferred from missing liveness reports (desktop_run_lost &
+    // co) may have cut the stream mid-reply, so the streamed copy cannot be
+    // trusted as the full content: mark it stale so the post-persist history
+    // refresh may adopt the real reply (enrichTurnFromHistory). A gateway
+    // resurrection rebuilds from the runtime snapshot and clears the mark.
+    if (turn && (turn.phase !== "settled" || (inferredLoss && turn.contentStale !== true))) {
+      replaceTurn(turn, {
+        ...turn,
+        phase: "settled",
+        contentStale: inferredLoss ? true : turn.contentStale,
+      });
     }
     activeRun = null;
     setToolStatus(null, false);
+    setRetryAttempts(EMPTY_RETRY_ATTEMPTS);
     schedule(true);
   };
 
   // edit_resend: truncate the transcript at the edited user message. This is
   // shared by the synchronous optimistic path and the authoritative stream
   // event so the latter remains idempotent when it arrives.
-  const rebaseFromMessageRef = (ref: unknown): boolean => {
+  const readRebaseAnchor = (ref: unknown): { messageId: string; contentHash: string } | null => {
     if (!ref || typeof ref !== "object") {
-      return false;
+      return null;
     }
     const refValue = ref as Record<string, unknown>;
     const rawMessageId = refValue.message_id ?? refValue.messageId;
@@ -583,8 +744,17 @@ export function createTranscriptStore(options?: {
     const rawContentHash = refValue.content_hash ?? refValue.contentHash;
     const contentHash = typeof rawContentHash === "string" ? rawContentHash.trim() : "";
     if (!messageId && !contentHash) {
+      return null;
+    }
+    return { messageId, contentHash };
+  };
+
+  const rebaseFromMessageRef = (ref: unknown): boolean => {
+    const anchor = readRebaseAnchor(ref);
+    if (!anchor) {
       return false;
     }
+    const { messageId, contentHash } = anchor;
     // Prefer the exact message id; the content hash is only a fallback for
     // refs without one — matching on it eagerly would truncate at the FIRST
     // occurrence of a re-sent identical prompt.
@@ -622,6 +792,26 @@ export function createTranscriptStore(options?: {
     const ref = (event as { base_message_ref?: unknown }).base_message_ref;
     if (rebaseFromMessageRef(ref)) {
       schedule(true);
+      return;
+    }
+    const anchor = readRebaseAnchor(ref);
+    if (!anchor) {
+      return;
+    }
+    // The truncation anchor is nowhere in this transcript (its turn was
+    // created before the persisted identity was known, or the anchor events
+    // fell out of the buffer). Silently keeping the tail is exactly how old
+    // edit versions pile up as extra user bubbles: mark the transcript
+    // rebase-divergent so the next history snapshot applies as an
+    // authoritative replace, and nudge one resync per unique anchor in case
+    // the anchor-bearing events were merely lost from this subscription.
+    rebaseDivergent = true;
+    schedule(true);
+    const anchorKey = anchor.messageId || anchor.contentHash;
+    if (!divergenceSignaled && !signaledRebaseAnchorMisses.has(anchorKey)) {
+      divergenceSignaled = true;
+      signaledRebaseAnchorMisses.add(anchorKey);
+      options?.onDivergence?.();
     }
   };
 
@@ -648,10 +838,15 @@ export function createTranscriptStore(options?: {
           turns = [...turns, turn];
         }
         const bound = adoptRun(turn, runId);
+        const entries = bound.inferredLossErrorEntryId
+          ? bound.entries.filter((entry) => entry.id !== bound.inferredLossErrorEntryId)
+          : bound.entries;
         replaceTurn(turn, {
           ...bound,
+          entries,
           phase: "streaming",
           folded: false,
+          inferredLossErrorEntryId: undefined,
         });
         activeRun = {
           runId,
@@ -663,6 +858,7 @@ export function createTranscriptStore(options?: {
           updatedAt: Date.now(),
         };
         setToolStatus(null, false, true);
+        setRetryAttempts(EMPTY_RETRY_ATTEMPTS, true);
         schedule(true);
         return;
       }
@@ -720,6 +916,12 @@ export function createTranscriptStore(options?: {
           typeof status === "string" ? status : null,
           (event as { isCompaction?: boolean }).isCompaction === true,
         );
+        const nextRetryAttempts = normalizeRetryAttempts(
+          (event as { retryAttempts?: unknown }).retryAttempts,
+        );
+        if (nextRetryAttempts !== null) {
+          setRetryAttempts(nextRetryAttempts);
+        }
         if (activeRun && activeRun.runId === runId) {
           activeRun = { ...activeRun, toolStatus, toolStatusIsCompaction };
         }
@@ -803,6 +1005,7 @@ export function createTranscriptStore(options?: {
       }
       toolStatus = null;
       toolStatusIsCompaction = false;
+      retryAttempts = EMPTY_RETRY_ATTEMPTS;
       // Set the activity before the rebuild so the snapshot can target the
       // optimistic pending turn by client_request_id (its user bubble then
       // keeps its identity instead of a duplicate run turn appearing).
@@ -844,6 +1047,29 @@ export function createTranscriptStore(options?: {
         continue;
       }
       applyOne(event);
+    }
+    // history.get and chat.subscribe race when a conversation is opened.
+    // If history painted first, the replay/snapshot above has only now
+    // materialized the active turn; run the same guarded replace alignment
+    // once more so the persisted copy of that running exchange is removed.
+    // This is deliberately gated on a user-bearing active turn: an
+    // assistant-only mid-run snapshot cannot be paired safely by position.
+    if (
+      historyEntries.length > 0 &&
+      turns.some(
+        (turn) => (turn.phase === "pending" || turn.phase === "streaming") && turn.user !== null,
+      )
+    ) {
+      const aligned = alignHistory({
+        historyEntries,
+        turns,
+        entries: historyEntries,
+        mode: "replace",
+      });
+      if (aligned.changed) {
+        historyEntries = aligned.historyEntries;
+        turns = aligned.turns;
+      }
     }
     lastSeq = Math.max(lastSeq, result.latestSeq);
   };
@@ -970,11 +1196,19 @@ export function createTranscriptStore(options?: {
 
     applyHistorySnapshot: (entries, options) => {
       editResendStash = null;
+      // After a rebase whose anchor was missing, the transcript still renders
+      // settled turns the server already deleted. The lag-protective enrich
+      // would keep them forever — apply this snapshot as an authoritative
+      // replace that drops uncovered ref-less settled turns instead
+      // (persist-lag protections for genuinely lagged replies still apply).
+      const rebaseReconcile = rebaseDivergent;
+      rebaseDivergent = false;
       const result = alignHistory({
         historyEntries,
         turns,
         entries,
-        mode: options?.mode ?? "enrich",
+        mode: rebaseReconcile ? "replace" : (options?.mode ?? "enrich"),
+        rebaseReconcile,
       });
       if (!result.changed) {
         return;

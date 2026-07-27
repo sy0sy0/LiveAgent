@@ -23,12 +23,14 @@ function normalizeCachePart(value: string | undefined) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+// 预览身份 = workspaceRoot + absolutePath：附件读取只认导入时返回的绝对
+// 路径，旧版本仅持久化相对路径的附件不再提供预览。
 export function getUploadedImagePreviewCacheKey(
   workspaceRoot: string | undefined,
-  file: Pick<PendingUploadedFile, "absolutePath" | "relativePath">,
+  file: Pick<PendingUploadedFile, "absolutePath">,
 ) {
   const root = normalizeCachePart(workspaceRoot);
-  const path = normalizeCachePart(file.absolutePath) || normalizeCachePart(file.relativePath);
+  const path = normalizeCachePart(file.absolutePath);
   return root && path ? `${root}\0${path}` : "";
 }
 
@@ -42,7 +44,7 @@ function readUploadedImagePreviewCacheByKey(cacheKey: string) {
 
 export function readUploadedImagePreviewCache(
   workspaceRoot: string | undefined,
-  file: Pick<PendingUploadedFile, "absolutePath" | "relativePath">,
+  file: Pick<PendingUploadedFile, "absolutePath">,
 ) {
   const cacheKey = getUploadedImagePreviewCacheKey(workspaceRoot, file);
   return cacheKey ? readUploadedImagePreviewCacheByKey(cacheKey) : undefined;

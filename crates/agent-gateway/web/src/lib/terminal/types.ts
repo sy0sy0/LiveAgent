@@ -1,3 +1,5 @@
+import type { SshLocalForwardEvent } from "./sshLocalForwardTypes";
+
 export type TerminalSession = {
   id: string;
   projectPathKey: string;
@@ -97,6 +99,7 @@ export type TerminalEvent = {
   outputStartOffset?: number;
   outputEndOffset?: number;
   sshTabs?: SshTerminalTabsSnapshot;
+  sshLocalForward?: SshLocalForwardEvent;
 };
 
 export type TerminalStreamChunk = {
@@ -161,6 +164,7 @@ export type TerminalClient = {
     trustHostKey?: boolean;
   }): Promise<TerminalSshCreateResult>;
   cancelSshPrompt(promptId: string): Promise<void>;
+  sshReconnect(sessionId: string, projectPathKey?: string): Promise<TerminalSession>;
   sshLatency(sessionId: string, projectPathKey?: string): Promise<TerminalSshLatency>;
   listSshTerminalTabs(projectPathKey: string): Promise<SshTerminalTabsSnapshot>;
   openSshTerminalTab(params: {

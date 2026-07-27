@@ -21,6 +21,7 @@ function createController(options = {}) {
       }
       sent.push(item);
     },
+    flushEvents: options.flushEvents,
     resolveErrorConversationId: options.resolveErrorConversationId,
   });
   return { controller, sent };
@@ -149,6 +150,51 @@ test("gateway bridge tool status is normalized and de-duplicated", () => {
   );
 });
 
+test("gateway bridge retry attempts ride tool_status with the current status and de-duplicate", () => {
+  const { controller, sent } = createController();
+
+  // The initial clear (fresh round, nothing to clear remotely) is suppressed.
+  controller.queueRetryAttempts([]);
+  assert.deepEqual(sent, []);
+
+  controller.queueToolStatus("第 1 轮：模型生成中...");
+  controller.queueRetryAttempts([
+    { attempt: 1, maxAttempts: 5, errorMessage: "503 service unavailable" },
+  ]);
+  // Same list again: de-duplicated.
+  controller.queueRetryAttempts([
+    { attempt: 1, maxAttempts: 5, errorMessage: "503 service unavailable" },
+  ]);
+  // Explicit clear after a non-empty list is forwarded.
+  controller.queueRetryAttempts([]);
+
+  assert.deepEqual(
+    sent.map((item) => item.event),
+    [
+      {
+        type: "tool_status",
+        status: "第 1 轮：模型生成中...",
+        isCompaction: false,
+        conversation_id: "conversation-1",
+      },
+      {
+        type: "tool_status",
+        status: "第 1 轮：模型生成中...",
+        isCompaction: false,
+        retryAttempts: [{ attempt: 1, maxAttempts: 5, errorMessage: "503 service unavailable" }],
+        conversation_id: "conversation-1",
+      },
+      {
+        type: "tool_status",
+        status: "第 1 轮：模型生成中...",
+        isCompaction: false,
+        retryAttempts: [],
+        conversation_id: "conversation-1",
+      },
+    ],
+  );
+});
+
 test("gateway bridge close blocks normal events but allows forced title updates", () => {
   const { controller, sent } = createController();
 
@@ -176,6 +222,40 @@ test("gateway bridge close blocks normal events but allows forced title updates"
       },
     ],
   );
+});
+
+test("gateway bridge close waits for the transport drain and stays idempotent", async () => {
+  let releaseDrain;
+  let drainCalls = 0;
+  const drain = new Promise((resolve) => {
+    releaseDrain = resolve;
+  });
+  const { controller } = createController({
+    flushEvents: async (requestId) => {
+      drainCalls += 1;
+      assert.equal(requestId, "request-1");
+      await drain;
+    },
+  });
+
+  controller.queueToken("tail");
+  const firstClose = controller.close();
+  const secondClose = controller.close();
+  assert.equal(firstClose, secondClose);
+  assert.equal(controller.isClosed(), true);
+  assert.equal(drainCalls, 1);
+
+  let settled = false;
+  void firstClose.then(() => {
+    settled = true;
+  });
+  await Promise.resolve();
+  assert.equal(settled, false, "close must remain pending until queued events drain");
+
+  releaseDrain();
+  await firstClose;
+  assert.equal(settled, true);
+  assert.equal(drainCalls, 1);
 });
 
 test("gateway bridge checkpoint emits compaction summary payload", () => {
@@ -259,6 +339,7 @@ test("gateway bridge user message carries the edit-resend truncation base", () =
   const { controller, sent } = createController();
 
   controller.queueUserMessage("edited prompt", [], {
+    messageId: "user-new-1",
     baseMessageRef: {
       segmentIndex: 0,
       messageIndex: 2,
@@ -275,6 +356,7 @@ test("gateway bridge user message carries the edit-resend truncation base", () =
       event: {
         type: "user_message",
         message: "edited prompt",
+        message_id: "user-new-1",
         uploaded_files: [],
         conversation_id: "conversation-1",
         base_message_ref: {
@@ -304,6 +386,7 @@ test("gateway bridge user message omits the truncation base for plain sends", ()
     conversation_id: "conversation-1",
   });
   assert.equal("base_message_ref" in sent[0].event, false);
+  assert.equal("message_id" in sent[0].event, false);
   assert.equal("reason" in sent[0].event, false);
 });
 

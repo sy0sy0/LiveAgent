@@ -1,8 +1,10 @@
 import type { MutableRefObject } from "react";
+import type { Locale } from "../../../i18n/config";
 import type { GatewayBridgeEventController } from "../../../lib/chat/conversation/run";
 import {
   buildConversationTitlePrompt,
-  normalizeConversationTitle,
+  buildConversationTitleSystemPrompt,
+  normalizeGeneratedConversationTitle,
 } from "../../../lib/chat/page/chatPageHelpers";
 import { assistantMessageToText, streamAssistantMessage } from "../../../lib/providers/llm";
 import type { ProviderId } from "../../../lib/settings";
@@ -21,6 +23,11 @@ type StartConversationTitleJobParams = {
   conversationId: string;
   titleSourceText: string;
   content: string;
+  /**
+   * UI locale; the generated title language follows it. Required so a new
+   * caller cannot silently fall back to Chinese titles in an English UI.
+   */
+  locale: Locale;
   // Only the pending row's title is streamed into the sidebar; persisted rows
   // are renamed through the history IPC by the caller.
   sidebarStore: Pick<SidebarStore, "peek" | "upsertLocal">;
@@ -50,6 +57,7 @@ export function startConversationTitleJob(params: StartConversationTitleJobParam
     conversationId,
     titleSourceText,
     content,
+    locale,
     sidebarStore,
     titleJobRef,
     gatewayBridgeEvents,
@@ -82,12 +90,11 @@ export function startConversationTitleJob(params: StartConversationTitleJobParam
     cacheRetention: "none",
     nativeWebSearch: false,
     context: {
-      systemPrompt:
-        "You generate concise conversation titles. Output the title only, with no extra explanation.",
+      systemPrompt: buildConversationTitleSystemPrompt(locale),
       messages: [
         {
           role: "user",
-          content: buildConversationTitlePrompt(titleSourceText || content),
+          content: buildConversationTitlePrompt(titleSourceText || content, locale),
           timestamp: Date.now(),
         },
       ],
@@ -109,7 +116,7 @@ export function startConversationTitleJob(params: StartConversationTitleJobParam
       });
     },
   })
-    .then((assistant) => normalizeConversationTitle(assistantMessageToText(assistant)))
+    .then((assistant) => normalizeGeneratedConversationTitle(assistantMessageToText(assistant)))
     .then((title) => title || null)
     .catch(() => null);
 

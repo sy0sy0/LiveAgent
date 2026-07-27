@@ -35,9 +35,14 @@ import {
   validateCronExpression,
 } from "../../lib/automation";
 import { parseModelValue, toModelValue } from "../../lib/providers/llm";
-import { type ExecutionMode, isAgentExecutionMode, type ProviderId } from "../../lib/settings";
+import {
+  type CustomProvider,
+  type ExecutionMode,
+  getChatRuntimeReasoningLevelsForProvider,
+  isAgentExecutionMode,
+  isThinkingAlwaysOnForModel,
+} from "../../lib/settings";
 import { useModalMotion } from "../../lib/shared/modalMotion";
-import { CronModelPicker } from "./cronModelPicker";
 import {
   createEmptyRequestDraft,
   type HttpRequestDraft,
@@ -45,14 +50,9 @@ import {
   parseHttpRequestDrafts,
   requestToDraft,
 } from "./httpRequestEditor";
+import { ModelPicker, type ModelPickerOption } from "./modelPicker";
 
-export type CronPromptModelOption = {
-  value: string;
-  label: string;
-  providerName: string;
-  providerId?: string;
-  providerType?: ProviderId;
-};
+export type CronPromptModelOption = ModelPickerOption;
 
 export type CronWorkspaceOption = {
   path: string;
@@ -113,6 +113,39 @@ function isCronReasoningLevel(value: string): value is CronReasoningLevel {
   return (CRON_REASONING_LEVELS as readonly string[]).includes(value);
 }
 
+function getCronReasoningLevels(
+  selectedModelValue: string,
+  providers: CustomProvider[],
+): CronReasoningLevel[] {
+  const selectedModel = parseModelValue(selectedModelValue);
+  const provider = selectedModel
+    ? providers.find((item) => item.id === selectedModel.customProviderId)
+    : undefined;
+  if (!selectedModel || !provider) return [...CRON_REASONING_LEVELS];
+
+  const supportedLevels = getChatRuntimeReasoningLevelsForProvider({
+    providerId: provider.type,
+    requestFormat: provider.requestFormat,
+    modelId: selectedModel.model,
+  }).filter(isCronReasoningLevel);
+  const thinkingAlwaysOn = isThinkingAlwaysOnForModel(provider.type, selectedModel.model);
+
+  return thinkingAlwaysOn ? supportedLevels : ["off", ...supportedLevels];
+}
+
+/**
+ * Non-reasoning models expose only `off`, so the default (`medium`) may itself
+ * be unsupported — fall back to the first offered level in that case.
+ */
+function coerceCronReasoningLevel(
+  levels: CronReasoningLevel[],
+  current: CronReasoningLevel,
+): CronReasoningLevel {
+  if (levels.includes(current)) return current;
+  if (levels.includes(DEFAULT_CRON_REASONING)) return DEFAULT_CRON_REASONING;
+  return levels[0] ?? DEFAULT_CRON_REASONING;
+}
+
 /**
  * Fields the modal edits. `enabled` is deliberately not part of the payload:
  * toggling is its own operation, so saving an edit can never write back a
@@ -124,6 +157,7 @@ type CronTaskModalProps = {
   mode: "add" | "edit";
   initialData?: CronTask;
   modelOptions: CronPromptModelOption[];
+  providers: CustomProvider[];
   workspaceOptions: CronWorkspaceOption[];
   executionMode: ExecutionMode;
   /**
@@ -140,6 +174,7 @@ export function CronTaskModal({
   mode,
   initialData,
   modelOptions,
+  providers,
   workspaceOptions,
   executionMode,
   onPickWorkdir,
@@ -212,6 +247,8 @@ export function CronTaskModal({
           },
         ]
       : modelOptions;
+
+  const cronReasoningLevels = getCronReasoningLevels(selectedModelValue, providers);
 
   const selectedWorkspaceOption = customWorkdir
     ? null
@@ -778,13 +815,18 @@ export function CronTaskModal({
                     <Label className="text-xs font-medium text-muted-foreground">
                       {t("settings.cronPromptModelLabel")}
                     </Label>
-                    <CronModelPicker
+                    <ModelPicker
                       options={promptModelOptions}
                       value={selectedModelValue}
                       disabled={promptModelOptions.length === 0}
+                      placeholder={t("settings.cronPromptModelPlaceholder")}
                       onChange={(value) => {
                         setFormError(null);
                         setSelectedModelValue(value);
+                        const nextReasoningLevels = getCronReasoningLevels(value, providers);
+                        setReasoning((current) =>
+                          coerceCronReasoningLevel(nextReasoningLevels, current),
+                        );
                       }}
                     />
                   </div>
@@ -805,7 +847,7 @@ export function CronTaskModal({
                         <SelectValue>{t(REASONING_LEVEL_I18N_KEYS[reasoning])}</SelectValue>
                       </SelectTrigger>
                       <SelectContent className="max-h-60">
-                        {CRON_REASONING_LEVELS.map((level) => (
+                        {cronReasoningLevels.map((level) => (
                           <SelectItem key={level} value={level}>
                             {t(REASONING_LEVEL_I18N_KEYS[level])}
                           </SelectItem>

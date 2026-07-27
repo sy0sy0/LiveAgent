@@ -54,12 +54,29 @@ function compactSegments(segments) {
 }
 
 test("user message skill mentions style only skill-like tokens", () => {
-  assert.equal(userMessageContent.isSkillMentionToken("$code-review"), true);
-  assert.equal(userMessageContent.isSkillMentionToken("$release_notes"), true);
-  assert.equal(userMessageContent.isSkillMentionToken("$PATH"), false);
-  assert.equal(userMessageContent.isSkillMentionToken("$PATH:"), false);
-  assert.equal(userMessageContent.isSkillMentionToken("price$tag"), false);
-  assert.equal(userMessageContent.isSkillMentionToken("$bad.name"), false);
+  assert.equal(userMessageContent.isSkillMentionToken("/code-review"), true);
+  assert.equal(userMessageContent.isSkillMentionToken("/release_notes"), true);
+  assert.equal(userMessageContent.isSkillMentionToken("/PATH"), false);
+  assert.equal(userMessageContent.isSkillMentionToken("price/tag"), false);
+  assert.equal(userMessageContent.isSkillMentionToken("/bad.name"), false);
+  // "$" is no longer a skill mention marker.
+  assert.equal(userMessageContent.isSkillMentionToken("$code-review"), false);
+  assert.equal(userMessageContent.isSkillMentionToken("$release_notes"), false);
+});
+
+test("slash skill mentions tokenize at word boundaries but leave paths alone", () => {
+  assert.deepEqual(
+    compactSegments(userMessageContent.tokenizeUserMessage("请用 /code-review 检查", [])),
+    [
+      { type: "text", value: "请用 " },
+      { type: "skill" },
+      { type: "text", value: " 检查" },
+    ],
+  );
+  assert.deepEqual(
+    compactSegments(userMessageContent.tokenizeUserMessage("查看 /usr/bin 目录", [])),
+    [{ type: "text", value: "查看 /usr/bin 目录" }],
+  );
 });
 
 test("file mention markdown references round trip through transcript tokenization", () => {

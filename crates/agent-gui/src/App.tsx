@@ -3,7 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppErrorBoundary } from "./components/AppErrorBoundary";
+import { CliIdentityUpdateHost } from "./components/CliIdentityUpdateHost";
 import { CronPromptRunner } from "./components/cron/CronPromptRunner";
+import { Pin } from "./components/icons";
 import { useNativeInputContextMenu } from "./components/input-context-menu/NativeInputContextMenu";
 import { MemoryOrganizerHost } from "./components/memory/useMemoryOrganizer";
 import { WindowsTitleBar } from "./components/WindowsTitleBar";
@@ -30,6 +32,8 @@ import {
   buildGatewaySettingsSyncPayload,
   type GatewaySettingsSyncPayload,
 } from "./lib/settings/sync";
+import { applyStoredGlobalShortcuts } from "./lib/shortcuts/globalShortcuts";
+import { applyFontFamilies } from "./lib/system/fontFamily";
 import { ChatPage } from "./pages/ChatPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import type { SectionId } from "./pages/settings/types";
@@ -75,6 +79,12 @@ function hasSettingsSyncChanged(prev: AppSettings, next: AppSettings) {
 function hasSensitiveSettingsUpdates(settings: AppSettings) {
   return (
     settings.customProviders.some((provider) => provider.apiKey.trim().length > 0) ||
+    settings.customProviders.some(
+      (provider) =>
+        provider.usageQuery.apiKey.trim().length > 0 ||
+        provider.usageQuery.accessToken.trim().length > 0 ||
+        provider.usageQuery.secretAccessKey.trim().length > 0,
+    ) ||
     settings.ssh.hosts.some(
       (host) => host.password.trim().length > 0 || host.privateKey.trim().length > 0,
     )
@@ -84,7 +94,11 @@ function hasSensitiveSettingsUpdates(settings: AppSettings) {
 function hasSensitiveSettingsUpdatesPayload(payload: unknown) {
   const source =
     payload && typeof payload === "object" && !Array.isArray(payload)
-      ? (payload as { providerApiKeyUpdates?: unknown; sshSecretUpdates?: unknown })
+      ? (payload as {
+          providerApiKeyUpdates?: unknown;
+          providerUsageQuerySecretUpdates?: unknown;
+          sshSecretUpdates?: unknown;
+        })
       : {};
   const providerUpdates = source.providerApiKeyUpdates;
   if (
@@ -94,6 +108,28 @@ function hasSensitiveSettingsUpdatesPayload(payload: unknown) {
     Object.values(providerUpdates).some(
       (value) => typeof value === "string" && value.trim().length > 0,
     )
+  ) {
+    return true;
+  }
+  const usageQueryUpdates = source.providerUsageQuerySecretUpdates;
+  if (
+    usageQueryUpdates &&
+    typeof usageQueryUpdates === "object" &&
+    !Array.isArray(usageQueryUpdates) &&
+    Object.values(usageQueryUpdates).some((value) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+      const update = value as {
+        apiKey?: unknown;
+        accessToken?: unknown;
+        secretAccessKey?: unknown;
+      };
+      // 显式携带字段(含空串=清除已配置密钥)即视为敏感更新,不得被丢弃。
+      return (
+        typeof update.apiKey === "string" ||
+        typeof update.accessToken === "string" ||
+        typeof update.secretAccessKey === "string"
+      );
+    })
   ) {
     return true;
   }
@@ -169,6 +205,18 @@ export default function App() {
   }, [effectiveTheme]);
 
   useEffect(() => {
+    applyFontFamilies({
+      interfaceFontFamily: settings.customSettings.interfaceFontFamily,
+      chatFontFamily: settings.customSettings.chatFontFamily,
+      codeFontFamily: settings.customSettings.codeFontFamily,
+    });
+  }, [
+    settings.customSettings.interfaceFontFamily,
+    settings.customSettings.chatFontFamily,
+    settings.customSettings.codeFontFamily,
+  ]);
+
+  useEffect(() => {
     if (!settingsReady) return;
     void invoke("app_set_close_window_behavior", {
       behavior: settings.closeWindowBehavior,
@@ -176,6 +224,45 @@ export default function App() {
       // Ignore non-Tauri and older desktop shells.
     });
   }, [settingsReady, settings.closeWindowBehavior]);
+
+  // 启动时恢复本机保存的全局快捷键（桌面端专属，非 Tauri 环境内部自动忽略）。
+  useEffect(() => {
+    void applyStoredGlobalShortcuts().catch(() => {});
+  }, []);
+
+  // 窗口置顶状态：Rust 侧是唯一事实源（快捷键或指示器切换都经它广播），
+  // 挂载时查询一次以覆盖 webview 重载后指示器丢失的情况。
+  const [windowPinned, setWindowPinned] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    invoke<boolean>("app_window_pinned")
+      .then((pinned) => {
+        if (!cancelled) setWindowPinned(Boolean(pinned));
+      })
+      .catch(() => {
+        // 非 Tauri 环境或旧版桌面壳：忽略。
+      });
+    listen<boolean>("global-shortcut:pin-changed", (event) => {
+      setWindowPinned(Boolean(event.payload));
+    })
+      .then((nextUnlisten) => {
+        if (cancelled) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {
+        // 非 Tauri 环境忽略。
+      });
+    return () => {
+      cancelled = true;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -326,6 +413,37 @@ export default function App() {
     setOverlay("leaving");
   }, []);
 
+  // 全局快捷键「新建对话」触发时，若设置覆盖层开着则先收起，露出对话页。
+  const closeSettingsRef = useRef(closeSettings);
+  closeSettingsRef.current = closeSettings;
+  const settingsOpenRef = useRef(settingsOpen);
+  settingsOpenRef.current = settingsOpen;
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    listen("global-shortcut:new-chat", () => {
+      if (settingsOpenRef.current) {
+        closeSettingsRef.current();
+      }
+    })
+      .then((nextUnlisten) => {
+        if (cancelled) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {
+        // 非 Tauri 环境忽略。
+      });
+    return () => {
+      cancelled = true;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, []);
+
   const handleTransitionEnd = useCallback(() => {
     if (overlay === "leaving") {
       setSettingsOpen(false);
@@ -416,6 +534,7 @@ export default function App() {
   return (
     <LocaleContext.Provider value={localeContextValue}>
       <AppChrome>
+        <CliIdentityUpdateHost settings={settings} setSettings={setSettings} />
         <CronPromptRunner settings={settings} />
         <MemoryOrganizerHost settings={settings} setSettings={setSettings} />
         <AppErrorBoundary>
@@ -448,6 +567,19 @@ export default function App() {
               />
             </AppErrorBoundary>
           </div>
+        )}
+        {windowPinned && (
+          <button
+            type="button"
+            onClick={() => {
+              void invoke("app_toggle_window_pin").catch(() => {});
+            }}
+            title={translate("app.windowPinnedHint", settings.locale)}
+            className="absolute top-3 left-1/2 z-[60] flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-primary/30 bg-primary/10 px-2.5 py-1 text-xs font-medium text-primary shadow-sm backdrop-blur transition-colors hover:bg-primary/20"
+          >
+            <Pin className="h-3 w-3" />
+            {translate("app.windowPinned", settings.locale)}
+          </button>
         )}
       </AppChrome>
     </LocaleContext.Provider>

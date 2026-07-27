@@ -126,9 +126,10 @@ function bindController(controller, overrides = {}) {
     },
     cancellation,
     sinks: recorder.sinks,
-    buildPreparedContext: (state) => conversationState.buildRequestContext(state),
-    buildResumeContext: (state, resumeMessage) => {
-      const context = conversationState.buildRequestContext(state);
+    buildPreparedContext: (state, _tools, options) =>
+      conversationState.buildRequestContext(state, options),
+    buildResumeContext: (state, resumeMessage, _tools, options) => {
+      const context = conversationState.buildRequestContext(state, options);
       return resumeMessage
         ? { ...context, messages: [...context.messages, resumeMessage] }
         : context;
@@ -213,7 +214,7 @@ test("below-threshold decisions are side-effect free", async () => {
   });
 
   assert.equal(applied, false);
-  assert.equal(midRun, null);
+  assert.equal(midRun.context, null);
   assert.equal(completeCalls, 0);
   assert.equal(recorder.events.length, 0);
 });
@@ -238,11 +239,11 @@ test("single-flight: a concurrent trigger is rejected while a compaction is in f
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(controller.shouldProtectMidStream(1_000_000), false);
   const second = await controller.compactDuringRun({ trigger: "post-tool", state });
-  assert.equal(second, null);
+  assert.equal(second.context, null);
 
   release();
   const firstContext = await first;
-  assert.ok(firstContext);
+  assert.ok(firstContext.context);
   assert.equal(completeCalls, 1);
 });
 
@@ -302,7 +303,7 @@ test("summarizer failure degrades to prune and still returns a usable context", 
 
   const context = await controller.compactDuringRun({ trigger: "post-tool", state });
 
-  assert.ok(context);
+  assert.ok(context.context);
   const [, prunedState] = recorder.byKind("applyStateMidRun")[0];
   const prunedMessages = prunedState.segments[0].messages.filter(
     (message) =>
@@ -317,6 +318,92 @@ test("summarizer failure degrades to prune and still returns a usable context", 
     .find((status) => status.phase === "failed");
   assert.match(failedStatus.message, /prune 降级/);
   assert.equal(recorder.byKind("bridge").at(-1)[1], null);
+});
+
+test("mid-stream compaction failure returns a safe continuation and disables protection", async () => {
+  const controller = new CompactionController();
+  const abortedAssistant = {
+    ...assistantWithUsage("working on src/app.ts", 190_000, 4),
+    stopReason: "aborted",
+  };
+  const state = conversationState.createConversationStateFromContext({
+    systemPrompt: "sys",
+    messages: [
+      user("please fix src/app.ts", 1),
+      user("continue with src/app.ts", 2),
+      user("check src/app.ts again", 3),
+      abortedAssistant,
+    ],
+  });
+  bindController(controller, {
+    complete: async () => {
+      throw new Error("invalid api key");
+    },
+  });
+
+  const result = await controller.compactDuringRun({
+    trigger: "mid-stream",
+    state,
+    includeAbortedMessages: true,
+  });
+
+  assert.ok(result.context);
+  assert.equal(result.shouldDisableProtection, true);
+  assert.equal(
+    result.context.messages.some(
+      (message) => message.role === "assistant" && message.stopReason === "aborted",
+    ),
+    false,
+  );
+  assert.equal(result.context.messages.at(-1)?.role, "user");
+  assert.equal(
+    result.context.messages.at(-1)?.content,
+    conversationState.INTERNAL_RESUME_MESSAGE_TEXT,
+  );
+});
+
+test("mid-stream prune fallback also returns a safe continuation", async () => {
+  const controller = new CompactionController();
+  const abortedAssistant = {
+    ...assistantWithUsage("working on src/app.ts", 190_000, 5),
+    stopReason: "aborted",
+  };
+  const state = conversationState.createConversationStateFromContext({
+    systemPrompt: "sys",
+    messages: [
+      user("please fix src/app.ts", 1),
+      toolResultBig(200_000, 2),
+      user("continue with src/app.ts", 3),
+      user("check src/app.ts again", 4),
+      abortedAssistant,
+    ],
+  });
+  const { recorder } = bindController(controller, {
+    complete: async () => {
+      throw new Error("invalid api key");
+    },
+  });
+
+  const result = await controller.compactDuringRun({
+    trigger: "mid-stream",
+    state,
+    includeAbortedMessages: true,
+  });
+
+  assert.ok(result.context);
+  assert.equal(result.shouldDisableProtection, false);
+  assert.equal(
+    result.context.messages.some(
+      (message) => message.role === "assistant" && message.stopReason === "aborted",
+    ),
+    false,
+  );
+  assert.equal(result.context.messages.at(-1)?.role, "user");
+  assert.equal(
+    result.context.messages.at(-1)?.content,
+    conversationState.INTERNAL_RESUME_MESSAGE_TEXT,
+  );
+  assert.equal(recorder.byKind("applyStateMidRun").length, 1);
 });
 
 test("escalation ladder: consecutive ineffective compactions advise but never hard-refuse", async () => {
@@ -339,7 +426,7 @@ test("escalation ladder: consecutive ineffective compactions advise but never ha
       trigger: "post-tool",
       state: bigState(),
     });
-    assert.ok(context, `compaction round ${round} must not be refused`);
+    assert.ok(context.context, `compaction round ${round} must not be refused`);
   }
 
   assert.equal(completeCalls, 3);

@@ -1,3 +1,5 @@
+import { hubFetch } from "../hubFetch";
+
 export type ClawHubSort = "downloads" | "stars" | "installs" | "updated" | "newest";
 
 export type ClawHubSkillCard = {
@@ -142,7 +144,8 @@ export class ClawHubHttpError extends Error {
 }
 
 async function fetchClawHubJson(url: URL): Promise<unknown> {
-  const response = await fetch(url.toString(), {
+  // 经 hubFetch 出网：桌面端由本地反代按应用代理配置转发，WebUI 浏览器直连。
+  const response = await hubFetch(url.toString(), {
     headers: { Accept: "application/json" },
   });
   const body = await response.text();

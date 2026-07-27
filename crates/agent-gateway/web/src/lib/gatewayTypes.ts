@@ -11,6 +11,7 @@ export type AgentStatus = {
   agent_ready?: boolean;
   chat_runtime_ready?: boolean;
   agent_id?: string;
+  name?: string;
   agent_version?: string;
   session_id?: string;
   connected_since?: number;
@@ -62,8 +63,12 @@ export type ChatUserMessageEvent = {
   type: "user_message";
   client_request_id?: string;
   conversation_id?: string;
+  message_id?: string;
   message?: string;
   uploaded_files?: unknown;
+  // The new message's own persisted identity (desktop mints it at persist
+  // time) — lets subscribers bind the turn's messageRef immediately.
+  message_ref?: unknown;
   base_message_ref?: unknown;
   reason?: string;
 };
@@ -138,6 +143,9 @@ export type ChatEvent = (
       type: "tool_status";
       status?: string | null;
       isCompaction?: boolean;
+      // Stream-retry history of the live run: null/absent = unchanged, an
+      // array (possibly empty) replaces the current list.
+      retryAttempts?: { attempt: number; maxAttempts: number; errorMessage: string }[] | null;
       round?: number;
       conversation_id?: string;
     }

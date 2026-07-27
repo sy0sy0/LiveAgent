@@ -23,19 +23,24 @@ const enabledSkills = [
 test("extractSkillMentionNamesFromText finds explicit skill tokens without treating common env vars as skills", () => {
   assert.deepEqual(
     skills.extractSkillMentionNamesFromText(
-      "Use $code-review and $release_notes, keep $PATH literal and ignore price$tags.",
+      "Use /code-review and /release_notes, keep /usr/bin literal and ignore price/tags.",
     ),
     ["code-review", "release_notes"],
   );
-  assert.deepEqual(skills.extractSkillMentionNamesFromText("$liveagent-code-review"), [
+  assert.deepEqual(skills.extractSkillMentionNamesFromText("/liveagent-code-review"), [
     "liveagent-code-review",
   ]);
+  // "$" is no longer a skill mention marker.
+  assert.deepEqual(
+    skills.extractSkillMentionNamesFromText("Use $code-review and $release_notes."),
+    [],
+  );
 });
 
 test("resolveExplicitSkillMentions only returns enabled skills and deduplicates structured/text mentions", () => {
   assert.deepEqual(
     skills.resolveExplicitSkillMentions({
-      text: "$disabled $release_notes $code-review $code-review",
+      text: "/disabled /release_notes /code-review /code-review",
       structured: [
         {
           name: "code-review",
@@ -67,7 +72,7 @@ test("buildSkillsSystemPrompt marks explicit mentions without granting disabled 
   assert.match(prompt, /Explicitly mentioned this turn:/);
   assert.match(prompt, /- code-review \(skillFile: code-review\/SKILL\.md, baseDir: code-review\)/);
   assert.doesNotMatch(prompt, /disabled\/SKILL\.md/);
-  assert.ok(prompt.includes("`$` mentions never grant access to disabled Skills"));
+  assert.ok(prompt.includes("`/` mentions never grant access to disabled Skills"));
   assert.match(prompt, /skill:\/\/<baseDir>\/\.\.\./);
   assert.doesNotMatch(prompt, /root=["']skills["']/);
   assert.doesNotMatch(prompt, /Read\(root=/);

@@ -1,3 +1,4 @@
+import { useRender } from "@base-ui/react/use-render";
 import { cva, type VariantProps } from "class-variance-authority";
 import * as React from "react";
 
@@ -29,30 +30,30 @@ const buttonVariants = cva(
   },
 );
 
-type ButtonProps = React.ButtonHTMLAttributes<HTMLButtonElement> &
+type ButtonProps = Omit<React.ButtonHTMLAttributes<HTMLButtonElement>, "className"> &
   VariantProps<typeof buttonVariants> & {
-    render?: React.ReactElement;
+    className?: string;
+    /** Base UI composition: replace the host element. */
+    render?:
+      | React.ReactElement
+      | ((
+          props: React.HTMLAttributes<HTMLElement>,
+          state: Record<string, unknown>,
+        ) => React.ReactElement);
   };
 
-export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
-  ({ className, variant, size, render: renderProp, children, ...props }, ref) => {
-    const mergedClass = cn(buttonVariants({ variant, size }), className);
-
-    if (renderProp) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const rp = renderProp as React.ReactElement<any>;
-      return React.cloneElement(rp, {
-        className: cn(mergedClass, rp.props.className),
+export const Button = React.forwardRef<HTMLElement, ButtonProps>(
+  ({ className, variant, size, render, type = "button", ...props }, ref) => {
+    return useRender({
+      defaultTagName: "button",
+      render,
+      ref,
+      props: {
+        type: render ? undefined : type,
         ...props,
-        children: children ?? rp.props.children,
-      });
-    }
-
-    return (
-      <button ref={ref} className={mergedClass} {...props}>
-        {children}
-      </button>
-    );
+        className: cn(buttonVariants({ variant, size }), className),
+      },
+    });
   },
 );
 

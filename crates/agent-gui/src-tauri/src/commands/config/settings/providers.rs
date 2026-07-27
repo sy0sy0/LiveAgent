@@ -49,6 +49,40 @@ fn redact_provider_credential(provider: Value) -> Result<Value, String> {
         "apiKeyConfigured".to_string(),
         Value::Bool(api_key_configured),
     );
+    if let Some(usage_query) = payload.remove("usageQuery") {
+        payload.insert("usageQuery".to_string(), redact_usage_query_secrets(usage_query)?);
+    }
+    Ok(Value::Object(payload))
+}
+
+fn redact_usage_query_secrets(usage_query: Value) -> Result<Value, String> {
+    let mut payload = expect_object(usage_query, "provider usage query settings")?;
+    let api_key_configured = match payload.remove("apiKey") {
+        Some(Value::String(value)) => !value.trim().is_empty(),
+        Some(Value::Null) | None => false,
+        Some(_) => return Err("provider usage query apiKey must be a string".to_string()),
+    } || matches!(payload.get("apiKeyConfigured"), Some(Value::Bool(true)));
+    let access_token_configured = match payload.remove("accessToken") {
+        Some(Value::String(value)) => !value.trim().is_empty(),
+        Some(Value::Null) | None => false,
+        Some(_) => return Err("provider usage query accessToken must be a string".to_string()),
+    } || matches!(payload.get("accessTokenConfigured"), Some(Value::Bool(true)));
+    let secret_access_key_configured = match payload.remove("secretAccessKey") {
+        Some(Value::String(value)) => !value.trim().is_empty(),
+        Some(Value::Null) | None => false,
+        Some(_) => {
+            return Err("provider usage query secretAccessKey must be a string".to_string())
+        }
+    } || matches!(
+        payload.get("secretAccessKeyConfigured"),
+        Some(Value::Bool(true))
+    );
+    payload.insert("apiKeyConfigured".to_string(), Value::Bool(api_key_configured));
+    payload.insert("accessTokenConfigured".to_string(), Value::Bool(access_token_configured));
+    payload.insert(
+        "secretAccessKeyConfigured".to_string(),
+        Value::Bool(secret_access_key_configured),
+    );
     Ok(Value::Object(payload))
 }
 fn save_providers(conn: &mut Connection, payload: Value) -> Result<(), String> {

@@ -3,8 +3,6 @@
 ## 协议总览
 
 自 v2 起，网关的全部实时链路统一为 **WebSocket + Protobuf**（下称 v2 协议）。
-v1 双协议（浏览器 JSON WebSocket + 桌面端 gRPC）**已整体移除**，网关只服务 v2
-（迁移与删除记录见 [protocol-v2-migration.md](./protocol-v2-migration.md)）。
 
 | 通道 | 端点 | 方向 | 用途 |
 |---|---|---|---|
@@ -18,7 +16,7 @@ v1 双协议（浏览器 JSON WebSocket + 桌面端 gRPC）**已整体移除**�
 ## v2 统一线协议
 
 权威定义：`crates/agent-gateway/proto/v2/gateway_ws.proto`（帧壳），业务消息
-全部复用 `proto/v1/gateway.proto`（`GatewayEnvelope`/`AgentEnvelope`/
+全部复用 `proto/v2/gateway.proto`（`GatewayEnvelope`/`AgentEnvelope`/
 `TerminalStreamFrame` 等——单一事实源，三端 Go/Rust/TS 均由它生成）。
 
 ### 传输与握手
@@ -28,22 +26,29 @@ v1 双协议（浏览器 JSON WebSocket + 桌面端 gRPC）**已整体移除**�
 - 首帧必须为 `ClientHello{protocol_version=2, role, token, ...}`；服务端应答
   `ServerHello{ok, session_id, heartbeat_period_seconds, max_message_bytes}`；
   鉴权失败以 close code 4401 关闭。agent 角色的 hello 同时完成会话登记。
-- 消息大小上限沿用 `GRPCMaxMessageBytes`（历史命名保留，默认 64 MiB），经
-  `ServerHello` 通告。
+- 消息大小上限按链路收紧并经 `ServerHello.max_message_bytes` 通告：`/ws/v2`
+  浏览器 4 MiB、`/ws/v2/agent` 沿用 `MaxMessageBytes`（默认 64 MiB，上传
+  需要）、`/ws/v2/terminal` 浏览器 1 MiB / Agent 16 MiB。并发连接上限
+  agent 256 / browser 128 / terminal 512（超限升级前 503）；浏览器链路另有
+  每连接在途派发上限 16 与入站令牌桶 100 帧/s（burst 200）。
 
 ### 浏览器链路（/ws/v2）
 
-- 请求帧 `WebClientFrame{request_id, oneof payload}`；响应帧回显同一
+- 请求帧 `WebClientFrame{request_id, agent_id, oneof payload}`；响应帧回显同一
   `request_id`；广播帧 `request_id` 为空。
-- **直通请求** `agent_request`（浏览器直接构造 `GatewayEnvelope` 载荷臂，消息定义
-  在 `proto/v1/gateway.proto`——proto 包名沿用 v1，消息即 v2 载荷）：
-  网关按白名单与限额校验（`internal/protocol/pbws/guard.go`）、把 `request_id`
-  按连接命名空间化后近乎原样转发桌面端，响应以原始 `AgentEnvelope`
-  （`agent_response` 臂）回送。v1 时代约 90 个"JSON 解码 → 手工组 proto →
-  手工拆 map"处理器由这一条路径取代。
+- **多 Agent 寻址**：目标型请求必须显式携带非空 `agent_id`，缺失时收到
+  `local_error: "agent_id is required"`。官方 WebUI 首次连接会先请求
+  `agent_list`，自动选择一个在线 Agent 并持久化选择，因此单 Agent 部署无需
+  手工操作；广播帧的 `agent_id` 标注事件来源，客户端严格过滤非活跃 Agent。
+  `agent_list` 返回全部已登记 Agent 的状态目录（含离线与仅签发凭证的条目）。
+- **直通请求** `agent_request`（浏览器直接构造 `GatewayEnvelope` 载荷臂）：
+  网关按白名单与限额校验（`internal/protocol/pbws/guard.go`；功能门控按目标 Agent 的 settings 快照判定）、把
+  `request_id` 按连接命名空间化后近乎原样转发目标桌面端，
+  响应以原始 `AgentEnvelope`（`agent_response` 臂）回送。原先约 90 个
+  “JSON 解码 → 手工组 proto → 手工拆 map” 处理器由这一条路径取代。
 - **本地帧**（网关状态直接应答/编排）：`status_get`、`chat_prepare`、
   `chat_command`（携带 `ChatCommandRequest`）、`chat_subscribe`/
-  `chat_unsubscribe`/`chat_activities`、`workspace_subscribe`/`workspace_unsubscribe`。
+  `chat_unsubscribe`/`chat_activities`、`workspace_subscribe`/`workspace_unsubscribe`。 其中 `chat.subscribe` 与 `chat.unsubscribe` 同样属于目标型操作，必须携带非空 `agent_id`；会话流按 `(agent_id, conversation_id)` 隔离，`chat.activities` 是全局目录查询。
 - **广播臂**：`history_event`/`settings_event`/`terminal_event`/`sftp_event`/
   `chat_queue_event`/`tunnel_state`/`process_state`/`workspace_activity`
   直转 session 层的 seam 消息；`status`/`chat_activity`/`chat_event`/
@@ -61,12 +66,41 @@ hello（role=AGENT）完成鉴权与会话登记后进入双向信封流：网�
 （响应/事件/Pong）；心跳走独立通道不受数据拥塞影响；传输层保活由 WS 控制帧
 ping/pong 承担，客户端以 3×心跳周期无入站为断链判据。
 
+**多 Agent**：网关按 `agent_id` 维护多个并存的 Agent 会话（≤10 台规模），
+同 `agent_id` 重连只顶掉该 id 的旧连接，不同 Agent 互不影响。快照
+（settings/终端/提示队列/托管进程）与广播事件按 Agent 隔离，隧道帧拒绝
+跨 Agent 的 stream_id 伪造。每个桌面端首次初始化设置时自动生成并持久化规范的
+`agent-UUIDv4`；设置页只读展示该标识，不依赖 hostname 或用户手工命名。
+
+### Agent 鉴权（每 Agent 独立凭证）
+
+网关默认自动创建内嵌 SQLite 数据库（可用 `-agent-db` 或
+`LIVEAGENT_GATEWAY_AGENT_DB` 指定路径）并启用每 Agent 凭证存储：
+
+- Agent 链路接受网关 Token 或按 `agent_id` 签发的独立凭证（`agt_` 前缀）；
+- Agent 独立凭证只授权绑定的 Agent 链路，不能冒充浏览器或调用 REST；网关 Token
+  同时授权浏览器、管理 API 和 Agent 链路；
+- 凭证可持续用于对应 Agent 连接，但明文只在签发响应展示一次，落盘仅存
+  SHA-256（SQLite 文件权限 0600）；
+- 管理 API（管理 token 门禁）：`GET /api/agents` 目录、
+  `POST /api/agents/{id}/token` 签发/轮换并设置可选名称；轮换会立即断开当前 Agent
+  会话、使旧凭证无法重连、
+  `PATCH /api/agents/{id}` 修改或清空名称、`DELETE /api/agents/{id}` 删除整条记录、
+  凭证并即时断开该 Agent 的活跃会话。
+
+Gateway 数据库的首版 Agent 结构为单表 `agents`。`agent_id` 主键服务凭证点查、
+名称更新和删除；`(created_at, agent_id)` 组合索引服务数据库层目录分页。
+
+网关 Token 与独立 Agent 凭证可以并存：使用网关 Token 的客户端必须提供稳定的
+`agent_id`，使用独立凭证的客户端还会受到 `agent_id` 绑定校验。
+
 ### 终端链路（/ws/v2/terminal）
 
 两端共用一条路径，hello.role 区分浏览器/桌面端；hello 之后双向承载
-`TerminalStreamFrame`（proto 直传）。浏览器侧语义：attach/detach 维护本连接
-订阅集，input/resize 需已附着，output 只投递给已附着连接；桌面端侧就绪信号
-由 `ServerHello` 承担。
+`TerminalStreamFrame`（proto 直传）。浏览器角色以 `hello.agent_id` 绑定数据面的
+目标 Agent；`agent_id` 必填，出站按绑定路由、入站只放行同源帧。
+attach/detach 维护本连接订阅集，input/resize 需已附着，output 只投递给
+已附着连接；桌面端侧就绪信号由 `ServerHello` 承担。
 
 ## Chat 协议
 
@@ -113,7 +147,7 @@ WebUI 对 command ACK 使用 4 秒上限。连接中断或 ACK 丢失时仅重�
 |---|---|
 | 1 | WebUI 将文件通过 multipart POST 到 `/api/files/import`。 |
 | 2 | Gateway 读取文件 bytes，注册 request stream，转成 `UploadReadableFilesRequest` 发给 Desktop。 |
-| 3 | Desktop 根据 workdir 导入 `.liveagent`/uploads 类工作区位置，返回 `ChatUploadedFile` 列表和 skipped 列表。 |
+| 3 | Desktop 把文件写入应用上传暂存区 `~/.liveagent/uploads/<batch>/`（工作区外），返回 `ChatUploadedFile` 列表和 skipped 列表。 |
 | 4 | WebUI 把返回的 uploaded files 附加到下一次 Chat Command。 |
 
 GUI 本地上传不需要 HTTP/Gateway，直接通过 Tauri command 导入。上传臂不在
@@ -141,7 +175,7 @@ session list/create/close/rename、SSH prompt、SSH tabs 等控制面与 metadat
 |---|---|
 | Browser-Gateway | `GET /ws/v2/terminal` 首帧 `ClientHello{role=BROWSER}`；之后 `TerminalClientFrame{frame}` / `TerminalServerFrame{frame}` 双向承载 proto `TerminalStreamFrame`。 |
 | Frame 字段 | `kind` 为 `attach/input/resize/detach/output/snapshot/error`；含 `stream_id/session_id/project_path_key/seq/start_offset/end_offset/cols/rows/max_bytes/truncated/error/data`。 |
-| Desktop-Gateway | `GET /ws/v2/terminal` 首帧 `ClientHello{role=AGENT}`，其后帧语义与 v1 `AgentTerminalConnect` 一致；主链路不承载 terminal output/input/resize。 |
+| Desktop-Gateway | `GET /ws/v2/terminal` 首帧 `ClientHello{role=AGENT}`，其后承载 `TerminalStreamFrame`；主链路不承载 terminal output/input/resize。 |
 | Snapshot | attach 返回 `snapshot` frame，data 为 tail bytes，`start_offset/end_offset` 用于前端去重。 |
 | Input | input frame 为 fire-and-forget bytes；不返回 session metadata，不进入普通 request pending map。 |
 | Resize | resize frame 只发送最新 cols/rows；不返回 session metadata。 |
@@ -185,9 +219,9 @@ Git 面板与文件树不再轮询：桌面端 `workspace_watch` 服务（notify
 
 | 场景 | 必查点 |
 |---|---|
-| 新增 Gateway request | 在 `proto/v1/gateway.proto` 加请求/响应臂（编号只增不改）→ `buf generate` → v2 直通白名单（`internal/protocol/pbws/guard.go`）放行 → WebUI client method + adapter；桌面端 `envelope_handler.rs` 增加分支。不再需要 Go 手工 payload 塑形。 |
+| 新增 Gateway request | 在 `proto/v2/gateway.proto` 加请求/响应臂（编号只增不改）→ `buf generate` → v2 直通白名单（`internal/protocol/pbws/guard.go`）放行 → WebUI client method + adapter；桌面端 `envelope_handler.rs` 增加分支。不再需要 Go 手工 payload 塑形。 |
 | 新增本地/编排操作 | `proto/v2/gateway_ws.proto` 加帧臂 → pbws 本地处理器 → 客户端方法。 |
-| proto 演进纪律 | CI `buf breaking`（WIRE_JSON）把关；删除字段用 `reserved`；v2 复用的 v1 消息永不改号、永不弃用。 |
+| proto 演进纪律 | CI `buf breaking`（WIRE_JSON）把关；删除字段用 `reserved`；v2 业务消息永不改号、永不弃用。 |
 | 新增 settings 字段 | GUI settings normalize/storage、Rust settings save/load、Gateway redaction whitelist、WebUI settings copy 都要同步。 |
 | 新增 history 字段 | Rust summary model、proto `ConversationSummary`、GUI/WebUI sidebar render 都要同步。 |
 | 新增 chat event | Desktop event publisher、proto enum、Gateway 事件规范化与 `chat_event` payload、WebUI event reducer/transcript 都要同步。 |

@@ -257,6 +257,74 @@ test("SSHManager exec auto-creates a visible session before running command", as
   assert.equal(result.details.session_created, true);
 });
 
+test("SSHManager exec abort requests runtime cancellation", async () => {
+  let resolveExec;
+  const execPromise = new Promise((resolve) => {
+    resolveExec = resolve;
+  });
+  const invocations = [];
+  const loader = createTsModuleLoader({
+    mocks: {
+      "@tauri-apps/api/core": {
+        async invoke(command, args) {
+          invocations.push({ command, args });
+          if (command === "terminal_list") {
+            return { sessions: [createSshSession()] };
+          }
+          if (command === "terminal_ssh_exec") {
+            return execPromise;
+          }
+          if (command === "runtime_cancel") {
+            return { cancelled: true };
+          }
+          throw new Error("unexpected invoke " + command);
+        },
+      },
+    },
+  });
+  const { createSSHManagerTools } = loader.loadModule("src/lib/tools/sshManagerTools.ts");
+  const bundle = createSSHManagerTools({
+    enabled: true,
+    runtimeScope: "chat",
+    workdir: "/workspace",
+    projectPathKey: "/workspace",
+    hosts: [SSH_HOST],
+    associatedHostIds: ["host-1"],
+  });
+  const controller = new AbortController();
+
+  const resultPromise = bundle.executeToolCall(
+    createToolCall({
+      action: "exec",
+      host_id: "host-1",
+      command: "sleep 30",
+    }),
+    controller.signal,
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.abort();
+  const result = await resultPromise;
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Cancelled/);
+  const execCall = invocations.find(
+    (call) =>
+      call.command === "terminal_ssh_exec" &&
+      typeof call.args.run_id === "string" &&
+      call.args.run_id.startsWith("ssh-exec:call-ssh:"),
+  );
+  assert.ok(execCall, "exec must carry a unique ssh-exec run id");
+  assert.ok(
+    invocations.some(
+      (call) => call.command === "runtime_cancel" && call.args.run_id === execCall.args.run_id,
+    ),
+    "runtime cancel must target the same run id as the exec call",
+  );
+
+  resolveExec({ exitCode: 0, stdout: "", stderr: "", timedOut: false });
+});
+
 test("SSHManager exec reuses an existing running SSH session for the same host", async () => {
   const invocations = [];
   const changes = [];

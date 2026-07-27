@@ -38,3 +38,10 @@ test("translation lookup falls back to the key for unknown entries", () => {
   assert.equal(i18n.t("app.name", "en-US"), "LiveAgent");
   assert.equal(i18n.t("missing.key", "en-US"), "missing.key");
 });
+
+test("usage query labels exist in both locales", () => {
+  for (const locale of ["zh-CN", "en-US"]) {
+    assert.ok(i18n.translations[locale]["settings.providerUsageQuery"]);
+    assert.ok(i18n.translations[locale]["settings.providerUsageTest"]);
+  }
+});

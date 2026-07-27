@@ -9,6 +9,7 @@ use crate::commands::settings::{
     RuntimeSshKnownHostStatus,
 };
 use crate::runtime::project_path::project_path_key as normalize_project_path_key;
+use crate::runtime::shell_runner::ShellCancelToken;
 
 use super::*;
 
@@ -326,6 +327,23 @@ impl TerminalSessionRegistry {
         let connection_id = runtime
             .install_connection(handle, input_tx, shutdown_tx)
             .await;
+        // A close() that ran while this attempt was connecting may have missed
+        // the new handle (the shutdown sender slot was empty at that point), so
+        // re-check and tear the fresh connection down instead of resurrecting a
+        // session that is already gone.
+        if runtime.is_closing() {
+            if let Some(handle) = runtime.handle.lock().await.as_ref() {
+                let _ = handle
+                    .disconnect(
+                        russh::Disconnect::ByApplication,
+                        "Session closed during reconnect",
+                        "en",
+                    )
+                    .await;
+            }
+            runtime.clear_connection_if_current(connection_id).await;
+            return Err("SSH session is closing".to_string());
+        }
         {
             let mut record = entry
                 .record
@@ -436,6 +454,84 @@ impl TerminalSessionRegistry {
             format!("[SSH] Reconnect failed after {SSH_RECONNECT_MAX_ATTEMPTS} attempts.\r\n"),
         );
         runtime.finish_reconnect_runner();
+    }
+
+    /// User-initiated reconnect: tears down the current connection (if any)
+    /// and immediately re-establishes it with the latest host configuration
+    /// from the settings store. Also revives sessions whose automatic
+    /// reconnect attempts were exhausted.
+    pub async fn ssh_reconnect(
+        self: &Arc<Self>,
+        session_id: String,
+    ) -> Result<TerminalSessionRecord, String> {
+        let entry = self.entry(&session_id)?;
+        let record = entry
+            .record
+            .lock()
+            .map_err(|_| "terminal session lock poisoned".to_string())?
+            .clone();
+        if record.kind.trim() != "ssh" {
+            return Err("terminal session is not an SSH connection".to_string());
+        }
+        let TerminalSessionBackend::Ssh { runtime } = &entry.backend else {
+            return Err("terminal session is not an SSH connection".to_string());
+        };
+        if runtime.is_closing() {
+            return Err("SSH session is closing".to_string());
+        }
+        if !runtime.begin_reconnect_runner() {
+            return Err("SSH reconnect already in progress".to_string());
+        }
+
+        // Tear the old connection down directly rather than via the shutdown
+        // channel: the writer task disconnects whatever handle occupies the
+        // shared slot at that moment, which would kill the replacement once
+        // installed. The orphaned IO pump observes ConnectionLost and its
+        // reconnect runner exits immediately because we hold the runner flag
+        // (or, later, because the connection generation no longer matches).
+        let old_connection_id = runtime.current_connection_id();
+        {
+            let handle = runtime.handle.lock().await;
+            if let Some(handle) = handle.as_ref() {
+                let _ = handle
+                    .disconnect(
+                        russh::Disconnect::ByApplication,
+                        "Reconnecting with updated settings",
+                        "en",
+                    )
+                    .await;
+            }
+        }
+        runtime.clear_connection_if_current(old_connection_id).await;
+
+        self.mark_ssh_reconnecting(&entry, 1);
+        let result = match timeout(
+            SSH_RECONNECT_ATTEMPT_TIMEOUT,
+            self.reconnect_ssh_session(Arc::clone(&entry), 1),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "SSH reconnect timed out after {} seconds",
+                SSH_RECONNECT_ATTEMPT_TIMEOUT.as_secs()
+            )),
+        };
+        match result {
+            Ok(()) => {
+                runtime.finish_reconnect_runner();
+                self.record(session_id)
+            }
+            Err(error) => {
+                self.append_output(
+                    &session_id,
+                    format!("\r\n[SSH] Manual reconnect failed: {error}\r\n"),
+                );
+                self.mark_ssh_disconnected(&entry);
+                runtime.finish_reconnect_runner();
+                Err(error)
+            }
+        }
     }
 
     pub(crate) async fn continue_ssh_keyboard_interactive(
@@ -721,6 +817,7 @@ impl TerminalSessionRegistry {
         cwd: Option<String>,
         timeout_ms: Option<u64>,
         max_bytes: Option<usize>,
+        cancel_token: Option<ShellCancelToken>,
     ) -> Result<TerminalSshExecResponse, String> {
         let command = command.trim().to_string();
         if command.is_empty() {
@@ -749,11 +846,21 @@ impl TerminalSessionRegistry {
         let timeout_duration = normalize_ssh_exec_timeout(timeout_ms);
         let capture_limit = normalize_ssh_exec_max_bytes(max_bytes);
         let start = Instant::now();
-        let result = timeout(
+        let execution = timeout(
             timeout_duration,
             run_ssh_exec_channel(runtime, wrapped_command, capture_limit),
-        )
-        .await;
+        );
+        tokio::pin!(execution);
+        let result = if let Some(cancel_token) = cancel_token {
+            tokio::select! {
+                result = &mut execution => result,
+                _ = cancel_token.cancelled() => {
+                    return Err("Cancelled".to_string());
+                }
+            }
+        } else {
+            execution.await
+        };
         let duration_ms = start.elapsed().as_millis();
 
         match result {

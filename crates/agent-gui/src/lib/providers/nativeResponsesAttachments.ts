@@ -76,28 +76,28 @@ type GeminiNativeAttachmentCandidate = {
 };
 
 const WORKSPACE_UPLOAD_INSTRUCTION = [
-  "Selected files are available in the workspace at these relative paths.",
-  "Use Read with the paths below before analyzing or modifying them:",
+  "The user attached the files below to this message.",
+  "Use Read with these exact paths before analyzing or modifying them:",
 ].join("\n");
 
 const NATIVE_UPLOAD_INSTRUCTION = [
-  "Selected files are attached to this OpenAI Responses request as native inputs when supported, and are also available in the workspace paths below.",
-  "Analyze the native attachments directly first. Use Read only when you need exact workspace file access, edits, or native attachment content is unavailable:",
+  "The attached files are inlined into this OpenAI Responses request as native inputs when supported, and are also readable at the exact paths below.",
+  "Analyze the native attachments directly first. Use Read only when you need exact file access, edits, or native attachment content is unavailable:",
 ].join("\n");
 
 const OPENAI_CHAT_COMPLETIONS_NATIVE_UPLOAD_INSTRUCTION = [
-  "Selected images are attached to this OpenAI Chat Completions request as native image inputs when supported, and are also available in the workspace paths below.",
-  "Analyze the native image attachments directly first. Use Read only when you need exact workspace file access, edits, or native attachment content is unavailable:",
+  "The attached images are inlined into this OpenAI Chat Completions request as native image inputs when supported, and are also readable at the exact paths below.",
+  "Analyze the native image attachments directly first. Use Read only when you need exact file access, edits, or native attachment content is unavailable:",
 ].join("\n");
 
 const ANTHROPIC_NATIVE_UPLOAD_INSTRUCTION = [
-  "Selected files are attached to this Anthropic Messages request as native image/document inputs when supported, and are also available in the workspace paths below.",
-  "Analyze the native attachments directly first. Use Read only when you need exact workspace file access, edits, or native attachment content is unavailable:",
+  "The attached files are inlined into this Anthropic Messages request as native image/document inputs when supported, and are also readable at the exact paths below.",
+  "Analyze the native attachments directly first. Use Read only when you need exact file access, edits, or native attachment content is unavailable:",
 ].join("\n");
 
 const GEMINI_NATIVE_UPLOAD_INSTRUCTION = [
-  "Selected files are attached to this Gemini request as native inlineData inputs when supported, and are also available in the workspace paths below.",
-  "Analyze the native attachments directly first. Use Read only when you need exact workspace file access, edits, or native attachment content is unavailable:",
+  "The attached files are inlined into this Gemini request as native inlineData inputs when supported, and are also readable at the exact paths below.",
+  "Analyze the native attachments directly first. Use Read only when you need exact file access, edits, or native attachment content is unavailable:",
 ].join("\n");
 
 const GEMINI_INLINE_NATIVE_ATTACHMENT_MAX_REQUEST_BYTES = 20 * 1024 * 1024;
@@ -201,12 +201,20 @@ async function readNativeAttachment(params: {
   workdir: string;
   file: PendingUploadedFile;
 }): Promise<NativeAttachmentCommandResponse> {
+  // 附件读取只走导入时返回的绝对路径；旧版本仅持久化 workdir 相对路径的
+  // 附件不再兼容，直接走各 adapter 的 Read-fallback 分支。
+  const absolutePath =
+    typeof params.file.absolutePath === "string" ? params.file.absolutePath.trim() : "";
+  if (!absolutePath) {
+    throw new Error(
+      `attachment ${params.file.relativePath} has no absolute path (legacy upload); re-upload it to inline natively`,
+    );
+  }
   const response = await invoke<NativeAttachmentCommandResponse>(
     "system_read_uploaded_native_attachment",
     {
       workdir: params.workdir,
-      absolute_path: params.file.absolutePath,
-      relative_path: params.file.relativePath,
+      absolute_path: absolutePath,
       kind: params.file.kind,
     },
   );
@@ -848,7 +856,7 @@ export function attachOpenAIResponsesNativeAttachments<
   },
 ): TOptions {
   if (
-    params.providerId !== "codex" ||
+    (params.providerId !== "codex" && params.providerId !== "xai") ||
     !params.context ||
     !isOpenAIResponsesModel(params.model) ||
     !params.workdir?.trim()

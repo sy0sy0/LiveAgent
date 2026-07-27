@@ -1,6 +1,7 @@
 import type { Tool, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 
+import type { ProviderRuntimeConfig } from "../providers/runtime/types";
 import type { RuntimePlatform } from "../runtimePlatform";
 import type { ProviderId } from "../settings";
 import {
@@ -28,12 +29,7 @@ import {
   formatRoster,
   formatTemplates,
 } from "./roster";
-import {
-  buildSubagentRunId,
-  executeSubagentRun,
-  type SubagentProviderRuntime,
-  type SubagentRunEnvironment,
-} from "./run";
+import { buildSubagentRunId, executeSubagentRun, type SubagentRunEnvironment } from "./run";
 import type { SubagentScheduler } from "./scheduler";
 import { createSendMessageTools } from "./sendMessageTool";
 import type { SubagentConversationStore } from "./store";
@@ -184,7 +180,7 @@ async function resolveOutputPaths(params: {
 export type SubagentRuntimeConfig = {
   providerId: ProviderId;
   model: string;
-  runtime: SubagentProviderRuntime;
+  runtime: ProviderRuntimeConfig;
   sessionId?: string;
   templates: SubagentTemplate[];
   store: SubagentConversationStore;
@@ -194,7 +190,7 @@ export type SubagentRuntimeConfig = {
 export function createSubagentTools(params: {
   providerId: ProviderId;
   model: string;
-  runtime: SubagentProviderRuntime;
+  runtime: ProviderRuntimeConfig;
   runtimePlatform?: RuntimePlatform;
   workdir: string;
   resolveHomeDir?: () => Promise<string>;

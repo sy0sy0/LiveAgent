@@ -123,6 +123,7 @@ export function createSidebarStore(
   let scope: SidebarScope = { kind: "none" };
   let byId = new Map<string, SidebarConversation>();
   let running = new Map<string, { workdir: string | null; updatedAt: number }>();
+  const runningStatusUpdatedAt = new Map<string, number>();
   const positionLocks = new Map<string, number>();
   let snapshot: SidebarSnapshot = {
     revision: 0,
@@ -321,10 +322,18 @@ export function createSidebarStore(
           typeof event.updatedAt === "number" && Number.isFinite(event.updatedAt)
             ? event.updatedAt
             : now();
+        const statusUpdatedAt = runningStatusUpdatedAt.get(event.conversationId);
         const current = running.get(event.conversationId);
+        if (
+          statusUpdatedAt !== undefined &&
+          (statusUpdatedAt > updatedAt || (statusUpdatedAt === updatedAt && !current))
+        ) {
+          return;
+        }
         if (current && current.workdir === workdir && current.updatedAt >= updatedAt) {
           return;
         }
+        runningStatusUpdatedAt.set(event.conversationId, updatedAt);
         running = new Map(running);
         running.set(event.conversationId, { workdir, updatedAt });
         commit({
@@ -335,6 +344,15 @@ export function createSidebarStore(
         return;
       }
       case "idle": {
+        const updatedAt =
+          typeof event.updatedAt === "number" && Number.isFinite(event.updatedAt)
+            ? event.updatedAt
+            : now();
+        const statusUpdatedAt = runningStatusUpdatedAt.get(event.conversationId);
+        if (statusUpdatedAt !== undefined && statusUpdatedAt > updatedAt) {
+          return;
+        }
+        runningStatusUpdatedAt.set(event.conversationId, updatedAt);
         if (!running.has(event.conversationId)) {
           return;
         }
@@ -836,7 +854,11 @@ export function createSidebarStore(
               workdir: patch.workdir,
               updatedAt: patch.updatedAt,
             }
-          : { kind: "idle", conversationId: patch.conversationId },
+          : {
+              kind: "idle",
+              conversationId: patch.conversationId,
+              updatedAt: patch.updatedAt,
+            },
       );
     },
 
@@ -845,13 +867,27 @@ export function createSidebarStore(
       for (const item of items) {
         const conversationId = item.conversationId.trim();
         if (!conversationId) continue;
-        next.set(conversationId, {
+        const hasUpdatedAt = typeof item.updatedAt === "number" && Number.isFinite(item.updatedAt);
+        const updatedAt = hasUpdatedAt ? item.updatedAt! : now();
+        const statusUpdatedAt = runningStatusUpdatedAt.get(conversationId);
+        const current = running.get(conversationId);
+        const staleAgainstKnownStatus =
+          statusUpdatedAt !== undefined &&
+          (!hasUpdatedAt ||
+            statusUpdatedAt > updatedAt ||
+            (statusUpdatedAt === updatedAt && !current));
+        if (staleAgainstKnownStatus) {
+          if (current) {
+            next.set(conversationId, current);
+          }
+          continue;
+        }
+        const entry = {
           workdir: item.workdir?.trim() || null,
-          updatedAt:
-            typeof item.updatedAt === "number" && Number.isFinite(item.updatedAt)
-              ? item.updatedAt
-              : now(),
-        });
+          updatedAt,
+        };
+        next.set(conversationId, entry);
+        runningStatusUpdatedAt.set(conversationId, updatedAt);
       }
       running = next;
       commit({

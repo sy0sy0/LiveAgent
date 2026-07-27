@@ -149,3 +149,141 @@ test("MCP business tool calls on different servers can run concurrently", async 
 
   assert.equal(maxActiveCalls, 2);
 });
+
+test("MCP abort releases the tool call and requests Rust runtime cancellation", async () => {
+  let resolveCall;
+  const callPromise = new Promise((resolve) => {
+    resolveCall = resolve;
+  });
+  const invocations = [];
+  const loader = createTsModuleLoader({
+    mocks: {
+      "@tauri-apps/api/core": {
+        async invoke(command, args) {
+          invocations.push({ command, args });
+          if (command === "mcp_list_tools") {
+            return [
+              {
+                serverId: "docs",
+                serverLabel: "Docs",
+                name: "search",
+                description: "Search docs",
+                inputSchema: { type: "object" },
+              },
+            ];
+          }
+          if (command === "mcp_call_tool") {
+            return callPromise;
+          }
+          if (command === "runtime_cancel") {
+            return { cancelled: true };
+          }
+          throw new Error("Unexpected invoke: " + command);
+        },
+      },
+    },
+  });
+  const { createMcpTools } = loader.loadModule("src/lib/tools/mcpTools.ts");
+  const bundle = await createMcpTools({ servers: [createServer("docs")] });
+  const search = bundle.tools[0];
+  const controller = new AbortController();
+
+  const resultPromise = bundle.executeToolCall(
+    createToolCall("call-abort", search.name, { q: "agent" }),
+    controller.signal,
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.abort();
+  const result = await resultPromise;
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Cancelled/);
+  const callInvocation = invocations.find(
+    (call) =>
+      call.command === "mcp_call_tool" &&
+      typeof call.args.run_id === "string" &&
+      call.args.run_id.startsWith("mcp:call-abort:"),
+  );
+  assert.ok(callInvocation, "the tool call must carry a unique mcp run id");
+  assert.ok(
+    invocations.some(
+      (call) =>
+        call.command === "runtime_cancel" && call.args.run_id === callInvocation.args.run_id,
+    ),
+    "runtime cancel must target the same run id as the tool call",
+  );
+
+  resolveCall({ content: [], isError: false, details: {} });
+});
+
+test("an abort while queued on the per-server lock still releases the lock", async () => {
+  let resolveFirstCall;
+  const firstCallGate = new Promise((resolve) => {
+    resolveFirstCall = resolve;
+  });
+  let sawFirstCall = false;
+  const loader = createTsModuleLoader({
+    mocks: {
+      "@tauri-apps/api/core": {
+        async invoke(command) {
+          if (command === "mcp_list_tools") {
+            return [
+              {
+                serverId: "docs",
+                serverLabel: "Docs",
+                name: "search",
+                description: "Search docs",
+                inputSchema: { type: "object" },
+              },
+              {
+                serverId: "docs",
+                serverLabel: "Docs",
+                name: "read",
+                description: "Read docs",
+                inputSchema: { type: "object" },
+              },
+            ];
+          }
+          if (command === "runtime_cancel") {
+            return { cancelled: true };
+          }
+          if (command === "mcp_call_tool") {
+            if (!sawFirstCall) {
+              sawFirstCall = true;
+              return firstCallGate;
+            }
+            return { content: [{ type: "text", text: "ok" }], isError: false, details: {} };
+          }
+          throw new Error("Unexpected invoke: " + command);
+        },
+      },
+    },
+  });
+  const { createMcpTools } = loader.loadModule("src/lib/tools/mcpTools.ts");
+  const bundle = await createMcpTools({ servers: [createServer("docs")] });
+  const [searchTool, readTool] = bundle.tools;
+
+  // Two concurrent calls against the same server: the second waits on the
+  // per-server lock; the user then stops the run while it is still queued.
+  const controller = new AbortController();
+  const first = bundle.executeToolCall(createToolCall("c1", searchTool.name), controller.signal);
+  const second = bundle.executeToolCall(createToolCall("c2", readTool.name), controller.signal);
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.abort();
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+  assert.equal(firstResult.isError, true);
+  assert.equal(secondResult.isError, true);
+
+  // A later call with a fresh signal must not hang: an abort while queued on
+  // the lock has to release it (regression: the whole server deadlocked).
+  const next = bundle.executeToolCall(createToolCall("c3", searchTool.name));
+  const outcome = await Promise.race([
+    next,
+    new Promise((resolve) => setTimeout(() => resolve("deadlocked"), 2_000)),
+  ]);
+  assert.notEqual(outcome, "deadlocked", "per-server lock leaked after an aborted queued call");
+  assert.equal(outcome.isError, false);
+
+  resolveFirstCall({ content: [], isError: false, details: {} });
+});

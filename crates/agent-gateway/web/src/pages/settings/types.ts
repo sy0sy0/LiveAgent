@@ -12,6 +12,7 @@ export type SectionId =
   | "memory"
   | "hooks"
   | "cron"
+  | "devices"
   | "remote";
 
 export type SettingsPageProps = {
@@ -21,9 +22,11 @@ export type SettingsPageProps = {
   onBack: () => void;
   initialSection?: SectionId;
   hiddenSections?: SectionId[];
+  onAgentDirectoryChanged?: () => void | Promise<void>;
 };
 
 export type SettingsSectionProps = {
   settings: AppSettings;
   setSettings: SetSettingsFn;
+  saveState?: WebSettingsSaveState;
 };

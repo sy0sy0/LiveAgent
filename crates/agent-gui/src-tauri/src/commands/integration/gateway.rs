@@ -7,25 +7,50 @@ use crate::services::gateway::{
     GatewayChatClaimedRequest, GatewayChatQueueEventInput, GatewayChatQueueResponseInput,
     GatewayChatRuntimeSnapshot, GatewayController, GatewayStatusSnapshot,
 };
+use crate::services::provider_usage::{ProviderUsageResult, ProviderUsageService};
 use crate::services::tunnel::{
     GatewayTunnelCreateInput, GatewayTunnelUpdateInput, TunnelStatePayload,
 };
 use crate::services::workspace_watch::WatchSource;
 
 #[tauri::command]
+pub async fn provider_usage_query(
+    provider_id: String,
+    refresh: bool,
+    provider_usage_service: tauri::State<'_, Arc<ProviderUsageService>>,
+) -> Result<ProviderUsageResult, String> {
+    Ok(provider_usage_service.query(&provider_id, refresh).await)
+}
+
+#[tauri::command]
+pub async fn provider_usage_test(
+    provider_id: String,
+    config_json: String,
+    provider_usage_service: tauri::State<'_, Arc<ProviderUsageService>>,
+) -> Result<ProviderUsageResult, String> {
+    Ok(provider_usage_service
+        .test(&provider_id, &config_json)
+        .await)
+}
+
+#[tauri::command]
 pub async fn gateway_connect(
     payload: Option<Value>,
     gateway_controller: tauri::State<'_, Arc<GatewayController>>,
 ) -> Result<(), String> {
-    let mut config = match payload {
-        Some(value) => parse_remote_settings_payload(value)?,
-        None => tauri::async_runtime::spawn_blocking(move || {
-            let conn = open_db()?;
-            load_remote_settings(&conn)
-        })
-        .await
-        .map_err(|e| format!("gateway_connect join 失败：{e}"))??,
-    };
+    let mut config = tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db()?;
+        let persisted = load_remote_settings(&conn)?;
+        let mut requested = match payload {
+            Some(value) => parse_remote_settings_payload(value)?,
+            None => persisted.clone(),
+        };
+        // Agent ID 始终取本地持久化身份，调用方不能借连接命令临时覆盖。
+        requested.agent_id = persisted.agent_id;
+        Ok::<_, String>(requested)
+    })
+    .await
+    .map_err(|e| format!("gateway_connect join 失败：{e}"))??;
     config.enabled = true;
     gateway_controller.apply_config(config)
 }
@@ -99,6 +124,17 @@ pub async fn gateway_chat_mark_local_started(
 ) -> Result<(), String> {
     gateway_controller
         .mark_local_chat_run_started(request_id, conversation_id)
+        .await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn gateway_chat_mark_local_cancelled(
+    request_id: String,
+    conversation_id: String,
+    gateway_controller: tauri::State<'_, Arc<GatewayController>>,
+) -> Result<(), String> {
+    gateway_controller
+        .mark_local_chat_run_cancelled(request_id, conversation_id)
         .await
 }
 

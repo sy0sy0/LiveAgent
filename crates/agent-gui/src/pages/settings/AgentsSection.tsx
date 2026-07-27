@@ -184,7 +184,7 @@ export function AgentsSection(props: SettingsSectionProps) {
                         title={template.enabled ? t("settings.disable") : t("settings.enable")}
                         onToggle={() => handleToggleEnabled(template.id)}
                       />
-                      <div className="ml-1 flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+                      <div className="settings-hover-actions ml-1 flex items-center gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
                         <Button
                           variant="ghost"
                           size="icon"

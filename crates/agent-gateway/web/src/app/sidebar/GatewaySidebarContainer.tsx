@@ -8,6 +8,8 @@ import { ChatHistorySidebar } from "@/components/chat/ChatHistorySidebar";
 import { useLocale } from "@/i18n";
 import type { ChatHistorySummary } from "@/lib/chat/chatHistory";
 import type { WorkspaceProject } from "@/lib/settings";
+import type { SidebarBatchDeleteOptions } from "@/lib/sidebar/batchDelete";
+import { deleteSidebarConversations } from "@/lib/sidebar/batchDelete";
 import {
   selectConversations,
   selectListState,
@@ -226,6 +228,28 @@ export function GatewaySidebarContainer(props: GatewaySidebarContainerProps) {
     void store.remove(id);
   });
 
+  const handleDeleteConversations = useStableCallback(
+    async (ids: readonly string[], options?: SidebarBatchDeleteOptions) => {
+      if (sectionsDisabled) {
+        return { deletedIds: [], failedIds: [...ids], skippedIds: [] };
+      }
+      clearMutationErrors();
+      return deleteSidebarConversations(
+        ids,
+        async (id) => {
+          const existing = store.peek(id);
+          if (existing?.isPending === true || isLocalDraftConversationId(id)) {
+            store.removeLocal(id);
+            props.onLocalDraftDeleted(id);
+            return true;
+          }
+          return store.remove(id);
+        },
+        options,
+      );
+    },
+  );
+
   const handleLoadMore = useStableCallback(() => {
     if (sectionsDisabled) {
       return;
@@ -350,6 +374,7 @@ export function GatewaySidebarContainer(props: GatewaySidebarContainerProps) {
       onShareConversation={props.onShareConversation}
       onOpenSharedConversations={props.onOpenSharedConversations}
       onDeleteConversation={handleDeleteConversation}
+      onDeleteConversations={handleDeleteConversations}
       onLoadMore={handleLoadMore}
       onCloseSidebar={props.onCloseSidebar}
       onOpenSettings={props.onOpenSettings}

@@ -12,8 +12,10 @@ use axum::{
     routing::{any, get},
     Router,
 };
+use base64::Engine as _;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::net::TcpListener as TokioTcpListener;
 use uuid::Uuid;
 
@@ -37,8 +39,10 @@ const TRAILER: &str = "trailer";
 const TRANSFER_ENCODING: &str = "transfer-encoding";
 const UPGRADE: &str = "upgrade";
 const UPSTREAM_ORIGIN_HEADER: &str = "x-liveagent-upstream-origin";
+const UPSTREAM_HEADERS_HEADER: &str = "x-liveagent-upstream-headers";
+const UPSTREAM_HEADERS_MAX_BYTES: usize = 8 * 1024;
 const USE_SYSTEM_PROXY_HEADER: &str = "x-liveagent-use-system-proxy";
-const DEFAULT_ALLOW_HEADERS: &str = "authorization,content-type,x-api-key,x-goog-api-key,anthropic-version,x-liveagent-upstream-origin,x-liveagent-proxy-token,x-liveagent-use-system-proxy";
+const DEFAULT_ALLOW_HEADERS: &str = "authorization,content-type,x-api-key,x-goog-api-key,anthropic-version,x-liveagent-upstream-origin,x-liveagent-upstream-headers,x-liveagent-proxy-token,x-liveagent-use-system-proxy";
 const ALLOW_METHODS_VALUE: &str = "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD";
 const VARY_VALUE: &str = "Origin, Access-Control-Request-Method, Access-Control-Request-Headers";
 const IMAGE_PROXY_MAX_BYTES: usize = 25 * 1024 * 1024;
@@ -119,18 +123,25 @@ pub fn start_proxy_server() -> Result<Arc<ProxyServerState>, String> {
     Ok(state)
 }
 
-async fn handle_image_proxy(
-    State(state): State<Arc<ProxyServerState>>,
-    Query(query): Query<ImageProxyQuery>,
-    headers: HeaderMap,
-) -> Response {
+async fn handle_image_proxy(Query(query): Query<ImageProxyQuery>, headers: HeaderMap) -> Response {
     let target_url = match validate_image_proxy_url(&query.url) {
         Ok(url) => url,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, &message, &headers),
     };
 
-    let image_request = state
-        .client
+    // 图片外链与商店链路同语义：恒随应用代理出网（未启用=直连，配置异常
+    // 502 fail fast）。<img> 请求无法携带自定义头，因此不走 per-request 开关。
+    let client = match crate::services::system_proxy::cached_client() {
+        Ok(client) => client,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("App proxy unavailable: {error}"),
+                &headers,
+            );
+        }
+    };
+    let image_request = client
         .get(target_url.clone())
         .timeout(Duration::from_secs(IMAGE_PROXY_TIMEOUT_SECS));
 
@@ -373,12 +384,13 @@ async fn handle_proxy(
     } else {
         state.client.clone()
     };
-    let mut request = client.request(method, target_url);
-    for (name, value) in &headers {
-        if should_forward_request_header(name) {
-            request = request.header(name, value);
-        }
-    }
+    let upstream_request_headers = match build_upstream_request_headers(&headers) {
+        Ok(upstream_request_headers) => upstream_request_headers,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message, &headers),
+    };
+    let mut request = client
+        .request(method, target_url)
+        .headers(upstream_request_headers);
     if !body_bytes.is_empty() {
         request = request.body(body_bytes);
     }
@@ -437,6 +449,11 @@ fn build_target_url(
         .strip_prefix(&prefix)
         .ok_or_else(|| "Invalid proxy path prefix".to_string())?;
     let resolved = if suffix.is_empty() { "/" } else { suffix };
+    // “//” 开头的后缀会被 Url::join 当作 scheme-relative 引用改写目标主机，
+    // 显式拒绝，防止请求被重定向到 upstream origin 之外的主机。
+    if resolved.starts_with("//") {
+        return Err("Proxy request path must not begin with //".to_string());
+    }
 
     origin
         .join(resolved)
@@ -537,6 +554,87 @@ fn should_forward_request_header(name: &HeaderName) -> bool {
         && !lowered.starts_with(PROXY_PREFIX)
 }
 
+/// 覆盖包的拒绝清单**窄于** should_forward_request_header：只拒会破坏请求本身的
+/// 头（host / content-length / hop-by-hop）与本地反代的内部命名空间。
+///
+/// 有意放行 origin / referer / cookie —— 常规拷贝过滤器的职责是剥掉 *WebView 自己
+/// 注入的* Origin/Referer，而不是否决用户在供应商配置里显式写下的同名头。
+fn is_protected_upstream_override(name: &HeaderName) -> bool {
+    let lowered = name.as_str();
+    matches!(
+        lowered,
+        HOST | CONTENT_LENGTH
+            | CONNECTION
+            | KEEP_ALIVE
+            | PROXY_CONNECTION
+            | PROXY_AUTHENTICATE
+            | PROXY_AUTHORIZATION
+            | TE
+            | TRAILER
+            | TRANSFER_ENCODING
+            | UPGRADE
+    ) || lowered.starts_with(PROXY_PREFIX)
+}
+
+/// 解出 x-liveagent-upstream-headers 覆盖包。畸形输入一律 Err（由调用方回 400）：
+/// 静默跳过会把「自定义请求头没生效」变成难查的偶发问题。
+fn decode_upstream_header_overrides(encoded: &str) -> Result<Vec<(HeaderName, HeaderValue)>, String> {
+    if encoded.len() > UPSTREAM_HEADERS_MAX_BYTES {
+        return Err(format!(
+            "{UPSTREAM_HEADERS_HEADER} exceeds {UPSTREAM_HEADERS_MAX_BYTES} bytes"
+        ));
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| format!("{UPSTREAM_HEADERS_HEADER} is not valid base64: {error}"))?;
+    if decoded.len() > UPSTREAM_HEADERS_MAX_BYTES {
+        return Err(format!(
+            "{UPSTREAM_HEADERS_HEADER} exceeds {UPSTREAM_HEADERS_MAX_BYTES} bytes"
+        ));
+    }
+    let parsed: serde_json::Map<String, Value> = serde_json::from_slice(&decoded)
+        .map_err(|error| format!("{UPSTREAM_HEADERS_HEADER} is not a valid JSON object: {error}"))?;
+
+    let mut overrides = Vec::with_capacity(parsed.len());
+    for (name, value) in parsed {
+        let Value::String(value) = value else {
+            return Err(format!(
+                "{UPSTREAM_HEADERS_HEADER} entry \"{name}\" must be a string"
+            ));
+        };
+        let header_name = HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes())
+            .map_err(|_| format!("{UPSTREAM_HEADERS_HEADER} entry \"{name}\" is not a valid header name"))?;
+        if is_protected_upstream_override(&header_name) {
+            continue;
+        }
+        let header_value = HeaderValue::from_str(&value).map_err(|_| {
+            format!("{UPSTREAM_HEADERS_HEADER} entry \"{name}\" has a value that is not valid for an HTTP header")
+        })?;
+        overrides.push((header_name, header_value));
+    }
+    Ok(overrides)
+}
+
+fn build_upstream_request_headers(headers: &HeaderMap) -> Result<HeaderMap, String> {
+    let mut upstream_headers = HeaderMap::new();
+    for (name, value) in headers {
+        if should_forward_request_header(name) {
+            upstream_headers.append(name, value.clone());
+        }
+    }
+    // 覆盖包是转发前的最后一步：insert 替换掉 SDK 或 WebView 注入的同名头，
+    // 让「自定义请求头覆盖内置默认头」在任意头名上都成立。
+    if let Some(encoded) = headers.get(UPSTREAM_HEADERS_HEADER) {
+        let encoded = encoded
+            .to_str()
+            .map_err(|_| format!("{UPSTREAM_HEADERS_HEADER} must be ASCII"))?;
+        for (name, value) in decode_upstream_header_overrides(encoded)? {
+            upstream_headers.insert(name, value);
+        }
+    }
+    Ok(upstream_headers)
+}
+
 fn should_forward_response_header(name: &HeaderName) -> bool {
     let lowered = name.as_str();
     !matches!(
@@ -584,6 +682,22 @@ mod tests {
             target.as_str(),
             "https://ark.cn-beijing.volces.com/api/coding/v1/messages?stream=true"
         );
+    }
+
+    #[test]
+    fn rejects_scheme_relative_proxy_suffix() {
+        let err = build_target_url("hub", "/proxy/hub//servers/foo", "https://api.smithery.ai")
+            .expect_err("scheme-relative suffix must be rejected");
+
+        assert!(err.contains("//"));
+    }
+
+    #[test]
+    fn builds_target_url_for_origin_root_with_query() {
+        let target = build_target_url("hub", "/proxy/hub?probe=1", "https://clawhub.ai")
+            .expect("root query target url should be built");
+
+        assert_eq!(target.as_str(), "https://clawhub.ai/?probe=1");
     }
 
     #[test]
@@ -693,5 +807,130 @@ mod tests {
         assert!(should_forward_request_header(&HeaderName::from_static(
             "anthropic-version"
         )));
+    }
+
+    #[test]
+    fn applies_explicit_upstream_header_overrides_last() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static("WebView/1.0"),
+        );
+        headers.insert(
+            HeaderName::from_static(CONTENT_TYPE),
+            HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            HeaderName::from_static(UPSTREAM_HEADERS_HEADER),
+            encoded_overrides(serde_json::json!({
+                "User-Agent": "codex_cli_rs/0.72.0",
+                "Content-Type": "application/custom+json",
+                "X-Request-Id": "trace-1",
+            })),
+        );
+
+        let upstream_headers = build_upstream_request_headers(&headers).expect("overrides decode");
+
+        assert_eq!(header_str(&upstream_headers, "user-agent"), Some("codex_cli_rs/0.72.0"));
+        assert_eq!(
+            header_str(&upstream_headers, CONTENT_TYPE),
+            Some("application/custom+json")
+        );
+        assert_eq!(header_str(&upstream_headers, "x-request-id"), Some("trace-1"));
+        assert!(!upstream_headers.contains_key(UPSTREAM_HEADERS_HEADER));
+    }
+
+    #[test]
+    fn upstream_overrides_restore_browser_forbidden_header_names() {
+        // WebView 的 fetch 根本不会发出 Cookie / Referer；常规拷贝过滤器还会主动
+        // 剥掉浏览器注入的 Referer。用户显式配置的同名头必须仍然送达上游。
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(REFERER),
+            HeaderValue::from_static("http://tauri.localhost"),
+        );
+        headers.insert(
+            HeaderName::from_static(UPSTREAM_HEADERS_HEADER),
+            encoded_overrides(serde_json::json!({
+                "Cookie": "session=abc",
+                "Referer": "https://relay.example/app",
+            })),
+        );
+
+        let upstream_headers = build_upstream_request_headers(&headers).expect("overrides decode");
+
+        assert_eq!(header_str(&upstream_headers, "cookie"), Some("session=abc"));
+        assert_eq!(
+            header_str(&upstream_headers, REFERER),
+            Some("https://relay.example/app")
+        );
+    }
+
+    #[test]
+    fn upstream_overrides_skip_protected_header_names() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(UPSTREAM_HEADERS_HEADER),
+            encoded_overrides(serde_json::json!({
+                "Host": "attacker.example",
+                "Content-Length": "0",
+                "Connection": "close",
+                "x-liveagent-proxy-token": "leaked",
+                "X-Kept": "yes",
+            })),
+        );
+
+        let upstream_headers = build_upstream_request_headers(&headers).expect("overrides decode");
+
+        assert_eq!(header_str(&upstream_headers, "x-kept"), Some("yes"));
+        for protected in ["host", "content-length", "connection", PROXY_TOKEN_HEADER] {
+            assert!(
+                !upstream_headers.contains_key(protected),
+                "{protected} must not be settable through the override channel"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_overrides_reject_malformed_payloads() {
+        for encoded in ["not-base64!!", "eyJhIjo="] {
+            assert!(decode_upstream_header_overrides(encoded).is_err());
+        }
+        // 合法 base64 但不是 JSON 对象
+        assert!(decode_upstream_header_overrides(
+            &base64::engine::general_purpose::STANDARD.encode(b"[1,2,3]")
+        )
+        .is_err());
+        // 非字符串取值
+        assert!(decode_upstream_header_overrides(
+            &base64::engine::general_purpose::STANDARD.encode(br#"{"X-A":1}"#)
+        )
+        .is_err());
+        // 头名非法
+        assert!(decode_upstream_header_overrides(
+            &base64::engine::general_purpose::STANDARD.encode(br#"{"Bad Header":"v"}"#)
+        )
+        .is_err());
+        // 取值含 CR/LF（header 注入）
+        assert!(decode_upstream_header_overrides(
+            &base64::engine::general_purpose::STANDARD.encode(b"{\"X-A\":\"a\\r\\nb\"}")
+        )
+        .is_err());
+        // 超限
+        let oversized = "A".repeat(UPSTREAM_HEADERS_MAX_BYTES + 4);
+        assert!(decode_upstream_header_overrides(&oversized).is_err());
+    }
+
+    fn encoded_overrides(value: serde_json::Value) -> HeaderValue {
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&value).expect("serialize overrides"));
+        HeaderValue::from_str(&encoded).expect("override header value")
+    }
+
+    fn header_str<K>(headers: &HeaderMap, name: K) -> Option<&str>
+    where
+        K: axum::http::header::AsHeaderName,
+    {
+        headers.get(name).and_then(|value| value.to_str().ok())
     }
 }

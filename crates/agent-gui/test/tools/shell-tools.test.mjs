@@ -14,7 +14,7 @@ function createBashCall(command = "echo ready") {
   };
 }
 
-test("Bash tool keeps one Bash entry and uses Windows-native policy for Claude Code", async () => {
+test("Bash tool keeps one Bash entry and uses Git Bash-first policy for Claude Code", async () => {
   const calls = [];
   const loader = createTsModuleLoader({
     mocks: {
@@ -24,10 +24,10 @@ test("Bash tool keeps one Bash entry and uses Windows-native policy for Claude C
           assert.equal(command, "shell_run");
           return {
             exit_code: 0,
-            shell: "pwsh",
+            shell: "bash",
             platform: "windows",
-            profile: "windows-pwsh",
-            shell_family: "powershell",
+            profile: "windows-git-bash",
+            shell_family: "posix",
             stdout: "ready\n",
             stderr: "",
             stdout_truncated: false,
@@ -50,8 +50,9 @@ test("Bash tool keeps one Bash entry and uses Windows-native policy for Claude C
   });
 
   assert.match(bundle.tools[0].description, /Windows runs Bash commands/);
-  assert.match(bundle.tools[0].description, /pwsh first/);
-  assert.doesNotMatch(bundle.tools[0].description, /Git Bash first/);
+  assert.match(bundle.tools[0].description, /Git Bash \(POSIX semantics\)/);
+  assert.match(bundle.tools[0].description, /Write POSIX\/bash syntax by default/);
+  assert.doesNotMatch(bundle.tools[0].description, /native Windows shell chain/);
 
   const result = await bundle.executeToolCall(createBashCall());
 
@@ -60,10 +61,10 @@ test("Bash tool keeps one Bash entry and uses Windows-native policy for Claude C
   assert.equal(calls[0].args.provider_id, "claude_code");
   assert.equal(calls[0].args.max_timeout_ms, 600_000);
   assert.match(result.content[0].text, /platform: windows/);
-  assert.match(result.content[0].text, /profile: windows-pwsh/);
+  assert.match(result.content[0].text, /profile: windows-git-bash/);
 });
 
-test("Bash tool uses the same Windows-native policy for Codex", async () => {
+test("Bash tool uses the same Git Bash-first policy for Codex", async () => {
   const calls = [];
   const loader = createTsModuleLoader({
     mocks: {
@@ -73,10 +74,10 @@ test("Bash tool uses the same Windows-native policy for Codex", async () => {
           assert.equal(command, "shell_run");
           return {
             exit_code: 0,
-            shell: "pwsh",
+            shell: "bash",
             platform: "windows",
-            profile: "windows-pwsh",
-            shell_family: "powershell",
+            profile: "windows-git-bash",
+            shell_family: "posix",
             stdout: "ready\n",
             stderr: "",
             stdout_truncated: false,
@@ -99,7 +100,7 @@ test("Bash tool uses the same Windows-native policy for Codex", async () => {
   });
 
   assert.match(bundle.tools[0].description, /Windows runs Bash commands/);
-  assert.match(bundle.tools[0].description, /PowerShell syntax/);
+  assert.match(bundle.tools[0].description, /Git Bash \(POSIX semantics\)/);
   assert.doesNotMatch(bundle.tools[0].description, /Codex-style auto shell selection/);
 
   const result = await bundle.executeToolCall(createBashCall());
@@ -207,6 +208,7 @@ test("Bash tool rejects background commands that keep stdio attached", async () 
   const bundle = createShellTools({
     workdir: "/repo",
     providerId: "claude_code",
+    runtimePlatform: "linux",
   });
 
   const result = await bundle.executeToolCall(
@@ -236,6 +238,7 @@ test("Bash tool rejects background commands when redirects belong to another com
   const bundle = createShellTools({
     workdir: "/repo",
     providerId: "claude_code",
+    runtimePlatform: "linux",
   });
 
   const result = await bundle.executeToolCall(
@@ -264,6 +267,7 @@ test("Bash tool rejects background commands with only stderr append redirected",
   const bundle = createShellTools({
     workdir: "/repo",
     providerId: "claude_code",
+    runtimePlatform: "linux",
   });
 
   const result = await bundle.executeToolCall(
@@ -275,7 +279,36 @@ test("Bash tool rejects background commands with only stderr append redirected",
   assert.deepEqual(calls, []);
 });
 
-test("Bash tool does not apply POSIX ampersand background validation on Windows", async () => {
+test("Bash tool applies POSIX ampersand background validation on Windows", async () => {
+  const calls = [];
+  const loader = createTsModuleLoader({
+    mocks: {
+      "@tauri-apps/api/core": {
+        async invoke(command, args) {
+          calls.push({ command, args });
+          throw new Error("shell_run should not be invoked for rejected commands");
+        },
+      },
+    },
+  });
+
+  const { createShellTools } = loader.loadModule("src/lib/tools/shellTools.ts");
+  const bundle = createShellTools({
+    workdir: "/repo",
+    providerId: "codex",
+    runtimePlatform: "windows",
+  });
+
+  const result = await bundle.executeToolCall(
+    createBashCall("deno run --allow-net main.ts 2>> /tmp/server.err &"),
+  );
+
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Background Bash commands must detach stdout and stderr/);
+  assert.equal(calls.length, 0);
+});
+
+test("Bash tool allows detached background commands on Windows", async () => {
   const calls = [];
   const loader = createTsModuleLoader({
     mocks: {
@@ -285,10 +318,10 @@ test("Bash tool does not apply POSIX ampersand background validation on Windows"
           assert.equal(command, "shell_run");
           return {
             exit_code: 0,
-            shell: "pwsh",
+            shell: "bash",
             platform: "windows",
-            profile: "windows-pwsh",
-            shell_family: "powershell",
+            profile: "windows-git-bash",
+            shell_family: "posix",
             stdout: "ok\n",
             stderr: "",
             stdout_truncated: false,
@@ -310,10 +343,70 @@ test("Bash tool does not apply POSIX ampersand background validation on Windows"
     runtimePlatform: "windows",
   });
 
-  const result = await bundle.executeToolCall(createBashCall('& "C:/Program Files/App/app.exe"'));
+  const result = await bundle.executeToolCall(
+    createBashCall("nohup deno run main.ts > /tmp/liveagent-test.log 2>&1 < /dev/null &"),
+  );
 
   assert.equal(result.isError, false);
   assert.equal(calls.length, 1);
+});
+
+function createWindowsFailureLoader(shellFamily, shell) {
+  return createTsModuleLoader({
+    mocks: {
+      "@tauri-apps/api/core": {
+        async invoke(command, args) {
+          assert.equal(command, "shell_run");
+          return {
+            exit_code: 1,
+            shell,
+            platform: "windows",
+            profile: shellFamily === "posix" ? "windows-git-bash" : "windows-pwsh",
+            shell_family: shellFamily,
+            stdout: "",
+            stderr: "export : The term 'export' is not recognized",
+            stdout_truncated: false,
+            stderr_truncated: false,
+            timed_out: false,
+            cancelled: false,
+            effective_timeout_ms: args.timeout_ms,
+            duration_ms: 12,
+          };
+        },
+      },
+    },
+  });
+}
+
+test("Bash tool hints about missing Git Bash when Windows falls back to PowerShell", async () => {
+  const loader = createWindowsFailureLoader("powershell", "pwsh");
+  const { createShellTools } = loader.loadModule("src/lib/tools/shellTools.ts");
+  const bundle = createShellTools({
+    workdir: "/repo",
+    providerId: "claude_code",
+    runtimePlatform: "windows",
+  });
+
+  const result = await bundle.executeToolCall(createBashCall("export NAME=value"));
+
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Git Bash was not found/);
+  assert.match(result.content[0].text, /LIVEAGENT_GIT_BASH_PATH/);
+});
+
+test("Bash tool does not hint about Git Bash when a Windows failure ran under Git Bash", async () => {
+  const loader = createWindowsFailureLoader("posix", "bash");
+  const { createShellTools } = loader.loadModule("src/lib/tools/shellTools.ts");
+  const bundle = createShellTools({
+    workdir: "/repo",
+    providerId: "claude_code",
+    runtimePlatform: "windows",
+  });
+
+  const result = await bundle.executeToolCall(createBashCall("exit 1"));
+
+  assert.equal(result.isError, true);
+  assert.doesNotMatch(result.content[0].text, /Git Bash was not found/);
 });
 
 test("Bash tool allows background commands with detached stdio", async () => {
@@ -437,6 +530,78 @@ test("ManagedProcess starts foreground commands through process manager", async 
   assert.equal(calls[0].args.cwd, "app");
 });
 
+test("ManagedProcess abort stops a process returned after cancellation", async () => {
+  let resolveStart;
+  const startPromise = new Promise((resolve) => {
+    resolveStart = resolve;
+  });
+  const calls = [];
+  const loader = createTsModuleLoader({
+    mocks: {
+      "@tauri-apps/api/core": {
+        async invoke(command, args) {
+          calls.push({ command, args });
+          if (command === "managed_process_start") {
+            return startPromise;
+          }
+          if (command === "managed_process_stop") {
+            return undefined;
+          }
+          throw new Error("unexpected invoke " + command);
+        },
+      },
+    },
+  });
+  const { createShellTools } = loader.loadModule("src/lib/tools/shellTools.ts");
+  const bundle = createShellTools({
+    workdir: "/repo",
+    providerId: "claude_code",
+  });
+  const controller = new AbortController();
+
+  const resultPromise = bundle.executeToolCall(
+    {
+      type: "toolCall",
+      id: "managed-cancelled-start",
+      name: "ManagedProcess",
+      arguments: {
+        action: "start",
+        command: "deno run --allow-net main.ts",
+      },
+    },
+    controller.signal,
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.abort();
+  const result = await resultPromise;
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Cancelled/);
+
+  resolveStart({
+    process: {
+      id: "proc-late",
+      label: "dev",
+      command: "deno run --allow-net main.ts",
+      cwd: "/repo",
+      shell: "zsh",
+      pid: 123,
+      log_path: "/tmp/proc-late.log",
+      started_at: 10,
+      finished_at: null,
+      exit_code: null,
+      running: true,
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.ok(
+    calls.some(
+      (call) =>
+        call.command === "managed_process_stop" && call.args.process_id === "proc-late",
+    ),
+  );
+});
+
 test("ManagedProcess rejects nested shell background operators", async () => {
   const calls = [];
   const loader = createTsModuleLoader({
@@ -454,6 +619,7 @@ test("ManagedProcess rejects nested shell background operators", async () => {
   const bundle = createShellTools({
     workdir: "/repo",
     providerId: "claude_code",
+    runtimePlatform: "linux",
   });
 
   const result = await bundle.executeToolCall({
@@ -471,29 +637,14 @@ test("ManagedProcess rejects nested shell background operators", async () => {
   assert.deepEqual(calls, []);
 });
 
-test("ManagedProcess does not apply POSIX ampersand background validation on Windows", async () => {
+test("ManagedProcess rejects background ampersand commands on Windows", async () => {
   const calls = [];
   const loader = createTsModuleLoader({
     mocks: {
       "@tauri-apps/api/core": {
         async invoke(command, args) {
           calls.push({ command, args });
-          assert.equal(command, "managed_process_start");
-          return {
-            process: {
-              id: "proc-win",
-              label: null,
-              command: args.command,
-              cwd: "C:\\repo",
-              shell: "pwsh",
-              pid: 456,
-              log_path: "C:\\Users\\me\\.liveagent\\process-logs\\proc-win.log",
-              started_at: 10,
-              finished_at: null,
-              exit_code: null,
-              running: true,
-            },
-          };
+          throw new Error("managed_process_start should not be invoked for rejected commands");
         },
       },
     },
@@ -512,12 +663,13 @@ test("ManagedProcess does not apply POSIX ampersand background validation on Win
     name: "ManagedProcess",
     arguments: {
       action: "start",
-      command: '& "C:/Program Files/App/app.exe"',
+      command: "vite --port 5173 &",
     },
   });
 
-  assert.equal(result.isError, false);
-  assert.equal(calls.length, 1);
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /must be a foreground command/);
+  assert.equal(calls.length, 0);
 });
 
 test("Bash tool marks stdio-open shell responses as errors", async () => {

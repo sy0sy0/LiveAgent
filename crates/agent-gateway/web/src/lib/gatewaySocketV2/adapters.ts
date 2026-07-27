@@ -1,6 +1,5 @@
-// v2 线协议适配层：把 v1「请求类型字符串 + snake_case JSON 载荷」译为 v2 protobuf 帧，并把服务端帧
-// 还原为 v1 JSON 线格式等价对象（形状以 Go 侧 websocket_payloads.go / websocket_*_handlers.go 为准），
-// 使 gatewaySocket 公开 API、归一化器与上层 UI 不感知协议替换。
+// v2 线协议适配层：把 gatewaySocket 公开 API 使用的请求类型字符串与 snake_case
+// UI 载荷编码为 protobuf 帧，并把服务端帧还原为现有归一化器需要的对象形状。
 // bigint 边界：本文件是 64 位整数（生成代码映射为 bigint）的唯一出入口——入站一律 Number()（均为
 // 时间戳/计数，远小于 2^53 无精度损失），出站 BigInt() 收窄；适配层之外不允许出现 bigint。
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
@@ -21,12 +20,15 @@ import type {
   TerminalEvent,
   TerminalResponse,
   TerminalSession,
+  TerminalSshLocalForward,
+  TerminalSshLocalForwardAction,
+  TerminalSshLocalForwardsSnapshot,
   TerminalSshTabsSnapshot,
   TerminalStreamFrame,
   TunnelHealth,
   TunnelStateSnapshot,
   WorkspaceActivityEvent,
-} from "@/lib/proto/gen/proto/v1/gateway_pb";
+} from "@/lib/proto/gen/proto/v2/gateway_pb";
 import {
   CancelChatRequestSchema,
   ChatCommandRequestSchema,
@@ -64,6 +66,7 @@ import {
   MemoryManageRequestSchema,
   ProviderListRequestSchema,
   ProviderModelsRequestSchema,
+  ProviderUsageRequestSchema,
   SettingsGetRequestSchema,
   SettingsResetSshKnownHostRequestSchema,
   SettingsUpdateRequestSchema,
@@ -76,7 +79,7 @@ import {
   TerminalStreamFrameSchema,
   TunnelMutationSchema,
   UploadedImagePreviewRequestSchema,
-} from "@/lib/proto/gen/proto/v1/gateway_pb";
+} from "@/lib/proto/gen/proto/v2/gateway_pb";
 import type {
   ChatActivityEvent,
   ChatCommandUpdate,
@@ -89,6 +92,7 @@ import type {
   WebServerFrame,
 } from "@/lib/proto/gen/proto/v2/gateway_ws_pb";
 import {
+  AgentListRequestSchema,
   ChatActivitiesRequestSchema,
   ChatPrepareRequestSchema,
   ChatSubscribeRequestSchema,
@@ -130,7 +134,7 @@ function trimStr(value: unknown): string {
   return str(value).trim();
 }
 
-// 32 位整数出站：非法值一律回落为 0（与 v1 服务端解码后的零值一致）。
+// 32 位整数出站：非法值一律回落为 0。
 function n32(value: unknown): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? Math.trunc(parsed) : 0;
@@ -167,7 +171,7 @@ function wireBytes(bytes: Uint8Array): WireBytes {
   return bytes as WireBytes;
 }
 
-// 网关本地/解码期错误，等价于 v1 的 type:"error" 信封。
+// 网关本地或解码期错误，由 gatewaySocket 统一转为请求失败。
 class GatewayFrameError extends Error {}
 
 function frameError(message: string): never {
@@ -202,14 +206,31 @@ export function encodePongFrame(timestamp: number): WireBytes {
   return wireBytes(toBinary(WebClientFrameSchema, frame));
 }
 
-// 把 v1 请求类型字符串 + JSON 载荷编码为一帧 WebClientFrame；未知类型抛错（调用方 reject）。
-export function encodeRequestFrame(requestId: string, type: string, payload: unknown): WireBytes {
-  return wireBytes(toBinary(WebClientFrameSchema, buildRequestFrame(requestId, type, payload)));
+// 把请求类型字符串与 UI 载荷编码为 WebClientFrame；未知类型抛错。
+// 目标型请求必须携带明确 agentId；目录与全局会话请求不需要目标。
+export function encodeRequestFrame(
+  requestId: string,
+  type: string,
+  payload: unknown,
+  agentId = "",
+): WireBytes {
+  const frame = buildRequestFrame(requestId, type, payload);
+  const normalizedAgentId = agentId.trim();
+  if (!normalizedAgentId && !["agent.list", "chat.activities"].includes(type)) {
+    throw new Error("agent_id is required");
+  }
+  frame.agentId = normalizedAgentId;
+  return wireBytes(toBinary(WebClientFrameSchema, frame));
 }
 
 function buildRequestFrame(requestId: string, type: string, payload: unknown): WebClientFrame {
   const body = rec(payload);
   switch (type) {
+    case "agent.list":
+      return create(WebClientFrameSchema, {
+        requestId,
+        payload: { case: "agentList", value: create(AgentListRequestSchema, {}) },
+      });
     case "status.get":
       return webFrame(requestId, "statusGet", create(StatusGetRequestSchema, {}));
     case "chat.prepare":
@@ -347,7 +368,7 @@ function buildMessageRef(ref: J) {
   });
 }
 
-// 构造直通 GatewayEnvelope，各臂字段映射与 v1 处理器的 JSON→proto 组包逐一对应。
+// 构造直通 GatewayEnvelope，并把 UI 字段映射到对应 proto 载荷臂。
 function buildAgentRequest(type: string, body: J): GatewayEnvelope {
   return create(GatewayEnvelopeSchema, { payload: agentRequestPayload(type, body) });
 }
@@ -384,11 +405,15 @@ function agentRequestPayload(type: string, body: J): GatewayEnvelope["payload"] 
         sftpEnabled: bool(body.sftp_enabled),
         tabId: trimStr(body.tab_id),
         tabKind: trimStr(body.tab_kind),
+        remoteHost: trimStr(body.remote_host),
+        remotePort: n32(body.remote_port),
+        localPort: n32(body.local_port),
+        forwardId: trimStr(body.forward_id),
       }),
     };
   }
   if (type.startsWith("sftp.")) {
-    // v1 侧 side 与 direction 互为回落；proto 只保留 direction。
+    // UI 载荷中的 side 与 direction 互为回落；proto 只保留 direction。
     const direction = trimStr(body.direction) || trimStr(body.side);
     return {
       case: "sftpRequest",
@@ -461,7 +486,7 @@ function agentRequestPayload(type: string, body: J): GatewayEnvelope["payload"] 
     case "history.workdirs":
       return { case: "historyWorkdirs", value: create(HistoryWorkdirsRequestSchema, {}) };
     case "history.shared_list":
-      // v1 网关把 shared_list 转译为 memory_manage 直通命令；v2 客户端直接构造同一命令，结果形状不变。
+      // shared_list 通过 memory_manage 直通命令实现，并保持现有结果形状。
       return {
         case: "memoryManage",
         value: create(MemoryManageRequestSchema, {
@@ -547,6 +572,15 @@ function agentRequestPayload(type: string, body: J): GatewayEnvelope["payload"] 
           baseUrl: trimStr(body.base_url),
           apiKey: trimStr(body.api_key),
           useSystemProxy: bool(body.use_system_proxy),
+        }),
+      };
+    case "provider.usage.query":
+      return {
+        case: "providerUsage",
+        value: create(ProviderUsageRequestSchema, {
+          providerId: trimStr(body.provider_id),
+          refresh: bool(body.refresh),
+          configJson: trimStr(body.config_json),
         }),
       };
     case "settings.get":
@@ -725,22 +759,23 @@ export type DecodedServerFrame =
       serverTime: number;
     }
   | { kind: "ping"; timestamp: number }
-  | { kind: "response"; requestId: string; payload: unknown }
-  | { kind: "error"; requestId: string; message: string }
-  | { kind: "event"; type: string; payload: unknown };
+  | { kind: "response"; requestId: string; agentId: string; payload: unknown }
+  | { kind: "error"; requestId: string; agentId: string; message: string }
+  | { kind: "event"; type: string; agentId: string; payload: unknown };
 
 export function decodeServerFrameBinary(data: ArrayBuffer | Uint8Array): WebServerFrame {
   const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
   return fromBinary(WebServerFrameSchema, bytes);
 }
 
-// 把一帧 WebServerFrame 归一化为分发单元。agentOnline 用于 process.state：v1 由网关注入
-// agent_online，v2 改由客户端从 status 事件维护的在线位补齐。
+// 把一帧 WebServerFrame 归一化为分发单元。agentOnline 用于给 process.state
+// 补齐客户端从 status 事件维护的在线位。
 export function decodeServerFrame(
   frame: WebServerFrame,
   options: { agentOnline: boolean },
 ): DecodedServerFrame | null {
   const requestId = frame.requestId ?? "";
+  const agentId = frame.agentId ?? "";
   const payload = frame.payload;
   switch (payload.case) {
     case "hello":
@@ -759,6 +794,7 @@ export function decodeServerFrame(
       return {
         kind: "error",
         requestId,
+        agentId,
         message: payload.value.message || "Request failed",
       };
     case "agentResponse":
@@ -766,26 +802,34 @@ export function decodeServerFrame(
         return {
           kind: "response",
           requestId,
+          agentId,
           payload: decodeAgentResponse(payload.value, options),
         };
       } catch (error) {
         return {
           kind: "error",
           requestId,
+          agentId,
           message: error instanceof Error ? error.message : "Request failed",
         };
       }
     case "status":
-      // status 臂身兼二职：带 request_id 是 status.get/chat.prepare 响应，空则为广播（v1 "status.event"）。
+      // status 臂身兼二职：带 request_id 是 status.get/chat.prepare 响应，空则为 status.event 广播。
       return requestId
-        ? { kind: "response", requestId, payload: statusPayload(payload.value) }
-        : { kind: "event", type: "status.event", payload: statusPayload(payload.value) };
+        ? { kind: "response", requestId, agentId, payload: statusPayload(payload.value) }
+        : { kind: "event", type: "status.event", agentId, payload: statusPayload(payload.value) };
     case "chatSubscribed":
-      return { kind: "response", requestId, payload: chatSubscribedPayload(payload.value) };
+      return {
+        kind: "response",
+        requestId,
+        agentId,
+        payload: chatSubscribedPayload(payload.value),
+      };
     case "chatAccepted":
       return {
         kind: "response",
         requestId,
+        agentId,
         payload: {
           run_id: payload.value.runId,
           conversation_id: payload.value.conversationId,
@@ -797,6 +841,7 @@ export function decodeServerFrame(
       return {
         kind: "response",
         requestId,
+        agentId,
         payload: {
           running_conversations: payload.value.runningConversations.map(runningConversationPayload),
         },
@@ -805,6 +850,7 @@ export function decodeServerFrame(
       return {
         kind: "response",
         requestId,
+        agentId,
         payload: {
           ok: payload.value.ok,
           run_id: payload.value.runId,
@@ -812,58 +858,95 @@ export function decodeServerFrame(
         },
       };
     case "ack":
-      return { kind: "response", requestId, payload: { ok: payload.value.ok } };
+      return { kind: "response", requestId, agentId, payload: { ok: payload.value.ok } };
     case "chatEvent": {
       const parsed = parseJsonBytes(payload.value.payloadJson);
-      return parsed === undefined ? null : { kind: "event", type: "chat.event", payload: parsed };
+      return parsed === undefined
+        ? null
+        : { kind: "event", type: "chat.event", agentId, payload: parsed };
     }
     case "chatCommandUpdate":
       return {
         kind: "event",
         type: "chat.command_update",
+        agentId,
         payload: chatCommandUpdatePayload(payload.value),
       };
     case "chatSubscriptionReset":
       return {
         kind: "event",
         type: "chat.subscription_reset",
+        agentId,
         payload: { conversation_id: payload.value.conversationId },
       };
     case "chatActivity":
-      return { kind: "event", type: "chat.activity", payload: chatActivityPayload(payload.value) };
+      return {
+        kind: "event",
+        type: "chat.activity",
+        agentId,
+        payload: chatActivityPayload(payload.value),
+      };
     case "historyEvent":
-      return { kind: "event", type: "history.event", payload: historyEventPayload(payload.value) };
+      return {
+        kind: "event",
+        type: "history.event",
+        agentId,
+        payload: historyEventPayload(payload.value),
+      };
     case "settingsEvent": {
-      // v1 网关把 settings_json 解析成对象后转发；v2 移到客户端解析。
+      // settings_json 在客户端解析为现有设置事件对象。
       const parsed = settingsEventPayload(payload.value);
-      return parsed === null ? null : { kind: "event", type: "settings.event", payload: parsed };
+      return parsed === null
+        ? null
+        : { kind: "event", type: "settings.event", agentId, payload: parsed };
     }
     case "terminalEvent":
       return {
         kind: "event",
         type: "terminal.event",
+        agentId,
         payload: terminalEventPayload(payload.value),
       };
     case "sftpEvent":
-      return { kind: "event", type: "sftp.event", payload: sftpEventPayload(payload.value) };
+      return {
+        kind: "event",
+        type: "sftp.event",
+        agentId,
+        payload: sftpEventPayload(payload.value),
+      };
     case "chatQueueEvent":
       return {
         kind: "event",
         type: "chat_queue.event",
+        agentId,
         payload: chatQueueEventPayload(payload.value),
       };
     case "tunnelState":
-      return { kind: "event", type: "tunnel.state", payload: tunnelStatePayload(payload.value) };
+      return {
+        kind: "event",
+        type: "tunnel.state",
+        agentId,
+        payload: tunnelStatePayload(payload.value),
+      };
     case "processState":
       return {
         kind: "event",
         type: "process.state",
+        agentId,
         payload: processStatePayload(payload.value, options.agentOnline),
+      };
+    case "agentList":
+      return {
+        kind: "response",
+        requestId,
+        agentId,
+        payload: { agents: payload.value.agents.map(statusPayload) },
       };
     case "workspaceActivity":
       return {
         kind: "event",
         type: "workspace.activity",
+        agentId,
         payload: workspaceActivityPayload(payload.value),
       };
     default:
@@ -880,7 +963,7 @@ function parseJsonBytes(bytes: Uint8Array): unknown {
 }
 
 // ---------------------------------------------------------------------------
-// 直通响应（AgentEnvelope）→ v1 JSON 线格式
+// 直通响应（AgentEnvelope）→ gatewaySocket 响应对象
 // ---------------------------------------------------------------------------
 
 function decodeAgentResponse(envelope: AgentEnvelope, options: { agentOnline: boolean }): unknown {
@@ -890,7 +973,7 @@ function decodeAgentResponse(envelope: AgentEnvelope, options: { agentOnline: bo
       frameError(payload.value.message || "Request failed");
       break;
     case "historyListResp":
-      // running_conversations 由 gatewaySocket 侧经 chat.activities 帧合并（v1 由网关顺带附上）。
+      // running_conversations 由 gatewaySocket 侧经 chat.activities 帧合并。
       return {
         conversations: payload.value.conversations.map(conversationSummaryPayload),
         total_count: payload.value.totalCount,
@@ -945,6 +1028,13 @@ function decodeAgentResponse(envelope: AgentEnvelope, options: { agentOnline: bo
         return parseJson(payload.value.modelsJson);
       } catch {
         frameError("provider model response is not valid JSON");
+      }
+      break;
+    case "providerUsageResp":
+      try {
+        return parseJson(payload.value.resultJson);
+      } catch {
+        frameError("provider usage response is not valid JSON");
       }
       break;
     case "settingsGetResp": {
@@ -1108,7 +1198,7 @@ function unmarshalJsonPayload(raw: string): unknown {
 }
 
 // ---------------------------------------------------------------------------
-// v1 载荷塑形（与 Go 手工 map 一一对应）
+// gatewaySocket 载荷塑形
 // ---------------------------------------------------------------------------
 
 // 对应 websocketConversationSummaryPayload：protojson UseProtoNames+EmitUnpopulated（全字段恒出现），
@@ -1204,6 +1294,7 @@ function statusPayload(status: StatusEvent): J {
   if (status.runtimeActiveRunCount) {
     payload.runtime_active_run_count = status.runtimeActiveRunCount;
   }
+  if (status.name) payload.name = status.name;
   return payload;
 }
 
@@ -1354,6 +1445,47 @@ function terminalSshTabsPayload(snapshot: TerminalSshTabsSnapshot | undefined): 
   };
 }
 
+function terminalSshLocalForwardPayload(forward: TerminalSshLocalForward | undefined): J | null {
+  if (!forward) return null;
+  const payload: J = {
+    id: forward.id.trim(),
+    session_id: forward.sessionId.trim(),
+    project_path_key: forward.projectPathKey.trim(),
+    local_host: forward.localHost.trim(),
+    local_port: forward.localPort,
+    address: forward.address.trim(),
+    remote_host: forward.remoteHost.trim(),
+    remote_port: forward.remotePort,
+    status: forward.status.trim(),
+    created_at: num(forward.createdAt),
+    updated_at: num(forward.updatedAt),
+  };
+  if (forward.error.trim()) payload.error = forward.error.trim();
+  return payload;
+}
+
+function terminalSshLocalForwardsPayload(
+  snapshot: TerminalSshLocalForwardsSnapshot | undefined,
+): J | null {
+  if (!snapshot) return null;
+  const forwards: J[] = [];
+  for (const forward of snapshot.forwards) {
+    const payload = terminalSshLocalForwardPayload(forward);
+    if (payload) forwards.push(payload);
+  }
+  return { forwards, revision: num(snapshot.revision) };
+}
+
+function terminalSshLocalForwardActionPayload(
+  action: TerminalSshLocalForwardAction | undefined,
+): J | null {
+  const forward = terminalSshLocalForwardPayload(action?.forward);
+  if (!action || !forward) return null;
+  const payload: J = { forward, revision: num(action.revision) };
+  if (action.kind.trim()) payload.kind = action.kind.trim();
+  return payload;
+}
+
 function terminalResponsePayload(resp: TerminalResponse): J {
   const sessions: J[] = [];
   for (const session of resp.sessions) {
@@ -1400,6 +1532,13 @@ function terminalResponsePayload(resp: TerminalResponse): J {
   }
   const sshTabs = terminalSshTabsPayload(resp.sshTabs);
   if (sshTabs) payload.ssh_tabs = sshTabs;
+  const sshLocalForwards = terminalSshLocalForwardsPayload(resp.sshLocalForwards);
+  if (sshLocalForwards) payload.ssh_local_forwards = sshLocalForwards;
+  const sshLocalForward = terminalSshLocalForwardActionPayload(resp.sshLocalForward);
+  if (sshLocalForward) payload.ssh_local_forward = sshLocalForward;
+  if (resp.action.trim() === "ssh_local_forward_check_port") {
+    payload.ssh_local_forward_port_available = resp.sshLocalForwardPortAvailable;
+  }
   return payload;
 }
 
@@ -1425,6 +1564,8 @@ function terminalEventPayload(event: TerminalEvent): J {
   if (session) payload.session = session;
   const sshTabs = terminalSshTabsPayload(event.sshTabs);
   if (sshTabs) payload.ssh_tabs = sshTabs;
+  const sshLocalForward = terminalSshLocalForwardActionPayload(event.sshLocalForward);
+  if (sshLocalForward) payload.ssh_local_forward = sshLocalForward;
   return payload;
 }
 
@@ -1513,7 +1654,7 @@ function tunnelStatePayload(snapshot: TunnelStateSnapshot): J {
   };
 }
 
-// 对应 websocketManagedProcessPayload；agent_online 由客户端 status 在线位注入（v1 由网关注入）。
+// 托管进程载荷；agent_online 由客户端维护的 status 在线位注入。
 function processStatePayload(
   snapshot: ManagedProcessSnapshot | undefined,
   agentOnline: boolean,
@@ -1551,7 +1692,7 @@ function managedProcessResponsePayload(
   const action = resp.action.trim();
   switch (action) {
     case "snapshot":
-      // v1 的 process.snapshot 直接返回扁平状态载荷。
+      // process.snapshot 返回扁平状态载荷。
       return processStatePayload(resp.snapshot, agentOnline);
     case "stop":
       return {
@@ -1594,7 +1735,12 @@ export type TerminalWireHeader = {
   session?: unknown;
 };
 
-export function encodeTerminalHelloFrame(token: string): WireBytes {
+// agentId 通过 hello.agent_id 显式绑定终端数据面的目标 Agent。
+export function encodeTerminalHelloFrame(token: string, agentId: string): WireBytes {
+  const normalizedAgentId = agentId.trim();
+  if (!normalizedAgentId) {
+    throw new Error("agent_id is required");
+  }
   const frame = create(TerminalClientFrameSchema, {
     payload: {
       case: "hello",
@@ -1602,6 +1748,7 @@ export function encodeTerminalHelloFrame(token: string): WireBytes {
         protocolVersion: GATEWAY_V2_PROTOCOL_VERSION,
         role: ClientRole.BROWSER,
         token,
+        agentId: normalizedAgentId,
         clientName: "webui",
         clientVersion: "",
       }),

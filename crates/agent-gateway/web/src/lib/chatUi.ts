@@ -26,6 +26,7 @@ export type ChatEntry =
       kind: "user";
       text: string;
       attachments: PendingUploadedFile[];
+      messageId?: string;
       messageRef?: HistoryMessageRef;
       timestamp?: number;
     }
@@ -230,7 +231,11 @@ export function normalizeLiveUploadedFiles(value: unknown): PendingUploadedFile[
     .filter((file): file is PendingUploadedFile => file !== null);
 }
 
-function readHistoryMessageRef(value: unknown): HistoryMessageRef | undefined {
+// Parses a persisted message identity from either wire casing: camelCase for
+// history's embedded liveAgentHistoryRef (desktop Rust producer), snake_case
+// for stream events' message_ref/base_message_ref (buildHistoryMessageRefPayload
+// mirrors). All six fields are required — a partial ref cannot anchor a rebase.
+export function readHistoryMessageRef(value: unknown): HistoryMessageRef | undefined {
   const record = asRecord(value);
   const segmentIndex = readNumber(record.segmentIndex ?? record.segment_index);
   const messageIndex = readNumber(record.messageIndex ?? record.message_index);
@@ -738,6 +743,7 @@ export function parseHistoryMessagesJson(raw: string): ChatEntry[] {
           kind: "user",
           text,
           attachments,
+          messageId: messageRef?.messageId,
           messageRef,
           timestamp: readMessageTimestamp(message.timestamp),
         });

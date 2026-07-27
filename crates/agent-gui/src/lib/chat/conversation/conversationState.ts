@@ -360,6 +360,28 @@ function locateHistoryMessageRef(state: ConversationViewState, ref: HistoryMessa
   return { segmentArrayIndex, messageIndex };
 }
 
+// Stable identity of a persisted user message, looked up by its message id.
+// Used at send time to stamp the just-appended user message's own ref onto
+// the outgoing user_message event, so remote subscribers can anchor a later
+// edit-resend rebase without waiting for a history refresh.
+export function findHistoryMessageRefByMessageId(
+  state: ConversationViewState,
+  messageId: string,
+): HistoryMessageRef | undefined {
+  const target = messageId.trim();
+  if (!target) return undefined;
+  for (let segmentIndex = state.segments.length - 1; segmentIndex >= 0; segmentIndex -= 1) {
+    const segment = state.segments[segmentIndex];
+    if (!segment) continue;
+    for (let messageIndex = segment.messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+      const message = segment.messages[messageIndex];
+      if (!message || readMessageStringId(message) !== target) continue;
+      return buildHistoryMessageRef({ segment, message, messageIndex });
+    }
+  }
+  return undefined;
+}
+
 function getSummaryId(summary: StoredSummaryMessage | undefined) {
   return summary?.id;
 }

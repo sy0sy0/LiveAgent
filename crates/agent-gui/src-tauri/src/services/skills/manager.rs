@@ -17,7 +17,7 @@ pub(crate) fn action_from_payload(
     match action {
         "read" | "list" | "install" | "install_start" | "install_status" | "install_cancel"
         | "create" | "validate" | "package" | "delete" | "clawhub_search" | "clawhub_install"
-        | "scan_external" | "scan_external_mcp" => Ok(action.to_string()),
+        | "scan_external" | "scan_external_mcp" | "scan_mcp_file" => Ok(action.to_string()),
         _ => Err(format!("SkillsManager action is not supported: {action}")),
     }
 }
@@ -72,6 +72,13 @@ pub fn system_manage_skill_sync(payload: Value) -> Result<SystemManageSkillRespo
             external_mcp: Some(scan_external_mcp_servers()),
             ..base
         }),
+        "scan_mcp_file" => {
+            let path = require_payload_string(payload, "path", "scan_mcp_file")?;
+            Ok(SystemManageSkillResponse {
+                external_mcp: Some(vec![scan_mcp_config_file(path)?]),
+                ..base
+            })
+        }
         "clawhub_search" => {
             let (clawhub_results, clawhub_next_cursor) =
                 search_clawhub_skills_from_payload(payload)?;

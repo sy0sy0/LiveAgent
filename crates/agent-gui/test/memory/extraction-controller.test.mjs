@@ -120,6 +120,33 @@ test("new turn boundary does NOT abort an in-flight run; dispose does", async ()
   }
 });
 
+test("parent cancellation aborts an in-flight extraction run", async () => {
+  const conversationId = newConversationId();
+  const parent = new AbortController();
+  const gate = deferred();
+  let observedSignal;
+  __setMemoryExtractionEngineForTests(async (params) => {
+    observedSignal = params.signal;
+    await gate.promise;
+    return okResult();
+  });
+  try {
+    const request = baseRequest(conversationId);
+    request.signal = parent.signal;
+    const run = memoryExtraction.requestExtraction(request);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    parent.abort();
+    assert.equal(observedSignal.aborted, true);
+
+    gate.resolve();
+    await run;
+  } finally {
+    __setMemoryExtractionEngineForTests(null);
+    memoryExtraction.dispose(conversationId);
+  }
+});
+
 test("gating skips run entirely for trivial messages", async () => {
   const conversationId = newConversationId();
   let engineCalls = 0;

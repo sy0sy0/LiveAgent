@@ -32,7 +32,7 @@ type Registration = {
 };
 
 const MAX_PENDING_EVENTS = 512;
-const SUBSCRIBE_REQUEST_TIMEOUT_MS = 5_000;
+const SUBSCRIBE_REQUEST_TIMEOUT_MS = 30_000;
 const SYNC_RETRY_INITIAL_DELAY_MS = 250;
 // Persistent failures (deleted conversation, permanent server-side rejects)
 // retry forever but back off far enough to stay negligible; transient

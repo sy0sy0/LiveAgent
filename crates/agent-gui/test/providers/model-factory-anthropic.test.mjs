@@ -18,15 +18,14 @@ const loader = createTsModuleLoader({
   },
 });
 
-const { createModelFromConfig, getAvailableThinkingLevelsForModel } = loader.loadModule(
-  "src/lib/providers/runtime/modelFactory.ts",
-);
+const { createModelFromConfig } = loader.loadModule("src/lib/providers/runtime/modelFactory.ts");
+const { resolveModelThinking } = loader.loadModule("src/lib/models/modelThinking.ts");
 const { streamSimpleByApi } = loader.loadModule("src/lib/providers/runtime/streamByApi.ts");
 
 const RELAY_BASE_URL = "https://relay.example.com/v1";
 
 function levelsFor(modelId) {
-  return getAvailableThinkingLevelsForModel("claude_code", modelId, RELAY_BASE_URL);
+  return resolveModelThinking("claude_code", modelId).levels;
 }
 
 async function captureWirePayload(modelId, reasoning, baseUrl = RELAY_BASE_URL) {
@@ -76,37 +75,31 @@ test("anthropic: 装饰过的目录模型 id（日期后缀/大小写/@版本）
 });
 
 test("anthropic: 装饰 id 的可选档位与目录基础模型一致（xhigh/max 不丢失）", () => {
+  // 档位来自生成目录（models.dev）：adaptive 世代无 minimal 档。
   assert.deepEqual(levelsFor("claude-opus-4-8-20260213"), [
-    "minimal",
     "low",
     "medium",
     "high",
     "xhigh",
     "max",
   ]);
-  assert.deepEqual(levelsFor("claude-sonnet-4-6-20251114"), [
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "max",
-  ]);
+  assert.deepEqual(levelsFor("claude-sonnet-4-6-20251114"), ["low", "medium", "high", "max"]);
 });
 
 test("anthropic: 目录未命中的三方改名 id 走启发式识别 adaptive 家族", () => {
-  // Opus 4.7+/Claude 5 家族：xhigh 直通。
+  // Opus 4.7+/Claude 5 家族：xhigh 直通；adaptive 世代无 minimal 档（目录同形）。
   for (const modelId of ["claude-4.7-opus", "claude-5-sonnet", "custom-fable-5-relay"]) {
     const model = createModelFromConfig("claude_code", modelId, RELAY_BASE_URL);
     assert.equal(model.compat?.forceAdaptiveThinking, true, `${modelId} should be adaptive`);
     assert.equal(model.contextWindow, 1_000_000, `${modelId} should expose the 1M window`);
-    assert.deepEqual(model.thinkingLevelMap, { xhigh: "xhigh", max: "max" });
+    assert.deepEqual(model.thinkingLevelMap, { minimal: null, xhigh: "xhigh", max: "max" });
   }
   // Opus 4.6/Sonnet 4.6/Mythos Preview：只到 max。
   for (const modelId of ["claude-4.6-sonnet", "claude-mythos-preview"]) {
     const model = createModelFromConfig("claude_code", modelId, RELAY_BASE_URL);
     assert.equal(model.compat?.forceAdaptiveThinking, true, `${modelId} should be adaptive`);
     assert.equal(model.contextWindow, 1_000_000, `${modelId} should expose the 1M window`);
-    assert.deepEqual(model.thinkingLevelMap, { max: "max" });
+    assert.deepEqual(model.thinkingLevelMap, { minimal: null, max: "max" });
   }
 });
 

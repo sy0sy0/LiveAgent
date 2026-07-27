@@ -253,6 +253,21 @@ impl ChatRunLedger {
         recent
     }
 
+    // Liveness stand-in for runs whose only refresher is a throttled webview
+    // timer: while the webview is known to be merely stalled (its runtime
+    // status record is recent but its DOM timers are not firing), the caller
+    // refreshes every live entry so a long event-silent run is not demoted to
+    // desktop_run_lost by the TTL sweep below. Never resurrects terminals.
+    pub fn refresh_running(&mut self, now: Instant, now_ms: i64) {
+        for entry in self.entries.values_mut() {
+            if entry.state.is_terminal() {
+                continue;
+            }
+            entry.touched_at = now;
+            entry.updated_at_ms = now_ms;
+        }
+    }
+
     pub fn sweep(&mut self, now: Instant, now_ms: i64) -> Vec<ChatRunLedgerEntry> {
         let mut demoted: Vec<ChatRunLedgerEntry> = Vec::new();
         for entry in self.entries.values_mut() {
@@ -377,6 +392,41 @@ mod tests {
             ledger.active_reports(t0 + Duration::from_secs(400)).len(),
             1
         );
+    }
+
+    #[test]
+    fn refresh_running_keeps_live_entries_out_of_sweep() {
+        let mut ledger = test_ledger();
+        let t0 = Instant::now();
+        ledger.mark_running("run-1", "conversation-1", t0, 1_000);
+        ledger.mark_terminal(
+            "run-2",
+            "conversation-2",
+            ChatRunLedgerState::Completed,
+            "",
+            "",
+            t0,
+            1_000,
+        );
+
+        // Untouched past the TTL, but refreshed by the webview-stall grace.
+        let t1 = t0 + Duration::from_secs(301);
+        ledger.refresh_running(t1, 2_000);
+        assert!(ledger.sweep(t1, 2_000).is_empty());
+        assert_eq!(ledger.active_reports(t1).len(), 1);
+        // Terminal entries are never resurrected by the refresh.
+        assert_eq!(ledger.recent_terminal_reports().len(), 1);
+        assert_eq!(
+            ledger.recent_terminal_reports()[0].state,
+            ChatRunLedgerState::Completed
+        );
+
+        // Without further refreshes the normal TTL judgment resumes.
+        let t2 = t1 + Duration::from_secs(301);
+        let demoted = ledger.sweep(t2, 3_000);
+        assert_eq!(demoted.len(), 1);
+        assert_eq!(demoted[0].run_id, "run-1");
+        assert_eq!(demoted[0].error_code, DESKTOP_RUN_LOST_ERROR_CODE);
     }
 
     #[test]

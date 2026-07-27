@@ -13,6 +13,13 @@ use tauri::Manager;
 use tauri::WindowEvent;
 
 const MAIN_WINDOW_LABEL: &str = "main";
+// Only size + maximized are persisted: POSITION would fight multi-monitor
+// layouts we don't manage, VISIBLE would re-show a tray-hidden window on
+// startup, and DECORATIONS would override the per-platform window chrome
+// (Windows runs undecorated with custom chrome).
+pub(crate) const WINDOW_STATE_FLAGS: tauri_plugin_window_state::StateFlags =
+    tauri_plugin_window_state::StateFlags::SIZE
+        .union(tauri_plugin_window_state::StateFlags::MAXIMIZED);
 const TRAY_SHOW_ID: &str = "tray-show";
 const TRAY_QUIT_ID: &str = "tray-quit";
 const TRAY_DOUBLE_CLICK_INTERVAL_MS: u64 = 500;
@@ -131,6 +138,9 @@ macro_rules! app_invoke_handler {
             commands::update::app_restart,
             commands::app::app_runtime_platform,
             commands::app::app_set_close_window_behavior,
+            commands::app::app_set_global_shortcuts,
+            commands::app::app_window_pinned,
+            commands::app::app_toggle_window_pin,
             commands::app::app_confirmed_exit,
             commands::app::app_macos_traffic_light_metrics,
             // Hooks
@@ -150,7 +160,7 @@ macro_rules! app_invoke_handler {
             commands::cron::automation_complete_prompt_run,
             // Local command execution
             commands::shell::shell_run,
-            commands::shell::shell_cancel,
+            commands::shell::runtime_cancel,
             commands::process::managed_process_start,
             commands::process::managed_process_status,
             commands::process::managed_process_stop,
@@ -163,8 +173,13 @@ macro_rules! app_invoke_handler {
             commands::terminal::terminal_create_ssh,
             commands::terminal::terminal_answer_ssh_prompt,
             commands::terminal::terminal_cancel_ssh_prompt,
+            commands::terminal::terminal_ssh_reconnect,
             commands::terminal::terminal_ssh_latency,
             commands::terminal::terminal_ssh_exec,
+            commands::terminal::terminal_ssh_local_forward_start,
+            commands::terminal::terminal_ssh_local_forward_list,
+            commands::terminal::terminal_ssh_local_forward_stop,
+            commands::terminal::terminal_ssh_local_forward_check_port,
             commands::terminal::ssh_terminal_tabs_list,
             commands::terminal::ssh_terminal_tab_open,
             commands::terminal::ssh_terminal_tab_close,
@@ -186,8 +201,15 @@ macro_rules! app_invoke_handler {
             commands::sftp::sftp_cancel_transfer,
             commands::sftp::sftp_transfer_status,
             commands::git::git_status,
+            commands::git::git_discover_repositories,
             commands::git::git_branches,
             commands::git::git_init,
+            commands::git::git_clone_repository,
+            commands::git::git_clone_repository_start,
+            commands::git::git_clone_repository_tasks,
+            commands::git::git_clone_repository_cancel,
+            commands::git::git_clone_repository_dismiss,
+            commands::git::git_list_remote_branches,
             commands::git::git_switch_branch,
             commands::git::git_create_branch,
             commands::git::git_diff,
@@ -213,6 +235,7 @@ macro_rules! app_invoke_handler {
             commands::git::git_stash_push,
             commands::git::git_stash_pop,
             commands::system::system_pick_folder,
+            commands::system::system_pick_file,
             commands::system::system_create_project_folder,
             commands::system::system_import_pasted_texts,
             commands::system::system_import_readable_file_paths,
@@ -228,6 +251,7 @@ macro_rules! app_invoke_handler {
             commands::system::system_append_debug_jsonl,
             commands::system::system_begin_power_activity,
             commands::system::system_end_power_activity,
+            commands::system::system_clipboard_read_text,
             commands::custom_tools::system_http_get_test,
             commands::gateway::gateway_connect,
             commands::gateway::gateway_disconnect,
@@ -237,6 +261,7 @@ macro_rules! app_invoke_handler {
             commands::gateway::gateway_chat_claim_next,
             commands::gateway::gateway_chat_mark_started,
             commands::gateway::gateway_chat_mark_local_started,
+            commands::gateway::gateway_chat_mark_local_cancelled,
             commands::gateway::gateway_chat_mark_queued_in_gui,
             commands::gateway::gateway_chat_complete,
             commands::gateway::gateway_chat_fail,
@@ -254,6 +279,8 @@ macro_rules! app_invoke_handler {
             commands::gateway::gateway_tunnel_close,
             commands::gateway::gateway_tunnel_check,
             commands::gateway::workspace_watch_set,
+            commands::gateway::provider_usage_query,
+            commands::gateway::provider_usage_test,
             services::proxy::proxy_get_server_info,
         ]
     };
@@ -267,6 +294,67 @@ fn show_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
     }
 
     Ok(())
+}
+
+fn toggle_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let visible = window.is_visible().unwrap_or(false);
+        let focused = window.is_focused().unwrap_or(false);
+        if visible && focused {
+            let _ = window.hide();
+        } else if let Err(error) = show_main_window(app) {
+            eprintln!("failed to show LiveAgent window from global shortcut: {error}");
+        }
+    }
+}
+
+fn toggle_main_window_pin(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let pin_state = app.state::<Arc<commands::app::WindowPinState>>();
+        let next = !pin_state.0.load(Ordering::SeqCst);
+        match window.set_always_on_top(next) {
+            Ok(()) => {
+                pin_state.0.store(next, Ordering::SeqCst);
+                if next {
+                    if let Err(error) = show_main_window(app) {
+                        eprintln!("failed to show LiveAgent window when pinning: {error}");
+                    }
+                }
+                let _ = app.emit("global-shortcut:pin-changed", next);
+            }
+            Err(error) => eprintln!("failed to toggle LiveAgent window pin: {error}"),
+        }
+    }
+}
+
+fn handle_global_shortcut(
+    app: &tauri::AppHandle,
+    shortcut: &tauri_plugin_global_shortcut::Shortcut,
+) {
+    let action = app
+        .state::<Arc<commands::app::GlobalShortcutRegistry>>()
+        .lookup_action(shortcut);
+    let Some(action) = action else {
+        return;
+    };
+    match action.as_str() {
+        "summon" => {
+            if let Err(error) = show_main_window(app) {
+                eprintln!("failed to show LiveAgent window from global shortcut: {error}");
+            }
+        }
+        "toggle" => toggle_main_window(app),
+        "newChat" => {
+            if let Err(error) = show_main_window(app) {
+                eprintln!("failed to show LiveAgent window from global shortcut: {error}");
+            }
+            if let Err(error) = app.emit("global-shortcut:new-chat", ()) {
+                eprintln!("failed to emit new-chat global shortcut event: {error}");
+            }
+        }
+        "pin" => toggle_main_window_pin(app),
+        _ => {}
+    }
 }
 
 fn request_app_exit(
@@ -406,10 +494,13 @@ pub fn run() {
     let memory_store = Arc::new(
         services::memory::MemoryStore::open().expect("failed to initialize LiveAgent memory store"),
     );
+    let provider_usage_service =
+        Arc::new(services::provider_usage::ProviderUsageService::default());
     let power_activity = Arc::new(services::power_activity::PowerActivityManager::default());
     let managed_process_registry =
         Arc::new(runtime::managed_process::ManagedProcessRegistry::open());
     let terminal_registry = Arc::new(runtime::terminal::TerminalSessionRegistry::default());
+    let git_clone_task_registry = Arc::new(commands::git::GitCloneTaskRegistry::default());
     let sftp_registry = Arc::new(runtime::sftp::SftpSessionRegistry::new(Arc::clone(
         &terminal_registry,
     )));
@@ -422,13 +513,31 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_mcp_bridge::init())
+        .plugin(
+            tauri_plugin_window_state::Builder::new()
+                .with_state_flags(WINDOW_STATE_FLAGS)
+                .build(),
+        )
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, shortcut, event| {
+                    if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        handle_global_shortcut(app, shortcut);
+                    }
+                })
+                .build(),
+        )
+        .manage(Arc::new(commands::app::GlobalShortcutRegistry::default()))
+        .manage(Arc::new(commands::app::WindowPinState::default()))
         .manage(Arc::new(commands::mcp::McpRuntimeManager::default()))
         .manage(Arc::clone(&memory_store))
+        .manage(Arc::clone(&provider_usage_service))
         .manage(Arc::clone(&power_activity))
         .manage(Arc::new(runtime::shell_runner::ShellRunRegistry::default()))
         .manage(Arc::clone(&managed_process_registry))
         .manage(Arc::clone(&terminal_registry))
         .manage(Arc::clone(&sftp_registry))
+        .manage(Arc::clone(&git_clone_task_registry))
         .manage(Arc::clone(&allow_exit))
         .manage(Arc::clone(&close_window_behavior))
         .manage(Arc::clone(&automation_store))
@@ -439,6 +548,8 @@ pub fn run() {
             let terminal_registry = Arc::clone(&terminal_registry);
             let sftp_registry = Arc::clone(&sftp_registry);
             let managed_process_registry = Arc::clone(&managed_process_registry);
+            let git_clone_task_registry = Arc::clone(&git_clone_task_registry);
+            let provider_usage_service = Arc::clone(&provider_usage_service);
             move |app| {
                 commands::history_db::initialize_history_db()?;
                 configure_system_tray(
@@ -451,6 +562,7 @@ pub fn run() {
                 if let Err(error) = commands::settings::initialize_system_proxy_from_db() {
                     eprintln!("failed to initialize system proxy state: {error}");
                 }
+                commands::system::gc_upload_staging_on_startup();
                 app.manage(services::proxy::start_proxy_server()?);
                 if let Err(error) = services::skills::ensure_builtin_agent_skills_sync() {
                     eprintln!("failed to seed builtin skills: {error}");
@@ -461,9 +573,11 @@ pub fn run() {
                     app.handle().clone(),
                     Arc::clone(&automation_store),
                     Arc::clone(&memory_store),
+                    Arc::clone(&provider_usage_service),
                     Arc::clone(&terminal_registry),
                     Arc::clone(&sftp_registry),
                     Arc::clone(&managed_process_registry),
+                    Arc::clone(&git_clone_task_registry),
                 ));
                 managed_process_registry.set_notifier(
                     runtime::managed_process::ManagedProcessNotifier {
@@ -553,7 +667,9 @@ pub fn run() {
             } else {
                 // Real exit: reclaim every non-isolated managed process
                 // before the OS tears us down (Drop is not guaranteed).
+                terminal_registry.shutdown_cleanup();
                 managed_process_registry.shutdown_cleanup();
+                git_clone_task_registry.shutdown_cleanup();
                 power_activity.clear_all();
             }
         }

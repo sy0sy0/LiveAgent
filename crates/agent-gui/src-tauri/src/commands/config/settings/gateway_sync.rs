@@ -79,6 +79,7 @@ fn load_masked_automation_hooks(conn: &Connection) -> Result<Value, String> {
 pub(crate) fn redact_gateway_settings_sync_payload(payload: Value) -> Result<Value, String> {
     let mut snapshot = expect_object(payload, "gateway settings sync payload")?;
     snapshot.remove(PROVIDER_API_KEY_UPDATES_FIELD);
+    snapshot.remove(PROVIDER_USAGE_QUERY_SECRET_UPDATES_FIELD);
     snapshot.remove(SSH_SECRET_UPDATES_FIELD);
     snapshot.remove(SYSTEM_PROXY_PASSWORD_UPDATE_FIELD);
     if let Some(providers) = snapshot.remove("customProviders") {

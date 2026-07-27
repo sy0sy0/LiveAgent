@@ -11,7 +11,7 @@ use crate::commands::{
         fs_read_editable_text_sync, fs_read_workspace_image_sync, fs_rename_sync, fs_roots_sync,
         fs_write_text_sync,
     },
-    git::git_gateway_action_sync,
+    git::{git_gateway_clone_task_action_sync, GitCloneTaskRegistry},
     settings::{load_providers, open_db},
     system::{
         system_create_project_folder_sync, system_import_uploaded_readable_files_sync,
@@ -29,10 +29,34 @@ use crate::services::memory::{
     MemoryOrganizeRunReadArgs, MemoryOrganizeRunUpdateArgs, MemoryQuotaSummaryArgs, MemoryReadArgs,
     MemoryRecentRejectionsArgs, MemorySearchArgs, MemoryStore, MemoryUpdateArgs, MemoryWriteArgs,
 };
+use crate::services::provider_usage::{ProviderUsageResult, ProviderUsageService};
 use crate::services::skills::system_manage_skill_sync;
 
 const DEFAULT_HISTORY_LIST_PAGE: i32 = 1;
 const DEFAULT_HISTORY_LIST_PAGE_SIZE: i32 = 80;
+
+pub fn provider_usage_response(
+    result: ProviderUsageResult,
+) -> Result<proto::ProviderUsageResponse, String> {
+    let result_json = serde_json::to_string(&result)
+        .map_err(|error| format!("serialize provider usage result failed: {error}"))?;
+    Ok(proto::ProviderUsageResponse { result_json })
+}
+
+pub async fn handle_provider_usage(
+    service: Arc<ProviderUsageService>,
+    request: proto::ProviderUsageRequest,
+) -> Result<proto::ProviderUsageResponse, String> {
+    // config_json 非空 = 按草稿测试(忽略启用开关、不读写缓存);空 = 常规查询。
+    let result = if request.config_json.is_empty() {
+        service.query(&request.provider_id, request.refresh).await
+    } else {
+        service
+            .test(&request.provider_id, &request.config_json)
+            .await
+    };
+    provider_usage_response(result)
+}
 
 #[derive(Debug, Deserialize)]
 struct HistorySharedListArgs {
@@ -639,10 +663,18 @@ pub async fn handle_fs_delete(
         })
 }
 
-pub async fn handle_git_request(request: proto::GitRequest) -> Result<proto::GitResponse, String> {
+pub async fn handle_git_request(
+    request: proto::GitRequest,
+    clone_task_registry: Arc<GitCloneTaskRegistry>,
+) -> Result<proto::GitResponse, String> {
     let action = request.action.trim().to_string();
     tauri::async_runtime::spawn_blocking(move || {
-        let result = git_gateway_action_sync(action.clone(), request.workdir, request.args_json)?;
+        let result = git_gateway_clone_task_action_sync(
+            action.clone(),
+            request.workdir,
+            request.args_json,
+            &clone_task_registry,
+        )?;
         Ok(proto::GitResponse {
             action,
             result_json: result.to_string(),
@@ -981,6 +1013,7 @@ fn is_builtin_share_tool_name(name: &str) -> bool {
     matches!(
         trimmed,
         "Agent"
+            | "AskUserQuestion"
             | "Bash"
             | "CronTaskManager"
             | "Delete"

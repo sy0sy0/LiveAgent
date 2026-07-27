@@ -60,6 +60,13 @@ export const DIRECTION_SLOP_PX = 1;
 // can never read as "dragged away from the bottom".
 export const POINTER_DRAG_SLOP_PX = 4;
 
+// Elements carrying this attribute keep their arrow/Home/End keys to
+// themselves: the transcript width handles resize on those keys, which must
+// not also read as a scroll intent and detach bottom-follow. useScrollFollow
+// builds its selector from this constant, so widget code and the follow engine
+// cannot drift onto different attribute names.
+export const SCROLL_FOLLOW_IGNORE_KEYS_ATTRIBUTE = "data-scroll-follow-ignore-keys";
+
 // Attach-side gesture latch. Armed only by toward-bottom wheel/touch/key input
 // and extended by chained downward scroll events (touchscreen momentum carries
 // no input events); it can extend an active latch but never create one.

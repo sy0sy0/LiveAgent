@@ -6,6 +6,7 @@ export type SetSettingsFn = (updater: (prev: AppSettings) => AppSettings) => voi
 
 export type SectionId =
   | "system"
+  | "shortcuts"
   | "systemTools"
   | "providers"
   | "agents"
@@ -29,4 +30,5 @@ export type SettingsPageProps = {
 export type SettingsSectionProps = {
   settings: AppSettings;
   setSettings: SetSettingsFn;
+  saveState?: SettingsSaveState;
 };

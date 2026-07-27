@@ -1,20 +1,29 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::time::Duration;
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tempfile::NamedTempFile;
 use wait_timeout::ChildExt;
 
-use crate::runtime::process::{configure_child_process_group, kill_child_process_tree_best_effort};
+use crate::commands::system::validate_project_folder_name;
+use crate::runtime::process::{
+    configure_child_process_group, kill_child_process_tree_best_effort,
+    terminate_process_tree_by_pid,
+};
 
 const GIT_DIFF_MAX_BYTES: usize = 512 * 1024;
 const GIT_UNTRACKED_FILE_MAX_BYTES: u64 = 128 * 1024;
 const GIT_COMMAND_TIMEOUT_SECS: u64 = 60;
+// Cloning a large repository easily outlives the default 60s command budget;
+// give clone its own, much larger allowance.
+const GIT_CLONE_TIMEOUT_SECS: u64 = 15 * 60;
 const GIT_TRANSIENT_RETRY_ATTEMPTS: usize = 3;
 const GIT_TRANSIENT_RETRY_DELAY_MS: u64 = 160;
 const GIT_LOG_DEFAULT_LIMIT: usize = 50;
@@ -65,6 +74,22 @@ pub struct GitRepositoryState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GitDiscoveredRepository {
+    pub root: String,
+    pub name: String,
+    pub relative_path: String,
+    pub is_workspace_root: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitRepositoryDiscovery {
+    pub workdir: String,
+    pub repositories: Vec<GitDiscoveredRepository>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GitBranch {
     pub name: String,
     pub full_name: String,
@@ -80,6 +105,13 @@ pub struct GitBranch {
 pub struct GitBranchesResponse {
     pub state: GitRepositoryState,
     pub branches: Vec<GitBranch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitRemoteBranchesResponse {
+    pub default_branch: String,
+    pub branches: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,15 +215,354 @@ struct GitGatewayArgs {
     start_point: Option<String>,
     limit: Option<usize>,
     skip: Option<usize>,
+    name: Option<String>,
     user_name: Option<String>,
     user_email: Option<String>,
     force: Option<bool>,
     new_branch: Option<String>,
+    task_id: Option<String>,
 }
 
 struct GitOutput {
     stdout: String,
     stderr: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitCloneTask {
+    pub id: String,
+    pub repository_name: String,
+    pub target_path: String,
+    pub branch: String,
+    pub status: String,
+    pub phase: String,
+    pub progress: Option<u8>,
+    pub detail: String,
+    pub error: String,
+    pub started_at: u128,
+}
+
+struct GitCloneTaskEntry {
+    task: GitCloneTask,
+    pid: u32,
+}
+
+#[derive(Default)]
+pub struct GitCloneTaskRegistry {
+    tasks: Mutex<HashMap<String, GitCloneTaskEntry>>,
+}
+
+impl GitCloneTaskRegistry {
+    pub fn start(
+        self: &Arc<Self>,
+        parent: String,
+        name: String,
+        remote_url: String,
+        branch: Option<String>,
+    ) -> Result<GitCloneTask, String> {
+        let parent = validate_git_clone_parent(&parent)?;
+        let name = validate_project_folder_name(&name)?.to_string();
+        let remote_url = validate_git_remote_url(&remote_url)?;
+        let branch = validate_git_config_value("分支名", branch)?.unwrap_or_default();
+        let target = parent.join(&name);
+
+        match fs::create_dir(&target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(format!("克隆目标已存在：{}", target.display()));
+            }
+            Err(error) => return Err(format!("创建克隆目标失败：{error}")),
+        }
+
+        let mut command = Command::new("git");
+        configure_child_process_group(&mut command);
+        command
+            .arg("clone")
+            .arg("--progress")
+            .current_dir(&target)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        if !branch.is_empty() {
+            command.args(["--branch", branch.as_str()]);
+        }
+        command.args(["--", remote_url.as_str(), "."]);
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&target);
+                return Err(format!("git 执行失败：{error}"));
+            }
+        };
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "无法读取 git clone 进度输出。".to_string())?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let task = GitCloneTask {
+            id: id.clone(),
+            repository_name: name,
+            target_path: target.to_string_lossy().into_owned(),
+            branch,
+            status: "running".to_string(),
+            phase: "preparing".to_string(),
+            progress: None,
+            detail: "正在准备克隆…".to_string(),
+            error: String::new(),
+            started_at: now_ms(),
+        };
+        {
+            let mut tasks = self
+                .tasks
+                .lock()
+                .map_err(|_| "克隆任务注册表不可用。".to_string())?;
+            tasks.insert(
+                id.clone(),
+                GitCloneTaskEntry {
+                    task: task.clone(),
+                    pid: child.id(),
+                },
+            );
+        }
+
+        let registry = Arc::clone(self);
+        thread::spawn(move || registry.run(id, target, child, stderr));
+        Ok(task)
+    }
+
+    pub fn snapshot(&self) -> Result<Vec<GitCloneTask>, String> {
+        let tasks = self
+            .tasks
+            .lock()
+            .map_err(|_| "克隆任务注册表不可用。".to_string())?;
+        let mut tasks = tasks
+            .values()
+            .map(|entry| entry.task.clone())
+            .collect::<Vec<_>>();
+        tasks.sort_by(|left, right| right.started_at.cmp(&left.started_at));
+        Ok(tasks)
+    }
+
+    pub fn cancel(&self, id: String) -> Result<GitCloneTask, String> {
+        let pid = {
+            let mut tasks = self
+                .tasks
+                .lock()
+                .map_err(|_| "克隆任务注册表不可用。".to_string())?;
+            let entry = tasks
+                .get_mut(id.trim())
+                .ok_or_else(|| "找不到克隆任务。".to_string())?;
+            if entry.task.status != "running" {
+                return Ok(entry.task.clone());
+            }
+            entry.task.status = "cancelling".to_string();
+            entry.task.detail = "正在取消克隆…".to_string();
+            entry.pid
+        };
+        terminate_process_tree_by_pid(pid, Duration::from_millis(500));
+        self.task(id.trim())
+    }
+
+    pub fn task(&self, id: &str) -> Result<GitCloneTask, String> {
+        self.tasks
+            .lock()
+            .map_err(|_| "克隆任务注册表不可用。".to_string())?
+            .get(id)
+            .map(|entry| entry.task.clone())
+            .ok_or_else(|| "找不到克隆任务。".to_string())
+    }
+
+    /// 终态任务的唯一清理路径：用户关闭任务卡时从注册表移除，
+    /// 否则刷新/重连后快照会让已关闭的卡片重现。运行中的任务拒绝移除。
+    pub fn dismiss(&self, id: String) -> Result<(), String> {
+        let mut tasks = self
+            .tasks
+            .lock()
+            .map_err(|_| "克隆任务注册表不可用。".to_string())?;
+        let id = id.trim();
+        let Some(entry) = tasks.get(id) else {
+            return Ok(());
+        };
+        if entry.task.status == "running" || entry.task.status == "cancelling" {
+            return Err("克隆任务仍在进行，无法移除。".to_string());
+        }
+        tasks.remove(id);
+        Ok(())
+    }
+
+    fn run(
+        self: Arc<Self>,
+        id: String,
+        target: PathBuf,
+        mut child: Child,
+        stderr: std::process::ChildStderr,
+    ) {
+        let (output_tx, output_rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            loop {
+                let mut bytes = Vec::new();
+                match reader.read_until(b'\r', &mut bytes) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let _ = output_tx.send(String::from_utf8_lossy(&bytes).into_owned());
+                    }
+                }
+            }
+        });
+
+        let status = loop {
+            while let Ok(chunk) = output_rx.try_recv() {
+                self.apply_output(&id, &chunk);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => thread::sleep(Duration::from_millis(100)),
+                Err(error) => {
+                    self.fail(&id, format!("等待 git clone 失败：{error}"), &target);
+                    break None;
+                }
+            }
+        };
+        let _ = reader.join();
+        while let Ok(chunk) = output_rx.try_recv() {
+            self.apply_output(&id, &chunk);
+        }
+
+        let Ok(task) = self.task(&id) else {
+            return;
+        };
+        if task.status == "cancelling" {
+            let _ = fs::remove_dir_all(&target);
+            self.update(&id, |task| {
+                task.status = "cancelled".to_string();
+                task.phase = "cancelled".to_string();
+                task.progress = None;
+                task.detail = "克隆已取消。".to_string();
+            });
+            return;
+        }
+        match status {
+            Some(status) if status.success() => {
+                match git_status_sync(target.to_string_lossy().into_owned()) {
+                    Ok(_) => self.update(&id, |task| {
+                        task.status = "completed".to_string();
+                        task.phase = "completed".to_string();
+                        task.progress = Some(100);
+                        task.detail = "克隆完成。".to_string();
+                    }),
+                    Err(error) => self.fail(&id, error, &target),
+                }
+            }
+            Some(status) => {
+                let message = task.detail.trim().to_string();
+                self.fail(
+                    &id,
+                    if message.is_empty() {
+                        format!("git clone 退出，状态码：{}", status.code().unwrap_or(-1))
+                    } else {
+                        message
+                    },
+                    &target,
+                );
+            }
+            None => {}
+        }
+    }
+
+    fn apply_output(&self, id: &str, chunk: &str) {
+        // 读取线程按 \r 切块，但 git 的非进度输出（Cloning into/remote: 等）
+        // 以 \n 结尾，会与下一条进度行合并进同一 chunk——逐行处理防止
+        // detail 混入多行文本。
+        for line in chunk.split(['\r', '\n']) {
+            let detail = line.trim();
+            if detail.is_empty() {
+                continue;
+            }
+            self.update(id, |task| {
+                if task.status != "running" {
+                    return;
+                }
+                task.detail = detail.to_string();
+                if let Some((phase, progress)) = parse_git_clone_progress(detail) {
+                    task.phase = phase.to_string();
+                    task.progress = Some(progress);
+                }
+            });
+        }
+    }
+
+    fn fail(&self, id: &str, error: String, target: &Path) {
+        let _ = fs::remove_dir_all(target);
+        self.update(id, |task| {
+            task.status = "failed".to_string();
+            task.phase = "failed".to_string();
+            task.progress = None;
+            task.error = error.clone();
+            task.detail = "克隆失败。".to_string();
+        });
+    }
+
+    pub fn shutdown_cleanup(&self) {
+        let tasks = match self.tasks.lock() {
+            Ok(tasks) => tasks
+                .values()
+                .filter(|entry| entry.task.status == "running" || entry.task.status == "cancelling")
+                .map(|entry| (entry.pid, PathBuf::from(&entry.task.target_path)))
+                .collect::<Vec<_>>(),
+            Err(_) => return,
+        };
+        for (pid, target) in tasks {
+            terminate_process_tree_by_pid(pid, Duration::from_millis(500));
+            let _ = fs::remove_dir_all(target);
+        }
+    }
+
+    fn update(&self, id: &str, update: impl FnOnce(&mut GitCloneTask)) {
+        if let Ok(mut tasks) = self.tasks.lock() {
+            if let Some(entry) = tasks.get_mut(id) {
+                update(&mut entry.task);
+            }
+        }
+    }
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn parse_git_clone_progress(line: &str) -> Option<(&'static str, u8)> {
+    let line = line.trim();
+    let parse_percent = |prefix: &str| {
+        line.strip_prefix(prefix)?
+            .trim_start()
+            .split('%')
+            .next()?
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .map(|percent| percent.min(100) as u16)
+    };
+    if let Some(percent) = parse_percent("Receiving objects:") {
+        return Some(("receiving", (5 + percent * 80 / 100) as u8));
+    }
+    if let Some(percent) = parse_percent("Resolving deltas:") {
+        return Some(("resolving", (85 + percent * 15 / 100) as u8));
+    }
+    if let Some(percent) = parse_percent("Checking out files:") {
+        return Some(("finalizing", (95 + percent * 5 / 100) as u8));
+    }
+    if line.starts_with("remote:") || line.starts_with("Cloning into") {
+        return Some(("preparing", 5));
+    }
+    None
 }
 
 fn trim_output(bytes: &[u8]) -> String {
@@ -211,6 +582,14 @@ fn read_temp_file(file: &mut NamedTempFile, label: &str) -> Result<Vec<u8>, Stri
 }
 
 fn git_output(workdir: &str, args: &[&str]) -> Result<Output, String> {
+    git_output_with_timeout(workdir, args, Duration::from_secs(GIT_COMMAND_TIMEOUT_SECS))
+}
+
+fn git_output_with_timeout(
+    workdir: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<Output, String> {
     let mut stdout_file =
         NamedTempFile::new().map_err(|error| format!("创建 git stdout 缓存失败：{error}"))?;
     let mut stderr_file =
@@ -236,14 +615,14 @@ fn git_output(workdir: &str, args: &[&str]) -> Result<Output, String> {
         .stderr(Stdio::from(stderr_target))
         .spawn()
         .map_err(|error| format!("git 执行失败：{error}"))?;
-    let timeout = Duration::from_secs(GIT_COMMAND_TIMEOUT_SECS);
     let Some(status) = child
         .wait_timeout(timeout)
         .map_err(|error| format!("等待 git 命令失败：{error}"))?
     else {
         kill_child_process_tree_best_effort(&mut child);
         return Err(format!(
-            "git 命令超时（{GIT_COMMAND_TIMEOUT_SECS} 秒）：git {}",
+            "git 命令超时（{} 秒）：git {}",
+            timeout.as_secs(),
             args.join(" ")
         ));
     };
@@ -255,9 +634,17 @@ fn git_output(workdir: &str, args: &[&str]) -> Result<Output, String> {
 }
 
 fn git_success(workdir: &str, args: &[&str]) -> Result<GitOutput, String> {
+    git_success_with_timeout(workdir, args, Duration::from_secs(GIT_COMMAND_TIMEOUT_SECS))
+}
+
+fn git_success_with_timeout(
+    workdir: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<GitOutput, String> {
     let mut last_error = String::new();
     for attempt in 0..GIT_TRANSIENT_RETRY_ATTEMPTS {
-        let output = git_output(workdir, args)?;
+        let output = git_output_with_timeout(workdir, args, timeout)?;
         let stdout = trim_output(&output.stdout);
         let stderr = trim_output(&output.stderr);
         if output.status.success() {
@@ -310,6 +697,164 @@ fn discover_repo(workdir: &str) -> Result<Option<String>, String> {
         return Ok(None);
     }
     Ok(Some(root))
+}
+
+// Subdirectory repository discovery, modeled on VSCode's git extension
+// (`git.repositoryScanMaxDepth` / `git.repositoryScanIgnoredFolders`): when
+// the workspace folder itself is not a git repository, repositories living in
+// its subdirectories are scanned so the review panel can still offer them.
+const GIT_REPO_SCAN_MAX_DEPTH: usize = 2;
+const GIT_REPO_SCAN_DIR_BUDGET: usize = 2048;
+const GIT_REPO_SCAN_MAX_REPOS: usize = 32;
+const GIT_REPO_SCAN_IGNORED_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "out",
+    "vendor",
+    "Pods",
+    "DerivedData",
+    "__pycache__",
+    "venv",
+];
+
+fn repo_scan_skips_dir_name(name: &str) -> bool {
+    name.starts_with('.') || GIT_REPO_SCAN_IGNORED_DIRS.contains(&name)
+}
+
+fn scan_subdirectory_repositories(workdir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut queue: std::collections::VecDeque<(PathBuf, usize)> = std::collections::VecDeque::new();
+    queue.push_back((workdir.to_path_buf(), 0));
+    let mut budget = GIT_REPO_SCAN_DIR_BUDGET;
+    while let Some((dir, depth)) = queue.pop_front() {
+        if found.len() >= GIT_REPO_SCAN_MAX_REPOS || budget == 0 {
+            break;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if found.len() >= GIT_REPO_SCAN_MAX_REPOS || budget == 0 {
+                break;
+            }
+            budget -= 1;
+            // Symlinked directories are skipped to keep the walk cycle-free.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if repo_scan_skips_dir_name(name) {
+                continue;
+            }
+            let candidate = entry.path();
+            // A `.git` entry (directory, or file for worktrees/submodules)
+            // marks a repository; found repositories are not descended into.
+            if candidate.join(".git").exists() {
+                found.push(candidate);
+                continue;
+            }
+            if depth + 1 < GIT_REPO_SCAN_MAX_DEPTH {
+                queue.push_back((candidate, depth + 1));
+            }
+        }
+    }
+    found
+}
+
+fn relative_display_path(base: &Path, target: &Path) -> String {
+    target
+        .strip_prefix(base)
+        .map(|relative| {
+            relative
+                .components()
+                .filter_map(|component| match component {
+                    Component::Normal(part) => Some(part.to_string_lossy().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .unwrap_or_default()
+}
+
+fn path_basename(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string_lossy().to_string())
+}
+
+pub(crate) fn git_discover_repositories_sync(
+    workdir: String,
+) -> Result<GitRepositoryDiscovery, String> {
+    let workdir = workdir.trim().to_string();
+    let mut repositories = Vec::new();
+    if workdir.is_empty() {
+        return Ok(GitRepositoryDiscovery {
+            workdir,
+            repositories,
+        });
+    }
+    let workdir_path = PathBuf::from(&workdir);
+    let mut seen_roots: HashSet<PathBuf> = HashSet::new();
+
+    if let Some(root) = discover_repo(&workdir)? {
+        let root_path = PathBuf::from(&root);
+        let canonical_root = fs::canonicalize(&root_path).unwrap_or(root_path.clone());
+        seen_roots.insert(canonical_root);
+        repositories.push(GitDiscoveredRepository {
+            root: root.clone(),
+            name: path_basename(&root_path),
+            relative_path: String::new(),
+            is_workspace_root: true,
+        });
+    }
+
+    if workdir_path.is_dir() {
+        for candidate in scan_subdirectory_repositories(&workdir_path) {
+            if repositories.len() >= GIT_REPO_SCAN_MAX_REPOS {
+                break;
+            }
+            let candidate_str = candidate.to_string_lossy().to_string();
+            // Verify the candidate really is a work tree (a stray `.git`
+            // entry must not surface as a repository); failures skip the
+            // candidate instead of aborting the whole discovery.
+            let Some(root) = discover_repo(&candidate_str).ok().flatten() else {
+                continue;
+            };
+            let canonical_root =
+                fs::canonicalize(PathBuf::from(&root)).unwrap_or_else(|_| PathBuf::from(&root));
+            let canonical_candidate = fs::canonicalize(&candidate).unwrap_or(candidate.clone());
+            // Nested paths already covered by a recorded repository (e.g. the
+            // workspace root repo) are deduplicated by their resolved root.
+            if canonical_root != canonical_candidate || !seen_roots.insert(canonical_root) {
+                continue;
+            }
+            repositories.push(GitDiscoveredRepository {
+                root: candidate_str,
+                name: path_basename(&candidate),
+                relative_path: relative_display_path(&workdir_path, &candidate),
+                is_workspace_root: false,
+            });
+        }
+    }
+
+    repositories.sort_by(|a, b| {
+        b.is_workspace_root
+            .cmp(&a.is_workspace_root)
+            .then_with(|| a.relative_path.cmp(&b.relative_path))
+    });
+    Ok(GitRepositoryDiscovery {
+        workdir,
+        repositories,
+    })
 }
 
 fn not_repo_state(workdir: &str) -> GitRepositoryState {
@@ -469,9 +1014,20 @@ pub(crate) fn git_status_sync(workdir: String) -> Result<GitRepositoryState, Str
     let Some(repo_root) = discover_repo(&workdir)? else {
         return Ok(not_repo_state(&workdir));
     };
+    // --untracked-files=all: without it git collapses a fully-untracked
+    // directory into a single `dir/` entry, so the files inside never show up
+    // in the review list (and the collapsed entry has no diff). The explicit
+    // flag also overrides a user-level `status.showUntrackedFiles = no`.
     let output = git_output(
         &repo_root,
-        &["status", "--porcelain=v2", "--branch", "--show-stash", "-z"],
+        &[
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--show-stash",
+            "--untracked-files=all",
+            "-z",
+        ],
     )?;
     if !output.status.success() {
         return Ok(GitRepositoryState {
@@ -735,6 +1291,114 @@ fn validate_git_init_workdir(workdir: &str) -> Result<String, String> {
     Ok(workdir.to_string())
 }
 
+fn validate_git_clone_parent(parent: &str) -> Result<PathBuf, String> {
+    let parent = parent.trim();
+    if parent.is_empty() {
+        return Err("克隆目标的父目录不能为空。".to_string());
+    }
+    let parent_path = PathBuf::from(parent);
+    if !parent_path.is_absolute() {
+        return Err(format!("克隆目标的父目录必须是绝对路径：{parent}"));
+    }
+    let metadata =
+        fs::metadata(&parent_path).map_err(|error| format!("克隆目标的父目录不可访问：{error}"))?;
+    if !metadata.is_dir() {
+        return Err("克隆目标的父目录必须是文件夹。".to_string());
+    }
+    fs::canonicalize(&parent_path).map_err(|error| format!("无法解析克隆目标的父目录：{error}"))
+}
+
+pub(crate) fn git_clone_repository_sync(
+    parent: String,
+    name: String,
+    remote_url: String,
+    branch: Option<String>,
+) -> Result<GitOperationResponse, String> {
+    let parent = validate_git_clone_parent(&parent)?;
+    let name = validate_project_folder_name(&name)?;
+    let remote_url = validate_git_remote_url(&remote_url)?;
+    let branch = validate_git_config_value("分支名", branch)?;
+    let target = parent.join(name);
+
+    match fs::create_dir(&target) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(format!("克隆目标已存在：{}", target.display()));
+        }
+        Err(error) => return Err(format!("创建克隆目标失败：{error}")),
+    }
+
+    let target_workdir = target.to_string_lossy().into_owned();
+    let mut clone_args = vec!["clone"];
+    if let Some(branch) = branch.as_deref() {
+        clone_args.extend(["--branch", branch]);
+    }
+    clone_args.extend(["--", remote_url.as_str(), "."]);
+    let clone_output = match git_success_with_timeout(
+        &target_workdir,
+        &clone_args,
+        Duration::from_secs(GIT_CLONE_TIMEOUT_SECS),
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&target);
+            return Err(error);
+        }
+    };
+    let state = git_status_sync(target_workdir)?;
+    Ok(GitOperationResponse {
+        ok: true,
+        state,
+        stdout: clone_output.stdout,
+        stderr: clone_output.stderr,
+        message: "仓库已克隆。".to_string(),
+    })
+}
+
+pub(crate) fn git_list_remote_branches_sync(
+    remote_url: String,
+) -> Result<GitRemoteBranchesResponse, String> {
+    let remote_url = validate_git_remote_url(&remote_url)?;
+    // Run ls-remote from a private temp dir so whatever repository happens to
+    // contain the process cwd can't leak its configuration into the lookup.
+    let scratch = tempfile::tempdir().map_err(|error| format!("创建临时目录失败：{error}"))?;
+    let cwd = scratch.path().to_string_lossy().into_owned();
+    let heads = git_success(&cwd, &["ls-remote", "--heads", "--", remote_url.as_str()])?;
+    let mut branches = heads
+        .stdout
+        .lines()
+        .filter_map(|line| {
+            line.split_once("refs/heads/")
+                .map(|(_, branch)| branch.trim())
+        })
+        .filter(|branch| !branch.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    branches.sort();
+    branches.dedup();
+
+    let default_branch = git_success(
+        &cwd,
+        &["ls-remote", "--symref", "--", remote_url.as_str(), "HEAD"],
+    )
+    .ok()
+    .and_then(|output| {
+        output.stdout.lines().find_map(|line| {
+            line.strip_prefix("ref: refs/heads/").and_then(|line| {
+                line.split_once('\t')
+                    .map(|(branch, _)| branch.trim().to_string())
+            })
+        })
+    })
+    .filter(|branch| branches.iter().any(|candidate| candidate == branch));
+
+    Ok(GitRemoteBranchesResponse {
+        default_branch: default_branch
+            .unwrap_or_else(|| branches.first().cloned().unwrap_or_default()),
+        branches,
+    })
+}
+
 fn validate_git_config_value(label: &str, value: Option<String>) -> Result<Option<String>, String> {
     let Some(value) = value else {
         return Ok(None);
@@ -757,7 +1421,22 @@ fn validate_git_remote_url(value: &str) -> Result<String, String> {
     if value.chars().any(|ch| matches!(ch, '\0' | '\n' | '\r')) {
         return Err("远端仓库地址不能包含换行或空字符。".to_string());
     }
+    if is_git_remote_helper_url(value) {
+        return Err("不支持 remote helper 形式的远端地址（如 ext::）。".to_string());
+    }
     Ok(value.to_string())
+}
+
+/// Mirrors git's transport-helper detection (transport.c): when the URL's
+/// leading scheme characters are followed by `::`, git invokes
+/// `git-remote-<scheme>` — and `ext::` runs an arbitrary command, so the
+/// whole helper syntax must be rejected up front.
+fn is_git_remote_helper_url(value: &str) -> bool {
+    let scheme_len = value
+        .chars()
+        .take_while(|&ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+        .count();
+    value[scheme_len..].starts_with("::")
 }
 
 fn git_remote_names(repo_root: &str) -> Result<Vec<String>, String> {
@@ -2333,12 +3012,22 @@ pub(crate) fn git_gateway_action_sync(
     let args = parse_gateway_args(args_json)?;
     let value = match action.as_str() {
         "status" => serde_json::to_value(git_status_sync(workdir)?),
+        "discover_repositories" => serde_json::to_value(git_discover_repositories_sync(workdir)?),
         "branches" => serde_json::to_value(git_branches_sync(workdir)?),
         "init" => serde_json::to_value(git_init_sync(
             workdir,
             args.branch.unwrap_or_else(|| "main".to_string()),
             args.user_name,
             args.user_email,
+        )?),
+        "clone" => serde_json::to_value(git_clone_repository_sync(
+            workdir,
+            args.name.unwrap_or_default(),
+            args.remote_url.unwrap_or_default(),
+            args.branch,
+        )?),
+        "list_remote_branches" => serde_json::to_value(git_list_remote_branches_sync(
+            args.remote_url.unwrap_or_default(),
         )?),
         "switch_branch" => serde_json::to_value(git_switch_branch_sync(
             workdir,
@@ -2414,11 +3103,47 @@ pub(crate) fn git_gateway_action_sync(
     Ok(value)
 }
 
+pub(crate) fn git_gateway_clone_task_action_sync(
+    action: String,
+    workdir: String,
+    args_json: String,
+    registry: &Arc<GitCloneTaskRegistry>,
+) -> Result<Value, String> {
+    let action = action.trim().to_ascii_lowercase();
+    let args = parse_gateway_args(args_json.clone())?;
+    match action.as_str() {
+        "clone_start" => serde_json::to_value(registry.start(
+            workdir,
+            args.name.unwrap_or_default(),
+            args.remote_url.unwrap_or_default(),
+            args.branch,
+        )?)
+        .map_err(|error| format!("序列化 Git 响应失败：{error}")),
+        "clone_tasks" => serde_json::to_value(registry.snapshot()?)
+            .map_err(|error| format!("序列化 Git 响应失败：{error}")),
+        "clone_cancel" => serde_json::to_value(registry.cancel(args.task_id.unwrap_or_default())?)
+            .map_err(|error| format!("序列化 Git 响应失败：{error}")),
+        "clone_dismiss" => {
+            registry.dismiss(args.task_id.unwrap_or_default())?;
+            serde_json::to_value(registry.snapshot()?)
+                .map_err(|error| format!("序列化 Git 响应失败：{error}"))
+        }
+        _ => git_gateway_action_sync(action, workdir, args_json),
+    }
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn git_status(workdir: String) -> Result<GitRepositoryState, String> {
     tauri::async_runtime::spawn_blocking(move || git_status_sync(workdir))
         .await
         .map_err(|error| format!("git_status join 失败：{error}"))?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn git_discover_repositories(workdir: String) -> Result<GitRepositoryDiscovery, String> {
+    tauri::async_runtime::spawn_blocking(move || git_discover_repositories_sync(workdir))
+        .await
+        .map_err(|error| format!("git_discover_repositories join 失败：{error}"))?
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -2469,6 +3194,64 @@ pub async fn git_init(
     })
     .await
     .map_err(|error| format!("git_init join 失败：{error}"))?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn git_clone_repository(
+    parent: String,
+    name: String,
+    remote_url: String,
+    branch: Option<String>,
+) -> Result<GitOperationResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        git_clone_repository_sync(parent, name, remote_url, branch)
+    })
+    .await
+    .map_err(|error| format!("git_clone_repository join 失败：{error}"))?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn git_clone_repository_start(
+    registry: tauri::State<'_, Arc<GitCloneTaskRegistry>>,
+    parent: String,
+    name: String,
+    remote_url: String,
+    branch: Option<String>,
+) -> Result<GitCloneTask, String> {
+    registry.start(parent, name, remote_url, branch)
+}
+
+#[tauri::command]
+pub fn git_clone_repository_tasks(
+    registry: tauri::State<'_, Arc<GitCloneTaskRegistry>>,
+) -> Result<Vec<GitCloneTask>, String> {
+    registry.snapshot()
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn git_clone_repository_cancel(
+    registry: tauri::State<'_, Arc<GitCloneTaskRegistry>>,
+    task_id: String,
+) -> Result<GitCloneTask, String> {
+    registry.cancel(task_id)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn git_clone_repository_dismiss(
+    registry: tauri::State<'_, Arc<GitCloneTaskRegistry>>,
+    task_id: String,
+) -> Result<Vec<GitCloneTask>, String> {
+    registry.dismiss(task_id)?;
+    registry.snapshot()
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn git_list_remote_branches(
+    remote_url: String,
+) -> Result<GitRemoteBranchesResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || git_list_remote_branches_sync(remote_url))
+        .await
+        .map_err(|error| format!("git_list_remote_branches join 失败：{error}"))?
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -2675,6 +3458,7 @@ pub async fn git_stash_pop(workdir: String) -> Result<GitOperationResponse, Stri
 mod tests {
     use super::*;
     use std::fs;
+    use std::time::Instant;
 
     use serde_json::json;
     use tempfile::TempDir;
@@ -2819,12 +3603,78 @@ mod tests {
         }
         let temp = tempfile::tempdir().expect("temp repo");
         run_temp_git(temp.path(), &["init"]);
+        run_temp_git(temp.path(), &["config", "core.autocrlf", "false"]);
         run_temp_git(temp.path(), &["config", "user.name", "LiveAgent Test"]);
         run_temp_git(temp.path(), &["config", "user.email", "test@example.com"]);
         fs::write(temp.path().join("README.md"), "initial\n").expect("write readme");
         run_temp_git(temp.path(), &["add", "README.md"]);
         run_temp_git(temp.path(), &["commit", "-m", "initial"]);
         Some(temp)
+    }
+
+    #[test]
+    fn discovers_repositories_in_subdirectories() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temp workspace");
+        let make_repo = |relative: &str| {
+            let dir = temp.path().join(relative);
+            fs::create_dir_all(&dir).expect("create repo dir");
+            run_temp_git(&dir, &["init"]);
+        };
+        make_repo("alpha");
+        make_repo("nested/beta");
+        make_repo("node_modules/skipped");
+        make_repo(".hidden/skipped");
+        fs::create_dir_all(temp.path().join("plain/dir")).expect("create plain dir");
+
+        let discovery = git_discover_repositories_sync(temp.path().to_string_lossy().to_string())
+            .expect("discover repositories");
+        let relative_paths: Vec<&str> = discovery
+            .repositories
+            .iter()
+            .map(|repo| repo.relative_path.as_str())
+            .collect();
+        assert_eq!(relative_paths, vec!["alpha", "nested/beta"]);
+        assert!(discovery
+            .repositories
+            .iter()
+            .all(|repo| !repo.is_workspace_root));
+        assert_eq!(discovery.repositories[0].name, "alpha");
+        assert_eq!(discovery.repositories[1].name, "beta");
+    }
+
+    #[test]
+    fn discover_reports_workspace_root_repo_first() {
+        let Some(repo) = init_temp_repo() else {
+            return;
+        };
+        let nested = repo.path().join("packages/nested-repo");
+        fs::create_dir_all(&nested).expect("create nested repo dir");
+        run_temp_git(&nested, &["init"]);
+
+        let discovery = git_discover_repositories_sync(repo.path().to_string_lossy().to_string())
+            .expect("discover repositories");
+        assert!(!discovery.repositories.is_empty());
+        assert!(discovery.repositories[0].is_workspace_root);
+        assert_eq!(discovery.repositories[0].relative_path, "");
+        assert!(discovery
+            .repositories
+            .iter()
+            .any(|entry| entry.relative_path == "packages/nested-repo"));
+    }
+
+    #[test]
+    fn discover_returns_empty_for_plain_directory() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temp dir");
+        fs::create_dir_all(temp.path().join("plain")).expect("create plain dir");
+        let discovery = git_discover_repositories_sync(temp.path().to_string_lossy().to_string())
+            .expect("discover repositories");
+        assert!(discovery.repositories.is_empty());
     }
 
     #[test]
@@ -2855,6 +3705,241 @@ mod tests {
         let duplicate = git_init_sync(workdir, "main".to_string(), None, None)
             .expect_err("second init should fail");
         assert!(duplicate.contains("Git 仓库内"), "{duplicate}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_clone_task_stops_its_isolated_process() {
+        let registry = GitCloneTaskRegistry::default();
+        let target = tempfile::tempdir().expect("clone target");
+        let mut command = Command::new("sh");
+        configure_child_process_group(&mut command);
+        let mut child = command
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("start isolated clone process");
+        let task = GitCloneTask {
+            id: "cancel-test".to_string(),
+            repository_name: "repository".to_string(),
+            target_path: target.path().to_string_lossy().into_owned(),
+            branch: String::new(),
+            status: "running".to_string(),
+            phase: "preparing".to_string(),
+            progress: None,
+            detail: "正在准备克隆…".to_string(),
+            error: String::new(),
+            started_at: now_ms(),
+        };
+        registry.tasks.lock().expect("task registry").insert(
+            task.id.clone(),
+            GitCloneTaskEntry {
+                task: task.clone(),
+                pid: child.id(),
+            },
+        );
+
+        let cancelled = registry.cancel(task.id.clone()).expect("cancel clone task");
+        assert_eq!(cancelled.status, "cancelling");
+        assert!(
+            registry.dismiss(task.id).is_err(),
+            "in-flight clone task must refuse dismissal"
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if child.try_wait().expect("read clone process").is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "clone process did not terminate");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn clones_repository_into_a_fresh_workspace() {
+        let Some(source) = init_temp_repo() else {
+            return;
+        };
+        run_temp_git(source.path(), &["checkout", "-b", "release"]);
+        fs::write(source.path().join("RELEASE.md"), "release\n").expect("write release file");
+        run_temp_git(source.path(), &["add", "RELEASE.md"]);
+        run_temp_git(source.path(), &["commit", "-m", "release"]);
+        let parent = tempfile::tempdir().expect("clone parent");
+        let response = git_clone_repository_sync(
+            parent.path().to_string_lossy().into_owned(),
+            "cloned-project".to_string(),
+            source.path().to_string_lossy().into_owned(),
+            Some("release".to_string()),
+        )
+        .expect("clone repository");
+
+        assert!(response.ok, "clone failed: {}", response.message);
+        assert_eq!(response.state.status, "ready");
+        assert_eq!(response.state.head, "release");
+        assert_eq!(response.state.remote_name, "origin");
+        assert!(parent.path().join("cloned-project/RELEASE.md").is_file());
+
+        let gateway_parent = tempfile::tempdir().expect("gateway clone parent");
+        let gateway_response: GitOperationResponse = serde_json::from_value(
+            git_gateway_action_sync(
+                "clone".to_string(),
+                gateway_parent.path().to_string_lossy().into_owned(),
+                serde_json::json!({
+                    "name": "gateway-project",
+                    "remoteUrl": source.path(),
+                    "branch": "release",
+                })
+                .to_string(),
+            )
+            .expect("gateway clone repository"),
+        )
+        .expect("decode gateway clone response");
+        assert_eq!(gateway_response.state.head, "release");
+        assert!(gateway_parent
+            .path()
+            .join("gateway-project/RELEASE.md")
+            .is_file());
+        assert!(git_clone_repository_sync(
+            parent.path().to_string_lossy().into_owned(),
+            "cloned-project".to_string(),
+            source.path().to_string_lossy().into_owned(),
+            None,
+        )
+        .expect_err("existing clone target must be rejected")
+        .contains("克隆目标已存在"));
+
+        let task_parent = tempfile::tempdir().expect("task clone parent");
+        let registry = Arc::new(GitCloneTaskRegistry::default());
+        let started = git_gateway_clone_task_action_sync(
+            "clone_start".to_string(),
+            task_parent.path().to_string_lossy().into_owned(),
+            json!({
+                "name": "task-project",
+                "remoteUrl": source.path(),
+                "branch": "release",
+            })
+            .to_string(),
+            &registry,
+        )
+        .expect("start gateway clone task");
+        let task_id = started["id"].as_str().expect("clone task id").to_string();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let task = registry.task(&task_id).expect("clone task state");
+            if task.status != "running" && task.status != "cancelling" {
+                assert_eq!(
+                    task.status, "completed",
+                    "clone task failed: {}",
+                    task.error
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "clone task timed out");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(task_parent.path().join("task-project/RELEASE.md").is_file());
+        let snapshot = git_gateway_clone_task_action_sync(
+            "clone_tasks".to_string(),
+            String::new(),
+            String::new(),
+            &registry,
+        )
+        .expect("read gateway clone tasks");
+        assert!(snapshot
+            .as_array()
+            .expect("task snapshot")
+            .iter()
+            .any(|task| task["id"] == task_id));
+        let dismissed = git_gateway_clone_task_action_sync(
+            "clone_dismiss".to_string(),
+            String::new(),
+            json!({ "taskId": task_id }).to_string(),
+            &registry,
+        )
+        .expect("dismiss gateway clone task");
+        assert!(
+            dismissed.as_array().expect("dismissed snapshot").is_empty(),
+            "dismissed task must leave the registry"
+        );
+    }
+
+    #[test]
+    fn parses_git_clone_progress_lines() {
+        assert_eq!(
+            parse_git_clone_progress("Cloning into '.'..."),
+            Some(("preparing", 5))
+        );
+        assert_eq!(
+            parse_git_clone_progress("remote: Enumerating objects: 1553, done."),
+            Some(("preparing", 5))
+        );
+        assert_eq!(
+            parse_git_clone_progress("Receiving objects:   0% (1/1553)"),
+            Some(("receiving", 5))
+        );
+        assert_eq!(
+            parse_git_clone_progress("Receiving objects:  50% (777/1553), 10.20 MiB | 5.00 MiB/s"),
+            Some(("receiving", 45))
+        );
+        assert_eq!(
+            parse_git_clone_progress("Receiving objects: 100% (1553/1553), done."),
+            Some(("receiving", 85))
+        );
+        assert_eq!(
+            parse_git_clone_progress("Resolving deltas: 100% (900/900), done."),
+            Some(("resolving", 100))
+        );
+        assert_eq!(
+            parse_git_clone_progress("Checking out files:  40% (200/500)"),
+            Some(("finalizing", 97))
+        );
+        assert_eq!(
+            parse_git_clone_progress("fatal: repository not found"),
+            None
+        );
+    }
+
+    #[test]
+    fn lists_remote_branches_and_default_branch() {
+        let Some(source) = init_temp_repo() else {
+            return;
+        };
+        run_temp_git(source.path(), &["checkout", "-b", "release"]);
+
+        let response = git_list_remote_branches_sync(source.path().to_string_lossy().into_owned())
+            .expect("list remote branches");
+
+        assert!(response.branches.iter().any(|branch| branch == "release"));
+        assert!(response
+            .branches
+            .iter()
+            .any(|branch| branch == &response.default_branch));
+    }
+
+    #[test]
+    fn rejects_remote_helper_transport_urls() {
+        let error = validate_git_remote_url("ext::sh -c 'touch /tmp/pwned'")
+            .expect_err("ext:: transport must be rejected");
+        assert!(error.contains("ext::"), "{error}");
+        assert!(validate_git_remote_url("hg::https://example.com/repo").is_err());
+        assert!(validate_git_remote_url("::example.com/repo").is_err());
+
+        assert!(validate_git_remote_url("https://example.com/owner/repo.git").is_ok());
+        assert!(validate_git_remote_url("git@github.com:owner/repo.git").is_ok());
+        assert!(validate_git_remote_url("ssh://[2001:db8::1]/repo.git").is_ok());
+        assert!(validate_git_remote_url("/tmp/local/repo").is_ok());
+
+        let parent = tempfile::tempdir().expect("clone parent");
+        let clone_error = git_clone_repository_sync(
+            parent.path().to_string_lossy().into_owned(),
+            "pwned".to_string(),
+            "ext::sh -c 'touch /tmp/pwned'".to_string(),
+            None,
+        )
+        .expect_err("clone must reject ext:: transport");
+        assert!(clone_error.contains("ext::"), "{clone_error}");
+        assert!(
+            git_list_remote_branches_sync("ext::sh -c 'touch /tmp/pwned'".to_string()).is_err()
+        );
     }
 
     #[test]
@@ -2977,6 +4062,64 @@ mod tests {
         assert!(discarded_all.state.entries.is_empty());
         assert!(!temp.path().join("bulk-staged.txt").exists());
         assert!(!temp.path().join("bulk-untracked.txt").exists());
+    }
+
+    #[test]
+    fn git_status_lists_files_inside_untracked_directories() {
+        let Some(repo) = init_temp_repo() else {
+            return;
+        };
+        let workdir = repo.path().to_string_lossy().to_string();
+        fs::create_dir_all(repo.path().join("newdir").join("nested")).expect("create untracked");
+        fs::write(repo.path().join("newdir").join("a.txt"), "a\n").expect("write a");
+        fs::write(
+            repo.path().join("newdir").join("nested").join("b.txt"),
+            "b\n",
+        )
+        .expect("write b");
+
+        // --untracked-files=all: every file inside the untracked directory is
+        // listed individually instead of one collapsed `newdir/` entry.
+        let state = git_status_sync(workdir.clone()).expect("status");
+        assert_eq!(state.status, "ready");
+        let untracked: Vec<&str> = state
+            .entries
+            .iter()
+            .filter(|entry| entry.untracked)
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert!(
+            untracked.contains(&"newdir/a.txt"),
+            "entries: {untracked:?}"
+        );
+        assert!(
+            untracked.contains(&"newdir/nested/b.txt"),
+            "entries: {untracked:?}"
+        );
+        assert!(!untracked.contains(&"newdir/"), "entries: {untracked:?}");
+        assert_eq!(state.dirty_counts.untracked, 2);
+
+        // The per-file entries stay actionable end to end: diff, stage, discard.
+        let diff = git_diff_sync(
+            workdir.clone(),
+            Some("working_tree".to_string()),
+            Some("newdir/a.txt".to_string()),
+        )
+        .expect("untracked diff");
+        assert!(diff.patch.contains("+a"), "diff patch:\n{}", diff.patch);
+        let staged = git_stage_sync(workdir.clone(), "newdir/a.txt".to_string()).expect("stage");
+        assert!(staged.ok, "stage failed: {}", staged.message);
+        assert_eq!(staged.state.dirty_counts.staged, 1);
+        assert_eq!(staged.state.dirty_counts.untracked, 1);
+        let discarded = git_discard_sync(workdir.clone(), "newdir/nested/b.txt".to_string(), None)
+            .expect("discard untracked");
+        assert!(discarded.ok, "discard failed: {}", discarded.message);
+        assert!(!repo
+            .path()
+            .join("newdir")
+            .join("nested")
+            .join("b.txt")
+            .exists());
     }
 
     #[test]

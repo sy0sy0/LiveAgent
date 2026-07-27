@@ -65,4 +65,4 @@ export type SidebarBackendEvent =
       workdir?: string | null;
       updatedAt?: number;
     }
-  | { kind: "idle"; conversationId: string };
+  | { kind: "idle"; conversationId: string; updatedAt?: number };

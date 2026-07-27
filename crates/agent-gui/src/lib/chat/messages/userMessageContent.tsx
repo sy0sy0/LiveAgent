@@ -64,7 +64,7 @@ function isCommonSkillMentionEnvVar(name: string) {
 }
 
 export function isSkillMentionToken(token: string) {
-  if (!token.startsWith("$")) return false;
+  if (!token.startsWith("/")) return false;
   const name = token.slice(1);
   return Boolean(name) && isSkillMentionName(name) && !isCommonSkillMentionEnvVar(name);
 }
@@ -359,7 +359,8 @@ function tokenizeInlineMentions(text: string): UserMessageSegment[] {
       continue;
     }
 
-    if (text[index] !== "$" || !isTokenBoundary(text, index)) {
+    const marker = text[index];
+    if (marker !== "/" || !isTokenBoundary(text, index)) {
       continue;
     }
 
@@ -367,6 +368,8 @@ function tokenizeInlineMentions(text: string): UserMessageSegment[] {
     while (nameEnd < text.length && /[A-Za-z0-9_:-]/.test(text[nameEnd])) {
       nameEnd += 1;
     }
+    // A slash right after the name means a filesystem path (/usr/bin), not a skill.
+    if (text[nameEnd] === "/") continue;
     const token = text.slice(index, nameEnd);
     if (!isSkillMentionToken(token)) continue;
     if (index > cursor) {

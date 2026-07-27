@@ -7,7 +7,27 @@ const webSettings = loader.loadModule("src/lib/webSettings.ts");
 const settings = loader.loadModule("@/lib/settings/index.ts");
 const settingsSync = loader.loadModule("@/lib/settings/sync.ts");
 const chatHelpers = loader.loadModule("@/lib/chat/chatPageHelpers.ts");
+const adminApi = loader.loadModule("@/lib/adminApi.ts");
 const RIGHT_DOCK_TAB_IDS = settings.RIGHT_DOCK_SINGLETON_TAB_IDS;
+
+test("custom provider normalization defaults and filters ordered custom headers", () => {
+  assert.deepEqual(settings.normalizeCustomProvider({}).customHeaders, []);
+
+  const provider = settings.normalizeCustomProvider({
+    customHeaders: [
+      { key: " X-Request-ID ", value: " request-123 " },
+      { key: "", value: "ignored" },
+      { key: "   ", value: "ignored" },
+      { key: "anthropic-beta", value: "feature-flag" },
+      null,
+    ],
+  });
+
+  assert.deepEqual(provider.customHeaders, [
+    { key: "X-Request-ID", value: " request-123 " },
+    { key: "anthropic-beta", value: "feature-flag" },
+  ]);
+});
 
 test("gateway model picker keeps same-name provider instances in separate groups", () => {
   const modelOptions = chatHelpers.buildModelOptions({
@@ -78,6 +98,91 @@ function installWindow(origin = "https://gateway.example") {
   return store;
 }
 
+test("agent directory requests database-paged status filters", async () => {
+  installWindow("https://gateway.example");
+  const originalFetch = globalThis.fetch;
+  let requestUrl;
+  let authorization;
+  globalThis.fetch = async (input, init) => {
+    requestUrl = new URL(String(input));
+    authorization = init?.headers?.Authorization;
+    return new Response(
+      JSON.stringify({
+        agents: [
+          {
+            agent_id: "shared-token-agent",
+            name: "",
+            online: false,
+            has_token: false,
+            registered_at: "2026-07-22T00:00:00Z",
+          },
+        ],
+        page: 3,
+        page_size: 50,
+        total: 1,
+        has_more: false,
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  };
+
+  try {
+    const result = await adminApi.listAdminAgents(" gateway-token ", 3, 50, "offline");
+    assert.equal(requestUrl.pathname, "/api/agents");
+    assert.equal(requestUrl.searchParams.get("page"), "3");
+    assert.equal(requestUrl.searchParams.get("page_size"), "50");
+    assert.equal(requestUrl.searchParams.get("status"), "offline");
+    assert.equal(authorization, "Bearer gateway-token");
+    assert.equal(result.page, 3);
+    assert.equal(result.agents[0].has_token, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("agent management validates generated IDs and uses the single-record API", async () => {
+  installWindow("https://gateway.example");
+  const agentId = "agent-550e8400-e29b-41d4-a716-446655440000";
+  assert.equal(adminApi.isGeneratedAgentID(` ${agentId} `), true);
+  assert.equal(adminApi.isGeneratedAgentID("agent-550e8400-e29b-11d4-a716-446655440000"), false);
+  assert.equal(adminApi.isGeneratedAgentID("agent-550E8400-E29B-41D4-A716-446655440000"), false);
+  assert.equal(adminApi.isGeneratedAgentID("manual-agent"), false);
+
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (input, init = {}) => {
+    requests.push({ url: new URL(String(input)), init });
+    if (init.method === "POST") {
+      return new Response(JSON.stringify({ token: "agt_plaintext" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+  };
+
+  try {
+    const issued = await adminApi.issueAdminToken(" gateway-token ", agentId, "  办公室电脑  ");
+    await adminApi.updateAdminAgentName("gateway-token", agentId, "   ");
+    await adminApi.deleteAdminAgent("gateway-token", agentId);
+
+    assert.equal(issued, "agt_plaintext");
+    assert.equal(requests.length, 3);
+    assert.equal(requests[0].url.pathname, `/api/agents/${agentId}/token`);
+    assert.equal(requests[0].init.method, "POST");
+    assert.equal(requests[0].init.headers.Authorization, "Bearer gateway-token");
+    assert.equal(requests[0].init.headers["Content-Type"], "application/json");
+    assert.equal(requests[0].init.body, JSON.stringify({ name: "办公室电脑" }));
+    assert.equal(requests[1].url.pathname, `/api/agents/${agentId}`);
+    assert.equal(requests[1].init.method, "PATCH");
+    assert.equal(requests[1].init.body, JSON.stringify({ name: "" }));
+    assert.equal(requests[2].url.pathname, `/api/agents/${agentId}`);
+    assert.equal(requests[2].init.method, "DELETE");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("getWebDefaultSettings enables remote settings from the gateway token", () => {
   installWindow("https://gateway.example");
 
@@ -87,6 +192,28 @@ test("getWebDefaultSettings enables remote settings from the gateway token", () 
   assert.equal(settings.remote.enabled, true);
   assert.equal(settings.remote.gatewayUrl, "https://gateway.example");
   assert.equal(settings.remote.token, "token");
+});
+
+test("web settings normalize independent font families and migrate the retired interface field", () => {
+  const migrated = settings.normalizeSettings({ customSettings: { fontFamily: "Inter" } });
+  assert.equal(migrated.customSettings.interfaceFontFamily, "Inter");
+  assert.equal(Object.hasOwn(migrated.customSettings, "fontFamily"), false);
+
+  const normalized = settings.normalizeSettings({
+    customSettings: {
+      interfaceFontFamily: 'Inter, "PingFang SC", sans-serif',
+      chatFontFamily: "rounded",
+      codeFontFamily: "Menlo",
+    },
+  });
+  assert.equal(normalized.customSettings.interfaceFontFamily, 'Inter, "PingFang SC", sans-serif');
+  assert.equal(normalized.customSettings.chatFontFamily, "rounded");
+  assert.equal(normalized.customSettings.codeFontFamily, "Menlo");
+  assert.equal(
+    settings.normalizeSettings({ customSettings: { codeFontFamily: "invalid;}" } }).customSettings
+      .codeFontFamily,
+    "",
+  );
 });
 
 test("web settings normalization canonicalizes project keyed maps with Windows path compatibility", () => {
@@ -188,23 +315,25 @@ test("web chat runtime controls default and follow model-aware reasoning support
       codex_openai_responses: "high",
       codex_openai_completions: "high",
       gemini: "high",
+      xai: "high",
     },
   });
 
   assert.deepEqual(settings.getChatRuntimeReasoningLevelsForProvider({}), []);
+  // 档位全部来自生成目录（models.dev）：adaptive 世代无 minimal 档。
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
       providerId: "claude_code",
       modelId: "claude-opus-4-8",
     }),
-    ["minimal", "low", "medium", "high", "xhigh", "max"],
+    ["low", "medium", "high", "xhigh", "max"],
   );
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
       providerId: "claude_code",
       modelId: "claude-sonnet-4-6",
     }),
-    ["minimal", "low", "medium", "high", "max"],
+    ["low", "medium", "high", "max"],
   );
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
@@ -212,7 +341,7 @@ test("web chat runtime controls default and follow model-aware reasoning support
       requestFormat: "openai-responses",
       modelId: "gpt-5.2",
     }),
-    ["minimal", "low", "medium", "high", "xhigh"],
+    ["low", "medium", "high", "xhigh"],
   );
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
@@ -229,29 +358,31 @@ test("web chat runtime controls default and follow model-aware reasoning support
     }),
     ["minimal", "low", "medium", "high"],
   );
-  // 目录之外的自定义模型（deepseek/glm 等）按可推理处理，与桌面端一致：
-  // 标准四档；deepseek 走 codex 时镜像桌面端适配层的 xhigh 档。
+  // 中转挂载的国产厂商模型走跨供应商回查命中真实形态：glm-4.7 纯 toggle
+  //（单 "high" 档），deepseek-reasoner 恒开不可调（无档位），deepseek-chat
+  // 非思考模型（思考控件整组隐藏）。
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
       providerId: "codex",
       requestFormat: "openai-completions",
       modelId: "glm-4.7",
     }),
-    ["minimal", "low", "medium", "high"],
+    ["high"],
   );
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
       providerId: "claude_code",
       modelId: "deepseek-reasoner",
     }),
-    ["minimal", "low", "medium", "high"],
+    [],
   );
+  assert.equal(settings.isThinkingAlwaysOnForModel("claude_code", "deepseek-reasoner"), true);
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
       providerId: "codex",
       modelId: "deepseek-chat",
     }),
-    ["minimal", "low", "medium", "high", "xhigh"],
+    [],
   );
 
   assert.equal(settings.isThinkingAlwaysOnForModel("claude_code", "claude-fable-5"), true);
@@ -265,30 +396,30 @@ test("web chat runtime controls default and follow model-aware reasoning support
       providerId: "claude_code",
       modelId: "claude-opus-4-8-20260213",
     }),
-    ["minimal", "low", "medium", "high", "xhigh", "max"],
+    ["low", "medium", "high", "xhigh", "max"],
   );
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
       providerId: "claude_code",
       modelId: "claude-sonnet-4-6-20251114",
     }),
-    ["minimal", "low", "medium", "high", "max"],
+    ["low", "medium", "high", "max"],
   );
   assert.equal(settings.isThinkingAlwaysOnForModel("claude_code", "Claude-Fable-5"), true);
-  // 目录彻底未命中的三方改名 id 走 id 启发式补 xhigh/max。
+  // 目录彻底未命中的三方改名 id 走 id 启发式补 xhigh/max（adaptive 世代无 minimal）。
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
       providerId: "claude_code",
       modelId: "claude-4.6-sonnet",
     }),
-    ["minimal", "low", "medium", "high", "max"],
+    ["low", "medium", "high", "max"],
   );
   assert.deepEqual(
     settings.getChatRuntimeReasoningLevelsForProvider({
       providerId: "claude_code",
       modelId: "claude-5-sonnet",
     }),
-    ["minimal", "low", "medium", "high", "xhigh", "max"],
+    ["low", "medium", "high", "xhigh", "max"],
   );
   // 旧世代 id 不误判。
   assert.deepEqual(
@@ -320,6 +451,7 @@ test("web chat runtime controls default and follow model-aware reasoning support
         codex_openai_responses: "xhigh",
         codex_openai_completions: "xhigh",
         gemini: "high",
+        xai: "xhigh",
       },
     },
   );
@@ -343,7 +475,10 @@ test("web chat runtime controls default and follow model-aware reasoning support
         claude_code: "xhigh",
         codex_openai_responses: "xhigh",
         codex_openai_completions: "xhigh",
+        // gemini / xai 未在 reasoningByProvider 输入里显式给出，也未参与本次调用
+        // 的当前 provider key，因此只继承顶层 reasoning 原值，不做钳制。
         gemini: "xhigh",
+        xai: "xhigh",
       },
     },
   );
@@ -363,6 +498,7 @@ test("web chat runtime controls default and follow model-aware reasoning support
         codex_openai_responses: "xhigh",
         codex_openai_completions: "high",
         gemini: "high",
+        xai: "high",
       },
     },
   );
@@ -1338,18 +1474,16 @@ test("web remote settings normalize single-slash http gateway URLs", () => {
   const remote = settings.normalizeRemoteSettings({
     enabled: true,
     gatewayUrl: " https:/gateway.example/ ",
-    grpcEndpoint: " https:/grpc.example/ ",
     token: " token ",
   });
 
   assert.equal(remote.gatewayUrl, "https://gateway.example");
-  assert.equal(remote.grpcEndpoint, "https://grpc.example");
   assert.equal(remote.token, "token");
 
   const remoteWithOversizedPort = settings.normalizeRemoteSettings({
-    grpcPort: "70000",
+    gatewayPort: "70000",
   });
-  assert.equal(remoteWithOversizedPort.grpcPort, 65_535);
+  assert.equal(remoteWithOversizedPort.gatewayPort, 65_535);
 });
 
 test("web provider normalization keeps native web search toggle", () => {
@@ -1465,4 +1599,69 @@ test("web right dock migrates the legacy tabs shape", () => {
   assert.equal(project.tools.fileTree.uiState.query, "q");
   assert.deepEqual(project.tabOrder, ["sess-1", RIGHT_DOCK_TAB_IDS.fileTree]);
   assert.equal(project.activeTabId, "sess-1");
+});
+
+test("xai model limits use the generated catalog without changing thinking detection", () => {
+  const grok45 = settings.getProviderModelDefaults("xai", "grok-4.5");
+  assert.equal(grok45.contextWindow, 500_000);
+  // 上游"输出=窗口"的退化条目在生成期统一钳到 32K。
+  assert.equal(grok45.maxOutputToken, 32_000);
+  // 上游（models.dev）已下架的旧模型与未收录模型一样吃供应商兜底值。
+  assert.equal(settings.getProviderModelDefaults("xai", "grok-3").contextWindow, 258_000);
+  assert.equal(settings.getProviderModelDefaults("xai", "grok-unknown").contextWindow, 258_000);
+  // 思考档位与限额同吃生成目录（见下一个用例）。
+  assert.ok(settings.getKnownModelThinkingLevels("xai", "grok-4.5").includes("high"));
+});
+
+test("xai thinking levels come from the catalog per model, thinking always on", () => {
+  // 档位按型号差异化（目录真值）：grok-4.5 只有 low/medium/high；
+  // grok-4.20-multi-agent-0309 声明到 xhigh。xai 思考一律恒开
+  //（wire 无法表达 off），目录的 off 声明对 xai 供应商不生效。
+  assert.deepEqual(settings.getKnownModelThinkingLevels("xai", "grok-4.5"), [
+    "low",
+    "medium",
+    "high",
+  ]);
+  assert.equal(settings.isThinkingAlwaysOnForModel("xai", "grok-4.5"), true);
+  const multiAgent = settings.getKnownModelThinkingLevels("xai", "grok-4.20-multi-agent-0309");
+  assert.ok(multiAgent.includes("xhigh"));
+  assert.equal(settings.isThinkingAlwaysOnForModel("xai", "grok-4.3"), true);
+  // 钳制路径：xhigh 超出 grok-4.5 档位表时压回默认 high。
+  const clamped = settings.normalizeChatRuntimeControlsForProvider(
+    { reasoning: "xhigh", reasoningByProvider: { xai: "xhigh" } },
+    { providerId: "xai", modelId: "grok-4.5" },
+  );
+  assert.equal(clamped.reasoning, "high");
+});
+
+test("gateway sync keeps all web font families local", () => {
+  const current = settings.normalizeSettings({
+    customSettings: {
+      interfaceFontFamily: "Inter",
+      chatFontFamily: "Noto Sans",
+      codeFontFamily: "Menlo",
+    },
+  });
+  const incoming = settingsSync.buildGatewaySettingsSyncPayload(
+    settings.normalizeSettings({
+      customSettings: {
+        interfaceFontFamily: "Arial",
+        chatFontFamily: "Open Sans",
+        codeFontFamily: "Monaco",
+      },
+    }),
+  );
+
+  assert.deepEqual(
+    {
+      interfaceFontFamily: incoming.customSettings.interfaceFontFamily,
+      chatFontFamily: incoming.customSettings.chatFontFamily,
+      codeFontFamily: incoming.customSettings.codeFontFamily,
+    },
+    { interfaceFontFamily: "", chatFontFamily: "", codeFontFamily: "" },
+  );
+  assert.deepEqual(
+    settingsSync.applyGatewaySettingsSyncPayload(current, incoming).customSettings,
+    current.customSettings,
+  );
 });

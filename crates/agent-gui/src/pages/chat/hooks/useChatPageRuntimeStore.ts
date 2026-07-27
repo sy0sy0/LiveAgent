@@ -83,6 +83,11 @@ export function useChatPageRuntimeStore(params: UseChatPageRuntimeStoreParams) {
   const persistedConversationStateRef = useRef(new Map<string, ConversationViewState>());
   const runningConversationIdsRef = useRef(new Set<string>());
   const conversationAbortControllersRef = useRef(new Map<string, AbortController>());
+  const conversationStopRequestsRef = useRef(new Set<string>());
+  const conversationStopRequestVersionsRef = useRef(new Map<string, number>());
+  const conversationStopHandlersRef = useRef(
+    new Map<string, (options: { force: boolean; requestVersion: number }) => void>(),
+  );
 
   const buildRuntimeEntryFromVisibleState = useCallback(
     (): ConversationRuntimeEntry =>
@@ -184,6 +189,9 @@ export function useChatPageRuntimeStore(params: UseChatPageRuntimeStoreParams) {
       if (!key) return;
       if (controller) {
         conversationAbortControllersRef.current.set(key, controller);
+        if (conversationStopRequestsRef.current.has(key)) {
+          controller.abort();
+        }
         return;
       }
       conversationAbortControllersRef.current.delete(key);
@@ -194,6 +202,89 @@ export function useChatPageRuntimeStore(params: UseChatPageRuntimeStoreParams) {
   const getConversationAbortController = useCallback((conversationId: string) => {
     return conversationAbortControllersRef.current.get(conversationId.trim()) ?? null;
   }, []);
+
+  const requestConversationStop = useCallback((conversationId: string) => {
+    const key = conversationId.trim();
+    if (!key) return false;
+    const alreadyRequested = conversationStopRequestsRef.current.has(key);
+    conversationStopRequestVersionsRef.current.set(
+      key,
+      (conversationStopRequestVersionsRef.current.get(key) ?? 0) + 1,
+    );
+    conversationStopRequestsRef.current.add(key);
+    return alreadyRequested;
+  }, []);
+
+  const getConversationStopRequestVersion = useCallback((conversationId: string) => {
+    return conversationStopRequestVersionsRef.current.get(conversationId.trim()) ?? 0;
+  }, []);
+
+  const isConversationStopRequested = useCallback((conversationId: string) => {
+    return conversationStopRequestsRef.current.has(conversationId.trim());
+  }, []);
+
+  const consumeConversationStop = useCallback(
+    (conversationId: string, expectedVersion?: number) => {
+      const key = conversationId.trim();
+      if (
+        expectedVersion !== undefined &&
+        conversationStopRequestVersionsRef.current.get(key) !== expectedVersion
+      ) {
+        return false;
+      }
+      return conversationStopRequestsRef.current.delete(key);
+    },
+    [],
+  );
+
+  const setConversationStopHandler = useCallback(
+    (
+      conversationId: string,
+      handler: ((options: { force: boolean; requestVersion: number }) => void) | null,
+    ) => {
+      const key = conversationId.trim();
+      if (!key) return;
+      if (handler) {
+        conversationStopHandlersRef.current.set(key, handler);
+        if (conversationStopRequestsRef.current.has(key)) {
+          handler({
+            force: false,
+            requestVersion: conversationStopRequestVersionsRef.current.get(key) ?? 0,
+          });
+        }
+        return;
+      }
+      conversationStopHandlersRef.current.delete(key);
+    },
+    [],
+  );
+
+  const clearConversationStopHandler = useCallback(
+    (
+      conversationId: string,
+      handler: (options: { force: boolean; requestVersion: number }) => void,
+    ) => {
+      const key = conversationId.trim();
+      if (conversationStopHandlersRef.current.get(key) === handler) {
+        conversationStopHandlersRef.current.delete(key);
+      }
+    },
+    [],
+  );
+
+  const requestActiveConversationStop = useCallback(
+    (conversationId: string, options: { force: boolean }) => {
+      const key = conversationId.trim();
+      const handler = conversationStopHandlersRef.current.get(key);
+      if (!handler) return false;
+      handler({
+        ...options,
+        requestVersion: conversationStopRequestVersionsRef.current.get(key) ?? 0,
+      });
+      return true;
+    },
+    [],
+  );
 
   const setConversationSendingState = useCallback(
     (conversationId: string, value: boolean) => {
@@ -258,6 +349,9 @@ export function useChatPageRuntimeStore(params: UseChatPageRuntimeStoreParams) {
         controller.abort();
       }
       conversationAbortControllersRef.current.clear();
+      conversationStopRequestsRef.current.clear();
+      conversationStopRequestVersionsRef.current.clear();
+      conversationStopHandlersRef.current.clear();
     },
     [],
   );
@@ -274,6 +368,13 @@ export function useChatPageRuntimeStore(params: UseChatPageRuntimeStoreParams) {
     isConversationRunning,
     setConversationAbortController,
     getConversationAbortController,
+    requestConversationStop,
+    getConversationStopRequestVersion,
+    isConversationStopRequested,
+    consumeConversationStop,
+    setConversationStopHandler,
+    clearConversationStopHandler,
+    requestActiveConversationStop,
     setConversationSendingState,
   };
 }

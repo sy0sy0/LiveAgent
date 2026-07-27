@@ -12,16 +12,19 @@ use crate::runtime::project_path::{
     project_path_key as normalize_project_path_key, project_path_keys_equal,
 };
 use crate::runtime::terminal::{
-    terminal_shell_options, SshTerminalTabRecord, SshTerminalTabsSnapshot, TerminalEventPayload,
-    TerminalSessionRecord, TerminalShellOption, TerminalSnapshotResponse,
-    TerminalSshCreateResponse, TerminalStreamEventPayload, TerminalStreamSnapshotResponse,
+    normalize_ssh_local_forward_local_port, ssh_local_forward_local_port_available,
+    terminal_shell_options, SshLocalForwardActionResponse, SshLocalForwardEventPayload,
+    SshLocalForwardListResponse, SshLocalForwardRecord, SshTerminalTabRecord,
+    SshTerminalTabsSnapshot, TerminalEventPayload, TerminalSessionRecord, TerminalShellOption,
+    TerminalSnapshotResponse, TerminalSshCreateResponse, TerminalStreamEventPayload,
+    TerminalStreamSnapshotResponse,
 };
 
 use super::gateway_proto::v2;
 use super::*;
 
 impl GatewayController {
-    /// v2 终端数据面（/ws/v2/terminal，角色 AGENT）：PTY/注册表侧播种口与 gRPC 版完全一致；
+    /// v2 终端数据面（/ws/v2/terminal，角色 AGENT）：PTY/注册表侧播种口与 WebSocket 版完全一致；
     /// 由 connect_and_serve 在主链路建立后生成本任务，与主链路同生命周期。
     pub(crate) fn spawn_terminal_stream_ws(
         self: &Arc<Self>,
@@ -34,7 +37,7 @@ impl GatewayController {
         })
     }
 
-    /// v2 终端流重连主循环，骨架与 gRPC 版一致（同一组退避常量）。
+    /// v2 终端流重连主循环，骨架与 WebSocket 版一致（同一组退避常量）。
     pub(crate) async fn run_terminal_stream_ws(
         self: Arc<Self>,
         config: RemoteSettingsPayload,
@@ -82,8 +85,8 @@ impl GatewayController {
         self.set_terminal_stream_sender(None);
     }
 
-    /// 单次 v2 终端流连接：hello ok=true 即就绪（v1 的合成 "gateway-ready" detach 握手帧不复存在），
-    /// 随后双向透传 TerminalStreamFrame；周期 WS Ping 取代 v1 的 detach 保活帧。
+    /// 单次 v2 终端流连接：hello ok=true 即就绪，随后双向透传
+    /// TerminalStreamFrame，并通过周期 WS Ping 保活。
     pub(crate) async fn run_terminal_stream_ws_once(
         self: Arc<Self>,
         config: RemoteSettingsPayload,
@@ -91,12 +94,12 @@ impl GatewayController {
     ) -> Result<(), String> {
         let ws_url = build_ws_url(
             &config.gateway_url,
-            config.grpc_port,
+            config.gateway_port,
             GATEWAY_WS_TERMINAL_PATH,
         )?;
         let hello = build_client_hello(
             &config.token,
-            effective_agent_id(&config),
+            effective_agent_id(&config)?,
             crate::app_version().to_string(),
         );
 
@@ -264,6 +267,9 @@ impl GatewayController {
                     ssh_prompt: None,
                     latency_ms: 0,
                     ssh_tabs: None,
+                    ssh_local_forwards: None,
+                    ssh_local_forward: None,
+                    ssh_local_forward_port_available: false,
                 })
             }
             "list" => {
@@ -297,6 +303,9 @@ impl GatewayController {
                     ssh_prompt: None,
                     latency_ms: 0,
                     ssh_tabs: None,
+                    ssh_local_forwards: None,
+                    ssh_local_forward: None,
+                    ssh_local_forward_port_available: false,
                 })
             }
             "create" => {
@@ -364,7 +373,21 @@ impl GatewayController {
                     ssh_prompt: None,
                     latency_ms: latency.latency_ms,
                     ssh_tabs: None,
+                    ssh_local_forwards: None,
+                    ssh_local_forward: None,
+                    ssh_local_forward_port_available: false,
                 })
+            }
+            "ssh_reconnect" => {
+                self.ensure_terminal_session_in_project(
+                    &request.session_id,
+                    &request.project_path_key,
+                )?;
+                let session = self
+                    .terminal_registry
+                    .ssh_reconnect(request.session_id)
+                    .await?;
+                Ok(terminal_record_response_to_proto(action, session))
             }
             "cancel_ssh_prompt" => {
                 self.terminal_registry
@@ -382,6 +405,9 @@ impl GatewayController {
                     ssh_prompt: None,
                     latency_ms: 0,
                     ssh_tabs: None,
+                    ssh_local_forwards: None,
+                    ssh_local_forward: None,
+                    ssh_local_forward_port_available: false,
                 })
             }
             "ssh_tabs_list" => {
@@ -403,6 +429,71 @@ impl GatewayController {
                     .terminal_registry
                     .ssh_terminal_tab_close(request.tab_id)?;
                 Ok(terminal_ssh_tabs_response_to_proto(action, snapshot))
+            }
+            "ssh_local_forward_start" => {
+                self.ensure_terminal_session_in_project(
+                    &request.session_id,
+                    &request.project_path_key,
+                )?;
+                let project_path_key =
+                    required_terminal_project_path_key(&request.project_path_key)?;
+                let response = self
+                    .terminal_registry
+                    .clone()
+                    .ssh_local_forward_start(
+                        request.session_id,
+                        Some(project_path_key),
+                        request.remote_host,
+                        request.remote_port,
+                        Some(request.local_port),
+                    )
+                    .await?;
+                Ok(terminal_ssh_local_forward_action_response_to_proto(
+                    action, response,
+                ))
+            }
+            "ssh_local_forward_list" => {
+                let response = self.terminal_registry.ssh_local_forward_list(
+                    optional_proto_text(request.session_id),
+                    optional_proto_text(request.project_path_key),
+                )?;
+                Ok(terminal_ssh_local_forward_list_response_to_proto(
+                    action, response,
+                ))
+            }
+            "ssh_local_forward_stop" => {
+                let response = self
+                    .terminal_registry
+                    .ssh_local_forward_stop(
+                        request.forward_id,
+                        optional_proto_text(request.session_id),
+                    )
+                    .await?;
+                Ok(terminal_ssh_local_forward_action_response_to_proto(
+                    action, response,
+                ))
+            }
+            "ssh_local_forward_check_port" => {
+                let port = normalize_ssh_local_forward_local_port(Some(request.local_port))?;
+                // Auto-assign never conflicts; the OS picks a free port at bind time.
+                let available = port == 0 || ssh_local_forward_local_port_available(port).await;
+                Ok(proto::TerminalResponse {
+                    action,
+                    sessions: Vec::new(),
+                    session: None,
+                    output: Vec::new(),
+                    truncated: false,
+                    shell_options: Vec::new(),
+                    default_shell: String::new(),
+                    output_start_offset: 0,
+                    output_end_offset: 0,
+                    ssh_prompt: None,
+                    latency_ms: 0,
+                    ssh_tabs: None,
+                    ssh_local_forwards: None,
+                    ssh_local_forward: None,
+                    ssh_local_forward_port_available: available,
+                })
             }
             "rename" => {
                 self.ensure_terminal_session_in_project(
@@ -473,8 +564,16 @@ impl GatewayController {
     ) -> Result<(), String> {
         let config = self.config_tx.borrow().clone();
         match action {
-            "create_ssh" | "answer_ssh_prompt" | "cancel_ssh_prompt" | "ssh_tabs_list"
-            | "ssh_tab_open" | "ssh_tab_close" => {
+            "create_ssh"
+            | "answer_ssh_prompt"
+            | "cancel_ssh_prompt"
+            | "ssh_tabs_list"
+            | "ssh_tab_open"
+            | "ssh_tab_close"
+            | "ssh_local_forward_start"
+            | "ssh_local_forward_list"
+            | "ssh_local_forward_stop"
+            | "ssh_local_forward_check_port" => {
                 if config.enable_web_ssh_terminal {
                     Ok(())
                 } else {
@@ -488,7 +587,8 @@ impl GatewayController {
                     Err("web terminal is disabled in desktop Remote settings".to_string())
                 }
             }
-            "attach" | "input" | "resize" | "rename" | "close" | "ssh_latency" => {
+            "attach" | "input" | "resize" | "rename" | "close" | "ssh_latency"
+            | "ssh_reconnect" => {
                 let session = self
                     .terminal_registry
                     .session_record(request.session_id.trim().to_string())?;
@@ -629,6 +729,9 @@ pub(crate) fn terminal_list_response_to_proto(
         ssh_prompt: None,
         latency_ms: 0,
         ssh_tabs: None,
+        ssh_local_forwards: None,
+        ssh_local_forward: None,
+        ssh_local_forward_port_available: false,
     }
 }
 
@@ -649,6 +752,9 @@ pub(crate) fn terminal_record_response_to_proto(
         ssh_prompt: None,
         latency_ms: 0,
         ssh_tabs: None,
+        ssh_local_forwards: None,
+        ssh_local_forward: None,
+        ssh_local_forward_port_available: false,
     }
 }
 
@@ -669,6 +775,9 @@ pub(crate) fn terminal_create_snapshot_response_to_proto(
         ssh_prompt: None,
         latency_ms: 0,
         ssh_tabs: None,
+        ssh_local_forwards: None,
+        ssh_local_forward: None,
+        ssh_local_forward_port_available: false,
     }
 }
 
@@ -700,6 +809,9 @@ pub(crate) fn terminal_ssh_create_response_to_proto(
         }),
         latency_ms: 0,
         ssh_tabs: None,
+        ssh_local_forwards: None,
+        ssh_local_forward: None,
+        ssh_local_forward_port_available: false,
     }
 }
 
@@ -720,6 +832,9 @@ pub(crate) fn terminal_ssh_tabs_response_to_proto(
         ssh_prompt: None,
         latency_ms: 0,
         ssh_tabs: Some(ssh_terminal_tabs_to_proto(snapshot)),
+        ssh_local_forwards: None,
+        ssh_local_forward: None,
+        ssh_local_forward_port_available: false,
     }
 }
 
@@ -817,6 +932,92 @@ pub(crate) fn ssh_terminal_tabs_to_proto(
     }
 }
 
+pub(crate) fn ssh_local_forward_record_to_proto(
+    record: SshLocalForwardRecord,
+) -> proto::TerminalSshLocalForward {
+    proto::TerminalSshLocalForward {
+        id: record.id,
+        session_id: record.session_id,
+        project_path_key: normalize_project_path_key(&record.project_path_key),
+        local_host: record.local_host,
+        local_port: u32::from(record.local_port),
+        address: record.address,
+        remote_host: record.remote_host,
+        remote_port: u32::from(record.remote_port),
+        status: record.status,
+        created_at: terminal_u128_to_u64(record.created_at),
+        updated_at: terminal_u128_to_u64(record.updated_at),
+        error: record.error.unwrap_or_default(),
+    }
+}
+
+pub(crate) fn ssh_local_forward_event_to_proto(
+    payload: SshLocalForwardEventPayload,
+) -> proto::TerminalSshLocalForwardAction {
+    proto::TerminalSshLocalForwardAction {
+        forward: Some(ssh_local_forward_record_to_proto(payload.forward)),
+        revision: payload.revision,
+        kind: payload.kind,
+    }
+}
+
+pub(crate) fn terminal_ssh_local_forward_list_response_to_proto(
+    action: String,
+    response: SshLocalForwardListResponse,
+) -> proto::TerminalResponse {
+    proto::TerminalResponse {
+        action,
+        sessions: Vec::new(),
+        session: None,
+        output: Vec::new(),
+        truncated: false,
+        shell_options: Vec::new(),
+        default_shell: String::new(),
+        output_start_offset: 0,
+        output_end_offset: 0,
+        ssh_prompt: None,
+        latency_ms: 0,
+        ssh_tabs: None,
+        ssh_local_forwards: Some(proto::TerminalSshLocalForwardsSnapshot {
+            forwards: response
+                .forwards
+                .into_iter()
+                .map(ssh_local_forward_record_to_proto)
+                .collect(),
+            revision: response.revision,
+        }),
+        ssh_local_forward: None,
+        ssh_local_forward_port_available: false,
+    }
+}
+
+pub(crate) fn terminal_ssh_local_forward_action_response_to_proto(
+    action: String,
+    response: SshLocalForwardActionResponse,
+) -> proto::TerminalResponse {
+    proto::TerminalResponse {
+        action,
+        sessions: Vec::new(),
+        session: None,
+        output: Vec::new(),
+        truncated: false,
+        shell_options: Vec::new(),
+        default_shell: String::new(),
+        output_start_offset: 0,
+        output_end_offset: 0,
+        ssh_prompt: None,
+        latency_ms: 0,
+        ssh_tabs: None,
+        ssh_local_forwards: None,
+        ssh_local_forward: Some(proto::TerminalSshLocalForwardAction {
+            forward: Some(ssh_local_forward_record_to_proto(response.forward)),
+            revision: response.revision,
+            kind: String::new(),
+        }),
+        ssh_local_forward_port_available: false,
+    }
+}
+
 pub(crate) fn build_terminal_event_envelope(payload: TerminalEventPayload) -> proto::AgentEnvelope {
     proto::AgentEnvelope {
         request_id: format!("terminal-event-{}", Uuid::new_v4()),
@@ -831,6 +1032,9 @@ pub(crate) fn build_terminal_event_envelope(payload: TerminalEventPayload) -> pr
                 output_start_offset: payload.output_start_offset.unwrap_or_default(),
                 output_end_offset: payload.output_end_offset.unwrap_or_default(),
                 ssh_tabs: payload.ssh_tabs.map(ssh_terminal_tabs_to_proto),
+                ssh_local_forward: payload
+                    .ssh_local_forward
+                    .map(ssh_local_forward_event_to_proto),
             },
         )),
     }

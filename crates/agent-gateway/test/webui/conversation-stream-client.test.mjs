@@ -87,7 +87,7 @@ test("subscribes with resume cursor and re-subscribes after reconnect", async ()
   assert.equal(transport.calls.length, 1);
   assert.equal(transport.calls[0].type, "chat.subscribe");
   assert.equal(transport.calls[0].payload.after_seq, 0);
-  assert.equal(transport.calls[0].options.timeoutMs, 5_000);
+  assert.equal(transport.calls[0].options.timeoutMs, 30_000);
   assert.equal(seen.syncs.length, 1);
 
   // Live events advance the cursor.

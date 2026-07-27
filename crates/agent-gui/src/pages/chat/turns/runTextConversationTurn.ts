@@ -1,11 +1,15 @@
 import type { AssistantMessage, Context } from "@earendil-works/pi-ai";
 import type { CompactionController } from "../../../lib/chat/compaction/controller";
+import { estimateTextTokenUnits } from "../../../lib/chat/compaction/tokenLedger";
 import type { ProviderRuntimeConfig } from "../../../lib/chat/compaction/types";
 import {
   appendMessagesToConversation,
   type ConversationViewState,
 } from "../../../lib/chat/conversation/conversationState";
-import type { LiveTranscriptStore } from "../../../lib/chat/conversation/liveTranscriptStore";
+import type {
+  LiveTranscriptStore,
+  RetryAttemptRecord,
+} from "../../../lib/chat/conversation/liveTranscriptStore";
 import type {
   ConversationHookLifecycle,
   GatewayBridgeEventController,
@@ -91,6 +95,7 @@ export type RunTextConversationTurnParams = {
     store: LiveTranscriptStore,
   ) => void;
   updateGatewayBridgeToolStatus: (status: string | null, isCompaction?: boolean) => void;
+  updateRetryAttempts: (attempts: RetryAttemptRecord[], store: LiveTranscriptStore) => void;
   commitVisibleAbortedConversation: () => boolean;
   updateConversationRuntimeEntry: (
     conversationId: string,
@@ -129,6 +134,7 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
     appendDraftAssistantText,
     batchLiveRoundsUpdate,
     updateGatewayBridgeToolStatus,
+    updateRetryAttempts,
     commitVisibleAbortedConversation,
     updateConversationRuntimeEntry,
     persistConversationWithHistorySync,
@@ -240,6 +246,7 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
     textModeUsesLiveRounds = false;
 
     let streamedAssistantText = "";
+    let streamedAssistantTokenUnits = 0;
     let protectionCheckChars = 0;
     let compactionRequested = false;
     let streamAttempt = 0;
@@ -258,6 +265,8 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
         status: nativeWebSearchStatus,
         onStatus: (status) => updateGatewayBridgeToolStatus(status),
       });
+      const retryAttemptsForAttempt: RetryAttemptRecord[] = [];
+      updateRetryAttempts(retryAttemptsForAttempt, transcriptStore);
       try {
         finalAssistant = await streamAssistantMessage({
           providerId,
@@ -282,12 +291,13 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
               appendDraftAssistantText(delta, transcriptStore);
             }
             streamedAssistantText += delta;
+            streamedAssistantTokenUnits += estimateTextTokenUnits(delta);
             protectionCheckChars += delta.length;
             if (compactionRequested || protectionCompactionDisabled || protectionCheckChars < 160) {
               return;
             }
             protectionCheckChars = 0;
-            if (!compaction.shouldProtectMidStream(streamedAssistantText.length)) return;
+            if (!compaction.shouldProtectMidStream(streamedAssistantTokenUnits)) return;
             compactionRequested = true;
             scope.controller.abort();
           },
@@ -301,6 +311,14 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
           },
           signal: scope.controller.signal,
           debugLogger: streamAttempt === 0 ? conversationDebugLogger : recoveryDebugLogger,
+          onRetryStatus: (attempt, maxAttempts, errorMessage) => {
+            updateGatewayBridgeToolStatus(`连接已断开，正在重试 (${attempt}/${maxAttempts})...`);
+            retryAttemptsForAttempt.push({ attempt, maxAttempts, errorMessage });
+            updateRetryAttempts(retryAttemptsForAttempt.slice(), transcriptStore);
+          },
+          onRetryRecovered: () => {
+            updateGatewayBridgeToolStatus(null);
+          },
         });
         nativeWebSearchStatusController.finish();
       } catch (streamErr) {
@@ -322,21 +340,19 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
             );
           }
 
-          const compactedContext = await compaction.compactDuringRun({
+          const compactionResult = await compaction.compactDuringRun({
             trigger: "mid-stream",
             state: getNextConversationState(),
             includeAbortedMessages: true,
             includeUploadedFilesMetadata: true,
           });
 
-          if (compactedContext) {
-            pendingTextContext = compactedContext;
-          } else {
+          if (!compactionResult.context) {
+            throw new Error("Mid-stream compaction did not provide a continuation context.");
+          }
+          pendingTextContext = compactionResult.context;
+          if (compactionResult.shouldDisableProtection) {
             protectionCompactionDisabled = true;
-            pendingTextContext = buildPreparedContext(getNextConversationState(), undefined, {
-              includeAbortedMessages: true,
-              includeUploadedFilesMetadata: true,
-            });
           }
           textRound += 1;
           continue textResponseLoop;
@@ -352,6 +368,7 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
         if (streamAttempt < 1) {
           streamAttempt += 1;
           streamedAssistantText = "";
+          streamedAssistantTokenUnits = 0;
           protectionCheckChars = 0;
           resetLiveTranscript(transcriptStore);
           textModeUsesLiveRounds = false;
@@ -383,7 +400,7 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
   }));
   hookLifecycle.ensureMessageEnded();
   hookLifecycle.endAgent();
-  void persistConversationWithHistorySync({
+  await persistConversationWithHistorySync({
     conversationId,
     sessionId,
     providerId,
@@ -398,7 +415,7 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
     type: "done",
     conversation_id: conversationId,
   });
-  gatewayBridgeEvents.close();
+  await gatewayBridgeEvents.close();
   if (shouldRunMemoryExtraction) {
     const currentMemoryExtractionModel: MemoryExtractionModelConfig = {
       providerId,
@@ -406,8 +423,8 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
       runtime,
       selectedModel,
     };
-    // Fire-and-forget; the controller owns lifecycle/abort, detached from the
-    // chat request signal.
+    // Fire-and-forget; the controller owns lifecycle while the stable turn-level
+    // userStop signal still cancels extraction.
     void memoryExtraction.requestExtraction({
       primary: memoryExtractionModel ?? currentMemoryExtractionModel,
       fallback: memoryExtractionModel ? currentMemoryExtractionModel : undefined,
@@ -417,6 +434,7 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
       workdir: conversationCwd,
       messages: buildPreparedContext(finalState).messages,
       statusText: memoryExtractionStatusText,
+      signal: cancellation.userStop.signal,
       debugLogger: conversationDebugLogger,
     });
   }

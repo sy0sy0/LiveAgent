@@ -1,9 +1,11 @@
+import { invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { GlassPanel } from "../../components/hub/HubChrome";
 import {
   AlertTriangle,
   Check,
   Download,
+  FileText,
   Folder,
   Globe2,
   Loader2,
@@ -18,15 +20,25 @@ import {
   type ExternalMcpServerEntry,
   type ExternalMcpToolScan,
   scanExternalMcpServers,
+  scanMcpConfigFile,
 } from "../../lib/skills";
 
 const EXTERNAL_MCP_TOOL_LABELS: Record<string, string> = {
   "claude-code": "Claude Code",
   codex: "Codex",
   "claude-desktop": "Claude Desktop",
+  codebuddy: "CodeBuddy",
 };
 
+/** 与后端 `LOCAL_FILE_MCP_TOOL` 对齐的「从文件导入」来源标识 */
+const LOCAL_FILE_TOOL = "local-file";
+
 const DEFAULT_IMPORT_TIMEOUT_MS = 60_000;
+
+function fileScanLabel(scan: ExternalMcpToolScan, fallback: string) {
+  const basename = scan.configPath.split(/[\\/]/).pop();
+  return basename || fallback;
+}
 
 function externalServerKey(tool: string, server: ExternalMcpServerEntry) {
   return `${tool}:${server.id.toLowerCase()}`;
@@ -61,10 +73,18 @@ export function McpImportView(props: {
   const [scans, setScans] = useState<ExternalMcpToolScan[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [fileScan, setFileScan] = useState<ExternalMcpToolScan | null>(null);
+  const [filePicking, setFilePicking] = useState(false);
+  const [fileError, setFileError] = useState<string | null>(null);
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [importedCount, setImportedCount] = useState<number | null>(null);
   const [activeTool, setActiveTool] = useState<string>("claude-code");
   const userChoseToolRef = useRef(false);
+
+  const allScans = useMemo(
+    () => (fileScan ? [...(scans ?? []), fileScan] : (scans ?? [])),
+    [scans, fileScan],
+  );
 
   const installedIds = useMemo(
     () => new Set(settings.mcp.servers.map((server) => server.id.trim().toLowerCase())),
@@ -77,14 +97,16 @@ export function McpImportView(props: {
     try {
       const result = await scanExternalMcpServers();
       setScans(result);
-      // 清掉扫描结果中已不存在的选择项
+      // 清掉扫描结果中已不存在的选择项（「从文件导入」的选择项不受重扫影响）
       setSelected((prev) => {
         const valid = new Set(
           result.flatMap((scan) =>
             scan.servers.map((server) => externalServerKey(scan.tool, server)),
           ),
         );
-        const next = new Set([...prev].filter((key) => valid.has(key)));
+        const next = new Set(
+          [...prev].filter((key) => valid.has(key) || key.startsWith(`${LOCAL_FILE_TOOL}:`)),
+        );
         return next.size === prev.size ? prev : next;
       });
     } catch (err) {
@@ -112,7 +134,33 @@ export function McpImportView(props: {
     }
   }, [scans, activeTool]);
 
-  const activeScan = scans?.find((scan) => scan.tool === activeTool);
+  const pickFileAndScan = useCallback(async () => {
+    setFileError(null);
+    setFilePicking(true);
+    try {
+      const picked = await invoke<string | null>("system_pick_file", {
+        filter_name: "JSON / TOML",
+        extensions: ["json", "toml"],
+      });
+      const path = picked?.trim();
+      if (!path) return;
+      const scan = await scanMcpConfigFile(path);
+      // 换文件后清掉上一个文件遗留的选择项，避免按 id 误选到新文件的同名条目
+      setSelected((prev) => {
+        const next = new Set([...prev].filter((key) => !key.startsWith(`${LOCAL_FILE_TOOL}:`)));
+        return next.size === prev.size ? prev : next;
+      });
+      setFileScan(scan);
+      userChoseToolRef.current = true;
+      setActiveTool(LOCAL_FILE_TOOL);
+    } catch (err) {
+      setFileError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setFilePicking(false);
+    }
+  }, []);
+
+  const activeScan = allScans.find((scan) => scan.tool === activeTool);
   const importableInActive = useMemo(
     () =>
       (activeScan?.servers ?? []).filter(
@@ -153,8 +201,7 @@ export function McpImportView(props: {
   }
 
   function importSelected() {
-    if (!scans) return;
-    const targets = scans.flatMap((scan) =>
+    const targets = allScans.flatMap((scan) =>
       scan.servers.filter((server) => selected.has(externalServerKey(scan.tool, server))),
     );
     if (targets.length === 0) return;
@@ -191,6 +238,17 @@ export function McpImportView(props: {
           </GlassPanel>
         ) : null}
 
+        {fileError ? (
+          <GlassPanel tone="error" className="hub-panel-enter">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="h-4 w-4 shrink-0 text-destructive" />
+              <span className="text-xs text-destructive">
+                {t("mcpHub.importFileFailed")}: {fileError}
+              </span>
+            </div>
+          </GlassPanel>
+        ) : null}
+
         {importedCount !== null && importedCount > 0 ? (
           <GlassPanel tone="muted" className="hub-panel-enter">
             <div className="flex items-center gap-2">
@@ -213,13 +271,17 @@ export function McpImportView(props: {
           <>
             <div className="hub-panel-enter flex flex-wrap items-center justify-between gap-3">
               <div className="inline-flex shrink-0 rounded-2xl border border-border/40 bg-background/60 p-1 backdrop-blur-xl shadow-[0_1px_0_rgba(255,255,255,0.5)_inset] dark:border-white/[0.06] dark:bg-white/[0.04] dark:shadow-[0_1px_0_rgba(255,255,255,0.04)_inset]">
-                {(scans ?? []).map((scan) => {
-                  const toolLabel = EXTERNAL_MCP_TOOL_LABELS[scan.tool] ?? scan.tool;
+                {allScans.map((scan) => {
+                  const isLocalFile = scan.tool === LOCAL_FILE_TOOL;
+                  const toolLabel = isLocalFile
+                    ? fileScanLabel(scan, t("mcpHub.importFileTab"))
+                    : (EXTERNAL_MCP_TOOL_LABELS[scan.tool] ?? scan.tool);
                   const active = scan.tool === activeTool;
                   return (
                     <button
                       key={scan.tool}
                       type="button"
+                      title={isLocalFile ? scan.configPath : undefined}
                       onClick={() => {
                         userChoseToolRef.current = true;
                         setActiveTool(scan.tool);
@@ -231,8 +293,12 @@ export function McpImportView(props: {
                           : "text-muted-foreground hover:bg-background/70 hover:text-foreground",
                       )}
                     >
-                      <Folder className="h-3.5 w-3.5" />
-                      <span>{toolLabel}</span>
+                      {isLocalFile ? (
+                        <FileText className="h-3.5 w-3.5" />
+                      ) : (
+                        <Folder className="h-3.5 w-3.5" />
+                      )}
+                      <span className="max-w-[10rem] truncate">{toolLabel}</span>
                       {scan.exists ? (
                         <span
                           className={cn(
@@ -255,6 +321,21 @@ export function McpImportView(props: {
               </div>
 
               <div className="flex shrink-0 items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="gap-1.5 rounded-full"
+                  disabled={filePicking}
+                  title={t("mcpHub.importFromFileHint")}
+                  onClick={() => void pickFileAndScan()}
+                >
+                  {filePicking ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <FileText className="h-3.5 w-3.5" />
+                  )}
+                  {t("mcpHub.importFromFile")}
+                </Button>
                 <Button
                   variant="outline"
                   size="sm"

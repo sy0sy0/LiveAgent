@@ -365,15 +365,19 @@ impl TerminalSessionRegistry {
     }
 
     pub fn close(&self, session_id: String) -> Result<TerminalSessionRecord, String> {
+        // Normalize once so cleanup of session-scoped resources (forwards, tabs)
+        // cannot miss entries when callers pass padded IDs.
+        let session_id = session_id.trim().to_string();
         let entry = self.entry(&session_id)?;
         terminate_terminal_entry(&entry);
+        self.stop_ssh_local_forwards_for_session(&session_id, true);
         let (session, tab_snapshots) = {
             let _tabs_tx = self.lock_ssh_terminal_tabs_tx()?;
             self.mark_finished(&session_id);
             self.sessions
                 .lock()
                 .expect("terminal session registry poisoned")
-                .remove(session_id.trim());
+                .remove(session_id.as_str());
             let session = entry
                 .record
                 .lock()

@@ -15,8 +15,12 @@ import { LazyCollapse } from "./LazyCollapse";
 import { AssistantStatus } from "./StatusText";
 import { areToolTraceItemsEqual, MemoToolCallItem } from "./ToolCallItem";
 
-function ToolTraceGroupInner(props: { items: ToolTraceItem[]; runningToolCallIds?: string[] }) {
-  const { items, runningToolCallIds = [] } = props;
+function ToolTraceGroupInner(props: {
+  items: ToolTraceItem[];
+  runningToolCallIds?: string[];
+  isAborted?: boolean;
+}) {
+  const { items, runningToolCallIds = [], isAborted = false } = props;
   const { t } = useLocale();
   const counts = useMemo(
     () => getToolGroupCounts(items, runningToolCallIds),
@@ -95,6 +99,7 @@ function ToolTraceGroupInner(props: { items: ToolTraceItem[]; runningToolCallIds
               <MemoToolCallItem
                 key={getToolTraceKey(item, index)}
                 item={item}
+                isAborted={isAborted}
                 isRunning={Boolean(
                   item.toolCall.id && runningToolCallIds.includes(item.toolCall.id),
                 )}
@@ -124,5 +129,6 @@ export const ToolTraceGroup = memo(
       (item, index) =>
         item === next.items[index] || areToolTraceItemsEqual(item, next.items[index]),
     ) &&
+    previous.isAborted === next.isAborted &&
     areRunningIdsEqual(previous.runningToolCallIds, next.runningToolCallIds),
 );

@@ -9,13 +9,14 @@ import {
   isDominantVerticalWheel,
   POINTER_DRAG_SLOP_PX,
   reduceFollowEvent,
+  SCROLL_FOLLOW_IGNORE_KEYS_ATTRIBUTE,
 } from "./scrollFollowCore";
 
 // Below this the element cannot meaningfully scroll; wheel/touch on it must
 // not change follow state, and nested elements under it don't consume wheels.
 const SCROLLABLE_OVERFLOW_MIN_PX = 4;
 
-function isEditableEventTarget(target: EventTarget | null) {
+function shouldIgnoreScrollKeyTarget(target: EventTarget | null) {
   if (!(target instanceof HTMLElement)) {
     return false;
   }
@@ -23,12 +24,13 @@ function isEditableEventTarget(target: EventTarget | null) {
     target.isContentEditable ||
     target instanceof HTMLInputElement ||
     target instanceof HTMLTextAreaElement ||
-    target instanceof HTMLSelectElement
+    target instanceof HTMLSelectElement ||
+    target.closest(`[${SCROLL_FOLLOW_IGNORE_KEYS_ATTRIBUTE}]`) !== null
   );
 }
 
 function isHistoryScrollKey(event: KeyboardEvent) {
-  if (isEditableEventTarget(event.target)) {
+  if (shouldIgnoreScrollKeyTarget(event.target)) {
     return false;
   }
   return (
@@ -40,7 +42,7 @@ function isHistoryScrollKey(event: KeyboardEvent) {
 }
 
 function isFollowScrollKey(event: KeyboardEvent) {
-  if (isEditableEventTarget(event.target)) {
+  if (shouldIgnoreScrollKeyTarget(event.target)) {
     return false;
   }
   return (
@@ -58,6 +60,11 @@ export type ScrollFollowHandle = {
   // (the jump button); programmatic pins (conversation switch, run start)
   // stay instant via stickToBottom.
   jumpToBottom: () => void;
+  // Detach follow mode for a programmatic jump into history (floor
+  // navigation, search results): reuses the historyKey semantics so the
+  // engine treats it exactly like a user-initiated jump away from the
+  // bottom, instead of re-pinning over the new scroll position.
+  breakFollow: () => void;
   isFollowing: () => boolean;
 };
 
@@ -379,13 +386,24 @@ export function useScrollFollow(args: UseScrollFollowArgs): {
     viewport,
   ]);
 
+  const breakFollow = useCallback(() => {
+    cancelJumpAnimation();
+    // 与键盘 historyKey 路径同构：溢出与否取实测值（无溢出时 reducer 不解除
+    // 跟随，避免「视觉在底部却被搁浅为 off」），时间基与其余事件一致用 Date.now()。
+    const el = boundViewportRef.current;
+    const hasOverflow =
+      el !== null && el.scrollHeight - el.clientHeight > SCROLLABLE_OVERFLOW_MIN_PX;
+    dispatch({ type: "historyKey", hasOverflow, now: Date.now() });
+  }, [cancelJumpAnimation, dispatch]);
+
   const handle = useMemo<ScrollFollowHandle>(
     () => ({
       stickToBottom,
       jumpToBottom,
+      breakFollow,
       isFollowing: () => stateRef.current.following,
     }),
-    [jumpToBottom, stickToBottom],
+    [breakFollow, jumpToBottom, stickToBottom],
   );
 
   return { handle, following };

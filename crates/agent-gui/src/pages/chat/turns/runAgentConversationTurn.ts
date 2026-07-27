@@ -5,7 +5,9 @@ import type {
   ToolCall,
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
+import { ASK_USER_QUESTION_TOOL_NAME } from "../../../lib/chat/askUserQuestion";
 import type { CompactionController } from "../../../lib/chat/compaction/controller";
+import { estimateTextTokenUnits } from "../../../lib/chat/compaction/tokenLedger";
 import type { ProviderRuntimeConfig } from "../../../lib/chat/compaction/types";
 import {
   isAbortedAssistantMessage,
@@ -16,7 +18,10 @@ import {
   appendRenderOnlyMessagesToConversation,
   type ConversationViewState,
 } from "../../../lib/chat/conversation/conversationState";
-import type { LiveTranscriptStore } from "../../../lib/chat/conversation/liveTranscriptStore";
+import type {
+  LiveTranscriptStore,
+  RetryAttemptRecord,
+} from "../../../lib/chat/conversation/liveTranscriptStore";
 import type {
   ConversationHookLifecycle,
   GatewayBridgeEventController,
@@ -253,6 +258,7 @@ export type RunAgentConversationTurnParams = {
     store: LiveTranscriptStore,
   ) => void;
   updateToolStatus: (status: string | null, store: LiveTranscriptStore) => void;
+  updateRetryAttempts: (attempts: RetryAttemptRecord[], store: LiveTranscriptStore) => void;
   updatePersistableAgentProgress: (progress: {
     completedThroughRound: number;
     suppressedToolTrace: SuppressedToolTraceSnapshot[];
@@ -311,6 +317,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
     resetLiveTranscript,
     batchLiveRoundsUpdate,
     updateToolStatus,
+    updateRetryAttempts,
     updatePersistableAgentProgress,
     commitVisibleAbortedConversation,
     updateConversationRuntimeEntry,
@@ -395,6 +402,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
     runtimePlatform,
     fileState,
     todoState,
+    askUserQuestionConversationId: conversationId,
     skillsEnabled: effectiveSkillsEnabled,
     skillsRootDir,
     skillAccessPolicy,
@@ -617,6 +625,9 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
 
   function queueToolCallDelta(toolCall: ToolCall, round: number) {
     if (!shouldShowToolEvent(toolCall)) return;
+    // 提问卡必须等问题与选项全部生成完毕再显示：跳过流式增量，双端
+    // （GUI 回合与网关 tool_call_delta）都只在 onToolCall 拿到完整参数后出现。
+    if (toolCall.name === ASK_USER_QUESTION_TOOL_NAME) return;
     pendingToolCallDeltas.set(toolCallDeltaKey(round, toolCall.id), { round, toolCall });
     schedulePendingToolCallDeltaFlush();
   }
@@ -632,6 +643,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
   let midStreamProtectionDisabled = false;
   while (!result) {
     let streamedAgentText = "";
+    let streamedAgentTokenUnits = 0;
     let protectionCheckChars = 0;
     let midStreamCompactionRequested = false;
     let sawToolCallInRound = false;
@@ -665,6 +677,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
         onTurnStart: (round) => {
           activeAgentRound = round;
           streamedAgentText = "";
+          streamedAgentTokenUnits = 0;
           protectionCheckChars = 0;
           sawToolCallInRound = false;
           hookLifecycle.startTurn(round);
@@ -685,6 +698,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
         onTextDelta: (delta, round) => {
           gatewayBridgeEvents.queueToken(delta, { round });
           streamedAgentText += delta;
+          streamedAgentTokenUnits += estimateTextTokenUnits(delta);
           batchLiveRoundsUpdate(
             (prev) =>
               updateLiveRound(prev, round, (target) => {
@@ -706,7 +720,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
 
           protectionCheckChars = 0;
           // O(1) 账本判定，触发时才 abort 本地 scope 并在 catch 中构建压缩输入。
-          if (!compaction.shouldProtectMidStream(streamedAgentText.length)) return;
+          if (!compaction.shouldProtectMidStream(streamedAgentTokenUnits)) return;
           midStreamCompactionRequested = true;
           scope.controller.abort();
         },
@@ -830,6 +844,9 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
           gatewayBridgeEvents.queueToolStatus(s, false);
           updateToolStatus(s, transcriptStore);
         },
+        onRetryAttempts: (_round, attempts) => {
+          updateRetryAttempts(attempts, transcriptStore);
+        },
         onBeforeNextTurn: async ({ round, assistant, toolResults, emittedMessages }) => {
           publishPersistableAgentProgress(round, assistant, toolResults);
           latestAgentEmittedMessages = emittedMessages.slice();
@@ -843,7 +860,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
               includeUploadedFilesMetadata: true,
             }),
           );
-          const compactedContext = await compaction.compactDuringRun({
+          const { context: compactedContext } = await compaction.compactDuringRun({
             trigger: "post-tool",
             state: tempState,
             budgetContext: tempContext,
@@ -901,7 +918,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
       applyConversationState(tempState);
       clearPersistableAgentProgress();
 
-      const compactedContext = await compaction.compactDuringRun({
+      const compactionResult = await compaction.compactDuringRun({
         trigger: "mid-stream",
         state: tempState,
         budgetContext: withSubagentRuntimeContext(
@@ -915,16 +932,12 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
         includeUploadedFilesMetadata: true,
       });
 
-      if (compactedContext) {
-        pendingAgentContext = compactedContext;
-      } else {
-        // 压缩与 prune 均不可用：本轮禁用 mid-stream 保护，带原上下文续跑，
-        // 让真正的溢出错误由 provider 显式暴露，而不是让整轮失败。
+      if (!compactionResult.context) {
+        throw new Error("Mid-stream compaction did not provide a continuation context.");
+      }
+      pendingAgentContext = compactionResult.context;
+      if (compactionResult.shouldDisableProtection) {
         midStreamProtectionDisabled = true;
-        pendingAgentContext = buildPreparedContext(tempState, combinedTools, {
-          includeAbortedMessages: true,
-          includeUploadedFilesMetadata: true,
-        });
       }
     } finally {
       scope.release();
@@ -967,8 +980,8 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
       runtime,
       selectedModel,
     };
-    // No chat signal: the controller owns the run's AbortController, so the
-    // next user turn cannot kill an in-flight extraction mid-write.
+    // The controller owns the extraction scope and links this stable turn-level
+    // userStop signal, so request-scope churn cannot detach cancellation.
     return memoryExtraction.requestExtraction({
       primary: memoryExtractionModel ?? currentMemoryExtractionModel,
       fallback: memoryExtractionModel ? currentMemoryExtractionModel : undefined,
@@ -978,6 +991,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
       workdir: conversationCwd ?? effectiveWorkdir,
       messages: buildPreparedContext(finalState).messages,
       statusText: memoryExtractionStatusText,
+      signal: cancellation.userStop.signal,
       debugLogger: conversationDebugLogger,
       visibleEvents,
     });
@@ -1123,7 +1137,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
     ...prev,
     state: completedState,
   }));
-  void persistConversationWithHistorySync({
+  await persistConversationWithHistorySync({
     conversationId,
     sessionId,
     providerId,
@@ -1138,7 +1152,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
     type: "done",
     conversation_id: conversationId,
   });
-  gatewayBridgeEvents.close();
+  await gatewayBridgeEvents.close();
   if (!showSilentMemoryExtraction && shouldRunMemoryExtraction) {
     void runPostTurnMemoryExtraction();
   }

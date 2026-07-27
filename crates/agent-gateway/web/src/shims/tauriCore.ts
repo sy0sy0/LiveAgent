@@ -64,9 +64,17 @@ async function invokeGatewayMemory<T>(command: string, args?: Record<string, unk
   });
 }
 
-async function pickWorkdirInBrowser(): Promise<string | null> {
+type BrowserPathPromptOptions = {
+  title: string;
+  description: string;
+  label: string;
+  placeholder: string;
+  inputId: string;
+};
+
+function promptPathInBrowser(options: BrowserPathPromptOptions): Promise<string | null> {
   if (typeof window === "undefined" || typeof document === "undefined" || !document.body) {
-    return null;
+    return Promise.resolve(null);
   }
 
   return new Promise((resolve) => {
@@ -75,7 +83,7 @@ async function pickWorkdirInBrowser(): Promise<string | null> {
       "fixed inset-0 z-[120] flex items-center justify-center bg-black/55 p-4 backdrop-blur-sm";
     overlay.setAttribute("role", "dialog");
     overlay.setAttribute("aria-modal", "true");
-    overlay.setAttribute("aria-label", "选择工作目录");
+    overlay.setAttribute("aria-label", options.title);
 
     const panel = document.createElement("form");
     panel.className =
@@ -86,26 +94,25 @@ async function pickWorkdirInBrowser(): Promise<string | null> {
 
     const title = document.createElement("div");
     title.className = "text-base font-semibold text-foreground";
-    title.textContent = "选择工作目录";
+    title.textContent = options.title;
 
     const description = document.createElement("div");
     description.className = "mt-1 text-xs text-muted-foreground";
-    description.textContent =
-      "浏览器无法直接打开远程目录选择器。请输入桌面端 Agent 可访问的绝对工作目录路径。";
+    description.textContent = options.description;
 
     const body = document.createElement("div");
     body.className = "space-y-2 px-5 py-5";
 
     const label = document.createElement("label");
     label.className = "block text-xs font-medium text-muted-foreground";
-    label.htmlFor = "gateway-browser-workdir-path";
-    label.textContent = "工作目录路径";
+    label.htmlFor = options.inputId;
+    label.textContent = options.label;
 
     const input = document.createElement("input");
-    input.id = "gateway-browser-workdir-path";
+    input.id = options.inputId;
     input.className =
       "h-10 w-full rounded-lg border border-input bg-background px-3 font-mono text-sm text-foreground outline-none transition-colors placeholder:text-muted-foreground/70 focus:border-ring focus:ring-2 focus:ring-ring/20";
-    input.placeholder = "/Users/name/project";
+    input.placeholder = options.placeholder;
     input.type = "text";
 
     const footer = document.createElement("div");
@@ -168,6 +175,26 @@ async function pickWorkdirInBrowser(): Promise<string | null> {
   });
 }
 
+async function pickWorkdirInBrowser(): Promise<string | null> {
+  return promptPathInBrowser({
+    title: "选择工作目录",
+    description: "浏览器无法直接打开远程目录选择器。请输入桌面端 Agent 可访问的绝对工作目录路径。",
+    label: "工作目录路径",
+    placeholder: "/Users/name/project",
+    inputId: "gateway-browser-workdir-path",
+  });
+}
+
+async function pickFilePathInBrowser(): Promise<string | null> {
+  return promptPathInBrowser({
+    title: "选择配置文件",
+    description: "浏览器无法直接打开远程文件选择器。请输入桌面端 Agent 可访问的配置文件绝对路径。",
+    label: "配置文件路径",
+    placeholder: "~/.mcp.json",
+    inputId: "gateway-browser-file-path",
+  });
+}
+
 export async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   if (command.startsWith("memory_")) {
     return invokeGatewayMemory<T>(command, args);
@@ -176,6 +203,8 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
   switch (command) {
     case "system_pick_folder":
       return (await pickWorkdirInBrowser()) as T;
+    case "system_pick_file":
+      return (await pickFilePathInBrowser()) as T;
     case "chat_history_list": {
       const response = await getGatewayWebSocketClient(loadToken().trim()).listHistory(
         typeof args?.page === "number" ? args.page : 1,
@@ -316,6 +345,22 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
         port,
       })) as T;
     }
+    case "terminal_list":
+      return {
+        sessions: await getGatewayWebSocketClient(loadToken().trim()).listTerminals(
+          typeof args?.project_path_key === "string" ? args.project_path_key : undefined,
+        ),
+      } as T;
+    case "terminal_close":
+      return (await getGatewayWebSocketClient(loadToken().trim()).closeTerminal(
+        String(args?.session_id ?? ""),
+        typeof args?.project_path_key === "string" ? args.project_path_key : undefined,
+      )) as T;
+    case "terminal_ssh_reconnect":
+      return (await getGatewayWebSocketClient(loadToken().trim()).reconnectSshTerminal(
+        String(args?.session_id ?? ""),
+        typeof args?.project_path_key === "string" ? args.project_path_key : undefined,
+      )) as T;
     case "system_http_get_test":
       return {
         url: `${window.location.origin}/api/status`,

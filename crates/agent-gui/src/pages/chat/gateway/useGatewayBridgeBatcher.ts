@@ -322,6 +322,14 @@ export function useGatewayBridgeBatcher() {
     }
   }, [flushGatewayBridgeEventBatchForRequest]);
 
+  const flushGatewayBridgeEventsForRequest = useCallback(
+    async (requestId: string) => {
+      flushGatewayBridgeEventBatchesForRequest(requestId);
+      await gatewayEventChainRef.current.catch(() => undefined);
+    },
+    [flushGatewayBridgeEventBatchesForRequest],
+  );
+
   useEffect(
     () => () => {
       for (const pending of pendingGatewayBridgeEventBatchesRef.current.values()) {
@@ -355,6 +363,7 @@ export function useGatewayBridgeBatcher() {
 
   return {
     queueGatewayBridgeEventForRequest,
+    flushGatewayBridgeEventsForRequest,
     flushPendingGatewayBridgeEvents,
   };
 }

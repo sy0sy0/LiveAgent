@@ -10,7 +10,7 @@ import {
 // `workspace:` / `skill:` / `skill://` references are literal tool-produced
 // strings and are never encoded or decoded.
 
-export type PathScope = "workspace" | "skill" | "external";
+export type PathScope = "workspace" | "skill" | "external" | "uploads";
 
 export type PathIntent = "read" | "write" | "edit" | "delete" | "list" | "search" | "cwd" | "image";
 
@@ -209,6 +209,36 @@ function fixedSkillsRelativePathFromAbsolute(value: string) {
   return normalized.slice(index + marker.length);
 }
 
+// Uploaded attachments are staged under ~/.liveagent/uploads (outside the
+// workspace). Tools may read them; every mutating intent is rejected.
+//
+// Staging paths are recognized by marker substring, mirroring the fixed
+// skills-root matching above: attachment absolute paths persisted in old
+// messages must keep resolving even when the current resolver's view of the
+// home directory differs from the one that produced them (another OS user,
+// Windows drive letters, symlinked homes). The deliberate looseness — any
+// absolute path containing the marker is treated as staged — only ever grants
+// read access; mutating intents are rejected for everything it matches.
+const UPLOAD_STAGING_MARKER = "/.liveagent/uploads/";
+const UPLOAD_STAGING_READ_INTENTS = new Set<PathIntent>(["read", "list", "search", "image"]);
+
+function uploadStagingSplitFromAbsolute(value: string) {
+  const normalized = normalizeComparablePath(value);
+  const index = normalized.indexOf(UPLOAD_STAGING_MARKER);
+  if (index >= 0) {
+    return {
+      root: normalized.slice(0, index + UPLOAD_STAGING_MARKER.length - 1),
+      relativePath: normalized.slice(index + UPLOAD_STAGING_MARKER.length),
+    };
+  }
+  // The bare staging root (no trailing separator) must resolve too, so List
+  // on ~/.liveagent/uploads can enumerate batch directories.
+  if (normalized.endsWith(UPLOAD_STAGING_MARKER.slice(0, -1))) {
+    return { root: normalized, relativePath: "" };
+  }
+  return null;
+}
+
 function operationForIntent(intent: PathIntent, label: string) {
   switch (intent) {
     case "write":
@@ -357,6 +387,31 @@ export class ToolPathResolver {
     };
   }
 
+  private resolveUploadStagingPath(
+    split: { root: string; relativePath: string },
+    options: ResolveOptions,
+  ): ResolvedPath {
+    const rawDisplay = split.relativePath ? `uploads/${split.relativePath}` : "uploads";
+    if (!UPLOAD_STAGING_READ_INTENTS.has(options.intent)) {
+      throw new Error(
+        `${options.label} targets the upload staging area, which only supports read access (Read/List/Grep/Image): ${rawDisplay}. Copy the file into the workspace first if it needs changes.`,
+      );
+    }
+    const sanitized = split.relativePath
+      ? sanitizeRelativePath(split.relativePath, options.label, true)
+      : undefined;
+    const absolutePath = sanitized ? joinNormalizedPath(split.root, sanitized) : split.root;
+    return {
+      scope: "uploads",
+      input: absolutePath,
+      root: split.root,
+      absolutePath,
+      relativePath: sanitized,
+      displayPath: sanitized ? `uploads/${sanitized}` : "uploads",
+      intent: options.intent,
+    };
+  }
+
   private resolveExternalAbsolutePath(value: string, options: ResolveOptions): ResolvedPath {
     const absolutePath = normalizeComparablePath(value);
     if (!options.allowExternal) {
@@ -402,6 +457,11 @@ export class ToolPathResolver {
         );
       }
       return this.resolveSkillRelativePath(fixedSkillRel, options);
+    }
+
+    const uploadSplit = uploadStagingSplitFromAbsolute(absolutePath);
+    if (uploadSplit !== null) {
+      return this.resolveUploadStagingPath(uploadSplit, options);
     }
 
     return this.resolveExternalAbsolutePath(absolutePath, options);

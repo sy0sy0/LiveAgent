@@ -91,6 +91,46 @@ pub struct TerminalSshLatencyResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SshLocalForwardRecord {
+    pub id: String,
+    pub session_id: String,
+    pub project_path_key: String,
+    pub local_host: String,
+    pub local_port: u16,
+    pub address: String,
+    pub remote_host: String,
+    pub remote_port: u16,
+    pub status: String,
+    pub created_at: u128,
+    pub updated_at: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshLocalForwardListResponse {
+    pub forwards: Vec<SshLocalForwardRecord>,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshLocalForwardActionResponse {
+    pub forward: SshLocalForwardRecord,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshLocalForwardEventPayload {
+    pub kind: String,
+    pub forward: SshLocalForwardRecord,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SshTerminalTabRecord {
     pub id: String,
     pub session_id: String,
@@ -166,6 +206,8 @@ pub struct TerminalEventPayload {
     pub output_end_offset: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh_tabs: Option<SshTerminalTabsSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_local_forward: Option<SshLocalForwardEventPayload>,
 }
 
 #[derive(Debug, Clone)]

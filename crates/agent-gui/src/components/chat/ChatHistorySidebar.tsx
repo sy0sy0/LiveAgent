@@ -11,6 +11,11 @@ import {
 } from "../../lib/settings";
 import { cn } from "../../lib/shared/utils";
 import type {
+  SidebarBatchDeleteOptions,
+  SidebarBatchDeleteResult,
+} from "../../lib/sidebar/batchDelete";
+import { reconcileSidebarSelection, updateSidebarSelection } from "../../lib/sidebar/selection";
+import type {
   SidebarConversation,
   SidebarListStatus,
   SidebarMutationKind,
@@ -21,12 +26,14 @@ import {
   ArchiveRestore,
   Blend,
   Cable,
+  Check,
   ChevronRight,
   CirclePlus,
   Edit3,
   FolderClosed,
   FolderOpen,
   FolderTree,
+  ListChecks,
   Loader2,
   MoreHorizontal,
   PanelLeftClose,
@@ -40,6 +47,7 @@ import {
 } from "../icons";
 import { isMacOsTauri, MacOsTitleBarSpacer } from "../MacOsTitleBarSpacer";
 import { Button } from "../ui/button";
+import { useConfirmDialog } from "../ui/confirm-dialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -111,6 +119,10 @@ type ChatHistorySidebarProps = {
   onShareConversation: (item: SidebarConversation) => void;
   onOpenSharedConversations: () => void;
   onDeleteConversation: (id: string) => void;
+  onDeleteConversations: (
+    ids: readonly string[],
+    options?: SidebarBatchDeleteOptions,
+  ) => Promise<SidebarBatchDeleteResult>;
   onLoadMore: () => void;
   onCloseSidebar: () => void;
   onOpenSettings: () => void;
@@ -161,6 +173,9 @@ const HistoryRow = memo(function HistoryRow(props: {
   canShareConversation: boolean;
   isRenaming: boolean;
   isPendingDelete: boolean;
+  isSelectionMode: boolean;
+  isSelected: boolean;
+  isSelectionDisabled: boolean;
   renameDraft: string;
   onSelectConversation: (id: string) => void;
   onStartRenaming: (item: SidebarConversation) => void;
@@ -171,6 +186,8 @@ const HistoryRow = memo(function HistoryRow(props: {
   onShareConversation: (item: SidebarConversation) => void;
   onDeleteConversation: (id: string) => void;
   onSetPendingDelete: (id: string | null) => void;
+  onSelectForBulk: (id: string, modifiers: { shiftKey: boolean; toggleKey: boolean }) => void;
+  onEnterSelectionMode: (id: string) => void;
 }) {
   const {
     item,
@@ -181,6 +198,9 @@ const HistoryRow = memo(function HistoryRow(props: {
     canShareConversation,
     isRenaming,
     isPendingDelete,
+    isSelectionMode,
+    isSelected,
+    isSelectionDisabled,
     renameDraft,
     onSelectConversation,
     onStartRenaming,
@@ -191,6 +211,8 @@ const HistoryRow = memo(function HistoryRow(props: {
     onShareConversation,
     onDeleteConversation,
     onSetPendingDelete,
+    onSelectForBulk,
+    onEnterSelectionMode,
   } = props;
   const { t } = useLocale();
 
@@ -200,9 +222,22 @@ const HistoryRow = memo(function HistoryRow(props: {
   const skipNextBlurCommitRef = useRef(false);
   const [menuOpen, setMenuOpen] = useState(false);
 
-  const handleSelect = useCallback(() => {
-    onSelectConversation(item.id);
-  }, [item.id, onSelectConversation]);
+  const handleSelect = useCallback(
+    (event: React.MouseEvent<HTMLButtonElement>) => {
+      const usesSelectionModifier = event.shiftKey || event.ctrlKey || event.metaKey;
+      if (isSelectionMode || usesSelectionModifier) {
+        if (!isSelectionDisabled) {
+          onSelectForBulk(item.id, {
+            shiftKey: event.shiftKey,
+            toggleKey: event.ctrlKey || event.metaKey,
+          });
+        }
+        return;
+      }
+      onSelectConversation(item.id);
+    },
+    [isSelectionDisabled, isSelectionMode, item.id, onSelectConversation, onSelectForBulk],
+  );
 
   const handleStartRenaming = useCallback(() => {
     onStartRenaming(item);
@@ -211,6 +246,10 @@ const HistoryRow = memo(function HistoryRow(props: {
   const handleRequestDelete = useCallback(() => {
     onSetPendingDelete(item.id);
   }, [item.id, onSetPendingDelete]);
+
+  const handleEnterSelectionMode = useCallback(() => {
+    onEnterSelectionMode(item.id);
+  }, [item.id, onEnterSelectionMode]);
 
   const handleTogglePinned = useCallback(() => {
     onSetPinned(item.id, item.isPinned !== true);
@@ -273,9 +312,12 @@ const HistoryRow = memo(function HistoryRow(props: {
     <div
       className={cn(
         "chat-history-row group/item grid h-[30px] grid-cols-[minmax(0,1fr)_auto] items-center rounded-lg pl-1 transition-colors",
-        isActive
-          ? "bg-foreground/[0.07] text-foreground hover:bg-foreground/[0.09]"
-          : "text-foreground/85 hover:bg-foreground/[0.05] hover:text-foreground",
+        isSelectionMode && isSelected
+          ? "bg-primary/10 text-foreground hover:bg-primary/[0.14]"
+          : isActive
+            ? "bg-foreground/[0.07] text-foreground hover:bg-foreground/[0.09]"
+            : "text-foreground/85 hover:bg-foreground/[0.05] hover:text-foreground",
+        isSelectionMode && isSelectionDisabled && "opacity-50",
       )}
     >
       {isRenaming ? (
@@ -312,21 +354,39 @@ const HistoryRow = memo(function HistoryRow(props: {
         <button
           type="button"
           onClick={handleSelect}
+          onMouseDown={(event) => {
+            if (event.shiftKey) event.preventDefault();
+          }}
           onDoubleClick={(event) => {
             event.preventDefault();
-            if (!isRunning && !isBusy) {
+            if (!isSelectionMode && !isRunning && !isBusy) {
               handleStartRenaming();
             }
           }}
-          className="flex h-[30px] min-w-0 items-center rounded-md px-2 text-left outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring"
+          aria-pressed={isSelectionMode ? isSelected : undefined}
+          disabled={isSelectionMode && isSelectionDisabled}
+          className="flex h-[30px] min-w-0 items-center gap-2 rounded-md px-2 text-left outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring"
           title={item.title}
         >
+          {isSelectionMode ? (
+            <span
+              aria-hidden="true"
+              className={cn(
+                "flex h-4 w-4 shrink-0 items-center justify-center rounded-[4px] border transition-colors",
+                isSelected
+                  ? "border-primary bg-primary text-primary-foreground"
+                  : "border-muted-foreground/45 bg-background/50",
+              )}
+            >
+              {isSelected ? <Check className="h-3 w-3" /> : null}
+            </span>
+          ) : null}
           <span className="sidebar-project-name-fade min-w-0 flex-1 overflow-hidden whitespace-nowrap text-[calc(14px*var(--zone-font-scale,1))] font-normal leading-5">
             {item.title}
           </span>
         </button>
       )}
-      {!isRenaming ? (
+      {!isRenaming && !isSelectionMode ? (
         <div
           className={cn(
             "relative flex items-center justify-end overflow-hidden transition-[max-width,opacity] duration-200 ease-out",
@@ -402,6 +462,14 @@ const HistoryRow = memo(function HistoryRow(props: {
                     {t("chat.conversationShare")}
                   </DropdownMenuItem>
                 ) : null}
+                <DropdownMenuItem
+                  disabled={isRunning || isBusy}
+                  onSelect={handleEnterSelectionMode}
+                  className="gap-2"
+                >
+                  <ListChecks className="h-3.5 w-3.5" />
+                  {t("chat.conversationBulkSelect")}
+                </DropdownMenuItem>
                 <DropdownMenuItem
                   disabled={isRunning || isBusy}
                   onSelect={handleStartRenaming}
@@ -969,6 +1037,7 @@ export const ChatHistorySidebar = memo(function ChatHistorySidebar(props: ChatHi
     onShareConversation,
     onOpenSharedConversations,
     onDeleteConversation,
+    onDeleteConversations,
     onLoadMore,
     onCloseSidebar,
     onOpenSettings,
@@ -979,6 +1048,11 @@ export const ChatHistorySidebar = memo(function ChatHistorySidebar(props: ChatHi
   const { t } = useLocale();
 
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedConversationIds, setSelectedConversationIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const [isBulkDeleting, setIsBulkDeleting] = useState(false);
   const [pendingProjectRemoveId, setPendingProjectRemoveId] = useState<string | null>(null);
   const [showAllProjects, setShowAllProjects] = useState(false);
   const [projectSectionHeight, setProjectSectionHeight] = useState<number | null>(null);
@@ -1002,7 +1076,28 @@ export const ChatHistorySidebar = memo(function ChatHistorySidebar(props: ChatHi
   });
   const projectSectionResizeFrameRef = useRef<number | null>(null);
   const projectSectionResizeCleanupRef = useRef<(() => void) | null>(null);
-  const handleSelectConversation = useStableEvent(onSelectConversation);
+  const selectionAnchorRef = useRef<string | null>(null);
+  const bulkConfirmOpenRef = useRef(false);
+  // Bumped to invalidate an in-flight bulk delete: its shouldStop callback
+  // starts returning true and its continuation stops touching state.
+  const bulkDeleteRunRef = useRef(0);
+  const { confirm: requestBulkDeleteConfirm, dialog: bulkDeleteDialog } = useConfirmDialog();
+  const orderedConversationIds = useMemo(() => items.map((item) => item.id), [items]);
+  const selectableConversationIds = useMemo(
+    () =>
+      new Set(
+        items
+          .filter(
+            (item) => !runningConversationIds.has(item.id) && !busyConversationIds.has(item.id),
+          )
+          .map((item) => item.id),
+      ),
+    [busyConversationIds, items, runningConversationIds],
+  );
+  const handleSelectConversation = useStableEvent((id: string) => {
+    selectionAnchorRef.current = id;
+    onSelectConversation(id);
+  });
   const handleStartRenaming = useStableEvent(onStartRenaming);
   const handleRenameDraftChange = useStableEvent(onRenameDraftChange);
   const handleCommitRename = useStableEvent(onCommitRename);
@@ -1011,6 +1106,7 @@ export const ChatHistorySidebar = memo(function ChatHistorySidebar(props: ChatHi
   const handleShareConversation = useStableEvent(onShareConversation);
   const handleOpenSharedConversations = useStableEvent(onOpenSharedConversations);
   const handleDeleteConversation = useStableEvent(onDeleteConversation);
+  const handleDeleteConversations = useStableEvent(onDeleteConversations);
   const handleSelectProject = useStableEvent((project: WorkspaceProject) => {
     onSelectProject?.(project);
   });
@@ -1043,6 +1139,101 @@ export const ChatHistorySidebar = memo(function ChatHistorySidebar(props: ChatHi
   });
   const handleUnarchiveProject = useStableEvent((project: WorkspaceProject) => {
     onUnarchiveProject?.(project);
+  });
+  const exitSelectionMode = useCallback(() => {
+    bulkDeleteRunRef.current += 1;
+    setIsBulkDeleting(false);
+    setSelectionMode(false);
+    setSelectedConversationIds(new Set());
+    selectionAnchorRef.current = null;
+  }, []);
+  const enterSelectionMode = useStableEvent((initialId?: string) => {
+    setPendingDeleteId(null);
+    handleCancelRename();
+    onRecentCollapsedChange?.(false);
+    setSelectionMode(true);
+    if (initialId && selectableConversationIds.has(initialId)) {
+      setSelectedConversationIds(new Set([initialId]));
+      selectionAnchorRef.current = initialId;
+    } else {
+      setSelectedConversationIds(new Set());
+      selectionAnchorRef.current = null;
+    }
+  });
+  const handleSelectForBulk = useStableEvent(
+    (id: string, modifiers: { shiftKey: boolean; toggleKey: boolean }) => {
+      if (!selectableConversationIds.has(id)) {
+        return;
+      }
+      setPendingDeleteId(null);
+      handleCancelRename();
+      setSelectionMode(true);
+      setSelectedConversationIds((current) => {
+        const next = updateSidebarSelection({
+          orderedIds: orderedConversationIds,
+          selectableIds: selectableConversationIds,
+          selectedIds: current,
+          anchorId: selectionAnchorRef.current,
+          targetId: id,
+          shiftKey: modifiers.shiftKey,
+          toggleKey: modifiers.toggleKey,
+        });
+        selectionAnchorRef.current = next.anchorId;
+        return next.selectedIds;
+      });
+    },
+  );
+  const handleBulkDelete = useStableEvent(async () => {
+    const ids = orderedConversationIds.filter(
+      (id) => selectedConversationIds.has(id) && selectableConversationIds.has(id),
+    );
+    if (ids.length === 0 || isBulkDeleting) {
+      return;
+    }
+
+    const count = String(ids.length);
+    bulkConfirmOpenRef.current = true;
+    const confirmed = await requestBulkDeleteConfirm({
+      title: t(
+        ids.length === 1
+          ? "chat.conversationBulkDeleteConfirmOne"
+          : "chat.conversationBulkDeleteConfirm",
+      ).replace("{count}", count),
+      description: t("chat.conversationBulkDeleteDescription"),
+      confirmLabel: t("chat.conversationBulkDelete"),
+      cancelLabel: t("chat.cancel"),
+      closeLabel: t("chat.cancel"),
+      tone: "destructive",
+    }).finally(() => {
+      bulkConfirmOpenRef.current = false;
+    });
+    if (!confirmed) {
+      return;
+    }
+
+    const runId = bulkDeleteRunRef.current + 1;
+    bulkDeleteRunRef.current = runId;
+    setIsBulkDeleting(true);
+    try {
+      const result = await handleDeleteConversations(ids, {
+        shouldStop: () => bulkDeleteRunRef.current !== runId,
+      });
+      if (bulkDeleteRunRef.current !== runId) {
+        // Cancelled mid-batch: exitSelectionMode already reset the selection UI.
+        return;
+      }
+      const orderedConversationIdSet = new Set(orderedConversationIds);
+      const failedIds = result.failedIds.filter((id) => orderedConversationIdSet.has(id));
+      setSelectedConversationIds(new Set(failedIds));
+      selectionAnchorRef.current = failedIds[0] ?? null;
+      if (failedIds.length === 0) {
+        setSelectionMode(false);
+      }
+    } finally {
+      if (bulkDeleteRunRef.current === runId) {
+        setIsBulkDeleting(false);
+      }
+    }
   });
   // Archived rows are split into their own collapsed group at the list end;
   // the render cap only applies to the active rows.
@@ -1165,6 +1356,7 @@ export const ChatHistorySidebar = memo(function ChatHistorySidebar(props: ChatHi
 
   // Workspace switch: land the new scope at the top; the keyed content
   // wrapper below replays the soft enter transition at the same time.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: scope identity intentionally drives the reset
   useEffect(() => {
     historyScrollRef.current?.scrollTo({ top: 0 });
   }, [scopeKey]);
@@ -1199,6 +1391,47 @@ export const ChatHistorySidebar = memo(function ChatHistorySidebar(props: ChatHi
       setPendingProjectRemoveId(null);
     }
   }, [pendingProjectRemoveId, projects]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: selection cannot cross sidebar scopes
+  useEffect(() => {
+    exitSelectionMode();
+  }, [exitSelectionMode, scopeKey]);
+
+  useEffect(() => {
+    setSelectedConversationIds((current) => {
+      const next = reconcileSidebarSelection({
+        orderedIds: orderedConversationIds,
+        selectableIds: selectableConversationIds,
+        selectedIds: current,
+        anchorId: selectionAnchorRef.current,
+      });
+      selectionAnchorRef.current = next.anchorId;
+      return next.selectedIds;
+    });
+  }, [orderedConversationIds, selectableConversationIds]);
+
+  useEffect(() => {
+    if (!selectionMode) {
+      return;
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented || bulkConfirmOpenRef.current) {
+        return;
+      }
+      // Escape inside the composer or any text field belongs to that editor,
+      // not to the sidebar selection.
+      const target = event.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)
+      ) {
+        return;
+      }
+      exitSelectionMode();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [exitSelectionMode, selectionMode]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: re-run to (re)observe section refs when sections mount/unmount or toggle
   useEffect(() => {
@@ -1379,6 +1612,9 @@ export const ChatHistorySidebar = memo(function ChatHistorySidebar(props: ChatHi
         canShareConversation={canShareConversations}
         isRenaming={renamingId === item.id}
         isPendingDelete={pendingDeleteId === item.id}
+        isSelectionMode={selectionMode}
+        isSelected={selectedConversationIds.has(item.id)}
+        isSelectionDisabled={isBulkDeleting || !selectableConversationIds.has(item.id)}
         renameDraft={renamingId === item.id ? renameDraft : ""}
         onSelectConversation={handleSelectConversation}
         onStartRenaming={handleStartRenaming}
@@ -1389,6 +1625,8 @@ export const ChatHistorySidebar = memo(function ChatHistorySidebar(props: ChatHi
         onShareConversation={handleShareConversation}
         onDeleteConversation={handleDeleteConversation}
         onSetPendingDelete={setPendingDeleteId}
+        onSelectForBulk={handleSelectForBulk}
+        onEnterSelectionMode={enterSelectionMode}
       />
     ),
     [
@@ -1397,16 +1635,22 @@ export const ChatHistorySidebar = memo(function ChatHistorySidebar(props: ChatHi
       handleCancelRename,
       handleCommitRename,
       handleDeleteConversation,
+      handleSelectForBulk,
       handleRenameDraftChange,
       handleSelectConversation,
       handleSetPinned,
       handleShareConversation,
       handleStartRenaming,
+      isBulkDeleting,
       canShareConversations,
+      enterSelectionMode,
       pendingDeleteId,
       renameDraft,
       renamingId,
       runningConversationIds,
+      selectableConversationIds,
+      selectedConversationIds,
+      selectionMode,
     ],
   );
 
@@ -1521,7 +1765,7 @@ export const ChatHistorySidebar = memo(function ChatHistorySidebar(props: ChatHi
             <>
               <div
                 ref={projectsHeaderRef}
-                className="group/workspace-header flex items-center justify-between px-2 pb-1 pt-2"
+                className="flex items-center justify-between px-2 pb-1 pt-2"
               >
                 <button
                   type="button"
@@ -1540,10 +1784,7 @@ export const ChatHistorySidebar = memo(function ChatHistorySidebar(props: ChatHi
                   type="button"
                   variant="ghost"
                   size="icon"
-                  className={cn(
-                    PROJECT_ICON_BUTTON_CLASS,
-                    "pointer-events-none opacity-0 transition-opacity hover:!bg-transparent group-hover/workspace-header:pointer-events-auto group-hover/workspace-header:opacity-100 focus-visible:opacity-100",
-                  )}
+                  className={cn(PROJECT_ICON_BUTTON_CLASS, "hover:!bg-transparent")}
                   title={t("chat.workspaceCreate")}
                   aria-label={t("chat.workspaceCreate")}
                   onClick={() => onCreateProject?.()}
@@ -1705,39 +1946,103 @@ export const ChatHistorySidebar = memo(function ChatHistorySidebar(props: ChatHi
               showProjects ? "border-t border-border/35 pt-0.5" : "pt-3",
             )}
           >
-            <button
-              type="button"
-              aria-expanded={!recentCollapsed}
-              className="group flex min-w-0 items-center gap-1 rounded-md px-3 py-1 text-xs font-semibold text-muted-foreground outline-hidden"
-              onClick={() => onRecentCollapsedChange?.(!recentCollapsed)}
-            >
-              <span className="min-w-0 truncate">{t("chat.recentConversation")}</span>
-              <ChevronRight
-                aria-hidden="true"
-                className="h-3.5 w-3.5 shrink-0 opacity-0 transition-[opacity,transform] duration-300 ease-in-out group-hover:opacity-100"
-                style={{ transform: `rotate(${recentCollapsed ? 0 : 90}deg)` }}
-              />
-            </button>
+            {selectionMode ? (
+              <div
+                role="status"
+                aria-live="polite"
+                className="flex min-w-0 items-center gap-1.5 px-3 py-1 text-xs font-semibold text-foreground/85"
+              >
+                <ListChecks className="h-3.5 w-3.5 shrink-0" />
+                <span className="min-w-0 truncate">
+                  {t("chat.conversationBulkSelectedCount").replace(
+                    "{count}",
+                    String(selectedConversationIds.size),
+                  )}
+                </span>
+              </div>
+            ) : (
+              <button
+                type="button"
+                aria-expanded={!recentCollapsed}
+                className="group flex min-w-0 items-center gap-1 rounded-md px-3 py-1 text-xs font-semibold text-muted-foreground outline-hidden"
+                onClick={() => onRecentCollapsedChange?.(!recentCollapsed)}
+              >
+                <span className="min-w-0 truncate">{t("chat.recentConversation")}</span>
+                <ChevronRight
+                  aria-hidden="true"
+                  className="h-3.5 w-3.5 shrink-0 opacity-0 transition-[opacity,transform] duration-300 ease-in-out group-hover:opacity-100"
+                  style={{ transform: `rotate(${recentCollapsed ? 0 : 90}deg)` }}
+                />
+              </button>
+            )}
             <div className="flex items-center gap-1.5">
-              {canShareConversations ? (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  onClick={handleOpenSharedConversations}
-                  className={PROJECT_ICON_BUTTON_CLASS}
-                  title={t("chat.manageSharedConversations").replace(
-                    "{count}",
-                    String(sharedConversationCount),
-                  )}
-                  aria-label={t("chat.manageSharedConversations").replace(
-                    "{count}",
-                    String(sharedConversationCount),
-                  )}
-                >
-                  <Share2 className="h-3.5 w-3.5" />
-                </Button>
-              ) : null}
+              {selectionMode ? (
+                <>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    onClick={handleBulkDelete}
+                    disabled={selectedConversationIds.size === 0 || isBulkDeleting}
+                    className={cn(PROJECT_ICON_BUTTON_CLASS, "text-destructive")}
+                    title={t("chat.conversationBulkDelete")}
+                    aria-label={t("chat.conversationBulkDelete")}
+                  >
+                    {isBulkDeleting ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Trash2 className="h-3.5 w-3.5" />
+                    )}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    onClick={exitSelectionMode}
+                    className={PROJECT_ICON_BUTTON_CLASS}
+                    title={t("chat.cancel")}
+                    aria-label={t("chat.cancel")}
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </Button>
+                </>
+              ) : (
+                <>
+                  {items.length > 0 ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => enterSelectionMode()}
+                      disabled={selectableConversationIds.size === 0}
+                      className={PROJECT_ICON_BUTTON_CLASS}
+                      title={t("chat.conversationBulkSelectHint")}
+                      aria-label={t("chat.conversationBulkSelect")}
+                    >
+                      <ListChecks className="h-3.5 w-3.5" />
+                    </Button>
+                  ) : null}
+                  {canShareConversations ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      onClick={handleOpenSharedConversations}
+                      className={PROJECT_ICON_BUTTON_CLASS}
+                      title={t("chat.manageSharedConversations").replace(
+                        "{count}",
+                        String(sharedConversationCount),
+                      )}
+                      aria-label={t("chat.manageSharedConversations").replace(
+                        "{count}",
+                        String(sharedConversationCount),
+                      )}
+                    >
+                      <Share2 className="h-3.5 w-3.5" />
+                    </Button>
+                  ) : null}
+                </>
+              )}
             </div>
           </div>
 
@@ -1843,6 +2148,7 @@ export const ChatHistorySidebar = memo(function ChatHistorySidebar(props: ChatHi
           </div>
         </div>
       </div>
+      {bulkDeleteDialog}
     </aside>
   );
 });

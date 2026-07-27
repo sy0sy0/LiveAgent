@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use tauri::Emitter;
 use tokio::sync::watch;
 
+use crate::commands::git::GitCloneTaskRegistry;
 use crate::commands::settings::{
     load_remote_settings, normalize_remote_settings_payload, open_db, RemoteSettingsPayload,
 };
@@ -15,6 +16,7 @@ use crate::runtime::terminal::TerminalSessionRegistry;
 use crate::services::automation::AutomationStore;
 use crate::services::chat_run_ledger::{ChatRunLedger, ChatRunLedgerState};
 use crate::services::memory::MemoryStore;
+use crate::services::provider_usage::ProviderUsageService;
 use crate::services::tunnel::{TunnelProxy, TunnelStore};
 use crate::services::workspace_watch::WorkspaceWatchService;
 
@@ -25,9 +27,11 @@ impl GatewayController {
         app_handle: tauri::AppHandle,
         automation_store: Arc<AutomationStore>,
         memory_store: Arc<MemoryStore>,
+        provider_usage_service: Arc<ProviderUsageService>,
         terminal_registry: Arc<TerminalSessionRegistry>,
         sftp_registry: Arc<SftpSessionRegistry>,
         managed_process_registry: Arc<ManagedProcessRegistry>,
+        git_clone_task_registry: Arc<GitCloneTaskRegistry>,
     ) -> Self {
         let initial_config = RemoteSettingsPayload::default();
         let (config_tx, _) = watch::channel(initial_config);
@@ -37,9 +41,11 @@ impl GatewayController {
             app_handle,
             automation_store,
             memory_store,
+            provider_usage_service,
             terminal_registry,
             sftp_registry,
             managed_process_registry,
+            git_clone_task_registry,
             config_tx,
             runner_task: Mutex::new(None),
             status: Mutex::new(GatewayStatusSnapshot {
@@ -47,7 +53,7 @@ impl GatewayController {
                 enabled: false,
                 configured: false,
                 gateway_url: String::new(),
-                agent_id: fallback_agent_id(),
+                agent_id: String::new(),
                 session_id: None,
                 connected_since: None,
                 last_heartbeat: None,
@@ -304,7 +310,7 @@ impl GatewayController {
             status.enabled = normalized.enabled;
             status.configured = is_remote_configured(&normalized);
             status.gateway_url = normalized.gateway_url.clone();
-            status.agent_id = effective_agent_id(&normalized);
+            status.agent_id = normalized.agent_id.clone();
             if !normalized.enabled {
                 set_disconnected_status(status, &normalized, None);
             } else if config_changed {
@@ -334,7 +340,7 @@ impl GatewayController {
                 enabled: false,
                 configured: false,
                 gateway_url: String::new(),
-                agent_id: fallback_agent_id(),
+                agent_id: String::new(),
                 session_id: None,
                 connected_since: None,
                 last_heartbeat: None,

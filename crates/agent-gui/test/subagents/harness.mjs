@@ -324,7 +324,7 @@ export function createDefaultCompactionMock(compactionCalls) {
 
     async compactDuringRun() {
       compactionCalls.push({ phase: "mid" });
-      return null;
+      return { context: null, shouldDisableProtection: false };
     }
 
     async handleTurnAbort() {

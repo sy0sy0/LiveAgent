@@ -28,11 +28,12 @@ DEV_GATEWAY_HTTP_ADDR ?= :50052
 DEV_WEBUI_PROXY_API ?= http://localhost:50052
 GATEWAY_DOCKER_IMAGE ?= liveagent-gateway:local
 RELEASE_TAG ?=
+MODEL_CATALOG_GENERATED_FILES := $(AGENT_GUI_DIR)/src/lib/models/catalog.generated.ts $(AGENT_GATEWAY_WEB_DIR)/src/lib/models/catalog.generated.ts
 
 .PHONY: all dev build desktop-build-macos desktop-build-macos-release desktop-build-macos-intel desktop-build-macos-m desktop-build-windows desktop-build-linux github-release-main check-github-release-tag help
-.PHONY: dev-gateway dev-webui
+.PHONY: dev-gateway dev-webui ensure-webui-embed-stub
 .PHONY: proto proto-check webui gateway-build gateway-docker-build gateway-docker-run gateway-docker-smoke build-linux build-linux-amd build-linux-arm
-.PHONY: clean check-rust-target-% check-macos-signing-identity check-macos-notary-profile desktop-store-macos-notary-profile desktop-wait-macos-notary desktop-staple-macos desktop-verify-macos
+.PHONY: clean update-model-catalog check-rust-target-% check-macos-signing-identity check-macos-notary-profile desktop-store-macos-notary-profile desktop-wait-macos-notary desktop-staple-macos desktop-verify-macos
 
 all: build gateway-build
 
@@ -94,9 +95,20 @@ github-release-main: check-github-release-tag
 		echo "Release tag already exists on origin: $(RELEASE_TAG)"; \
 		exit 1; \
 	fi
+# The catalog refresh must land on main before the tag is cut, and only after
+# test:release has validated the new snapshot (catalog invariant tests).
+	$(MAKE) update-model-catalog
 	pnpm --dir $(AGENT_GUI_DIR) install --frozen-lockfile
 	pnpm --dir $(AGENT_GUI_DIR) test:release
 	cargo check --manifest-path $(AGENT_GUI_DIR)/src-tauri/Cargo.toml --tests
+	@set -e; \
+	if ! git diff --quiet -- $(MODEL_CATALOG_GENERATED_FILES); then \
+		git add $(MODEL_CATALOG_GENERATED_FILES); \
+		git commit -m "chore(models): refresh model catalog for $(RELEASE_TAG)"; \
+		git push origin main; \
+	else \
+		echo "Model catalog is already up to date."; \
+	fi
 	node scripts/release/prepare-app-version-from-tag.mjs "$(RELEASE_TAG)" --json
 	git tag -a "$(RELEASE_TAG)" -m "LiveAgent $(RELEASE_TAG)"
 	git push origin "$(RELEASE_TAG)"
@@ -106,11 +118,26 @@ check-github-release-tag:
 	@node scripts/release/prepare-app-version-from-tag.mjs "$(RELEASE_TAG)" --json >/dev/null
 
 ## Gateway development
-dev-gateway:
+# go:embed requires web/dist at compile time. Dev serves the SPA from Vite, so
+# a tiny stub is enough to let `go run` start without a full WebUI build.
+dev-gateway: ensure-webui-embed-stub
 	go -C $(AGENT_GATEWAY_DIR) run ./cmd/gateway --token=$(DEV_GATEWAY_TOKEN) --http-addr=$(DEV_GATEWAY_HTTP_ADDR)
 
 dev-webui:
 	npm_config_proxy_api=$(DEV_WEBUI_PROXY_API) pnpm --dir $(AGENT_GATEWAY_WEB_DIR) dev
+
+ensure-webui-embed-stub:
+	@if [ ! -f "$(AGENT_GATEWAY_WEB_DIR)/dist/index.html" ]; then \
+		mkdir -p "$(AGENT_GATEWAY_WEB_DIR)/dist"; \
+		printf '%s\n' \
+			'<!doctype html>' \
+			'<html lang="en">' \
+			'<head><meta charset="utf-8"><title>LiveAgent Gateway</title></head>' \
+			'<body><p>WebUI embed stub. Run <code>make dev-webui</code> for the real SPA.</p></body>' \
+			'</html>' \
+			> "$(AGENT_GATEWAY_WEB_DIR)/dist/index.html"; \
+		echo "created $(AGENT_GATEWAY_WEB_DIR)/dist stub for go:embed"; \
+	fi
 
 ## Gateway build and generated assets
 proto:
@@ -118,12 +145,12 @@ proto:
 	cd $(AGENT_GATEWAY_DIR) && buf generate
 
 # buf breaking 的对比基线（本地默认与当前 HEAD 对比；CI 覆写为 origin/main）。
-BUF_BREAKING_AGAINST ?= ../../.git#subdir=$(AGENT_GATEWAY_DIR)
+BUF_BREAKING_AGAINST ?= ../../.git\#subdir=$(AGENT_GATEWAY_DIR)
 
 proto-check:
 	@command -v buf >/dev/null || (echo "buf is required. Run: mise install" && exit 1)
 	cd $(AGENT_GATEWAY_DIR) && buf lint
-	cd $(AGENT_GATEWAY_DIR) && buf breaking --against '$(BUF_BREAKING_AGAINST)'
+	node scripts/check-buf-breaking.mjs "$(AGENT_GATEWAY_DIR)" "$(BUF_BREAKING_AGAINST)"
 
 webui:
 	pnpm --dir $(AGENT_GATEWAY_WEB_DIR) install --offline
@@ -171,6 +198,9 @@ gateway-build-windows: build-windows
 ## Maintenance
 clean:
 	rm -rf $(AGENT_GATEWAY_DIR)/bin/ $(AGENT_GATEWAY_WEB_DIR)/dist/
+
+update-model-catalog:
+	node scripts/generate-model-catalog.mjs
 
 check-rust-target-%:
 	@rustup target list --installed | grep -qx "$*" || (echo "Rust target $* is not installed. Run: rustup target add $*" && exit 1)
@@ -225,7 +255,7 @@ help:
 	@printf "  %-34s %s\n" "make desktop-build-macos-m" "构建 macOS M 系列版本"
 	@printf "  %-34s %s\n" "make desktop-build-windows" "构建 Windows Tauri 应用"
 	@printf "  %-34s %s\n" "make desktop-build-linux" "构建 Linux AppImage/deb/rpm"
-	@printf "  %-34s %s\n" "make github-release-main RELEASE_TAG=vX.Y.Z" "从 main 打 tag 并触发 GitHub Release"
+	@printf "  %-34s %s\n" "make github-release-main RELEASE_TAG=vX.Y.Z" "从 main 打 tag 并触发 GitHub Release（自动刷新模型目录并提交）"
 	@printf "\n%s\n" "Gateway development"
 	@printf "  %-34s %s\n" "make dev-gateway" "启动 agent-gateway Go 服务"
 	@printf "  %-34s %s\n" "make dev-webui" "启动 agent-gateway Web UI 开发服务"
@@ -242,4 +272,5 @@ help:
 	@printf "\n%s\n" "Maintenance"
 	@printf "  %-34s %s\n" "make all" "同时构建 GUI 和 agent-gateway"
 	@printf "  %-34s %s\n" "make clean" "清理 agent-gateway 构建产物"
+	@printf "  %-34s %s\n" "make update-model-catalog" "刷新 models.dev 模型目录快照"
 	@printf "  %-34s %s\n" "make help" "查看可用命令"

@@ -1,9 +1,12 @@
 import { memo, useMemo } from "react";
+import { ChangedFilesCard } from "../../components/chat/ChangedFilesCard";
+import { collectChangedFiles } from "../../lib/chat/changedFiles";
 import type { UiRound } from "../../lib/chat/uiMessages";
 import { AssistantAvatar } from "./assistant-bubble/AssistantAvatar";
 import { RoundContent } from "./assistant-bubble/RoundContent";
 
 export { AssistantAvatar } from "./assistant-bubble/AssistantAvatar";
+export { RetryDetailsBlock } from "./assistant-bubble/RoundContent";
 export { AssistantStatus, CompactingText, VibingText } from "./assistant-bubble/StatusText";
 
 const EMPTY_RUNNING_TOOL_CALL_IDS: string[] = [];
@@ -56,6 +59,16 @@ export const AssistantBubble = memo(function AssistantBubble(props: {
     }
     return null;
   }, [rounds]);
+  const isAborted = useMemo(
+    () => rounds.some((round) => round.meta?.stopReason === "aborted"),
+    [rounds],
+  );
+  // 回复末尾的已编辑文件卡：聚合整条回复所有 round 的 Write/Edit/Delete，
+  // 只在回复结束（流停止）后出现；脱敏视图（分享页隐藏工具内容）不渲染。
+  const changedFiles = useMemo(
+    () => (isStreaming || redactToolContent ? null : collectChangedFiles(rounds)),
+    [isStreaming, redactToolContent, rounds],
+  );
 
   return (
     <div className="assistant-bubble-shell flex w-full max-w-full items-start gap-3">
@@ -78,8 +91,10 @@ export const AssistantBubble = memo(function AssistantBubble(props: {
             readOnly={readOnly}
             redactToolContent={redactToolContent}
             latestTodoItem={latestTodoItem}
+            isAborted={isAborted}
           />
         ))}
+        {changedFiles ? <ChangedFilesCard summary={changedFiles} /> : null}
       </div>
     </div>
   );

@@ -9,6 +9,12 @@ import { invoke } from "@tauri-apps/api/core";
 
 import type { McpServerConfig } from "../settings";
 import { type BuiltinToolBundle, createBuiltinMetadataMap } from "./builtinTypes";
+import {
+  createToolRunId,
+  invokeWithAbort,
+  requestRuntimeCancel,
+  waitForAbortablePromise,
+} from "./invokeWithAbort";
 
 type McpToolInfo = {
   serverId: string;
@@ -26,7 +32,11 @@ type McpCallToolResponse = {
 
 const mcpServerCallLocks = new Map<string, Promise<void>>();
 
-async function withMcpServerCallLock<T>(serverId: string, run: () => Promise<T>): Promise<T> {
+async function withMcpServerCallLock<T>(
+  serverId: string,
+  run: () => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
   const previous = mcpServerCallLocks.get(serverId) ?? Promise.resolve();
   let release!: () => void;
   const current = new Promise<void>((resolve) => {
@@ -35,8 +45,16 @@ async function withMcpServerCallLock<T>(serverId: string, run: () => Promise<T>)
   const tail = previous.catch(() => undefined).then(() => current);
   mcpServerCallLocks.set(serverId, tail);
 
-  await previous.catch(() => undefined);
+  // The abortable wait can throw, so it must live inside the same
+  // release/cleanup scope as run(): a waiter aborted while queued would
+  // otherwise leave `current` unresolved and deadlock every later call to
+  // this server. Releasing early is safe — `tail` still chains behind
+  // `previous`, so serialization is preserved for the next caller.
   try {
+    await waitForAbortablePromise(
+      previous.catch(() => undefined),
+      signal,
+    );
     return await run();
   } finally {
     release();
@@ -236,40 +254,51 @@ export async function createMcpTools(params: {
     }
 
     try {
-      return await withMcpServerCallLock(mapped.serverId, async () => {
-        if (signal?.aborted) {
+      return await withMcpServerCallLock(
+        mapped.serverId,
+        async () => {
+          if (signal?.aborted) {
+            return {
+              role: "toolResult",
+              toolCallId: toolCall.id,
+              toolName: toolCall.name,
+              content: [{ type: "text", text: "Cancelled" }],
+              details: {},
+              isError: true,
+              timestamp: Date.now(),
+            };
+          }
+
+          const runId = createToolRunId("mcp", toolCall.id);
+          const res = await invokeWithAbort<McpCallToolResponse>(
+            "mcp_call_tool",
+            {
+              server_id: mapped.serverId,
+              tool_name: mapped.toolName,
+              arguments: toolCall.arguments ?? {},
+              run_id: runId,
+            },
+            signal,
+            { onAbort: () => requestRuntimeCancel(runId) },
+          );
+
           return {
             role: "toolResult",
             toolCallId: toolCall.id,
             toolName: toolCall.name,
-            content: [{ type: "text", text: "Cancelled" }],
-            details: {},
-            isError: true,
+            content: (res?.content ?? [{ type: "text", text: "" }]) as any,
+            details: {
+              serverId: mapped.serverId,
+              serverLabel: mapped.serverLabel,
+              tool: mapped.toolName,
+              mcp: res?.details,
+            },
+            isError: Boolean(res?.isError),
             timestamp: Date.now(),
           };
-        }
-
-        const res = await invoke<McpCallToolResponse>("mcp_call_tool", {
-          server_id: mapped.serverId,
-          tool_name: mapped.toolName,
-          arguments: toolCall.arguments ?? {},
-        } as any);
-
-        return {
-          role: "toolResult",
-          toolCallId: toolCall.id,
-          toolName: toolCall.name,
-          content: (res?.content ?? [{ type: "text", text: "" }]) as any,
-          details: {
-            serverId: mapped.serverId,
-            serverLabel: mapped.serverLabel,
-            tool: mapped.toolName,
-            mcp: res?.details,
-          },
-          isError: Boolean(res?.isError),
-          timestamp: Date.now(),
-        };
-      });
+        },
+        signal,
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return {

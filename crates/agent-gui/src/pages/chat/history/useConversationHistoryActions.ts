@@ -31,7 +31,7 @@ type TitleJobRefValue = {
   promise: Promise<string | null>;
 } | null;
 
-type PersistConversationParams = {
+export type PersistConversationParams = {
   conversationId: string;
   sessionId: string;
   providerId: string;

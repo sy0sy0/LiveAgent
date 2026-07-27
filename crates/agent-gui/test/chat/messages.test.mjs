@@ -21,12 +21,14 @@ const fileA = {
 };
 const fileB = {
   relativePath: "assets/diagram.png",
+  absolutePath: "/workspace/assets/diagram.png",
   fileName: "diagram.png",
   kind: "image",
   sizeBytes: 3 * 1024 * 1024,
 };
 const fileC = {
   relativePath: "uploads/report.docx",
+  absolutePath: "/Users/me/.liveagent/uploads/1/report.docx",
   fileName: "report.docx",
   kind: "word",
   sizeBytes: 4096,
@@ -208,8 +210,8 @@ test("uploaded file helpers preserve display text and strip model-hidden metadat
   assert.equal(message.timestamp, 1234);
   assert.equal(uploadedFiles.getUserMessageDisplayText(message), "Please review");
   assert.deepEqual(uploadedFiles.getUserMessageAttachments(message), [fileA]);
-  assert.match(message.content, /Selected files are available in the workspace/);
-  assert.match(message.content, /src\/App\.tsx \(text\)/);
+  assert.match(message.content, /The user attached the files below/);
+  assert.match(message.content, /Use Read with these exact paths/);
 
   const stripped = uploadedFiles.stripUploadedFilesMessageMetadata(message);
   assert.equal(uploadedFiles.getUserMessageDisplayText(stripped), message.content);
@@ -245,25 +247,41 @@ test("uploaded file helpers preserve office and archive attachment kinds", () =>
     fileC,
     {
       relativePath: "uploads/workbook.xlsx",
+      absolutePath: "/Users/me/.liveagent/uploads/1/workbook.xlsx",
       fileName: "workbook.xlsx",
       kind: "spreadsheet",
       sizeBytes: 8192,
     },
     {
       relativePath: "uploads/assets.zip",
+      absolutePath: "/Users/me/.liveagent/uploads/1/assets.zip",
       fileName: "assets.zip",
       kind: "archive",
       sizeBytes: 16384,
     },
   ]);
   assert.ok(message);
-  assert.match(message.content, /uploads\/report\.docx \(word\)/);
-  assert.match(message.content, /uploads\/workbook\.xlsx \(spreadsheet\)/);
-  assert.match(message.content, /uploads\/assets\.zip \(archive\)/);
+  assert.match(message.content, /\/\.liveagent\/uploads\/1\/report\.docx \(word\)/);
+  assert.match(message.content, /\/\.liveagent\/uploads\/1\/workbook\.xlsx \(spreadsheet\)/);
+  assert.match(message.content, /\/\.liveagent\/uploads\/1\/assets\.zip \(archive\)/);
   assert.deepEqual(
     uploadedFiles.getUserMessageAttachments(message).map((file) => file.kind),
     ["word", "spreadsheet", "archive"],
   );
+});
+
+test("legacy relative-only attachments are excluded from the model instruction", () => {
+  const legacyOnly = uploadedFiles.createUserMessageWithUploads("Check this", [
+    {
+      relativePath: "uploads/legacy.docx",
+      fileName: "legacy.docx",
+      kind: "word",
+      sizeBytes: 64,
+    },
+  ]);
+  assert.ok(legacyOnly);
+  assert.equal(legacyOnly.content, "Check this");
+  assert.doesNotMatch(legacyOnly.content, /uploads\/legacy\.docx/);
 });
 
 test("attachment-only messages instruct the model to inspect selected files first", () => {
@@ -280,6 +298,7 @@ test("pasted text uploads preserve display metadata and parse display references
   const pastedFile = uploadedFiles.withPastedTextDisplayMetadata(
     {
       relativePath: "uploads/pasted-text-1.txt",
+      absolutePath: "/Users/me/.liveagent/uploads/1/pasted-text-1.txt",
       fileName: "pasted-text-1.txt",
       kind: "text",
       sizeBytes: 12345,
@@ -2266,6 +2285,40 @@ test("chat page helpers keep model options stable and normalize status/title edg
   );
   assert.equal(chatHelpers.normalizeConversationTitle("  one two \n three  "), "one two three");
   assert.equal(chatHelpers.normalizeConversationTitle("one two three four five six seven eight nine ten eleven"), "one two three four five six seven eight nine ten");
+  // Rename box shares this normalizer: a long CJK title the user typed must survive intact.
+  assert.equal(
+    chatHelpers.normalizeConversationTitle("关于侧边栏会话标题生成逻辑的重构与国际化适配讨论记录第二版"),
+    "关于侧边栏会话标题生成逻辑的重构与国际化适配讨论记录第二版",
+  );
+  assert.equal(
+    chatHelpers.normalizeConversationTitle("Fix 中文 encoding in the parser module and add regression tests"),
+    "Fix 中文 encoding in the parser module and add regression",
+  );
+  // Generated titles additionally get a CJK character cap.
+  assert.equal(
+    chatHelpers.normalizeGeneratedConversationTitle("关于侧边栏会话标题生成逻辑的重构与国际化适配讨论记录第二版"),
+    "关于侧边栏会话标题生成逻辑的重构与国际化适配讨论",
+  );
+  // Latin-dominant titles keep the word cap even when they contain a CJK token.
+  assert.equal(
+    chatHelpers.normalizeGeneratedConversationTitle("Fix 中文 encoding in the parser module and add regression tests"),
+    "Fix 中文 encoding in the parser module and add regression",
+  );
+  assert.equal(
+    chatHelpers.normalizeGeneratedConversationTitle("one two three four five six seven eight nine ten eleven"),
+    "one two three four five six seven eight nine ten",
+  );
+  // The CJK cap counts code points, so an astral char at the boundary is not split in half.
+  const cappedAstralTitle = chatHelpers.normalizeGeneratedConversationTitle(
+    `${"中".repeat(23)}😀尾`,
+  );
+  assert.equal(cappedAstralTitle, `${"中".repeat(23)}😀`);
+  assert.equal(/[\uD800-\uDBFF]$/.test(cappedAstralTitle), false);
+  assert.equal(chatHelpers.normalizeGeneratedConversationTitle("  "), "");
+  assert.match(chatHelpers.buildConversationTitleSystemPrompt("zh-CN"), /简体中文/);
+  assert.match(chatHelpers.buildConversationTitleSystemPrompt("en-US"), /concise conversation titles/i);
+  assert.match(chatHelpers.buildConversationTitlePrompt("hello", "zh-CN"), /简体中文标题/);
+  assert.match(chatHelpers.buildConversationTitlePrompt("hello", "en-US"), /within 10 words/i);
   assert.equal(chatHelpers.buildFallbackConversationTitle("x".repeat(60)), `${"x".repeat(48)}...`);
   assert.equal(chatHelpers.normalizeLiveToolStatus("第 2 轮：模型生成中..."), chatHelpers.VIBING_STATUS);
   assert.equal(chatHelpers.normalizeLiveToolStatus("Running"), "Running");
@@ -2320,5 +2373,71 @@ test("chat page helpers keep same-name provider instances in separate model grou
         options: [{ value: "different-api::model-c", model: "model-c" }],
       },
     ],
+  );
+});
+
+test("shouldDisplayToolTraceItem hides provider-native web_fetch rows like web_search rows", () => {
+  const fetchCall = {
+    type: "toolCall",
+    id: "toolu_fetch",
+    name: "web_fetch",
+    arguments: { url: "https://example.com/article" },
+  };
+
+  // Bridged (non-executing endpoint) results carry the recovered marker.
+  assert.equal(
+    uiMessages.shouldDisplayToolTraceItem({
+      toolCall: fetchCall,
+      toolResult: {
+        role: "toolResult",
+        toolCallId: "toolu_fetch",
+        toolName: "web_fetch",
+        content: [{ type: "text", text: "This endpoint did not execute..." }],
+        details: { recoveredProviderNativeWebFetch: true },
+        isError: false,
+        timestamp: 0,
+      },
+    }),
+    false,
+  );
+
+  // History written before the bridge existed ("Tool web_fetch not found").
+  assert.equal(
+    uiMessages.shouldDisplayToolTraceItem({
+      toolCall: fetchCall,
+      toolResult: {
+        role: "toolResult",
+        toolCallId: "toolu_fetch",
+        toolName: "web_fetch",
+        content: [{ type: "text", text: "Tool web_fetch not found" }],
+        details: {},
+        isError: true,
+        timestamp: 0,
+      },
+    }),
+    false,
+  );
+
+  // Any web_fetch row disappears once the round has a hosted search card.
+  assert.equal(
+    uiMessages.shouldDisplayToolTraceItem({ toolCall: fetchCall }, { hasHostedSearch: true }),
+    false,
+  );
+
+  // A genuinely failed local tool with a different name keeps its row.
+  assert.equal(
+    uiMessages.shouldDisplayToolTraceItem({
+      toolCall: { type: "toolCall", id: "toolu_other", name: "Read", arguments: {} },
+      toolResult: {
+        role: "toolResult",
+        toolCallId: "toolu_other",
+        toolName: "Read",
+        content: [{ type: "text", text: "Tool Read not found" }],
+        details: {},
+        isError: true,
+        timestamp: 0,
+      },
+    }),
+    true,
   );
 });

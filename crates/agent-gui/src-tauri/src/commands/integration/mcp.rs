@@ -16,6 +16,7 @@ use crate::runtime::platform::{
     expand_tilde_path, maybe_augment_macos_path, resolve_program_path_with_current_dir,
 };
 use crate::runtime::process::{configure_child_process_group, kill_child_process_tree_best_effort};
+use crate::runtime::shell_runner::ShellRunRegistry;
 
 const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 const LEGACY_SSE_ENDPOINT_WAIT_MS: u64 = 3_000;
@@ -77,12 +78,23 @@ fn build_stdio_command(cmd: &str, args: &[String], cwd: Option<&Path>) -> Comman
     #[cfg(windows)]
     {
         if is_windows_batch_program(&program) {
+            use std::os::windows::process::CommandExt;
+
+            // .cmd/.bat 无法被 CreateProcess 直接执行，需经 cmd.exe 转发。
+            // /C 后的命令行必须用 raw_arg 原样传入：arg() 会按 MSVCRT 规则
+            // 把内嵌引号转义成 `\"`，cmd.exe 不识别该转义，子进程瞬退，
+            // stdin 写入报 os error 232（issue #205）。
+            // /E:ON 保证命令扩展可用（`%%cd:~,` 防展开 hack 依赖它），
+            // /V:OFF 关闭延迟展开，防止参数里的 `!VAR!` 被替换；
+            // 均与 std `make_bat_command_line` 的 `/e:ON /v:OFF` 对齐。
             let mut command = Command::new("cmd.exe");
             command
+                .arg("/E:ON")
+                .arg("/V:OFF")
                 .arg("/D")
                 .arg("/S")
-                .arg("/C")
-                .arg(windows_batch_command_line(&program, args));
+                .arg("/C");
+            command.raw_arg(windows_cmd_c_argument(&program, args));
             return command;
         }
     }
@@ -92,7 +104,7 @@ fn build_stdio_command(cmd: &str, args: &[String], cwd: Option<&Path>) -> Comman
     command
 }
 
-#[cfg(windows)]
+#[cfg_attr(not(windows), allow(dead_code))]
 fn is_windows_batch_program(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -100,19 +112,46 @@ fn is_windows_batch_program(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(windows)]
-fn windows_batch_command_line(program: &Path, args: &[String]) -> String {
-    std::iter::once(program.to_string_lossy().into_owned())
+/// 组装 `cmd.exe /S /C` 之后的整段命令行：外层再包一对引号，`/S` 语义下
+/// cmd 仅剥掉首尾引号，剩余部分按原样执行。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_cmd_c_argument(program: &Path, args: &[String]) -> String {
+    let line = std::iter::once(program.to_string_lossy().into_owned())
         .chain(args.iter().cloned())
         .map(|value| windows_cmd_quote_arg(&value))
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    format!("\"{line}\"")
 }
 
-#[cfg(windows)]
+/// 引号包裹单个参数，转义规则对齐 std `sys/args/windows.rs::append_bat_arg`：
+/// - 内嵌引号前的反斜杠补齐至 2n 再把引号翻倍（cmd.exe 不识别 `\"`）；
+/// - 收尾引号前的尾部反斜杠同样翻倍，防止 `C:\dir\` 这类参数把闭合引号
+///   转义掉、与后一个参数粘连；
+/// - `%`/`\r` 前插入 `%%cd:~,` no-op（yt-dlp hack，依赖 `/E:ON`），阻止
+///   `%VAR%` 被 cmd 当环境变量展开，子进程仍收到原文。
+#[cfg_attr(not(windows), allow(dead_code))]
 fn windows_cmd_quote_arg(value: &str) -> String {
-    let escaped = value.replace('"', "\\\"");
-    format!("\"{escaped}\"")
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+    let mut backslashes = 0usize;
+    for ch in value.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+        } else {
+            if ch == '"' {
+                escaped.extend(std::iter::repeat_n('\\', backslashes));
+                escaped.push('"');
+            } else if ch == '%' || ch == '\r' {
+                escaped.push_str("%%cd:~,");
+            }
+            backslashes = 0;
+        }
+        escaped.push(ch);
+    }
+    escaped.extend(std::iter::repeat_n('\\', backslashes));
+    escaped.push('"');
+    escaped
 }
 
 #[derive(Debug, Serialize)]
@@ -340,6 +379,11 @@ impl StdioTransport {
             .stderr(Stdio::piped());
         maybe_augment_macos_path(&mut command);
         configure_child_process_group(&mut command);
+        // 应用代理 env 先注入（含 NO_PROXY 环回豁免），server 配置的 env 后写保持更高优先级；
+        // 代理配置异常时 fail fast，不静默直连。
+        for (key, value) in crate::services::system_proxy::shell_proxy_envs()? {
+            command.env(key, value);
+        }
         if let Some(env) = &config.env {
             command.envs(env);
         }
@@ -533,7 +577,9 @@ impl HttpTransport {
 
         let headers = build_header_map(&config.headers)?;
 
-        let client = HttpClient::builder()
+        // 经 system_proxy 构建：应用代理启用时走代理（环回地址豁免），异常配置 fail fast。
+        let client = crate::services::system_proxy::blocking_client_builder()
+            .map_err(|e| format!("创建 HTTP client 失败：{e}"))?
             .connect_timeout(Duration::from_secs(10))
             .timeout(config.timeout())
             .build()
@@ -736,12 +782,15 @@ impl SseTransport {
             }
         };
 
-        let client_get = HttpClient::builder()
+        // 两个 client 均经 system_proxy 构建（GET 长连接不设总超时），语义同 HttpTransport。
+        let client_get = crate::services::system_proxy::blocking_client_builder()
+            .map_err(|e| format!("创建 SSE http client 失败：{e}"))?
             .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| format!("创建 SSE http client 失败：{e}"))?;
 
-        let client_post = HttpClient::builder()
+        let client_post = crate::services::system_proxy::blocking_client_builder()
+            .map_err(|e| format!("创建 POST http client 失败：{e}"))?
             .connect_timeout(Duration::from_secs(10))
             .timeout(config.timeout())
             .build()
@@ -1063,6 +1112,10 @@ impl McpTransport {
 #[derive(Debug)]
 struct McpClient {
     config: McpServerConfig,
+    /// spawn 时的应用代理配置 revision。transport 的 reqwest client 与
+    /// stdio 子进程 env 都在 spawn 时固化，ensure_client 据此在代理配置
+    /// 变更后重建连接。
+    proxy_revision: u64,
     transport: McpTransport,
     next_id: u64,
     initialized: bool,
@@ -1070,6 +1123,9 @@ struct McpClient {
 
 impl McpClient {
     fn spawn(config: McpServerConfig) -> Result<Self, String> {
+        // 在建 transport 之前取 revision：若 spawn 期间代理配置变更，
+        // 记录的旧值会在下次 ensure_client 触发重建，宁可多建一次。
+        let proxy_revision = crate::services::system_proxy::revision();
         let transport = match config.transport().trim() {
             "http" => McpTransport::Http(HttpTransport::spawn(&config)?),
             "sse" => McpTransport::Sse(SseTransport::spawn(&config)?),
@@ -1078,6 +1134,7 @@ impl McpClient {
 
         Ok(Self {
             config,
+            proxy_revision,
             transport,
             next_id: 1,
             initialized: false,
@@ -1410,19 +1467,40 @@ impl McpRuntimeManager {
             .map_err(|_| "MCP 状态锁失败".to_string())?
             .get(&id)
             .cloned();
-        if let Some(existing) = existing {
+        if let Some(existing) = existing.as_ref() {
             // Restart if config changed. Same-id calls serialize on the client
             // lock (protocol streams cannot be shared), other servers do not.
+            // 应用代理配置变更（revision 变化）同样视作配置变化重建连接。
+            let proxy_revision = crate::services::system_proxy::revision();
             let same_config = existing
                 .lock()
-                .map(|client| client.config == cfg)
+                .map(|client| client.config == cfg && client.proxy_revision == proxy_revision)
                 .unwrap_or(false);
             if same_config {
-                return Ok(existing);
+                return Ok(existing.clone());
             }
         }
 
-        let client = McpClient::spawn(cfg)?;
+        let client = match McpClient::spawn(cfg) {
+            Ok(client) => client,
+            Err(error) => {
+                // 重建失败必须逐出已判定过期的旧 client：mcp_call_tool 直读 map
+                // 不经本函数，留着旧 client 会让失效配置（如无效应用代理）下的
+                // 调用继续走旧通道，违背 fail fast 不静默直连的语义。
+                // 仅在 map 里仍是同一个 Arc 时移除，避免误杀并发换上的新 client。
+                if let Some(stale) = existing {
+                    if let Ok(mut map) = self.clients.lock() {
+                        if map
+                            .get(&id)
+                            .is_some_and(|current| Arc::ptr_eq(current, &stale))
+                        {
+                            map.remove(&id);
+                        }
+                    }
+                }
+                return Err(error);
+            }
+        };
         let arc = Arc::new(Mutex::new(client));
         self.clients
             .lock()
@@ -1573,6 +1651,8 @@ pub async fn mcp_list_tools(
     run_blocking("mcp_list_tools", move || {
         let mut out: Vec<McpToolInfo> = Vec::new();
 
+        let mut succeeded = 0usize;
+        let mut failures: Vec<String> = Vec::new();
         for cfg in servers.into_iter().filter(|s| s.enabled) {
             let server_id = cfg.id.clone();
             let tools = match manager.ensure_client(cfg.clone()) {
@@ -1584,14 +1664,27 @@ pub async fn mcp_list_tools(
             };
 
             match tools {
-                Ok(tools) => out.extend(tools),
+                Ok(tools) => {
+                    succeeded += 1;
+                    out.extend(tools);
+                }
                 Err(err) => {
                     eprintln!(
                         "[MCP] 跳过 server `{}` 的 tools/list，继续对话流程：{}",
                         server_id, err
                     );
+                    failures.push(format!("{server_id}: {err}"));
                 }
             }
+        }
+
+        // 部分失败沿用跳过语义；全军覆没（如应用代理配置异常一次性击毁全部
+        // server）必须让前端可见（onLoadError/throw），否则工具静默消失无从排查。
+        if succeeded == 0 && !failures.is_empty() {
+            return Err(format!(
+                "所有已启用的 MCP server 都不可用：\n{}",
+                failures.join("\n")
+            ));
         }
 
         Ok(out)
@@ -1602,13 +1695,22 @@ pub async fn mcp_list_tools(
 #[tauri::command(rename_all = "snake_case")]
 pub async fn mcp_call_tool(
     state: tauri::State<'_, Arc<McpRuntimeManager>>,
+    run_registry: tauri::State<'_, Arc<ShellRunRegistry>>,
     server_id: String,
     tool_name: String,
     arguments: Value,
+    run_id: Option<String>,
 ) -> Result<McpCallToolResponse, String> {
     // IMPORTANT: tool call can block (network / pipes / SSE). Offload.
     let manager = state.inner().clone();
-    run_blocking("mcp_call_tool", move || {
+    let normalized_run_id = run_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let cancel_token = normalized_run_id
+        .as_deref()
+        .map(|id| run_registry.register(id));
+    let registered_token = cancel_token.clone();
+    let mut task = tauri::async_runtime::spawn_blocking(move || {
         let id = server_id.trim().to_string();
         if id.is_empty() {
             return Err("server_id cannot be empty".to_string());
@@ -1630,8 +1732,22 @@ pub async fn mcp_call_tool(
             .lock()
             .map_err(|_| "Failed to lock MCP client".to_string())?;
         locked.tools_call(tool_name.trim(), arguments)
-    })
-    .await
+    });
+    let result = if let Some(cancel_token) = cancel_token {
+        tokio::select! {
+            join = &mut task => {
+                join.map_err(|error| format!("mcp_call_tool join failed: {error}"))?
+            }
+            _ = cancel_token.cancelled() => Err("Cancelled".to_string()),
+        }
+    } else {
+        task.await
+            .map_err(|error| format!("mcp_call_tool join failed: {error}"))?
+    };
+    if let (Some(run_id), Some(token)) = (normalized_run_id.as_deref(), registered_token.as_ref()) {
+        run_registry.unregister(run_id, token);
+    }
+    result
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1819,6 +1935,28 @@ mod tests {
     }
 
     #[test]
+    fn ensure_client_evicts_stale_client_when_respawn_fails() {
+        let manager = McpRuntimeManager::default();
+        manager
+            .ensure_client(offline_http_config("srv"))
+            .expect("initial ensure");
+
+        // 换成必然 spawn 失败的配置（URL 通过存在性校验但解析失败）：
+        // 旧 client 必须被逐出，否则 mcp_call_tool 直读 map 会继续走失效通道。
+        manager
+            .ensure_client(url_config("srv", "http", Some("::not-a-url::")))
+            .expect_err("respawn must fail");
+        assert!(
+            !manager
+                .clients
+                .lock()
+                .expect("clients lock")
+                .contains_key("srv"),
+            "stale client must be evicted after failed respawn"
+        );
+    }
+
+    #[test]
     fn busy_client_does_not_block_other_servers() {
         use std::sync::Barrier;
         use std::time::Duration;
@@ -1869,5 +2007,79 @@ mod tests {
             .expect("join contender")
             .expect("contender ensure eventually succeeds");
         holder.join().expect("join holder");
+    }
+
+    #[test]
+    fn detects_windows_batch_programs_by_extension() {
+        assert!(is_windows_batch_program(Path::new(
+            r"C:\Program Files\nodejs\npx.cmd"
+        )));
+        assert!(is_windows_batch_program(Path::new(r"C:\tools\run.BAT")));
+        assert!(!is_windows_batch_program(Path::new(
+            r"C:\Program Files\nodejs\node.exe"
+        )));
+        assert!(!is_windows_batch_program(Path::new("npx")));
+    }
+
+    #[test]
+    fn windows_cmd_quote_arg_doubles_embedded_quotes() {
+        // cmd.exe 不认 `\"` 转义，翻倍才能保持引号配对。
+        assert_eq!(windows_cmd_quote_arg("-y"), r#""-y""#);
+        assert_eq!(windows_cmd_quote_arg(r#"a"b"#), r#""a""b""#);
+        assert_eq!(windows_cmd_quote_arg("with space"), r#""with space""#);
+    }
+
+    #[test]
+    fn windows_cmd_quote_arg_doubles_backslashes_before_quotes() {
+        // 内嵌引号前的反斜杠须补齐至 2n，重解析后还原为 n 个反斜杠 + 字面引号。
+        assert_eq!(windows_cmd_quote_arg(r#"a\"b"#), r#""a\\""b""#);
+        // 尾部反斜杠若不翻倍会把闭合引号转义掉，与后一个参数粘连。
+        assert_eq!(windows_cmd_quote_arg(r"C:\data\"), r#""C:\data\\""#);
+        // 非贴引号的反斜杠保持原样（路径分隔符不受影响）。
+        assert_eq!(windows_cmd_quote_arg(r"C:\a\b"), r#""C:\a\b""#);
+        assert_eq!(windows_cmd_quote_arg(""), r#""""#);
+    }
+
+    #[test]
+    fn windows_cmd_quote_arg_neutralizes_percent_expansion() {
+        // `%%cd:~,` no-op 打断 %VAR% 配对，cmd 展开后子进程仍收到原文。
+        assert_eq!(windows_cmd_quote_arg("%PATH%"), r#""%%cd:~,%PATH%%cd:~,%""#);
+        assert_eq!(windows_cmd_quote_arg("100%"), r#""100%%cd:~,%""#);
+        assert_eq!(windows_cmd_quote_arg("a\rb"), "\"a%%cd:~,\rb\"");
+    }
+
+    #[test]
+    fn windows_cmd_c_argument_wraps_whole_line_for_slash_s() {
+        // `/S` 语义：cmd 剥掉首尾引号后必须还原出可执行的完整命令行。
+        let program = Path::new(r"C:\Program Files\nodejs\npx.cmd");
+        let args = vec!["-y".to_string(), "@playwright/mcp".to_string()];
+        assert_eq!(
+            windows_cmd_c_argument(program, &args),
+            r#"""C:\Program Files\nodejs\npx.cmd" "-y" "@playwright/mcp"""#
+        );
+    }
+
+    #[test]
+    fn windows_cmd_c_argument_without_args_still_quotes_program() {
+        let program = Path::new(r"C:\tools\npx.cmd");
+        assert_eq!(
+            windows_cmd_c_argument(program, &[]),
+            r#"""C:\tools\npx.cmd"""#
+        );
+    }
+
+    #[test]
+    fn windows_cmd_c_argument_survives_trailing_backslash_arg() {
+        // filesystem 类 MCP server 常见传法：目录参数带尾部反斜杠。
+        let program = Path::new(r"C:\Program Files\nodejs\npx.cmd");
+        let args = vec![
+            "-y".to_string(),
+            "@modelcontextprotocol/server-filesystem".to_string(),
+            r"C:\Users\me\docs\".to_string(),
+        ];
+        assert_eq!(
+            windows_cmd_c_argument(program, &args),
+            r#"""C:\Program Files\nodejs\npx.cmd" "-y" "@modelcontextprotocol/server-filesystem" "C:\Users\me\docs\\"""#
+        );
     }
 }

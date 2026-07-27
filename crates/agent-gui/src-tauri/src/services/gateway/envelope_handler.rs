@@ -13,6 +13,17 @@ use crate::services::workspace_watch::WatchSource;
 
 use super::*;
 
+pub(super) fn provider_usage_agent_envelope(
+    request_id: String,
+    response: proto::ProviderUsageResponse,
+) -> proto::AgentEnvelope {
+    proto::AgentEnvelope {
+        request_id,
+        timestamp: now_unix_seconds(),
+        payload: Some(proto::agent_envelope::Payload::ProviderUsageResp(response)),
+    }
+}
+
 impl GatewayController {
     pub(crate) async fn handle_gateway_envelope(
         self: &Arc<Self>,
@@ -461,6 +472,25 @@ impl GatewayController {
                     }
                     Err(error) => self.send_error_response(request_id, 500, error).await,
                 }
+            }
+            Some(proto::gateway_envelope::Payload::ProviderUsage(request)) => {
+                let sender = self.current_outbound_sender()?;
+                let provider_usage_service = Arc::clone(&self.provider_usage_service);
+                tauri::async_runtime::spawn(async move {
+                    let envelope = match gateway_bridge::handle_provider_usage(
+                        provider_usage_service,
+                        request,
+                    )
+                    .await
+                    {
+                        Ok(response) => provider_usage_agent_envelope(request_id, response),
+                        Err(error) => build_error_response_envelope(request_id, 500, error),
+                    };
+                    if let Err(error) = send_agent_envelope_to(sender, envelope).await {
+                        eprintln!("gateway provider usage handler failed: {error}");
+                    }
+                });
+                Ok(())
             }
             Some(proto::gateway_envelope::Payload::ProviderModels(request)) => {
                 match gateway_bridge::handle_provider_models(request).await {
@@ -935,7 +965,12 @@ impl GatewayController {
                 }
             }
             Some(proto::gateway_envelope::Payload::GitRequest(request)) => {
-                match gateway_bridge::handle_git_request(request).await {
+                match gateway_bridge::handle_git_request(
+                    request,
+                    Arc::clone(&self.git_clone_task_registry),
+                )
+                .await
+                {
                     Ok(response) => {
                         self.send_agent_envelope(proto::AgentEnvelope {
                             request_id,

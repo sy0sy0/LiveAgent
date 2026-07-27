@@ -24,6 +24,7 @@ impl TerminalSessionRegistry {
             output_start_offset,
             output_end_offset,
             ssh_tabs: None,
+            ssh_local_forward: None,
         };
 
         if let Ok(app_handle) = self.app_handle.lock() {
@@ -141,6 +142,7 @@ impl TerminalSessionRegistry {
             output_start_offset: None,
             output_end_offset: None,
             ssh_tabs: Some(snapshot),
+            ssh_local_forward: None,
         };
 
         if let Ok(app_handle) = self.app_handle.lock() {

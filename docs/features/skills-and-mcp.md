@@ -42,8 +42,8 @@
 | Store identity | ClawHub Skill 以 `ownerHandle + slug` 作为唯一身份；React key、安装任务、已安装状态和 `_meta.json` 回读不得只按 slug 合并。 |
 | list 缺 owner | `/api/v1/skills` 条目缺少发布者时，详情/安装前通过精确搜索按 `updatedAt`、version、downloads 等字段懒解析 owner；无法唯一匹配时明确失败，不盲选发布者。 |
 | 下载/详情 | 所有已解析的详情和 `/api/v1/download` 请求都携带 `ownerHandle`，避免重名 slug 返回 HTTP 409。 |
-| 非便携名称 | 仍严格执行 Agent Skills 小写名称规范；只有 ClawHub 单 Skill 包的非法名称归一化后与 registry slug 完全一致时，才改写临时副本并把原名、规范名和转换类型写入 `_meta.json`。 |
-| 原始内容 | 名称兼容转换只发生在下载临时目录，不修改注册表下载包；其他名称不匹配继续按严格校验拒绝。 |
+| 非便携名称 | 仍严格执行 Agent Skills 小写名称规范；ClawHub 官方语义是 slug 与目录显示名分离、互不派生，因此单 Skill 包的非法 `name` 一律修复而非拒绝：优先改写为 registry slug（payload 缺 slug 时从下载 URL query 兜底解析），slug 不可用时回退为规范化后的 `name`；原名、规范名和转换类型写入 `_meta.json`。 |
+| 原始内容 | 名称兼容转换只发生在下载临时目录，不修改注册表下载包；合法 `name` 即便与 slug 不同也保持原样；slug 与规范化 `name` 都不可用（如 Windows 保留名）时仍按严格校验拒绝。 |
 
 ## Skills 选择与 Prompt 注入
 

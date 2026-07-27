@@ -473,6 +473,8 @@ pub(crate) fn build_chat_event_envelope(
             proto::chat_event::ChatEventType::UserMessage as i32,
             json!({
                 "message": required_raw_string_field(object, "message")?,
+                "message_id": optional_string_field(object, "message_id")
+                    .or_else(|| optional_string_field(object, "messageId")),
                 "uploaded_files": object.get("uploaded_files")
                     .or_else(|| object.get("uploadedFiles"))
                     .cloned()
@@ -490,6 +492,10 @@ pub(crate) fn build_chat_event_envelope(
                     .unwrap_or(Value::Null),
                 "selected_model": object.get("selected_model")
                     .or_else(|| object.get("selectedModel"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "message_ref": object.get("message_ref")
+                    .or_else(|| object.get("messageRef"))
                     .cloned()
                     .unwrap_or(Value::Null),
                 "base_message_ref": object.get("base_message_ref")
@@ -517,6 +523,10 @@ pub(crate) fn build_chat_event_envelope(
             json!({
                 "status": object.get("status").cloned().unwrap_or(Value::Null),
                 "isCompaction": object.get("isCompaction").and_then(Value::as_bool).unwrap_or(false),
+                // Optional stream-retry history (array of {attempt,
+                // maxAttempts, errorMessage}); absent/null means "unchanged"
+                // on the WebUI, an empty array clears its list.
+                "retryAttempts": object.get("retryAttempts").cloned().unwrap_or(Value::Null),
                 "round": optional_number_field(object, "round"),
             }),
         ),

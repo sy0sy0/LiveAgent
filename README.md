@@ -82,7 +82,7 @@ LiveAgent is a **local-first** AI agent desktop client. It deeply integrates lar
 
 - **An agent that actually gets things done** — beyond chat: read and write files, make precise edits, run Bash, and supervise long-running processes
 - **A fully open ecosystem** — bridge any external tool via the MCP protocol, and load Skills packages on demand
-- **Local and remote, both** — the desktop app works fully standalone; deploy the Gateway and control it from any browser
+- **Both local and remote** — the desktop app works fully standalone; deploy the Gateway and control it from any browser
 
 ---
 
@@ -177,9 +177,12 @@ docker run -d \
   --name liveagent-gateway \
   --restart unless-stopped \
   -p 3000:8080 \
+  -v liveagent-gateway-data:/var/lib/liveagent \
   -e LIVEAGENT_GATEWAY_TOKEN=your-token \
   ghcr.io/stack-cairn/liveagent-gateway:latest
 ```
+
+The named volume persists the Gateway database and independently issued Agent tokens across container upgrades.
 
 **One-command upgrade to the latest version** — pull the new image → remove the old container → recreate it with the same arguments (if you changed the port mappings or token, adjust the arguments below accordingly):
 
@@ -190,6 +193,7 @@ docker pull ghcr.io/stack-cairn/liveagent-gateway:latest \
     --name liveagent-gateway \
     --restart unless-stopped \
     -p 3000:8080 \
+    -v liveagent-gateway-data:/var/lib/liveagent \
     -e LIVEAGENT_GATEWAY_TOKEN=your-token \
     ghcr.io/stack-cairn/liveagent-gateway:latest \
   && docker image prune -f
@@ -321,7 +325,7 @@ LiveAgent/
 │   └── agent-gateway/            # Go gateway service
 │       ├── cmd/gateway/          #   Entry point
 │       ├── internal/             #   Core implementation
-│       ├── proto/v1/             #   Protobuf definitions
+│       ├── proto/v2/             #   Protobuf definitions
 │       └── web/                  #   Embedded WebUI
 │
 ├── docs/                         # Project docs
@@ -403,7 +407,7 @@ Before submitting a PR, make sure all of the following checks pass (they match t
 Thanks to everyone who has contributed to LiveAgent!
 
 <a href="https://github.com/Stack-Cairn/LiveAgent/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=Stack-Cairn/LiveAgent" alt="Contributors" />
+  <img src="docs/images/contributors.svg" alt="Contributors" />
 </a>
 
 ---

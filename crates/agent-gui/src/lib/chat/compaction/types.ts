@@ -1,20 +1,9 @@
-import type { CodexRequestFormat, ProviderModelConfig, ReasoningLevel } from "../../settings";
+export type { ProviderRuntimeConfig } from "../../providers/runtime/types";
 
 export type CompactionTrigger = "pre-send" | "mid-stream" | "post-tool";
 
 // optimization = 发送前的从容压缩（阈值更宽），protection = 运行中的保护性压缩（阈值更紧）。
 export type CompactionIntent = "optimization" | "protection";
-
-export type ProviderRuntimeConfig = {
-  baseUrl: string;
-  apiKey: string;
-  requestFormat?: CodexRequestFormat;
-  reasoning?: ReasoningLevel;
-  promptCachingEnabled?: boolean;
-  nativeWebSearchEnabled?: boolean;
-  useSystemProxy?: boolean;
-  modelConfig?: ProviderModelConfig;
-};
 
 export type CompactionStatus =
   | { phase: "idle" }

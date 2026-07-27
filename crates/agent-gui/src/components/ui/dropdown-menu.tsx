@@ -1,7 +1,6 @@
 import { Menu } from "@base-ui/react";
 import * as React from "react";
 import { cn } from "../../lib/shared/utils";
-import { Check } from "../icons";
 
 export const DropdownMenu = Menu.Root;
 export const DropdownMenuTrigger = Menu.Trigger;
@@ -52,28 +51,6 @@ export const DropdownMenuSeparator = React.forwardRef<
   <Menu.Separator ref={ref} className={cn("-mx-1 my-1 h-px bg-muted", className)} {...props} />
 ));
 DropdownMenuSeparator.displayName = "DropdownMenuSeparator";
-
-export const DropdownMenuCheckboxItem = React.forwardRef<
-  HTMLDivElement,
-  React.ComponentPropsWithoutRef<typeof Menu.CheckboxItem>
->(({ className, children, ...props }, ref) => (
-  <Menu.CheckboxItem
-    ref={ref}
-    className={cn(
-      "relative flex cursor-default select-none items-center rounded-xs py-1.5 pl-8 pr-2 text-sm outline-hidden transition-colors data-[highlighted]:bg-accent data-[highlighted]:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
-      className,
-    )}
-    {...props}
-  >
-    <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
-      <Menu.CheckboxItemIndicator>
-        <Check className="h-4 w-4" />
-      </Menu.CheckboxItemIndicator>
-    </span>
-    {children}
-  </Menu.CheckboxItem>
-));
-DropdownMenuCheckboxItem.displayName = "DropdownMenuCheckboxItem";
 
 type DropdownMenuSubTriggerProps = React.ComponentPropsWithoutRef<typeof Menu.SubmenuTrigger> & {
   // Menu-button style trigger (e.g. an icon "⋯" button): disables hover-open,
@@ -136,11 +113,11 @@ export const DropdownMenuItem = React.forwardRef<HTMLDivElement, DropdownMenuIte
         "relative flex cursor-default select-none items-center rounded-xs px-2 py-1.5 text-sm outline-hidden transition-colors data-[highlighted]:bg-accent data-[highlighted]:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
         className,
       )}
+      {...props}
       onClick={(e) => {
         onSelect?.();
         onClick?.(e);
       }}
-      {...props}
     />
   ),
 );

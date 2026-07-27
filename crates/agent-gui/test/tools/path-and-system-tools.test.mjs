@@ -232,6 +232,70 @@ test("ToolPathResolver resolves enabled Skill paths and gates external paths by 
     /not enabled/,
   );
 
+  const stagedUpload = await resolver.resolvePath(
+    "/Users/me/.liveagent/uploads/1721550000000/report.pdf",
+    {
+      label: "Read.path",
+      intent: "read",
+      required: true,
+    },
+  );
+  assert.equal(stagedUpload.scope, "uploads");
+  assert.equal(stagedUpload.root, "/Users/me/.liveagent/uploads");
+  assert.equal(stagedUpload.relativePath, "1721550000000/report.pdf");
+  assert.equal(stagedUpload.displayPath, "uploads/1721550000000/report.pdf");
+
+  const stagedUploadDir = await resolver.resolvePath(
+    "C:\\Users\\Me\\.liveagent\\uploads\\1721550000000",
+    {
+      label: "List.path",
+      intent: "list",
+      required: true,
+    },
+  );
+  assert.equal(stagedUploadDir.scope, "uploads");
+  assert.equal(stagedUploadDir.relativePath, "1721550000000");
+
+  const stagedUploadRoot = await resolver.resolvePath("/Users/me/.liveagent/uploads", {
+    label: "List.path",
+    intent: "list",
+    required: true,
+  });
+  assert.equal(stagedUploadRoot.scope, "uploads");
+  assert.equal(stagedUploadRoot.root, "/Users/me/.liveagent/uploads");
+  assert.equal(stagedUploadRoot.absolutePath, "/Users/me/.liveagent/uploads");
+  assert.equal(stagedUploadRoot.relativePath, undefined);
+  assert.equal(stagedUploadRoot.displayPath, "uploads");
+
+  await assert.rejects(
+    () =>
+      resolver.resolvePath("/Users/me/.liveagent/uploads", {
+        label: "Write.path",
+        intent: "write",
+        required: true,
+      }),
+    /only supports read access/,
+  );
+
+  await assert.rejects(
+    () =>
+      resolver.resolvePath("/Users/me/.liveagent/uploads/1721550000000/report.pdf", {
+        label: "Write.path",
+        intent: "write",
+        required: true,
+      }),
+    /only supports read access/,
+  );
+  await assert.rejects(
+    () =>
+      resolver.resolvePath("/Users/me/.liveagent/uploads/1721550000000/report.pdf", {
+        label: "Delete.path",
+        intent: "delete",
+        required: true,
+      }),
+    /only supports read access/,
+  );
+
   const externalImage = await resolver.resolvePath("/Users/me/Pictures/chart.png", {
     label: "Image.path",
     intent: "image",

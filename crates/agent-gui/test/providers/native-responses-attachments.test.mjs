@@ -160,7 +160,7 @@ test("OpenAI Responses native attachment adapter preserves Read fallback when na
     });
 
   assert.equal(result, payload);
-  assert.match(payload.input[0].content[0].text, /Use Read with the paths below/);
+  assert.match(payload.input[0].content[0].text, /Use Read with these exact paths/);
 });
 
 test("OpenAI Responses native attachment adapter skips tool output turns", async () => {
@@ -355,7 +355,7 @@ test("Anthropic Messages native attachment adapter preserves Read fallback for u
     });
 
   assert.equal(result, payload);
-  assert.match(payload.messages[0].content, /Use Read with the paths below/);
+  assert.match(payload.messages[0].content, /Use Read with these exact paths/);
 });
 
 test("Anthropic Messages native attachment adapter skips tool result turns", async () => {
@@ -484,7 +484,7 @@ test("Gemini native attachment adapter follows Gemini image MIME support", async
   const calls = [];
   const loader = createLoader(async (command, args) => {
     calls.push({ command, args });
-    if (args.relative_path.endsWith(".heic")) {
+    if (args.absolute_path.endsWith(".heic")) {
       return { mimeType: "image/heic", data: "aGVpYw==", sizeBytes: 4 };
     }
     return { mimeType: "image/gif", data: "Z2lm", sizeBytes: 3 };
@@ -560,7 +560,7 @@ test("Gemini native attachment adapter preserves Read fallback for unsupported f
     });
 
   assert.equal(result, payload);
-  assert.match(payload.contents[0].parts[0].text, /Use Read with the paths below/);
+  assert.match(payload.contents[0].parts[0].text, /Use Read with these exact paths/);
 });
 
 test("Gemini native attachment adapter preserves Read fallback when inline data is too large", async () => {
@@ -599,7 +599,7 @@ test("Gemini native attachment adapter preserves Read fallback when inline data 
 
   assert.equal(calls.length, 1);
   assert.equal(result, payload);
-  assert.match(payload.contents[0].parts[0].text, /Use Read with the paths below/);
+  assert.match(payload.contents[0].parts[0].text, /Use Read with these exact paths/);
 });
 
 test("Gemini native attachment adapter skips synthetic tool image turns", async () => {
@@ -751,7 +751,7 @@ test("Gemini native attachment adapter enforces inline budget across user turns"
   assert.equal(calls.length, 2);
   assert.equal(result.contents[0].parts.filter((part) => part.inlineData).length, 1);
   assert.equal(result.contents[2].parts.filter((part) => part.inlineData).length, 0);
-  assert.match(result.contents[2].parts[0].text, /Use Read with the paths below/);
+  assert.match(result.contents[2].parts[0].text, /Use Read with these exact paths/);
 });
 
 test("text-mode OpenAI Responses stream forwards workdir for native attachments", async () => {

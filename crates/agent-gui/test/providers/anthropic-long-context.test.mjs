@@ -78,7 +78,7 @@ test("长上下文 beta：compat 关闭 eager streaming 且带工具时镜像 fi
   assert.equal(next.headers["anthropic-beta"], `${FINE_GRAINED_BETA},${CONTEXT_1M_BETA}`);
 });
 
-test("长上下文 beta：合并并去重已有 anthropic-beta，不覆盖自定义 beta", () => {
+test("长上下文 beta：忽略已有值，仅使用 pi-ai 动态 beta 与 context-1m", () => {
   const next = longContext.attachAnthropicLongContextBeta(
     {
       apiKey: "sk-relay-key",
@@ -90,13 +90,13 @@ test("长上下文 beta：合并并去重已有 anthropic-beta，不覆盖自定
     {
       providerId: "claude_code",
       baseUrl: "https://relay.example.com/v1",
-      model: makeAnthropicModel({ compat: undefined }),
+      model: makeAnthropicModel({
+        compat: undefined,
+        headers: { "anthropic-beta": "model-custom-beta" },
+      }),
     },
   );
-  assert.equal(
-    next.headers["anthropic-beta"],
-    `prompt-caching-scope-2026-01-05,${CONTEXT_1M_BETA},${INTERLEAVED_BETA}`,
-  );
+  assert.equal(next.headers["anthropic-beta"], `${INTERLEAVED_BETA},${CONTEXT_1M_BETA}`);
   assert.equal(next.headers["Anthropic-Beta"], undefined);
   assert.equal(next.headers.Authorization, "Bearer sk-relay-key");
 });

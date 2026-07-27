@@ -380,3 +380,268 @@ test("hosted search aggregation extracts OpenAI url_citation annotations and mar
     [{ url: "https://example.com/openai", sourceType: "citation" }],
   );
 });
+
+test("codex aggregator tracks xAI x_search_call items and extracts action sources", () => {
+  const aggregator = hostedSearchEvents.createHostedSearchEventAggregator({
+    providerId: "codex",
+  });
+
+  aggregator.accept({
+    type: "response.output_item.added",
+    item: {
+      type: "x_search_call",
+      id: "xs-1",
+      status: "in_progress",
+      action: { query: "武汉今天的天气" },
+    },
+  });
+
+  let block = aggregator.getBlocks().find((candidate) => candidate.id === "xs-1");
+  assert.equal(block.status, "searching");
+  assert.deepEqual(block.queries, ["武汉今天的天气"]);
+
+  aggregator.accept({
+    type: "response.output_item.done",
+    item: {
+      type: "x_search_call",
+      id: "xs-1",
+      status: "completed",
+      action: {
+        query: "武汉今天的天气",
+        sources: [{ url: "https://example.com/weather", title: "Weather" }, "https://example.com/extra"],
+      },
+    },
+  });
+
+  block = aggregator.getBlocks().find((candidate) => candidate.id === "xs-1");
+  assert.equal(block.status, "completed");
+  assert.deepEqual(
+    block.sources.map((source) => ({ url: source.url, title: source.title })),
+    [
+      { url: "https://example.com/weather", title: "Weather" },
+      { url: "https://example.com/extra", title: undefined },
+    ],
+  );
+});
+
+test("codex aggregator treats xAI custom_tool_call search items as hosted search activity", () => {
+  const aggregator = hostedSearchEvents.createHostedSearchEventAggregator({
+    providerId: "codex",
+  });
+
+  aggregator.accept({
+    type: "response.output_item.added",
+    item: {
+      type: "custom_tool_call",
+      id: "ct-1",
+      name: "x_keyword_search",
+      status: "in_progress",
+      input: JSON.stringify({ query: "grok news" }),
+    },
+  });
+
+  let block = aggregator.getBlocks().find((candidate) => candidate.id === "ct-1");
+  assert.equal(block.status, "searching");
+  assert.deepEqual(block.queries, ["grok news"]);
+
+  aggregator.accept({
+    type: "response.output_item.done",
+    item: {
+      type: "custom_tool_call",
+      id: "ct-1",
+      name: "x_keyword_search",
+      status: "completed",
+      input: JSON.stringify({ query: "grok news" }),
+    },
+  });
+
+  block = aggregator.getBlocks().find((candidate) => candidate.id === "ct-1");
+  assert.equal(block.status, "completed");
+
+  aggregator.accept({
+    type: "response.output_item.added",
+    item: {
+      type: "custom_tool_call",
+      id: "ct-2",
+      name: "x_semantic_search",
+      status: "in_progress",
+      arguments: JSON.stringify({ query: "semantic query" }),
+    },
+  });
+
+  block = aggregator.getBlocks().find((candidate) => candidate.id === "ct-2");
+  assert.equal(block.status, "searching");
+  assert.deepEqual(block.queries, ["semantic query"]);
+
+  aggregator.accept({
+    type: "response.output_item.added",
+    item: {
+      type: "custom_tool_call",
+      id: "ct-3",
+      name: "unrelated_custom_tool",
+      status: "in_progress",
+      input: JSON.stringify({ query: "not a search" }),
+    },
+  });
+  assert.equal(
+    aggregator.getBlocks().find((candidate) => candidate.id === "ct-3"),
+    undefined,
+  );
+});
+
+test("codex aggregator extracts web_search_call action sources delivered via include", () => {
+  const aggregator = hostedSearchEvents.createHostedSearchEventAggregator({
+    providerId: "codex",
+  });
+
+  aggregator.accept({
+    type: "response.output_item.done",
+    item: {
+      type: "web_search_call",
+      id: "ws-1",
+      status: "completed",
+      action: {
+        query: "today news",
+        sources: [{ url: "https://example.com/news", title: "News" }],
+      },
+    },
+  });
+
+  const block = aggregator.getBlocks().find((candidate) => candidate.id === "ws-1");
+  assert.equal(block.status, "completed");
+  assert.deepEqual(block.queries, ["today news"]);
+  assert.deepEqual(
+    block.sources.map((source) => ({ url: source.url, title: source.title })),
+    [{ url: "https://example.com/news", title: "News" }],
+  );
+});
+
+test("codex aggregator maps response.x_search_call lifecycle events onto block status", () => {
+  const aggregator = hostedSearchEvents.createHostedSearchEventAggregator({
+    providerId: "codex",
+  });
+
+  aggregator.accept({ type: "response.x_search_call.searching", item_id: "xs-9" });
+  let block = aggregator.getBlocks().find((candidate) => candidate.id === "xs-9");
+  assert.equal(block.status, "searching");
+
+  aggregator.accept({ type: "response.x_search_call.completed", item_id: "xs-9" });
+  block = aggregator.getBlocks().find((candidate) => candidate.id === "xs-9");
+  assert.equal(block.status, "completed");
+});
+
+test("hosted search aggregation tracks Anthropic web_fetch server tool blocks", () => {
+  const aggregator = hostedSearchEvents.createHostedSearchEventAggregator({
+    providerId: "claude_code",
+  });
+  aggregator.accept({
+    type: "content_block_start",
+    content_block: {
+      type: "server_tool_use",
+      id: "srvtoolu_fetch_1",
+      name: "web_fetch",
+      input: { url: "https://example.com/article" },
+    },
+  });
+
+  let block = aggregator.getBlocks().find((candidate) => candidate.id === "srvtoolu_fetch_1");
+  assert.equal(block.status, "searching");
+  assert.deepEqual(block.queries, []);
+  assert.deepEqual(
+    block.sources.map((source) => source.url),
+    ["https://example.com/article"],
+  );
+
+  aggregator.accept({
+    type: "content_block_start",
+    content_block: {
+      type: "web_fetch_tool_result",
+      tool_use_id: "srvtoolu_fetch_1",
+      content: {
+        type: "web_fetch_result",
+        url: "https://example.com/article",
+        content: {
+          type: "document",
+          source: { type: "text", media_type: "text/plain", data: "Full text..." },
+          title: "Article Title",
+        },
+        retrieved_at: "2026-07-24T10:30:00Z",
+      },
+    },
+  });
+
+  block = aggregator.getBlocks().find((candidate) => candidate.id === "srvtoolu_fetch_1");
+  assert.equal(block.status, "completed");
+  assert.deepEqual(block.sources, [
+    { url: "https://example.com/article", title: "Article Title", sourceType: "source" },
+  ]);
+});
+
+test("hosted search aggregation accumulates an Anthropic web_fetch url streamed as partial_json fragments", () => {
+  const aggregator = hostedSearchEvents.createHostedSearchEventAggregator({
+    providerId: "claude_code",
+  });
+  aggregator.accept({
+    type: "content_block_start",
+    index: 3,
+    content_block: {
+      type: "server_tool_use",
+      id: "srvtoolu_fetch_2",
+      name: "web_fetch",
+    },
+  });
+  aggregator.accept({
+    type: "content_block_delta",
+    index: 3,
+    delta: { type: "input_json_delta", partial_json: '{"url":"https://exa' },
+  });
+
+  let block = aggregator.getBlocks().find((candidate) => candidate.id === "srvtoolu_fetch_2");
+  assert.equal(block, undefined);
+
+  aggregator.accept({
+    type: "content_block_delta",
+    index: 3,
+    delta: { type: "input_json_delta", partial_json: 'mple.com/paper.pdf"}' },
+  });
+
+  block = aggregator.getBlocks().find((candidate) => candidate.id === "srvtoolu_fetch_2");
+  assert.equal(block.status, "searching");
+  assert.deepEqual(
+    block.sources.map((source) => source.url),
+    ["https://example.com/paper.pdf"],
+  );
+});
+
+test("hosted search aggregation marks Anthropic web_fetch errors as failed", () => {
+  const aggregator = hostedSearchEvents.createHostedSearchEventAggregator({
+    providerId: "claude_code",
+  });
+  aggregator.accept({
+    type: "content_block_start",
+    content_block: {
+      type: "server_tool_use",
+      id: "srvtoolu_fetch_3",
+      name: "web_fetch",
+      input: { url: "https://blocked.example.com/page" },
+    },
+  });
+  aggregator.accept({
+    type: "content_block_start",
+    content_block: {
+      type: "web_fetch_tool_result",
+      tool_use_id: "srvtoolu_fetch_3",
+      content: {
+        type: "web_fetch_tool_result_error",
+        error_code: "url_not_accessible",
+      },
+    },
+  });
+
+  const block = aggregator.getBlocks().find((candidate) => candidate.id === "srvtoolu_fetch_3");
+  assert.equal(block.status, "failed");
+  assert.deepEqual(
+    block.sources.map((source) => source.url),
+    ["https://blocked.example.com/page"],
+  );
+});

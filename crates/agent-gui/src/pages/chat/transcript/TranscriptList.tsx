@@ -1,5 +1,6 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
+  type MutableRefObject,
   memo,
   type ReactNode,
   useCallback,
@@ -31,7 +32,10 @@ import type { GitClient } from "../../../lib/git/types";
 import { createEntranceRegistry } from "../../../lib/transcript-virtual/entranceOnce";
 import { extractLiveRange } from "../../../lib/transcript-virtual/liveRangeExtractor";
 import { createLiveRowScrollAdjustPolicy } from "../../../lib/transcript-virtual/liveScrollAdjustPolicy";
-import { createTranscriptMeasurementsLru } from "../../../lib/transcript-virtual/measurementsLru";
+import {
+  buildTranscriptLayoutKey,
+  createTranscriptMeasurementsLru,
+} from "../../../lib/transcript-virtual/measurementsLru";
 import { AssistantRow } from "./AssistantRow";
 import { createTranscriptRowModel } from "./rowModel";
 import { UserMessageRow } from "./UserMessageRow";
@@ -80,7 +84,7 @@ const SummaryCard = memo(function SummaryCard(props: { item: RenderSummaryCard }
         </button>
         {expanded ? (
           <div className="checkpoint-expand border-t border-black/[0.05] px-3.5 py-3 dark:border-white/[0.06]">
-            <Markdown content={item.content} className="font-openai-chat text-sm" />
+            <Markdown content={item.content} className="font-chat text-sm" />
           </div>
         ) : null}
       </div>
@@ -88,11 +92,17 @@ const SummaryCard = memo(function SummaryCard(props: { item: RenderSummaryCard }
   );
 });
 
+export type TranscriptNavHandle = {
+  /** 按行 key 跳转到对应消息（动态行高下会连帧重对准确保落位）。 */
+  scrollToRowKey: (rowKey: string) => void;
+};
+
 export type TranscriptListProps = {
   conversationId: string;
   historyItems: RenderTimelineItem[];
   liveTranscriptStore: LiveTranscriptStore;
   scrollViewport: HTMLDivElement | null;
+  layoutWidth: number;
   // Whether the scroll-follow engine is attached to the bottom; gates the
   // virtualizer's resize-compensation carve-out for live-row growth.
   isViewportFollowing?: () => boolean;
@@ -103,6 +113,10 @@ export type TranscriptListProps = {
   usageContextWindow?: number;
   workspaceRoot?: string;
   gitClient?: GitClient | null;
+  // 楼层导航：跳转句柄挂载点（与 followRef 同一模式），以及「视口顶部
+  // 当前处于哪条用户消息行」变化时的上报回调。
+  navRef?: MutableRefObject<TranscriptNavHandle | null>;
+  onAnchorUserRowChange?: (rowKey: string | null) => void;
   onResendFromEdit: (
     messageRef: HistoryMessageRef,
     text: string,
@@ -127,6 +141,7 @@ export const TranscriptList = memo(function TranscriptList(props: TranscriptList
     historyItems,
     liveTranscriptStore,
     scrollViewport,
+    layoutWidth,
     isViewportFollowing,
     isSending,
     isAgentMode,
@@ -135,6 +150,8 @@ export const TranscriptList = memo(function TranscriptList(props: TranscriptList
     usageContextWindow,
     workspaceRoot,
     gitClient,
+    navRef,
+    onAnchorUserRowChange,
     onResendFromEdit,
     onBranchConversation,
     onFirstLayoutSettled,
@@ -228,7 +245,10 @@ export const TranscriptList = memo(function TranscriptList(props: TranscriptList
   const [initialMeasurementsCache] = useState(
     () =>
       (scrollViewport
-        ? transcriptMeasurementsLru.restore(conversationId, scrollViewport.clientWidth)
+        ? transcriptMeasurementsLru.restore(
+            conversationId,
+            buildTranscriptLayoutKey(scrollViewport.clientWidth, layoutWidth),
+          )
         : null) ?? [],
   );
 
@@ -262,6 +282,133 @@ export const TranscriptList = memo(function TranscriptList(props: TranscriptList
     getLiveStartIndex: () => liveStartIndexRef.current,
     isFollowing: () => isViewportFollowing?.() ?? false,
   });
+
+  // Every mounted row is already tracked by the virtualizer's ResizeObserver,
+  // which updates its measured height as the centered transcript reflows.
+  // Do not call virtualizer.measure() on width commits: it clears those fresh
+  // measurements after the DOM has already resized, so no later resize event
+  // may repopulate them and estimate-based row positions can overlap.
+
+  // 楼层导航跳转句柄：按行 key 定位 index 后 scrollToIndex。沿途行首次真实
+  // 测量会不断修正总高度，连续若干帧重新对准，让滚动收敛在目标行顶部
+  // （对准同一 index 是收敛操作，不会震荡）。收敛期间用户的滚轮/触摸/按键
+  // 立即取消收敛；新跳转替换旧收敛；卸载时一并清理。
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
+  const cancelJumpSettleRef = useRef<() => void>(() => {});
+  useLayoutEffect(() => {
+    if (!navRef) return;
+    const handle: TranscriptNavHandle = {
+      scrollToRowKey: (rowKey) => {
+        cancelJumpSettleRef.current();
+        const alignToRow = () => {
+          const index = rowsRef.current.findIndex((row) => row.key === rowKey);
+          if (index < 0) return false;
+          virtualizer.scrollToIndex(index, { align: "start" });
+          return true;
+        };
+        if (!alignToRow()) return;
+        let rafId: number | null = null;
+        const stopSettle = () => {
+          if (rafId !== null) {
+            cancelAnimationFrame(rafId);
+            rafId = null;
+          }
+          scrollViewport?.removeEventListener("wheel", stopSettle);
+          scrollViewport?.removeEventListener("touchstart", stopSettle);
+          scrollViewport?.removeEventListener("keydown", stopSettle);
+          if (cancelJumpSettleRef.current === stopSettle) {
+            cancelJumpSettleRef.current = () => {};
+          }
+        };
+        cancelJumpSettleRef.current = stopSettle;
+        scrollViewport?.addEventListener("wheel", stopSettle, { passive: true });
+        scrollViewport?.addEventListener("touchstart", stopSettle, { passive: true });
+        scrollViewport?.addEventListener("keydown", stopSettle);
+        let remainingFrames = 6;
+        const settle = () => {
+          rafId = null;
+          if (!alignToRow()) {
+            stopSettle();
+            return;
+          }
+          remainingFrames -= 1;
+          if (remainingFrames > 0) {
+            rafId = requestAnimationFrame(settle);
+          } else {
+            stopSettle();
+          }
+        };
+        rafId = requestAnimationFrame(settle);
+      },
+    };
+    navRef.current = handle;
+    return () => {
+      cancelJumpSettleRef.current();
+      if (navRef.current === handle) {
+        navRef.current = null;
+      }
+    };
+  }, [navRef, virtualizer, scrollViewport]);
+
+  // 楼层导航当前楼层：以「视口顶缘（+8px 容差）」所落在的用户消息为准——与
+  // 跳转的 align:"start" 落位一致，跳转后高亮的必然是刚点的楼层；视口贴近
+  // 内容底部时直接取最后一层（否则短对话拼满一屏时底部楼层永远无法成为当前
+  // 层）。贴底判定用 scrollHeight（与 scrollTop/clientHeight 同一坐标系，
+  // 含底部输入框保留区），避免与 getTotalSize 的列表局部坐标错位。
+  const lastAnchorRef = useRef<string | null>(null);
+  const onAnchorUserRowChangeRef = useRef(onAnchorUserRowChange);
+  onAnchorUserRowChangeRef.current = onAnchorUserRowChange;
+  const reportAnchorRef = useRef(() => {});
+  reportAnchorRef.current = () => {
+    const callback = onAnchorUserRowChangeRef.current;
+    if (!callback || !scrollViewport) return;
+    const rowList = rowsRef.current;
+    let anchorKey: string | null = null;
+    if (rowList.length > 0) {
+      const scrollTop = scrollViewport.scrollTop;
+      const viewportHeight = scrollViewport.clientHeight;
+      const nearBottom = scrollTop + viewportHeight >= scrollViewport.scrollHeight - 32;
+      let anchorIndex = -1;
+      if (nearBottom) {
+        anchorIndex = rowList.length - 1;
+      } else {
+        const anchorLine = scrollTop + 8;
+        const items = virtualizer.getVirtualItems();
+        for (const item of items) {
+          if (item.start > anchorLine) break;
+          anchorIndex = item.index;
+        }
+        if (anchorIndex === -1) anchorIndex = items[0]?.index ?? -1;
+      }
+      for (let i = Math.min(anchorIndex, rowList.length - 1); i >= 0; i--) {
+        const row = rowList[i];
+        if (row?.kind === "user") {
+          anchorKey = row.key;
+          break;
+        }
+      }
+    }
+    if (anchorKey !== lastAnchorRef.current) {
+      lastAnchorRef.current = anchorKey;
+      callback(anchorKey);
+    }
+  };
+
+  useEffect(() => {
+    if (!scrollViewport) return;
+    const handler = () => reportAnchorRef.current();
+    handler();
+    scrollViewport.addEventListener("scroll", handler, { passive: true });
+    return () => scrollViewport.removeEventListener("scroll", handler);
+  }, [scrollViewport]);
+
+  // 行集合变化（消息追加、流式落定）后兜底重算一次；依赖 rows 而不是每次
+  // 渲染都跑，避免「上报 → 父级重渲染 → 再上报」的空转循环。
+  useEffect(() => {
+    rowsRef.current = rows;
+    reportAnchorRef.current();
+  }, [rows]);
 
   // First paint of a conversation lands at the bottom before the user sees
   // anything: scrollToEnd re-targets as dynamic measurements land, replacing
@@ -324,7 +471,7 @@ export const TranscriptList = memo(function TranscriptList(props: TranscriptList
     if (!scrollViewport) return;
     transcriptMeasurementsLru.save(
       conversationId,
-      scrollViewport.clientWidth,
+      buildTranscriptLayoutKey(scrollViewport.clientWidth, layoutWidth),
       virtualizer.takeSnapshot(),
     );
   };
@@ -364,6 +511,7 @@ export const TranscriptList = memo(function TranscriptList(props: TranscriptList
                 isAgentMode={isAgentMode}
                 isCompactionRunning={row.live ? isCompactionRunning : false}
                 toolStatus={row.live ? displayedToolStatus : null}
+                retryAttempts={row.live ? liveState.retryAttempts : undefined}
                 onResendFromEdit={onResendFromEdit}
                 onBranchConversation={onBranchConversation}
               />

@@ -70,6 +70,7 @@ test("conversation title job disables thinking, caching, and native web search",
     conversationId: "conversation-1",
     titleSourceText: "Please build a fast settings drawer.",
     content: "Please build a fast settings drawer.",
+    locale: "en-US",
     sidebarStore,
     titleJobRef,
     gatewayBridgeEvents: {
@@ -88,4 +89,32 @@ test("conversation title job disables thinking, caching, and native web search",
   assert.equal(capturedParams.cacheRetention, "none");
   assert.equal(historyItemsById.get("conversation-1").title, "Fast title");
   assert.equal(forwardedTitles[0], "Fast title");
+  // The requested locale must reach the model, not just the prompt builders.
+  assert.match(capturedParams.context.systemPrompt, /concise conversation titles/i);
+  assert.match(capturedParams.context.messages[0].content, /within 10 words/i);
+
+  historyItemsById.set("conversation-1", {
+    id: "conversation-1",
+    title: "新会话",
+    updatedAt: 1,
+    isPending: true,
+  });
+  await startConversationTitleJob({
+    providerId: "codex",
+    model: "gpt-5",
+    runtime,
+    signal: new AbortController().signal,
+    conversationId: "conversation-1",
+    titleSourceText: "请帮我做一个很快的设置抽屉。",
+    content: "请帮我做一个很快的设置抽屉。",
+    locale: "zh-CN",
+    sidebarStore,
+    titleJobRef,
+    gatewayBridgeEvents: {
+      queueTitle: (nextTitle) => forwardedTitles.push(nextTitle),
+    },
+  });
+
+  assert.match(capturedParams.context.systemPrompt, /简体中文/);
+  assert.match(capturedParams.context.messages[0].content, /简体中文标题/);
 });

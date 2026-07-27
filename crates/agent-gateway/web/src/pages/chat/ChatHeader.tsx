@@ -1,31 +1,37 @@
-import { memo, type ReactNode, useEffect, useMemo, useState } from "react";
+import { Popover } from "@base-ui/react";
+import { memo, type ReactNode, useEffect, useId, useMemo, useRef, useState } from "react";
 import {
+  ArrowDownAZ,
   Check,
   ChevronDown,
   ClaudeIcon,
   GeminiIcon,
+  GrokIcon,
+  Layers,
   MonitorSmartphone,
   Moon,
   OpenaiChatgptIcon,
   PanelLeft,
+  Search,
   Settings,
   Sun,
 } from "../../components/icons";
 
 import { Button } from "../../components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "../../components/ui/dropdown-menu";
 import { useLocale } from "../../i18n";
-import { groupModelOptionsByProvider } from "../../lib/chat/chatPageHelpers";
+import {
+  groupModelOptionsByProvider,
+  type ProviderSortMode,
+  persistProviderSortMode,
+  readStoredProviderSortMode,
+  sortModelOptionGroups,
+} from "../../lib/chat/chatPageHelpers";
 import { type ModelOption, parseModelValue } from "../../lib/providers/llm";
 import {
   type AppSettings,
   getNextTheme,
+  isAgentDevMode,
+  isAgentExecutionMode,
   type ProviderId,
   type SelectedModel,
   type Theme,
@@ -37,6 +43,7 @@ function ProviderBrandIcon({ type, className }: { type: ProviderId; className?: 
   const cls = cn("h-4 w-4 shrink-0", className);
   if (type === "claude_code") return <ClaudeIcon className={cls} />;
   if (type === "gemini") return <GeminiIcon className={cls} />;
+  if (type === "xai") return <GrokIcon className={cls} />;
   return <OpenaiChatgptIcon className={cn(cls, "fill-current dark:text-white")} />;
 }
 
@@ -54,6 +61,9 @@ export const ChatHeader = memo(function ChatHeader(props: {
   selectedValue?: string;
   sidebarOpen: boolean;
   onSelectModel: (selection: SelectedModel) => void;
+  // 模型下拉内嵌的执行模式分段器：请求切到 Chat("text") 或 Agent("tools")。
+  // agent-dev 视为 Agent 的一种，由调用方决定是否保持不降级。
+  onSelectExecutionMode: (mode: "text" | "tools") => void;
   onOpenSettings: (section?: SectionId) => void;
   onToggleTheme: () => void;
   onOpenSidebar: () => void;
@@ -68,6 +78,7 @@ export const ChatHeader = memo(function ChatHeader(props: {
     selectedValue,
     sidebarOpen,
     onSelectModel,
+    onSelectExecutionMode,
     onOpenSettings,
     onToggleTheme,
     onOpenSidebar,
@@ -82,20 +93,44 @@ export const ChatHeader = memo(function ChatHeader(props: {
       : nextTheme === "dark"
         ? t("tooltip.switchToDark")
         : t("tooltip.switchToAuto");
-  const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
+  const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
+  const [modelSearch, setModelSearch] = useState("");
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
+  const [providerSortMode, setProviderSortMode] = useState<ProviderSortMode>(() =>
+    readStoredProviderSortMode(),
+  );
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const executionModeRadioName = useId();
 
   useEffect(() => {
-    if (isModelMenuOpen) {
+    if (isModelPickerOpen) {
+      setModelSearch("");
       setExpandedGroups({});
     }
-  }, [isModelMenuOpen]);
+  }, [isModelPickerOpen]);
 
-  const groups = useMemo(() => groupModelOptionsByProvider(modelOptions), [modelOptions]);
+  const normalizedSearch = modelSearch.trim().toLowerCase();
+  const groups = useMemo(
+    () => sortModelOptionGroups(groupModelOptionsByProvider(modelOptions), providerSortMode),
+    [modelOptions, providerSortMode],
+  );
+
+  // 副作用放在 updater 外：StrictMode 会双调用传给 setState 的函数
+  const nextProviderSortMode: ProviderSortMode = providerSortMode === "type" ? "alpha" : "type";
+  const toggleProviderSortMode = () => {
+    persistProviderSortMode(nextProviderSortMode);
+    setProviderSortMode(nextProviderSortMode);
+  };
+  const sortToggleTitle =
+    nextProviderSortMode === "alpha"
+      ? t("chat.sortProvidersByName")
+      : t("chat.sortProvidersByType");
+
   const selectedOption = modelOptions.find((option) => option.value === selectedValue);
   const selectedGroupId = selectedOption?.providerId;
-  // 默认全部折叠，仅当前选中模型所在分组展开
-  const isGroupExpanded = (id: string) => expandedGroups[id] ?? id === selectedGroupId;
+  // 默认全部折叠，仅当前选中模型所在分组展开；搜索时强制展开所有匹配分组
+  const isGroupExpanded = (id: string) =>
+    normalizedSearch.length > 0 || (expandedGroups[id] ?? id === selectedGroupId);
   const toggleGroup = (id: string) =>
     setExpandedGroups((prev) => ({
       ...prev,
@@ -117,110 +152,225 @@ export const ChatHeader = memo(function ChatHeader(props: {
           </Button>
         ) : null}
 
-        <DropdownMenu open={isModelMenuOpen} onOpenChange={setIsModelMenuOpen}>
-          <DropdownMenuTrigger asChild>
-            <Button
-              variant="ghost"
-              disabled={!hasModels}
-              className={cn(
-                "model-selector-trigger h-8 max-w-[min(20rem,calc(100vw-8.5rem))] justify-between gap-1.5 overflow-hidden rounded-lg px-2.5 py-1 text-base font-semibold text-foreground transition-all duration-200 ease-out hover:bg-muted/60 dark:text-white",
-                isModelMenuOpen && "bg-muted/60",
-              )}
-            >
-              <span className="model-selector-current-label flex min-w-0 items-center gap-1.5 text-left">
-                {selectedOption ? (
-                  <ProviderBrandIcon type={selectedOption.providerType} className="opacity-80" />
-                ) : null}
-                <span className="min-w-0 truncate">{currentModelLabel}</span>
-              </span>
-              <ChevronDown
+        <Popover.Root open={isModelPickerOpen} onOpenChange={setIsModelPickerOpen}>
+          <Popover.Trigger
+            render={
+              <Button
+                variant="ghost"
+                disabled={!hasModels}
                 className={cn(
-                  "h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200 ease-out dark:text-white",
-                  isModelMenuOpen && "rotate-180",
+                  "model-selector-trigger h-8 max-w-[min(20rem,calc(100vw-8.5rem))] justify-between gap-1.5 overflow-hidden rounded-lg px-2.5 py-1 text-base font-semibold text-foreground transition-all duration-200 ease-out hover:bg-muted/60 dark:text-white",
+                  isModelPickerOpen && "bg-muted/60",
                 )}
               />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent
-            align="start"
-            sideOffset={4}
-            collisionPadding={8}
-            className="model-selector-dropdown w-[min(18rem,calc(100vw-1rem))] overflow-hidden rounded-xl p-0 text-xs"
+            }
           >
-            <div className="max-h-[min(24rem,var(--radix-dropdown-menu-content-available-height))] overflow-y-auto overscroll-contain px-1 pb-1 [scrollbar-gutter:stable]">
-              {(() => {
-                let animationIndex = 0;
-                return groups.map((group, groupIndex) => {
-                  const expanded = isGroupExpanded(group.id);
+            <span className="model-selector-current-label flex min-w-0 items-center gap-1.5 text-left">
+              {selectedOption ? (
+                <ProviderBrandIcon type={selectedOption.providerType} className="opacity-80" />
+              ) : null}
+              <span className="min-w-0 truncate">{currentModelLabel}</span>
+            </span>
+            <ChevronDown
+              className={cn(
+                "h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200 ease-out dark:text-white",
+                isModelPickerOpen && "rotate-180",
+              )}
+            />
+          </Popover.Trigger>
+          <Popover.Portal>
+            <Popover.Positioner
+              side="bottom"
+              align="start"
+              sideOffset={4}
+              collisionPadding={8}
+              className="z-50"
+            >
+              <Popover.Popup
+                initialFocus={searchInputRef}
+                aria-label={t("chat.selectModel")}
+                className="model-selector-dropdown w-[min(18rem,calc(100vw-1rem))] overflow-hidden rounded-xl border bg-popover p-0 text-xs text-popover-foreground shadow-md outline-none"
+              >
+                {(() => {
+                  const isAgent = isAgentExecutionMode(settings.system.executionMode);
+                  const isDev = isAgentDevMode(settings.system.executionMode);
                   return (
-                    <div key={group.id} className="flex flex-col gap-0.5">
-                      {groupIndex > 0 ? <DropdownMenuSeparator /> : null}
-                      <DropdownMenuItem
-                        onSelect={(event) => {
-                          // 阻止 Radix 默认的选中即关闭：分组头只负责展开/收起
-                          event.preventDefault();
-                          toggleGroup(group.id);
-                        }}
-                        aria-expanded={expanded}
-                        title={expanded ? t("chat.collapseProvider") : t("chat.expandProvider")}
-                        className="model-selector-group-label sticky top-0 z-10 flex h-[30px] shrink-0 cursor-pointer items-center gap-1.5 bg-popover/95 px-2 py-0 text-xs font-medium text-muted-foreground backdrop-blur transition-colors supports-[backdrop-filter]:bg-popover/80 dark:text-white/80"
-                      >
-                        <ProviderBrandIcon
-                          type={group.providerType}
-                          className="h-3.5 w-3.5 opacity-90"
-                        />
-                        <span className="min-w-0 flex-1 truncate">{group.name}</span>
-                        <span className="inline-flex h-4 min-w-[1.1rem] shrink-0 items-center justify-center rounded-full bg-muted/70 px-1 text-[10px] tabular-nums">
-                          {group.opts.length}
+                    <div className="px-2 pb-1 pt-2">
+                      <div className="flex items-center justify-between gap-2 rounded-lg bg-muted/40 px-2 py-1.5">
+                        <span className="text-[11px] font-medium text-muted-foreground">
+                          {t("settings.executionMode")}
                         </span>
-                        <ChevronDown
-                          className={cn(
-                            "h-3.5 w-3.5 shrink-0 transition-transform duration-200",
-                            expanded && "rotate-180",
-                          )}
-                        />
-                      </DropdownMenuItem>
-                      {expanded
-                        ? group.opts.map((option) => {
-                            const isSelected = option.value === selectedValue;
-                            const itemAnimationDelay = `${Math.min(animationIndex, 5) * 0.025}s`;
-                            animationIndex += 1;
-                            return (
-                              <DropdownMenuItem
-                                key={option.value}
-                                onSelect={() => {
-                                  const parsed = parseModelValue(option.value);
-                                  if (!parsed) return;
-                                  onSelectModel(parsed);
-                                }}
-                                className={cn(
-                                  "model-selector-item h-[30px] max-w-full shrink-0 justify-between gap-3 overflow-hidden py-0 text-xs font-normal leading-5 text-foreground transition-none focus:bg-foreground/[0.05] dark:text-white",
-                                  isSelected &&
-                                    "bg-foreground/[0.07] font-medium text-foreground focus:bg-foreground/[0.09]",
-                                )}
-                                style={{ animationDelay: itemAnimationDelay }}
-                              >
-                                <span className="flex min-w-0 items-center gap-2">
-                                  <ProviderBrandIcon
-                                    type={option.providerType}
-                                    className={cn("opacity-70", isSelected && "opacity-100")}
-                                  />
-                                  <span className="min-w-0 truncate">{option.model}</span>
-                                </span>
-                                {isSelected ? (
-                                  <Check className="h-4 w-4 shrink-0 text-primary" />
-                                ) : null}
-                              </DropdownMenuItem>
-                            );
-                          })
-                        : null}
+                        <div
+                          role="radiogroup"
+                          aria-label={t("settings.executionMode")}
+                          className="flex rounded-md bg-background/80 p-0.5 shadow-sm ring-1 ring-border/40"
+                        >
+                          <label
+                            className={cn(
+                              "relative cursor-pointer rounded-[5px] px-2.5 py-1 text-[11px] font-medium transition-colors has-[:focus-visible]:outline-none has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-primary/40",
+                              isAgent
+                                ? "text-muted-foreground hover:text-foreground"
+                                : "bg-foreground/[0.07] text-foreground",
+                            )}
+                          >
+                            <input
+                              type="radio"
+                              name={executionModeRadioName}
+                              value="text"
+                              checked={!isAgent}
+                              onChange={() => onSelectExecutionMode("text")}
+                              className="sr-only"
+                            />
+                            Chat
+                          </label>
+                          <label
+                            className={cn(
+                              "relative cursor-pointer rounded-[5px] px-2.5 py-1 text-[11px] font-medium transition-colors has-[:focus-visible]:outline-none has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-primary/40",
+                              isAgent
+                                ? "bg-foreground/[0.07] text-foreground"
+                                : "text-muted-foreground hover:text-foreground",
+                            )}
+                          >
+                            <input
+                              type="radio"
+                              name={executionModeRadioName}
+                              value="tools"
+                              checked={isAgent}
+                              onChange={() => onSelectExecutionMode("tools")}
+                              className="sr-only"
+                            />
+                            {isDev ? "Agent·dev" : "Agent"}
+                          </label>
+                        </div>
+                      </div>
                     </div>
                   );
-                });
-              })()}
-            </div>
-          </DropdownMenuContent>
-        </DropdownMenu>
+                })()}
+                <div className="px-2 py-1.5">
+                  <div className="flex items-center gap-1.5">
+                    <div className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md border border-border/50 bg-muted/40 px-2 py-1">
+                      <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground/70" />
+                      <input
+                        ref={searchInputRef}
+                        value={modelSearch}
+                        onChange={(event) => setModelSearch(event.target.value)}
+                        placeholder={t("chat.searchModel")}
+                        className="min-w-0 flex-1 bg-transparent text-xs text-foreground outline-none placeholder:text-muted-foreground/60"
+                        onKeyDown={(event) => event.stopPropagation()}
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      onClick={toggleProviderSortMode}
+                      title={sortToggleTitle}
+                      aria-label={sortToggleTitle}
+                      className="flex w-7 shrink-0 cursor-pointer items-center justify-center self-stretch rounded-md border border-border/50 bg-muted/40 text-muted-foreground/70 transition-colors hover:bg-muted/70 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+                    >
+                      {nextProviderSortMode === "alpha" ? (
+                        <ArrowDownAZ className="h-3.5 w-3.5" />
+                      ) : (
+                        <Layers className="h-3.5 w-3.5" />
+                      )}
+                    </button>
+                  </div>
+                </div>
+                <div className="max-h-[min(20rem,var(--available-height,20rem))] overflow-y-auto overscroll-contain px-1 pb-1 [scrollbar-gutter:stable]">
+                  {(() => {
+                    let animationIndex = 0;
+                    const filteredGroups = normalizedSearch
+                      ? groups
+                          .map((group) => ({
+                            ...group,
+                            opts: group.opts.filter(
+                              (option) =>
+                                option.model.toLowerCase().includes(normalizedSearch) ||
+                                option.providerName.toLowerCase().includes(normalizedSearch),
+                            ),
+                          }))
+                          .filter((group) => group.opts.length > 0)
+                      : groups;
+
+                    if (filteredGroups.length === 0) {
+                      return (
+                        <div className="px-2 py-6 text-center text-xs text-muted-foreground">
+                          {t("chat.noModelFound")}
+                        </div>
+                      );
+                    }
+
+                    return filteredGroups.map((group, groupIndex) => {
+                      const expanded = isGroupExpanded(group.id);
+                      return (
+                        <div key={group.id} className="flex flex-col gap-0.5">
+                          {groupIndex > 0 ? <hr className="my-1 h-px border-0 bg-muted" /> : null}
+                          <button
+                            type="button"
+                            onClick={() => toggleGroup(group.id)}
+                            aria-expanded={expanded}
+                            title={expanded ? t("chat.collapseProvider") : t("chat.expandProvider")}
+                            className="model-selector-group-label sticky top-0 z-10 flex h-[30px] w-full shrink-0 cursor-pointer items-center gap-1.5 bg-popover/95 px-2 py-0 text-left text-xs font-medium text-muted-foreground backdrop-blur transition-colors hover:bg-muted/40 focus-visible:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 supports-[backdrop-filter]:bg-popover/80 dark:text-white/80"
+                          >
+                            <ProviderBrandIcon
+                              type={group.providerType}
+                              className="h-3.5 w-3.5 opacity-90"
+                            />
+                            <span className="min-w-0 flex-1 truncate">{group.name}</span>
+                            <span className="inline-flex h-4 min-w-[1.1rem] shrink-0 items-center justify-center rounded-full bg-muted/70 px-1 text-[10px] tabular-nums">
+                              {group.opts.length}
+                            </span>
+                            <ChevronDown
+                              className={cn(
+                                "h-3.5 w-3.5 shrink-0 transition-transform duration-200",
+                                expanded && "rotate-180",
+                              )}
+                            />
+                          </button>
+                          {expanded
+                            ? group.opts.map((option) => {
+                                const isSelected = option.value === selectedValue;
+                                const itemAnimationDelay = `${Math.min(animationIndex, 5) * 0.025}s`;
+                                animationIndex += 1;
+                                return (
+                                  <button
+                                    type="button"
+                                    key={option.value}
+                                    aria-pressed={isSelected}
+                                    onClick={() => {
+                                      const parsed = parseModelValue(option.value);
+                                      if (!parsed) return;
+                                      onSelectModel(parsed);
+                                      setIsModelPickerOpen(false);
+                                    }}
+                                    className={cn(
+                                      "model-selector-item flex h-[30px] w-full max-w-full shrink-0 cursor-pointer items-center justify-between gap-3 overflow-hidden px-2 py-0 text-left text-xs font-normal leading-5 text-foreground transition-none hover:bg-foreground/[0.05] focus-visible:bg-foreground/[0.05] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 dark:text-white",
+                                      isSelected &&
+                                        "bg-foreground/[0.07] font-medium text-foreground hover:bg-foreground/[0.09] focus-visible:bg-foreground/[0.09]",
+                                    )}
+                                    style={{ animationDelay: itemAnimationDelay }}
+                                  >
+                                    <span className="flex min-w-0 items-center gap-2">
+                                      <ProviderBrandIcon
+                                        type={option.providerType}
+                                        className={cn("opacity-70", isSelected && "opacity-100")}
+                                      />
+                                      <span className="min-w-0 truncate">{option.model}</span>
+                                    </span>
+                                    {isSelected ? (
+                                      <Check className="h-4 w-4 shrink-0 text-primary" />
+                                    ) : null}
+                                  </button>
+                                );
+                              })
+                            : null}
+                        </div>
+                      );
+                    });
+                  })()}
+                </div>
+              </Popover.Popup>
+            </Popover.Positioner>
+          </Popover.Portal>
+        </Popover.Root>
       </div>
 
       <div className="flex shrink-0 items-center gap-1">

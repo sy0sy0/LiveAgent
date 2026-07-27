@@ -62,6 +62,7 @@ pub struct SystemSkillSummary {
     pub skill_file: String,
     pub base_dir: String,
     pub built_in: bool,
+    pub installed_at: Option<u64>,
     pub source: Option<SystemSkillSourceMetadata>,
 }
 

@@ -5,6 +5,7 @@ pub mod gateway_bridge;
 pub mod memory;
 pub mod power_activity;
 pub mod provider_models;
+pub mod provider_usage;
 pub mod proxy;
 pub mod skills;
 pub mod system_proxy;

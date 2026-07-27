@@ -33,7 +33,9 @@ pub(crate) enum TerminalSessionBackend {
 }
 
 pub(crate) struct SshSessionRuntime {
-    pub(crate) handle: tokio::sync::Mutex<Option<client::Handle<LiveAgentSshClient>>>,
+    // Arc so short-lived channel opens can clone the handle and release the
+    // mutex before awaiting dials (forwards/exec/SFTP).
+    pub(crate) handle: tokio::sync::Mutex<Option<Arc<client::Handle<LiveAgentSshClient>>>>,
     pub(crate) input_tx: Mutex<Option<tokio::sync::mpsc::Sender<SshSessionInput>>>,
     pub(crate) shutdown_tx: Mutex<Option<tokio::sync::mpsc::Sender<()>>>,
     pub(crate) connection_id: AtomicUsize,
@@ -60,7 +62,7 @@ impl SshSessionRuntime {
         shutdown_tx: tokio::sync::mpsc::Sender<()>,
     ) -> usize {
         let connection_id = self.connection_id.fetch_add(1, Ordering::SeqCst) + 1;
-        *self.handle.lock().await = Some(handle);
+        *self.handle.lock().await = Some(Arc::new(handle));
         if let Ok(mut slot) = self.input_tx.lock() {
             *slot = Some(input_tx);
         }
@@ -81,6 +83,10 @@ impl SshSessionRuntime {
         if let Ok(mut slot) = self.shutdown_tx.lock() {
             *slot = None;
         }
+    }
+
+    pub(crate) async fn current_handle(&self) -> Option<Arc<client::Handle<LiveAgentSshClient>>> {
+        self.handle.lock().await.as_ref().map(Arc::clone)
     }
 
     pub(crate) fn input_sender(&self) -> Option<tokio::sync::mpsc::Sender<SshSessionInput>> {

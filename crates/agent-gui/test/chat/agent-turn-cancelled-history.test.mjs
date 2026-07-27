@@ -212,7 +212,7 @@ test("agent turn preserves suppressed parent Agent trace for cancellation persis
       beginRequest: noOp,
       shouldProtectMidStream: () => false,
       async compactDuringRun() {
-        return null;
+        return { context: null, shouldDisableProtection: false };
       },
     },
     cancellation: {

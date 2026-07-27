@@ -1,9 +1,11 @@
-//! 扫描本机其他 AI 工具（Claude Code / Codex / Claude Desktop）已配置的 MCP
-//! Server，供 MCP Hub「本地导入」页展示后由用户勾选导入。导入本身是纯前端
-//! 设置写入（追加进 `AppSettings.mcp.servers`），这里只负责读取与解析配置。
+//! 扫描本机其他 AI 工具（Claude Code / Codex / Claude Desktop / CodeBuddy）已配置的 MCP
+//! Server，并支持解析用户手选的本地配置文件（[`scan_mcp_config_file`]），供
+//! MCP Hub「本地导入」页展示后由用户勾选导入。导入本身是纯前端设置写入
+//! （追加进 `AppSettings.mcp.servers`），这里只负责读取与解析配置。
 //!
-//! 解析全部容错：单个文件 / 单个条目解析失败只记入 `errors`，绝不让整个
-//! 扫描失败。凡是值里带 `${VAR}` 展开语法的按原样保留，由用户导入后自行调整。
+//! 固定路径扫描全容错：单个文件 / 单个条目解析失败只记入 `errors`，绝不让整个
+//! 扫描失败；手选文件（[`scan_mcp_config_file`]）则在整个文件不可用时直接报错。
+//! 凡是值里带 `${VAR}` 展开语法的按原样保留，由用户导入后自行调整。
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -11,14 +13,143 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use super::types::{SystemExternalMcpServerEntry, SystemExternalMcpToolScan};
+use super::util::strip_utf8_bom;
 use crate::runtime::platform::expand_tilde_path;
 
 const TRANSPORT_STDIO: &str = "stdio";
 const TRANSPORT_HTTP: &str = "http";
 const TRANSPORT_SSE: &str = "sse";
 
+/// 「从文件导入」的来源标识，前端据此与固定工具扫描区分展示。
+pub(crate) const LOCAL_FILE_MCP_TOOL: &str = "local-file";
+
+/// 手选配置文件的体积上限，防止误选大文件把整份内容读进内存。
+const MAX_MCP_CONFIG_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
 pub(crate) fn scan_external_mcp_servers() -> Vec<SystemExternalMcpToolScan> {
-    vec![scan_claude_code(), scan_codex(), scan_claude_desktop()]
+    vec![
+        scan_claude_code(),
+        scan_codex(),
+        scan_claude_desktop(),
+        scan_codebuddy(),
+    ]
+}
+
+/// 解析用户手选的本地 MCP 配置文件，供 MCP Hub「本地导入」的「从文件导入」使用。
+///
+/// 按扩展名区分两类格式：
+/// - `.toml`：Codex 风格 `[mcp_servers.*]` 段
+/// - 其余按 JSON：顶层 `mcpServers` 对象（含 `projects.<路径>.mcpServers`），或整个
+///   根对象就是 server map 的裸格式 `{ "<id>": { ... } }`
+///
+/// 与固定路径扫描的容错策略不同：文件不可读、语法错误或找不到任何 server 定义时
+/// 直接返回 `Err` 让前端明确报错；单条目解析失败仍记入 `errors` 跳过。
+pub(crate) fn scan_mcp_config_file(path: &str) -> Result<SystemExternalMcpToolScan, String> {
+    let file = expand_tilde_path(path.trim());
+    let metadata = std::fs::metadata(&file)
+        .map_err(|err| format!("Cannot access config file {}: {err}", file.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("Not a file: {}", file.display()));
+    }
+    if metadata.len() > MAX_MCP_CONFIG_FILE_BYTES {
+        return Err(format!(
+            "Config file too large: {} ({} bytes, max {MAX_MCP_CONFIG_FILE_BYTES} bytes)",
+            file.display(),
+            metadata.len(),
+        ));
+    }
+    let display = file.display().to_string();
+    let text =
+        std::fs::read_to_string(&file).map_err(|err| format!("Failed to read {display}: {err}"))?;
+
+    let is_toml = file
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"));
+
+    let mut servers = Vec::new();
+    let mut errors = Vec::new();
+    if is_toml {
+        parse_mcp_config_toml(&text, &display, &mut servers, &mut errors)?;
+    } else {
+        parse_mcp_config_json(&text, &display, &mut servers, &mut errors)?;
+    }
+    if servers.is_empty() {
+        let mut message = format!("No MCP server definitions found in {display}");
+        // 误选无关 JSON（如大体量 locale 文件）时条目错误可能上千条，只展示前几条。
+        if !errors.is_empty() {
+            const MAX_SHOWN_ERRORS: usize = 3;
+            let shown = errors
+                .iter()
+                .take(MAX_SHOWN_ERRORS)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ");
+            if errors.len() > MAX_SHOWN_ERRORS {
+                message.push_str(&format!(
+                    " ({shown}; … and {} more)",
+                    errors.len() - MAX_SHOWN_ERRORS
+                ));
+            } else {
+                message.push_str(&format!(" ({shown})"));
+            }
+        }
+        return Err(message);
+    }
+    Ok(finish_scan(
+        LOCAL_FILE_MCP_TOOL,
+        vec![display.clone()],
+        &display,
+        servers,
+        errors,
+    ))
+}
+
+fn parse_mcp_config_json(
+    text: &str,
+    display: &str,
+    servers: &mut Vec<SystemExternalMcpServerEntry>,
+    errors: &mut Vec<String>,
+) -> Result<(), String> {
+    let root: Value = serde_json::from_str(strip_utf8_bom(text))
+        .map_err(|err| format!("Failed to parse {display}: {err}"))?;
+    let Some(map) = root.as_object() else {
+        return Err(format!("Config root must be a JSON object: {display}"));
+    };
+    if map.contains_key("mcpServers") || map.contains_key("projects") {
+        collect_json_server_map(map.get("mcpServers"), "user", servers, errors);
+        if let Some(projects) = map.get("projects").and_then(Value::as_object) {
+            for (project_path, project) in projects {
+                collect_json_server_map(project.get("mcpServers"), project_path, servers, errors);
+            }
+        }
+    } else {
+        // 没有 `mcpServers` 包装时按裸 server map 解析。
+        collect_json_server_map(Some(&root), "user", servers, errors);
+    }
+    Ok(())
+}
+
+fn parse_mcp_config_toml(
+    text: &str,
+    display: &str,
+    servers: &mut Vec<SystemExternalMcpServerEntry>,
+    errors: &mut Vec<String>,
+) -> Result<(), String> {
+    // 只取 message() 不用 Display：Display 会把出错的原文行渲染进错误信息，
+    // 误选敏感文件时会把文件内容回显给调用方（含 gateway 远端）。
+    let root: toml::Value = toml::from_str(strip_utf8_bom(text))
+        .map_err(|err| format!("Failed to parse {display}: {}", err.message()))?;
+    let Some(map) = root.get("mcp_servers").and_then(toml::Value::as_table) else {
+        return Err(format!("No [mcp_servers] section found in {display}"));
+    };
+    for (name, entry) in map {
+        match toml_entry_to_server(name, entry) {
+            Ok(server) => servers.push(server),
+            Err(err) => errors.push(err),
+        }
+    }
+    Ok(())
 }
 
 fn scan_claude_code() -> SystemExternalMcpToolScan {
@@ -135,6 +266,32 @@ fn claude_desktop_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|dir| dir.join("Claude").join("claude_desktop_config.json"))
 }
 
+fn scan_codebuddy() -> SystemExternalMcpToolScan {
+    // CodeBuddy Code 的用户级 MCP 配置：~/.codebuddy/mcp.json，标准 `mcpServers` 对象。
+    let mut servers = Vec::new();
+    let mut errors = Vec::new();
+    let mut scanned_paths = Vec::new();
+
+    let mcp_json = expand_tilde_path("~/.codebuddy/mcp.json");
+    if mcp_json.is_file() {
+        scanned_paths.push("~/.codebuddy/mcp.json".to_string());
+        match read_json(&mcp_json) {
+            Ok(root) => {
+                collect_json_server_map(root.get("mcpServers"), "user", &mut servers, &mut errors);
+            }
+            Err(err) => errors.push(err),
+        }
+    }
+
+    finish_scan(
+        "codebuddy",
+        scanned_paths,
+        "~/.codebuddy/mcp.json",
+        servers,
+        errors,
+    )
+}
+
 fn finish_scan(
     tool: &str,
     scanned_paths: Vec<String>,
@@ -189,6 +346,9 @@ fn json_entry_to_server(
     entry: &Value,
     origin: &str,
 ) -> Result<SystemExternalMcpServerEntry, String> {
+    if name.trim().is_empty() {
+        return Err("MCP server has an empty name".to_string());
+    }
     let entry = entry
         .as_object()
         .ok_or_else(|| format!("MCP server \"{name}\" is not an object"))?;
@@ -261,6 +421,9 @@ fn toml_entry_to_server(
     name: &str,
     entry: &toml::Value,
 ) -> Result<SystemExternalMcpServerEntry, String> {
+    if name.trim().is_empty() {
+        return Err("MCP server has an empty name".to_string());
+    }
     let entry = entry
         .as_table()
         .ok_or_else(|| format!("MCP server \"{name}\" is not a table"))?;
@@ -370,6 +533,154 @@ fn toml_string(value: Option<&toml::Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::skills::util::TempDir;
+
+    fn write_config(dir: &TempDir, name: &str, content: &str) -> String {
+        let path = dir.path().join(name);
+        std::fs::write(&path, content).expect("write config file");
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn scan_mcp_config_file_parses_claude_style_json() {
+        let tmp = TempDir::new("liveagent-mcp-file-claude-test").expect("temp dir");
+        let path = write_config(
+            &tmp,
+            "config.json",
+            r#"{
+                "mcpServers": { "files": { "command": "npx", "args": ["-y", "server-files"] } },
+                "projects": {
+                    "/repo": { "mcpServers": { "search": { "type": "http", "url": "https://mcp.example.com" } } }
+                }
+            }"#,
+        );
+        let scan = scan_mcp_config_file(&path).expect("scan file");
+
+        assert_eq!(scan.tool, LOCAL_FILE_MCP_TOOL);
+        assert!(scan.exists);
+        assert!(
+            scan.errors.is_empty(),
+            "unexpected errors: {:?}",
+            scan.errors
+        );
+        assert_eq!(scan.servers.len(), 2);
+        let files = scan.servers.iter().find(|s| s.id == "files").unwrap();
+        assert_eq!(files.transport, "stdio");
+        assert_eq!(files.origin, "user");
+        let search = scan.servers.iter().find(|s| s.id == "search").unwrap();
+        assert_eq!(search.transport, "http");
+        assert_eq!(search.origin, "/repo");
+    }
+
+    #[test]
+    fn scan_mcp_config_file_parses_bare_server_map_json() {
+        let tmp = TempDir::new("liveagent-mcp-file-bare-test").expect("temp dir");
+        let path = write_config(
+            &tmp,
+            "servers.json",
+            r#"{ "files": { "command": "npx" }, "broken": { "args": [] } }"#,
+        );
+        let scan = scan_mcp_config_file(&path).expect("scan file");
+
+        assert_eq!(scan.servers.len(), 1);
+        assert_eq!(scan.servers[0].id, "files");
+        assert_eq!(scan.errors.len(), 1);
+        assert!(scan.errors[0].contains("broken"));
+    }
+
+    #[test]
+    fn scan_mcp_config_file_parses_codex_toml() {
+        let tmp = TempDir::new("liveagent-mcp-file-toml-test").expect("temp dir");
+        let path = write_config(
+            &tmp,
+            "config.toml",
+            r#"
+[mcp_servers.commander]
+command = "cmd"
+args = ["/c", "npx"]
+
+[mcp_servers.remote]
+url = "https://mcp.example.com"
+"#,
+        );
+        let scan = scan_mcp_config_file(&path).expect("scan file");
+
+        assert!(
+            scan.errors.is_empty(),
+            "unexpected errors: {:?}",
+            scan.errors
+        );
+        assert_eq!(scan.servers.len(), 2);
+        let commander = scan.servers.iter().find(|s| s.id == "commander").unwrap();
+        assert_eq!(commander.transport, "stdio");
+        let remote = scan.servers.iter().find(|s| s.id == "remote").unwrap();
+        assert_eq!(remote.transport, "http");
+    }
+
+    #[test]
+    fn scan_mcp_config_file_rejects_empty_server_names() {
+        let tmp = TempDir::new("liveagent-mcp-file-empty-id-test").expect("temp dir");
+        let path = write_config(
+            &tmp,
+            "servers.json",
+            r#"{ "": { "command": "x" }, "  ": { "command": "y" }, "ok": { "command": "z" } }"#,
+        );
+        let scan = scan_mcp_config_file(&path).expect("scan file");
+
+        assert_eq!(scan.servers.len(), 1);
+        assert_eq!(scan.servers[0].id, "ok");
+        assert_eq!(scan.errors.len(), 2);
+        assert!(scan.errors.iter().all(|err| err.contains("empty name")));
+    }
+
+    #[test]
+    fn scan_mcp_config_file_caps_joined_errors_in_no_server_message() {
+        let tmp = TempDir::new("liveagent-mcp-file-error-cap-test").expect("temp dir");
+        let entries = (0..10)
+            .map(|index| format!("\"key{index}\": \"value\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let path = write_config(&tmp, "flat.json", &format!("{{ {entries} }}"));
+        let err = scan_mcp_config_file(&path).unwrap_err();
+
+        assert!(err.contains("No MCP server definitions found"));
+        assert!(err.contains("… and 7 more"));
+    }
+
+    #[test]
+    fn scan_mcp_config_file_rejects_invalid_and_empty_sources() {
+        let tmp = TempDir::new("liveagent-mcp-file-invalid-test").expect("temp dir");
+
+        let missing = tmp
+            .path()
+            .join("missing.json")
+            .to_string_lossy()
+            .into_owned();
+        assert!(scan_mcp_config_file(&missing)
+            .unwrap_err()
+            .contains("Cannot access config file"));
+
+        let invalid = write_config(&tmp, "invalid.json", "{ not json");
+        assert!(scan_mcp_config_file(&invalid)
+            .unwrap_err()
+            .contains("Failed to parse"));
+
+        let not_object = write_config(&tmp, "array.json", r#"["a", "b"]"#);
+        assert!(scan_mcp_config_file(&not_object)
+            .unwrap_err()
+            .contains("must be a JSON object"));
+
+        // package.json 之类的普通 JSON：条目全部解析失败 → 整体报错并带上原因。
+        let unrelated = write_config(&tmp, "package.json", r#"{ "name": "x", "version": "1" }"#);
+        let err = scan_mcp_config_file(&unrelated).unwrap_err();
+        assert!(err.contains("No MCP server definitions found"));
+        assert!(err.contains("is not an object"));
+
+        let no_section = write_config(&tmp, "plain.toml", "model = \"custom\"\n");
+        assert!(scan_mcp_config_file(&no_section)
+            .unwrap_err()
+            .contains("No [mcp_servers] section"));
+    }
 
     #[test]
     fn parses_claude_json_stdio_and_http_entries() {

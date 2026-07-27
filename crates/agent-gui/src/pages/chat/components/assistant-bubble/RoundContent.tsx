@@ -1,8 +1,9 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 
-import { ChevronRight, Lightbulb } from "../../../../components/icons";
+import { ChevronRight, Lightbulb, RefreshCw } from "../../../../components/icons";
 import { Markdown } from "../../../../components/Markdown";
 import { useLocale } from "../../../../i18n";
+import type { RetryAttemptRecord } from "../../../../lib/chat/conversation/liveTranscriptStore";
 import type { ToolTraceItem, UiRound } from "../../../../lib/chat/messages/uiMessages";
 import { normalizeLiveToolStatus, VIBING_STATUS } from "../../../../lib/chat/page/chatPageHelpers";
 import { groupRoundBlocks } from "./assistantBubbleUtils";
@@ -76,6 +77,56 @@ const ThinkingBlock = memo(function ThinkingBlock({
   );
 });
 
+export const RetryDetailsBlock = memo(function RetryDetailsBlock({
+  attempts,
+}: {
+  attempts: RetryAttemptRecord[];
+}) {
+  const { t } = useLocale();
+  const [isOpen, setIsOpen] = useState(false);
+
+  if (attempts.length === 0) return null;
+
+  return (
+    <div className="group/retry w-full">
+      <button
+        type="button"
+        aria-expanded={isOpen}
+        onClick={() => setIsOpen((prev) => !prev)}
+        className="retry-details-toggle flex w-full cursor-pointer select-none items-center gap-2 py-1.5 text-left text-[calc(13px*var(--zone-font-scale,1))] font-normal text-muted-foreground/80 hover:text-foreground"
+      >
+        <RefreshCw className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
+        <span>{t("chat.retryDetailsToggle").replace("{count}", String(attempts.length))}</span>
+        <ChevronRight
+          className={`ml-auto h-3.5 w-3.5 text-muted-foreground/60 transition-transform duration-200 ease-out ${isOpen ? "rotate-90" : ""}`}
+        />
+      </button>
+      <LazyCollapse open={isOpen}>
+        {() => (
+          <div className="space-y-1 pb-1 pt-1.5">
+            {/* Index-keyed: attempt ordinals can repeat within one list (text
+                mode's tool-recovery loop restarts each wrapper's counter at 1)
+                and the list is append-only, so the index is the stable key. */}
+            {attempts.map((entry, index) => (
+              <div
+                key={`${index}-${entry.attempt}-${entry.maxAttempts}`}
+                className="rounded-md border border-border/60 bg-muted/30 px-2.5 py-1.5 text-[calc(12px*var(--zone-font-scale,1))] text-muted-foreground"
+              >
+                <div className="font-medium text-foreground/80">
+                  {t("chat.retryAttemptLabel")
+                    .replace("{attempt}", String(entry.attempt))
+                    .replace("{maxAttempts}", String(entry.maxAttempts))}
+                </div>
+                <div className="whitespace-pre-wrap break-words">{entry.errorMessage}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </LazyCollapse>
+    </div>
+  );
+});
+
 export const RoundContent = memo(function RoundContent(props: {
   round: UiRound;
   showUsage?: boolean;
@@ -87,9 +138,11 @@ export const RoundContent = memo(function RoundContent(props: {
   renderMode?: "streaming" | "static";
   toolStatus?: string | null;
   toolStatusVariant?: "default" | "compaction";
+  retryAttempts?: RetryAttemptRecord[];
   runningToolCallIds?: string[];
   thinkingOpen?: boolean;
   latestTodoItem?: ToolTraceItem | null;
+  isAborted?: boolean;
 }) {
   const {
     round,
@@ -100,9 +153,11 @@ export const RoundContent = memo(function RoundContent(props: {
     renderMode,
     toolStatus,
     toolStatusVariant,
+    retryAttempts,
     runningToolCallIds,
     thinkingOpen,
     latestTodoItem,
+    isAborted = false,
   } = props;
   const groupedBlocks = useMemo(() => groupRoundBlocks(round.blocks), [round.blocks]);
   const visibleGroupedBlocks = useMemo(
@@ -158,7 +213,20 @@ export const RoundContent = memo(function RoundContent(props: {
   if (!hasContent) return null;
 
   return (
-    <div className="space-y-2">
+    <div
+      className={
+        isLive
+          ? "space-y-2"
+          : // Settled rounds freeze todo-card animations; the strike-through /
+            // dimming of incomplete items is reserved for aborted replies —
+            // a normally completed reply may legitimately leave todos open.
+            `space-y-2 [&_.todo-list-view_.animate-spin]:!animate-none [&_.todo-list-view_.shimmer]:!animate-none${
+              isAborted
+                ? " [&_.todo-list-view_[data-todo-incomplete]>span:last-child]:!text-muted-foreground/40 [&_.todo-list-view_[data-todo-incomplete]>span:last-child]:line-through"
+                : ""
+            }`
+      }
+    >
       {isActive &&
       isLive &&
       normalizedToolStatus &&
@@ -172,6 +240,10 @@ export const RoundContent = memo(function RoundContent(props: {
             <AssistantStatus>{normalizedToolStatus}</AssistantStatus>
           )}
         </div>
+      ) : null}
+
+      {isActive && isLive && retryAttempts && retryAttempts.length > 0 ? (
+        <RetryDetailsBlock attempts={retryAttempts} />
       ) : null}
 
       {visibleGroupedBlocks.map((block) => {
@@ -201,6 +273,7 @@ export const RoundContent = memo(function RoundContent(props: {
             <MemoToolCallItem
               key={block.key}
               item={block.item}
+              isAborted={isAborted}
               isRunning={Boolean(
                 isLive &&
                   block.item.toolCall.id &&
@@ -215,6 +288,7 @@ export const RoundContent = memo(function RoundContent(props: {
             <ToolTraceGroup
               key={block.key}
               items={block.items}
+              isAborted={isAborted}
               runningToolCallIds={isLive ? (runningToolCallIds ?? []) : []}
             />
           );
@@ -235,7 +309,7 @@ export const RoundContent = memo(function RoundContent(props: {
           <Markdown
             key={block.key}
             content={block.text}
-            className="font-openai-chat"
+            className="font-chat"
             renderMode={renderMode ?? (isLive ? "streaming" : "static")}
             showCaret={Boolean(isLive && isActive)}
           />

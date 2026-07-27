@@ -28,6 +28,7 @@ mod ssh_auth;
 mod ssh_channel;
 mod ssh_connect;
 mod ssh_io;
+mod ssh_local_forward;
 mod ssh_session;
 mod state;
 mod tabs;
@@ -43,6 +44,7 @@ pub(crate) use ssh_auth::*;
 pub(crate) use ssh_channel::*;
 pub(crate) use ssh_connect::*;
 pub(crate) use ssh_io::*;
+pub(crate) use ssh_local_forward::*;
 pub(crate) use state::*;
 pub use types::*;
 pub(crate) use util::*;
@@ -66,6 +68,11 @@ pub(crate) const SSH_STATUS_RECONNECTING: &str = "reconnecting";
 pub(crate) const SSH_STATUS_DISCONNECTED: &str = "disconnected";
 pub const TERMINAL_EVENT_NAME: &str = "terminal:event";
 pub const TERMINAL_STREAM_EVENT_NAME: &str = "terminal:stream";
+pub const SSH_LOCAL_FORWARD_EVENT_NAME: &str = "terminal:ssh-local-forward";
+pub(crate) const SSH_LOCAL_FORWARD_CHANNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const SSH_LOCAL_FORWARD_MAX_PER_SESSION: usize = 8;
+pub(crate) const SSH_LOCAL_FORWARD_MAX_CONNECTIONS: usize = 32;
+pub(crate) const SSH_LOCAL_FORWARD_MAX_GLOBAL_CONNECTIONS: usize = 128;
 pub(crate) const SSH_EXEC_DEFAULT_MAX_BYTES: usize = 64 * 1024;
 pub(crate) const SSH_EXEC_MAX_BYTES: usize = 256 * 1024;
 pub(crate) const SSH_EXEC_DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -81,11 +88,13 @@ pub struct TerminalSessionRegistry {
     subscribers: Arc<Mutex<HashMap<usize, mpsc::Sender<TerminalEvent>>>>,
     stream_subscribers: Arc<Mutex<HashMap<usize, mpsc::Sender<TerminalStreamEvent>>>>,
     echo_dispatch: Mutex<HashMap<String, TerminalEchoDispatchState>>,
+    ssh_local_forwards: SshLocalForwardRegistry,
     next_subscriber_id: AtomicUsize,
 }
 
 impl Drop for TerminalSessionRegistry {
     fn drop(&mut self) {
+        self.ssh_local_forwards.cancel_all();
         if let Ok(sessions) = self.sessions.get_mut() {
             for entry in sessions.values() {
                 terminate_terminal_entry(entry);

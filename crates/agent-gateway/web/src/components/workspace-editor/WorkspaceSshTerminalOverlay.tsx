@@ -9,7 +9,7 @@ import type {
   TerminalClient,
   TerminalSession,
 } from "@/lib/terminal/types";
-import { AlertTriangle, FolderTree, Terminal, X } from "../icons";
+import { AlertTriangle, FolderTree, RefreshCw, Terminal, X } from "../icons";
 import { XTermViewport } from "../project-tools/XTermViewport";
 
 const WorkspaceSftpPanel = lazy(async () => {
@@ -78,6 +78,7 @@ export function WorkspaceSshTerminalOverlay(props: WorkspaceSshTerminalOverlayPr
   });
   const [activeTabId, setActiveTabId] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [reconnectingSessionId, setReconnectingSessionId] = useState<string | null>(null);
   const openRequestIdRef = useRef<number | null>(null);
   const optimisticTabIdsRef = useRef<Set<string>>(new Set());
   const locallyClosedTabIdsRef = useRef<Set<string>>(new Set());
@@ -148,6 +149,36 @@ export function WorkspaceSshTerminalOverlay(props: WorkspaceSshTerminalOverlayPr
   const activateTab = useCallback((tabId: string) => {
     setActiveTabId(tabId);
   }, []);
+
+  const reconnectActiveSession = useCallback(async () => {
+    const session = activeSession;
+    if (!session || reconnectingSessionId) return;
+    setReconnectingSessionId(session.id);
+    setError(null);
+    try {
+      await client.sshReconnect(session.id, session.projectPathKey);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes("already in progress")) {
+        // The automatic reconnect loop owns the session and re-reads the
+        // latest settings on every attempt — nothing else to do here.
+      } else if (message.includes("keyboard-interactive")) {
+        // Tabs are keyed by session id, so a close-and-recreate flow would
+        // tear this tab down; point at the tunnel panel instead.
+        setError(t("workspaceSshTerminal.reconnectKbiHint"));
+      } else {
+        setError(message);
+      }
+    } finally {
+      setReconnectingSessionId((current) => (current === session.id ? null : current));
+    }
+  }, [activeSession, client, reconnectingSessionId, t]);
+
+  const activeSessionReconnecting = Boolean(
+    activeSession &&
+      (reconnectingSessionId === activeSession.id ||
+        sshSessionStatus(activeSession) === "reconnecting"),
+  );
 
   useEffect(() => {
     setTabsSnapshot({ projectPathKey, tabs: [], revision: 0 });
@@ -285,6 +316,16 @@ export function WorkspaceSshTerminalOverlay(props: WorkspaceSshTerminalOverlayPr
             {activeSession ? sessionEndpointLabel(activeSession) : t("workspaceSshTerminal.empty")}
           </div>
         </div>
+        <button
+          type="button"
+          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-transparent text-muted-foreground transition-colors hover:border-border hover:bg-background hover:text-amber-600 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 dark:hover:text-amber-400"
+          title={t("workspaceSshTerminal.reconnect")}
+          aria-label={t("workspaceSshTerminal.reconnect")}
+          disabled={!activeSession || activeSessionReconnecting}
+          onClick={() => void reconnectActiveSession()}
+        >
+          <RefreshCw className={cn("h-4 w-4", activeSessionReconnecting && "animate-spin")} />
+        </button>
         <button
           type="button"
           className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-transparent text-muted-foreground transition-colors hover:border-border hover:bg-background hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"

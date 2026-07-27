@@ -5,6 +5,7 @@ import { createTsModuleLoader } from "../helpers/load-ts-module.mjs";
 const loader = createTsModuleLoader();
 const providers = loader.loadModule("src/lib/providers/llm.ts");
 const proxy = loader.loadModule("src/lib/providers/proxy.ts");
+const customHeaderHelpers = loader.loadModule("src/lib/providers/customHeaders.ts");
 const providerUtils = loader.loadModule("src/pages/settings/providerUtils.ts");
 
 function createMockAssistantStream() {
@@ -65,10 +66,14 @@ test("llm facade preserves provider runtime exports", () => {
     "attachCodexResponsesStorage",
     "attachPayloadDebugLogging",
     "attachProviderNativeWebSearch",
-    "buildDualAuthHeaders",
+    "buildAnthropicAuthHeaders",
     "buildGeminiAuthHeaders",
-    "buildProviderAuthHeaders",
+    "buildOpenAIAuthHeaders",
+    "buildProviderRequestHeaders",
     "buildProviderRequestMetadata",
+    "isValidCustomHeaderKey",
+    "prepareProviderRequest",
+    "createProviderRuntimeConfig",
     "completeAssistantMessage",
     "composePayloadMiddlewares",
     "createModelFromConfig",
@@ -128,20 +133,78 @@ test("image proxy URL builder encodes the source URL", () => {
 });
 
 test("provider request helpers normalize auth, metadata, errors, and model values", () => {
-  assert.deepEqual(providers.buildDualAuthHeaders("secret"), {
-    Authorization: "Bearer secret",
+  assert.deepEqual(providers.buildAnthropicAuthHeaders("secret"), {
     "x-api-key": "secret",
+  });
+  assert.deepEqual(providers.buildOpenAIAuthHeaders("secret"), {
+    Authorization: "Bearer secret",
   });
   assert.deepEqual(providers.buildGeminiAuthHeaders("secret"), {
     "x-goog-api-key": "secret",
   });
-  assert.deepEqual(providers.buildProviderAuthHeaders("gemini", "secret"), {
+  assert.deepEqual(
+    providers.buildProviderRequestHeaders("claude_code", "secret", "conversation-1"),
+    {
+      "x-api-key": "secret",
+      "x-app": "cli",
+      "User-Agent": "claude-cli/2.1.71 (external, cli)",
+      "Content-Type": "application/json",
+      "X-Stainless-OS": "MacOS",
+      "X-Stainless-Arch": "arm64",
+      "X-Stainless-Lang": "js",
+      "anthropic-version": "2023-06-01",
+      "X-Stainless-Runtime": "node",
+      "X-Stainless-Timeout": "600",
+      "x-stainless-retry-count": "0",
+      "X-Stainless-Package-Version": "0.74.0",
+      "X-Stainless-Runtime-Version": "v22.19.0",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+  );
+  assert.deepEqual(
+    providers.buildProviderRequestHeaders("claude_code", "sk-ant-oat01-test", "conversation-1"),
+    {},
+  );
+  assert.deepEqual(providers.buildProviderRequestHeaders("codex", "secret", "conversation-1"), {
+    Authorization: "Bearer secret",
+    "User-Agent": "codex_cli_rs/0.72.0 (Ubuntu 24.4.0; x86_64) WindowsTerminal",
+    session_id: "conversation-1",
+    conversation_id: "conversation-1",
+  });
+  // Responses 格式显式指定时保持 Codex CLI 身份头。
+  assert.deepEqual(
+    providers.buildProviderRequestHeaders("codex", "secret", "conversation-1", "openai-responses"),
+    {
+      Authorization: "Bearer secret",
+      "User-Agent": "codex_cli_rs/0.72.0 (Ubuntu 24.4.0; x86_64) WindowsTerminal",
+      session_id: "conversation-1",
+      conversation_id: "conversation-1",
+    },
+  );
+  // 标准 Chat Completions 是无状态协议：只带 Authorization，
+  // 不带 codex_cli_rs UA 与 session_id/conversation_id。
+  assert.deepEqual(
+    providers.buildProviderRequestHeaders(
+      "codex",
+      "secret",
+      "conversation-1",
+      "openai-completions",
+    ),
+    {
+      Authorization: "Bearer secret",
+    },
+  );
+  assert.deepEqual(providers.buildProviderRequestHeaders("gemini", "secret", "conversation-1"), {
     "x-goog-api-key": "secret",
   });
-  assert.deepEqual(providers.buildProviderAuthHeaders("codex", "secret"), {
+  // xai：Bearer + grok CLI 身份 UA，不带 Codex CLI 的 session 头。
+  assert.deepEqual(providers.buildProviderRequestHeaders("xai", "secret", "conversation-1"), {
     Authorization: "Bearer secret",
-    "x-api-key": "secret",
+    "User-Agent": "grok-shell/0.2.110 (linux; x86_64)",
   });
+  const generatedCodexHeaders = providers.buildProviderRequestHeaders("codex", "secret");
+  assert.match(generatedCodexHeaders.session_id, /^[0-9a-f-]{36}$/i);
+  assert.equal(generatedCodexHeaders.conversation_id, generatedCodexHeaders.session_id);
   assert.equal(providers.toSimpleStreamReasoning("off"), undefined);
   assert.equal(providers.toSimpleStreamReasoning("high"), "high");
   assert.equal(providers.toSimpleStreamReasoning("max"), "max");
@@ -195,6 +258,82 @@ test("provider request helpers normalize auth, metadata, errors, and model value
   assert.equal(
     providers.normalizeErrorMessage('prefix {"error":{"message":"nested failure"}}'),
     "nested failure",
+  );
+});
+
+test("provider-specific custom header suggestions include standard model headers", () => {
+  const anthropicPresets = customHeaderHelpers.getCustomHeaderKeyPresets("claude_code");
+  assert.ok(anthropicPresets.includes("User-Agent"));
+  assert.ok(anthropicPresets.includes("Content-Type"));
+  assert.ok(anthropicPresets.includes("anthropic-version"));
+  assert.ok(anthropicPresets.includes("X-Stainless-Runtime-Version"));
+  assert.ok(anthropicPresets.includes("anthropic-dangerous-direct-browser-access"));
+  assert.ok(!anthropicPresets.includes("anthropic-beta"));
+  assert.ok(!anthropicPresets.includes("session_id"));
+
+  const codexPresets = customHeaderHelpers.getCustomHeaderKeyPresets("codex");
+  assert.ok(codexPresets.includes("User-Agent"));
+  assert.ok(codexPresets.includes("session_id"));
+  assert.ok(codexPresets.includes("conversation_id"));
+  assert.ok(!codexPresets.includes("anthropic-version"));
+
+  const xaiPresets = customHeaderHelpers.getCustomHeaderKeyPresets("xai");
+  assert.ok(xaiPresets.includes("User-Agent"));
+  assert.ok(!xaiPresets.includes("session_id"));
+  assert.ok(!xaiPresets.includes("anthropic-version"));
+});
+
+function decodeUpstreamHeaderOverrides(encoded) {
+  return JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
+}
+
+test("upstream override channel carries every non-auth header for the local proxy hop", () => {
+  // 这些头名里 user-agent 会被 WebView 的 fetch 静默丢弃，靠覆盖包才能送达上游。
+  const encoded = proxy.encodeUpstreamHeaderOverrides({
+    "user-agent": "custom-agent/1.0",
+    "CONTENT-TYPE": "application/custom+json",
+    Cookie: "session=abc",
+    "X-Request-ID": "trace-1",
+    Authorization: "Bearer secret",
+    "x-api-key": "secret",
+    "x-goog-api-key": "secret",
+    "x-liveagent-proxy-token": "internal",
+  });
+
+  assert.deepEqual(decodeUpstreamHeaderOverrides(encoded), {
+    "user-agent": "custom-agent/1.0",
+    "CONTENT-TYPE": "application/custom+json",
+    Cookie: "session=abc",
+    "X-Request-ID": "trace-1",
+  });
+});
+
+test("upstream override channel stays empty when there is nothing to override", () => {
+  assert.equal(proxy.encodeUpstreamHeaderOverrides({}), undefined);
+  assert.equal(
+    proxy.encodeUpstreamHeaderOverrides({ Authorization: "Bearer secret" }),
+    undefined,
+  );
+});
+
+test("upstream override channel rejects oversized custom header sets", () => {
+  assert.throws(
+    () => proxy.encodeUpstreamHeaderOverrides({ "X-Big": "v".repeat(9 * 1024) }),
+    /too large/i,
+  );
+});
+
+test("anthropic-beta never enters the upstream override package", () => {
+  // 覆盖包在 prepareProxyRequest 时刻构建，早于长上下文中间件算出 anthropic-beta；
+  // 它是保留头（用户填不进来），因此绝不会回头压掉中间件的 beta 串。
+  const base = providers.buildProviderRequestHeaders("claude_code", "secret");
+  const merged = customHeaderHelpers.mergeCustomHeaders(base, [
+    { key: "anthropic-beta", value: "hijacked" },
+  ]);
+  const overrides = decodeUpstreamHeaderOverrides(proxy.encodeUpstreamHeaderOverrides(merged));
+  assert.ok(
+    !Object.keys(overrides).some((key) => key.toLowerCase() === "anthropic-beta"),
+    "anthropic-beta must stay owned by attachAnthropicLongContextBeta",
   );
 });
 
@@ -411,8 +550,12 @@ test("DeepSeek Codex models force Chat Completions compat", () => {
   assert.equal(model.compat.requiresReasoningContentOnAssistantMessages, true);
   assert.equal(model.compat.supportsStrictMode, false);
   assert.equal(model.compat.maxTokensField, "max_tokens");
-  assert.equal(model.thinkingLevelMap.minimal, "high");
-  assert.equal(model.thinkingLevelMap.xhigh, "max");
+  // 档位来自生成目录：deepseek-v4-pro 只有 high/max（minimal/low/medium=null），
+  // xhigh 目录未声明故不复活；wire 改写只补到已支持档位（high→"high"）。
+  assert.equal(model.thinkingLevelMap.minimal, null);
+  assert.equal(model.thinkingLevelMap.high, "high");
+  assert.equal(model.thinkingLevelMap.xhigh, undefined);
+  assert.equal(model.thinkingLevelMap.max, "max");
 });
 
 test("DeepSeek OpenAI payload adapter injects thinking and reasoning_content", async () => {
@@ -859,6 +1002,27 @@ test("provider payload finalization enables native web search for hosted search 
     { type: "web_search_20250305", name: "web_search" },
   ]);
 
+  // Modern Anthropic models get the paired web_fetch server tool alongside
+  // web_search; legacy/unknown catalog entries (above) keep search-only.
+  const anthropicModernPayload = await anthropicOptions.onPayload(
+    { messages: [{ role: "user", content: "hello" }] },
+    {
+      api: "anthropic-messages",
+      provider: "anthropic",
+      id: "claude-sonnet-5",
+      compat: { forceAdaptiveThinking: true },
+    },
+  );
+  assert.deepEqual(anthropicModernPayload.tools, [
+    { type: "web_search_20260318", name: "web_search" },
+    {
+      type: "web_fetch_20260318",
+      name: "web_fetch",
+      max_uses: 10,
+      max_content_tokens: 50_000,
+    },
+  ]);
+
   const geminiOptions = providers.finalizeProviderStreamOptions({
     providerId: "gemini",
     baseUrl: "https://generativelanguage.googleapis.com/v1beta",
@@ -1158,4 +1322,200 @@ test("streaming text reconciler emits only missing final text suffixes", () => {
   assert.equal(reconciler.reconcileFinalText("round-1", "hello world"), " world");
   assert.equal(reconciler.reconcileFinalText("round-1", "different"), "");
   assert.equal(reconciler.reconcileFinalText("round-2", "new"), "new");
+});
+
+test("custom provider headers merge without mutating the base headers", () => {
+  const base = { Accept: "application/json", "X-Tenant": "old" };
+  assert.deepEqual(
+    customHeaderHelpers.mergeCustomHeaders(base, [
+      { key: "X-Tenant", value: "new" },
+      { key: "X-Request-ID", value: "request-123" },
+    ]),
+    { Accept: "application/json", "X-Tenant": "new", "X-Request-ID": "request-123" },
+  );
+  assert.deepEqual(base, { Accept: "application/json", "X-Tenant": "old" });
+});
+
+test("custom provider headers override model defaults but not credential or protocol headers", () => {
+  const base = {
+    Authorization: "Bearer real",
+    "x-api-key": "real-api-key",
+    "x-goog-api-key": "real-google-key",
+    "anthropic-beta": "context-1m-2025-08-07",
+    "anthropic-version": "2023-06-01",
+    "Content-Type": "application/json",
+    Host: "api.example.com",
+    "Content-Length": "42",
+  };
+  assert.deepEqual(
+    customHeaderHelpers.mergeCustomHeaders(base, [
+      { key: "authorization", value: "Bearer attacker" },
+      { key: "X-API-KEY", value: "attacker" },
+      { key: "X-GOOG-API-KEY", value: "attacker" },
+      { key: "Anthropic-Beta", value: "custom-beta" },
+      { key: "Anthropic-Version", value: "attacker" },
+      { key: "content-type", value: "text/plain" },
+      { key: "host", value: "attacker.example" },
+      { key: "content-length", value: "0" },
+    ]),
+    {
+      Authorization: "Bearer real",
+      "x-api-key": "real-api-key",
+      "x-goog-api-key": "real-google-key",
+      "anthropic-beta": "context-1m-2025-08-07",
+      "Anthropic-Version": "attacker",
+      "content-type": "text/plain",
+      Host: "api.example.com",
+      "Content-Length": "42",
+    },
+  );
+});
+
+test("custom provider headers filter invalid HTTP token keys", () => {
+  assert.deepEqual(
+    customHeaderHelpers.mergeCustomHeaders({}, [
+      { key: "", value: "empty" },
+      { key: "Bad Header", value: "space" },
+      { key: "Bad:Header", value: "colon" },
+      { key: "Bad\nHeader", value: "newline" },
+      { key: "X.Valid-Header_1", value: "kept" },
+    ]),
+    { "X.Valid-Header_1": "kept" },
+  );
+  assert.equal(providers.isValidCustomHeaderKey("anthropic-beta"), true);
+  assert.equal(customHeaderHelpers.isReservedCustomHeaderKey("Anthropic-Beta"), true);
+  assert.equal(providers.isValidCustomHeaderKey("X-Request-ID"), true);
+  assert.equal(providers.isValidCustomHeaderKey("Bad Header"), false);
+  // 本地反代的内部命名空间不可被自定义头注入。
+  assert.equal(customHeaderHelpers.isReservedCustomHeaderKey("X-LiveAgent-Proxy-Token"), true);
+  assert.equal(customHeaderHelpers.isReservedCustomHeaderKey("x-liveagent-anything"), true);
+});
+
+test("custom provider headers reject values fetch() cannot transmit", () => {
+  assert.equal(customHeaderHelpers.isValidCustomHeaderValue("plain-ascii/1.0"), true);
+  assert.equal(customHeaderHelpers.isValidCustomHeaderValue(""), true);
+  assert.equal(customHeaderHelpers.isValidCustomHeaderValue("中文"), false);
+  assert.equal(customHeaderHelpers.isValidCustomHeaderValue("a\r\nb"), false);
+  assert.deepEqual(
+    customHeaderHelpers.mergeCustomHeaders({}, [
+      { key: "X-Bad", value: "中文" },
+      { key: "X-Injected", value: "a\r\nHost: evil" },
+      { key: "X-Good", value: "kept" },
+    ]),
+    { "X-Good": "kept" },
+  );
+});
+
+test("custom provider headers accept undefined and empty arrays", () => {
+  const base = { Accept: "application/json" };
+  assert.deepEqual(customHeaderHelpers.mergeCustomHeaders(base, undefined), base);
+  assert.deepEqual(customHeaderHelpers.mergeCustomHeaders(base, []), base);
+});
+
+test("resolveProviderCacheRetention maps provider settings and per-request overrides", () => {
+  const resolve = providers.resolveProviderCacheRetention;
+  assert.equal(resolve("claude_code", true), "short");
+  assert.equal(resolve("claude_code", undefined), "short");
+  assert.equal(resolve("claude_code", true, undefined, "long"), "long");
+  assert.equal(resolve("claude_code", false, undefined, "long"), "none");
+  // 请求级 override（压缩/标题等辅助请求）永远优先于供应商偏好。
+  assert.equal(resolve("claude_code", true, "none", "long"), "none");
+  assert.equal(resolve("codex", undefined), "short");
+  assert.equal(resolve("codex", false), "none");
+  assert.equal(resolve("codex", true, "none"), "none");
+  // long 档位仅对 Anthropic 生效。
+  assert.equal(resolve("codex", true, undefined, "long"), "short");
+  assert.equal(resolve("gemini", true), undefined);
+});
+
+test("codex payloads get a stable prompt_cache_key on relay hosts", async () => {
+  const options = providers.finalizeProviderStreamOptions({
+    providerId: "codex",
+    baseUrl: "https://relay.example/v1",
+    options: { sessionId: "conv-1234", cacheRetention: "short" },
+  });
+
+  const completionsPayload = await options.onPayload(
+    { messages: [] },
+    { api: "openai-completions", provider: "openai", id: "relay-model" },
+  );
+  assert.equal(completionsPayload.prompt_cache_key, "conv-1234");
+
+  const responsesPayload = await options.onPayload(
+    { input: "hello" },
+    { api: "openai-responses", provider: "openai", id: "relay-model" },
+  );
+  assert.equal(responsesPayload.prompt_cache_key, "conv-1234");
+});
+
+test("codex prompt_cache_key injection respects retention, existing keys, and length", async () => {
+  const disabled = providers.finalizeProviderStreamOptions({
+    providerId: "codex",
+    baseUrl: "https://relay.example/v1",
+    options: { sessionId: "conv-1234", cacheRetention: "none" },
+  });
+  const disabledPayload = await disabled.onPayload(
+    { messages: [] },
+    { api: "openai-completions", provider: "openai", id: "relay-model" },
+  );
+  assert.equal(disabledPayload.prompt_cache_key, undefined);
+
+  const preset = providers.finalizeProviderStreamOptions({
+    providerId: "codex",
+    baseUrl: "https://relay.example/v1",
+    options: {
+      sessionId: "conv-1234",
+      cacheRetention: "short",
+      onPayload: async (payload) => ({ ...payload, prompt_cache_key: "explicit-key" }),
+    },
+  });
+  const presetPayload = await preset.onPayload(
+    { messages: [] },
+    { api: "openai-completions", provider: "openai", id: "relay-model" },
+  );
+  assert.equal(presetPayload.prompt_cache_key, "explicit-key");
+
+  const clamped = providers.finalizeProviderStreamOptions({
+    providerId: "codex",
+    baseUrl: "https://relay.example/v1",
+    options: { sessionId: "k".repeat(80), cacheRetention: "short" },
+  });
+  const clampedPayload = await clamped.onPayload(
+    { messages: [] },
+    { api: "openai-completions", provider: "openai", id: "relay-model" },
+  );
+  assert.equal(clampedPayload.prompt_cache_key, "k".repeat(64));
+});
+
+test("runtime models always carry zero pricing (billing removed)", () => {
+  // 计费功能已移除：pi-ai 的 Model.cost 是结构必填字段，构造侧统一喂零价，
+  // 目录内外模型一致，usage.cost 恒为 0。
+  const zeroCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+
+  const customModel = providers.createModelFromConfig(
+    "codex",
+    "relay-gpt",
+    "https://relay.example/v1",
+    undefined,
+    { id: "relay-gpt", contextWindow: 128_000, maxOutputToken: 8_192 },
+  );
+  assert.deepEqual(customModel.cost, zeroCost);
+
+  const knownModel = providers.createModelFromConfig(
+    "codex",
+    "gpt-5",
+    "https://api.openai.com/v1",
+    undefined,
+    { id: "gpt-5", contextWindow: 400_000, maxOutputToken: 128_000 },
+  );
+  assert.deepEqual(knownModel.cost, zeroCost);
+
+  const claudeModel = providers.createModelFromConfig(
+    "claude_code",
+    "claude-sonnet-4-6",
+    "https://api.anthropic.com/v1",
+    undefined,
+    { id: "claude-sonnet-4-6", contextWindow: 1_000_000, maxOutputToken: 128_000 },
+  );
+  assert.deepEqual(claudeModel.cost, zeroCost);
 });

@@ -1,7 +1,9 @@
 import type { AssistantMessage, Context, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
 import type { HostedSearchBlock } from "../../chat/messages/hostedSearch";
 import {
+  buildProviderNativeWebFetchBridgeResult,
   buildProviderNativeWebSearchBridgeResult,
+  isProviderNativeWebFetchToolName as isProviderNativeWebFetchToolCallName,
   isProviderNativeWebSearchToolName as isProviderNativeWebSearchToolCallName,
 } from "../nativeWebSearch";
 
@@ -39,15 +41,25 @@ function buildTextModeToolResultForToolCall(
   toolCall: ToolCall,
   hostedSearchBlocks: HostedSearchBlock[],
 ): ToolResultMessage {
-  return isProviderNativeWebSearchToolCallName(toolCall.name)
-    ? buildProviderNativeWebSearchBridgeResult({
-        toolCall,
-        hostedSearchBlocks,
-        sourcesIntro: "Hosted search sources already captured in this response:",
-        fallbackText:
-          "No hosted search result was returned for this recovered request. Continue from existing context without repeating raw tool-call markup.",
-      })
-    : buildTextModeUnsupportedToolResult(toolCall);
+  if (isProviderNativeWebSearchToolCallName(toolCall.name)) {
+    return buildProviderNativeWebSearchBridgeResult({
+      toolCall,
+      hostedSearchBlocks,
+      sourcesIntro: "Hosted search sources already captured in this response:",
+      fallbackText:
+        "No hosted search result was returned for this recovered request. Continue from existing context without repeating raw tool-call markup.",
+    });
+  }
+  if (isProviderNativeWebFetchToolCallName(toolCall.name)) {
+    return buildProviderNativeWebFetchBridgeResult({
+      toolCall,
+      hostedSearchBlocks,
+      sourcesIntro: "Hosted search sources already captured in this response:",
+      fallbackText:
+        "No hosted search sources were captured for this response. Continue from existing context without repeating raw tool-call markup.",
+    });
+  }
+  return buildTextModeUnsupportedToolResult(toolCall);
 }
 
 function findNextNonToolResultMessageIndex(messages: Context["messages"], startIndex: number) {

@@ -595,6 +595,13 @@ export const tauriTerminalClient: TerminalClient = {
       prompt_id: promptId,
     });
   },
+  async sshReconnect(sessionId, _projectPathKey) {
+    return normalizeSession(
+      await invoke<RawTerminalSession>("terminal_ssh_reconnect", {
+        session_id: sessionId,
+      }),
+    );
+  },
   async sshLatency(sessionId, _projectPathKey) {
     return normalizeSshLatency(
       await invoke<RawTerminalSshLatency>("terminal_ssh_latency", {

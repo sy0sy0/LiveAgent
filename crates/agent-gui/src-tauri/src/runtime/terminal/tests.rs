@@ -207,6 +207,166 @@ fn insert_test_ssh_session(
         .insert(id.to_string(), entry);
 }
 
+fn block_on_test<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build test runtime")
+        .block_on(future)
+}
+
+#[test]
+fn ssh_local_forward_rejects_disconnected_session() {
+    let registry = Arc::new(TerminalSessionRegistry::default());
+    insert_test_ssh_session(
+        &registry,
+        "ssh-forward",
+        "/tmp/project",
+        false,
+        SSH_STATUS_DISCONNECTED,
+    );
+
+    let error = block_on_test(registry.ssh_local_forward_start(
+        "ssh-forward".to_string(),
+        Some("/tmp/project".to_string()),
+        "127.0.0.1".to_string(),
+        5432,
+        Some(0),
+    ))
+    .unwrap_err();
+
+    assert_eq!(error, "SSH connection is not connected");
+}
+
+#[test]
+fn ssh_local_forward_session_close_removes_registered_forwards() {
+    let registry = TerminalSessionRegistry::default();
+    insert_test_ssh_session(
+        &registry,
+        "ssh-forward",
+        "/tmp/project",
+        false,
+        SSH_STATUS_CONNECTED,
+    );
+    let record = SshLocalForwardRecord {
+        id: "forward-1".to_string(),
+        session_id: "ssh-forward".to_string(),
+        project_path_key: normalize_project_path_key("/tmp/project"),
+        local_host: "127.0.0.1".to_string(),
+        local_port: 43210,
+        address: "127.0.0.1:43210".to_string(),
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: 5432,
+        status: "active".to_string(),
+        created_at: now_ms(),
+        updated_at: now_ms(),
+        error: None,
+    };
+    let mut cancel_rx = registry.insert_test_ssh_local_forward(record);
+
+    registry.close("ssh-forward".to_string()).unwrap();
+
+    assert!(registry
+        .ssh_local_forward_list(None, None)
+        .unwrap()
+        .forwards
+        .is_empty());
+    assert!(*cancel_rx.borrow_and_update());
+}
+
+#[test]
+fn ssh_local_forward_session_close_trims_session_id() {
+    let registry = TerminalSessionRegistry::default();
+    insert_test_ssh_session(
+        &registry,
+        "ssh-forward",
+        "/tmp/project",
+        false,
+        SSH_STATUS_CONNECTED,
+    );
+    let record = SshLocalForwardRecord {
+        id: "forward-padded".to_string(),
+        session_id: "ssh-forward".to_string(),
+        project_path_key: normalize_project_path_key("/tmp/project"),
+        local_host: "127.0.0.1".to_string(),
+        local_port: 43211,
+        address: "127.0.0.1:43211".to_string(),
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: 5432,
+        status: "active".to_string(),
+        created_at: now_ms(),
+        updated_at: now_ms(),
+        error: None,
+    };
+    let mut cancel_rx = registry.insert_test_ssh_local_forward(record);
+
+    registry
+        .close("  ssh-forward  ".to_string())
+        .expect("padded session close should succeed");
+
+    assert!(registry
+        .ssh_local_forward_list(None, None)
+        .unwrap()
+        .forwards
+        .is_empty());
+    assert!(*cancel_rx.borrow_and_update());
+}
+
+fn test_ssh_runtime(registry: &TerminalSessionRegistry, id: &str) -> Arc<SshSessionRuntime> {
+    let entry = registry.entry(id).expect("terminal session entry");
+    let TerminalSessionBackend::Ssh { runtime } = &entry.backend else {
+        panic!("expected ssh backend");
+    };
+    Arc::clone(runtime)
+}
+
+#[test]
+fn ssh_reconnect_rejects_missing_session() {
+    let registry = Arc::new(TerminalSessionRegistry::default());
+
+    let result = block_on_test(registry.ssh_reconnect("missing".to_string()));
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn ssh_reconnect_rejects_closing_session() {
+    let registry = Arc::new(TerminalSessionRegistry::default());
+    insert_test_ssh_session(
+        &registry,
+        "ssh-1",
+        "/tmp/project",
+        false,
+        SSH_STATUS_CONNECTED,
+    );
+    test_ssh_runtime(&registry, "ssh-1").close();
+
+    let result = block_on_test(registry.ssh_reconnect("ssh-1".to_string()));
+
+    assert_eq!(result.unwrap_err(), "SSH session is closing");
+}
+
+#[test]
+fn ssh_reconnect_rejects_concurrent_reconnect_runner() {
+    let registry = Arc::new(TerminalSessionRegistry::default());
+    insert_test_ssh_session(
+        &registry,
+        "ssh-1",
+        "/tmp/project",
+        false,
+        SSH_STATUS_RECONNECTING,
+    );
+    let runtime = test_ssh_runtime(&registry, "ssh-1");
+    assert!(runtime.begin_reconnect_runner());
+
+    let result = block_on_test(registry.ssh_reconnect("ssh-1".to_string()));
+
+    assert_eq!(result.unwrap_err(), "SSH reconnect already in progress");
+    // The rejected call must not release the flag owned by the active runner.
+    runtime.finish_reconnect_runner();
+    assert!(runtime.begin_reconnect_runner());
+}
+
 fn test_stream_payload(start_offset: u64, bytes: &[u8]) -> TerminalStreamEventPayload {
     TerminalStreamEventPayload {
         kind: "output".to_string(),
@@ -769,4 +929,170 @@ fn read_tail_requires_terminal_id_when_project_has_multiple_sessions() {
     assert_eq!(selected.sessions.len(), 2);
 
     registry.close_all().expect("close terminal sessions");
+}
+
+// Throwaway ed25519 keypair generated exclusively for these tests; it is not
+// authorized on any host.
+const TEST_ED25519_PRIVATE_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACAhgk+uA1+13AN5TzsuvFZ6XDF0GlH9Kalc5hiRwXZqwAAAAKDyBWEV8gVh
+FQAAAAtzc2gtZWQyNTUxOQAAACAhgk+uA1+13AN5TzsuvFZ6XDF0GlH9Kalc5hiRwXZqwA
+AAAECRQtp7Gi2+TPkNeccdy+icQHNF/IzJfSQKpKQV2gGOYCGCT64DX7XcA3lPOy68Vnpc
+MXQaUf0pqVzmGJHBdmrAAAAAFmxpdmVhZ2VudC10ZXN0LWZpeHR1cmUBAgMEBQYH
+-----END OPENSSH PRIVATE KEY-----";
+
+// Same fixture key encrypted with the passphrase "test-passphrase".
+const TEST_ED25519_ENCRYPTED_PRIVATE_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABCDMU8BW1
+9ccIJ7UHoiwkS7AAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIGitZyZ1OZcCXZWJ
+EE8s43cVaBefHroCHgCzq+B01aK3AAAAoD4IuQwaxZi4m/hCmL4GT9kUERgxkZmQVN8noi
++OqtXHQ2+W7ykmmIJ8iwHTpK3W5WWJMmW+6tKhubShGMti7DwxpwJzL4dIkmTqs+e0wMZP
+MZP6dJOnynjSTFz0RzJPHmEEOoy5kMDEXZx7UtRGNH/PYzZ5OeG5k9MhwVSp42TYs18wMI
+OC6JVzVSYPJ41KjMtWIJkGFfLqqIPlNM5J2WI=
+-----END OPENSSH PRIVATE KEY-----";
+
+fn ssh_private_key_host(private_key: &str, passphrase: &str) -> RuntimeSshHostConfig {
+    RuntimeSshHostConfig {
+        id: "keyed".to_string(),
+        name: "Keyed".to_string(),
+        host: "keyed.example.com".to_string(),
+        port: 22,
+        username: "deploy".to_string(),
+        auth_type: "privateKey".to_string(),
+        password: String::new(),
+        private_key: private_key.to_string(),
+        private_key_path: String::new(),
+        private_key_passphrase: passphrase.to_string(),
+        proxy: crate::commands::settings::RuntimeSshProxyConfig {
+            proxy_type: String::new(),
+            url: String::new(),
+            port: 0,
+            username: String::new(),
+            password: String::new(),
+            password_configured: false,
+        },
+    }
+}
+
+fn resolved_private_key(host: &RuntimeSshHostConfig) -> String {
+    match resolve_ssh_auth_material(host).expect("resolve private key auth") {
+        ResolvedSshAuth::PrivateKey { key, .. } => key,
+        _ => panic!("expected private key auth material"),
+    }
+}
+
+#[test]
+fn normalize_private_key_repairs_paste_artifacts() {
+    let canonical = normalize_ssh_private_key_material(TEST_ED25519_PRIVATE_KEY);
+    russh::keys::decode_secret_key(&canonical, None).expect("canonical key decodes");
+
+    let crlf = TEST_ED25519_PRIVATE_KEY.replace('\n', "\r\n");
+    let indented: String = TEST_ED25519_PRIVATE_KEY
+        .lines()
+        .map(|line| format!("  {line}\n"))
+        .collect();
+    let trailing_ws: String = TEST_ED25519_PRIVATE_KEY
+        .lines()
+        .map(|line| format!("{line} \n"))
+        .collect();
+    let single_line = TEST_ED25519_PRIVATE_KEY.replace('\n', " ");
+    let escaped_newlines = TEST_ED25519_PRIVATE_KEY.replace('\n', "\\n");
+    let with_bom = format!("\u{feff}{TEST_ED25519_PRIVATE_KEY}");
+    let surrounded = format!("key material:\n{TEST_ED25519_PRIVATE_KEY}\n");
+
+    for (label, mangled) in [
+        ("crlf", crlf),
+        ("indented", indented),
+        ("trailing-ws", trailing_ws),
+        ("single-line", single_line),
+        ("escaped-newlines", escaped_newlines),
+        ("bom", with_bom),
+        ("surrounded", surrounded),
+    ] {
+        let normalized = normalize_ssh_private_key_material(&mangled);
+        assert_eq!(normalized, canonical, "variant {label} normalizes");
+        russh::keys::decode_secret_key(&normalized, None)
+            .unwrap_or_else(|error| panic!("variant {label} decodes: {error}"));
+    }
+}
+
+#[test]
+fn normalize_private_key_is_idempotent() {
+    let normalized = normalize_ssh_private_key_material(TEST_ED25519_PRIVATE_KEY);
+    assert_eq!(normalize_ssh_private_key_material(&normalized), normalized);
+}
+
+#[test]
+fn normalize_private_key_keeps_encrypted_pem_headers() {
+    let legacy_encrypted = "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0123456789ABCDEF0123456789ABCDEF\n\nAAAABBBBCCCC\n-----END RSA PRIVATE KEY-----";
+    let normalized = normalize_ssh_private_key_material(legacy_encrypted);
+    assert!(normalized.contains("Proc-Type: 4,ENCRYPTED\n"));
+    assert!(normalized.contains("DEK-Info: AES-128-CBC,"));
+    assert!(normalized.contains("\nAAAABBBBCCCC\n"));
+}
+
+#[test]
+fn normalize_private_key_passes_ppk_through() {
+    let ppk = "PuTTY-User-Key-File-3: ssh-ed25519\nEncryption: none\nComment: test\nPublic-Lines: 2\nAAAA\nBBBB";
+    assert_eq!(normalize_ssh_private_key_material(ppk), ppk);
+}
+
+#[test]
+fn resolve_ssh_auth_material_normalizes_pasted_private_key() {
+    let mangled: String = TEST_ED25519_PRIVATE_KEY
+        .lines()
+        .map(|line| format!("  {line} \r\n"))
+        .collect();
+    let host = ssh_private_key_host(&mangled, "");
+
+    let key = resolved_private_key(&host);
+    russh::keys::decode_secret_key(&key, None).expect("normalized pasted key decodes");
+}
+
+#[test]
+fn resolve_ssh_auth_material_reads_key_from_file() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let key_path = dir.path().join("fixture_ed25519");
+    std::fs::write(&key_path, format!("{TEST_ED25519_PRIVATE_KEY}\n")).expect("write fixture key");
+
+    let mut host = ssh_private_key_host("", "");
+    host.private_key_path = key_path.to_string_lossy().into_owned();
+
+    let key = resolved_private_key(&host);
+    russh::keys::decode_secret_key(&key, None).expect("file-based key decodes");
+}
+
+#[test]
+fn encrypted_private_key_decodes_with_passphrase() {
+    let host = ssh_private_key_host(TEST_ED25519_ENCRYPTED_PRIVATE_KEY, "test-passphrase");
+    match resolve_ssh_auth_material(&host).expect("resolve encrypted key auth") {
+        ResolvedSshAuth::PrivateKey { key, passphrase } => {
+            russh::keys::decode_secret_key(&key, passphrase.as_deref())
+                .expect("encrypted key decodes with passphrase");
+        }
+        _ => panic!("expected private key auth material"),
+    }
+}
+
+#[test]
+fn private_key_decode_error_explains_missing_passphrase() {
+    let key = normalize_ssh_private_key_material(TEST_ED25519_ENCRYPTED_PRIVATE_KEY);
+
+    let missing = russh::keys::decode_secret_key(&key, None)
+        .map(|_| ())
+        .expect_err("encrypted key without passphrase fails");
+    let message = describe_ssh_private_key_decode_error(&missing, false);
+    assert!(
+        message.contains("passphrase"),
+        "missing-passphrase message should mention the passphrase: {message}"
+    );
+
+    let wrong = russh::keys::decode_secret_key(&key, Some("wrong"))
+        .map(|_| ())
+        .expect_err("encrypted key with wrong passphrase fails");
+    let message = describe_ssh_private_key_decode_error(&wrong, true);
+    assert!(
+        message.contains("wrong passphrase"),
+        "wrong-passphrase message should hint at the passphrase: {message}"
+    );
 }

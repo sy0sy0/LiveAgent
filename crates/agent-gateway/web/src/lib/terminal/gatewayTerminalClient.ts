@@ -21,6 +21,9 @@ export function createGatewayTerminalClient(api: GatewayWebSocketClientLike): Te
     async cancelSshPrompt(promptId) {
       await api.cancelSshTerminalPrompt(promptId);
     },
+    sshReconnect(sessionId, projectPathKey) {
+      return api.reconnectSshTerminal(sessionId, projectPathKey);
+    },
     sshLatency(sessionId, projectPathKey) {
       return api.sshTerminalLatency(sessionId, projectPathKey);
     },
