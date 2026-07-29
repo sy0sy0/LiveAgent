@@ -64,6 +64,8 @@ func vetAgentRequest(sm session.AgentView, env *gatewayv2.GatewayEnvelope) error
 		*gatewayv2.GatewayEnvelope_FsReadWorkspaceImage,
 		*gatewayv2.GatewayEnvelope_ChatQueue:
 		return nil
+	case *gatewayv2.GatewayEnvelope_ChatFileOpen:
+		return vetChatFileOpen(payload.ChatFileOpen)
 
 	// ---- 带功能门控 / 限额的直通臂 ----
 	case *gatewayv2.GatewayEnvelope_GitRequest:
@@ -103,6 +105,35 @@ func vetAgentRequest(sm session.AgentView, env *gatewayv2.GatewayEnvelope) error
 		// （走 HTTP 上传）、history_share_resolve（公共分享端点专用）及网关内部推送臂。
 		return errors.New("unsupported agent_request payload")
 	}
+}
+
+func vetChatFileOpen(req *gatewayv2.ChatFileOpenRequest) error {
+	if req == nil || strings.TrimSpace(req.GetConversationId()) == "" || len(req.GetConversationId()) > 256 {
+		return errors.New("conversation is unavailable")
+	}
+	if strings.TrimSpace(req.GetWorkdir()) == "" || strings.TrimSpace(req.GetPath()) == "" {
+		return errors.New("linked file request is incomplete")
+	}
+	if len(req.GetWorkdir()) > 32768 || len(req.GetPath()) > 32768 {
+		return errors.New("linked file request is too large")
+	}
+	switch strings.TrimSpace(req.GetSource()) {
+	case "absolute", "relative", "file-url":
+	default:
+		return errors.New("linked file source is invalid")
+	}
+	if (req.Line != nil && req.GetLine() == 0) ||
+		(req.EndLine != nil && req.GetEndLine() == 0) ||
+		(req.Column != nil && req.GetColumn() == 0) {
+		return errors.New("linked file location is invalid")
+	}
+	if req.Line == nil && (req.EndLine != nil || req.Column != nil) {
+		return errors.New("linked file location is invalid")
+	}
+	if req.Line != nil && req.EndLine != nil && req.GetEndLine() < req.GetLine() {
+		return errors.New("linked file location is invalid")
+	}
+	return nil
 }
 
 // gitActionIsWrite 判定 git 直通请求是否为写操作：写操作受桌面端 Remote 设置

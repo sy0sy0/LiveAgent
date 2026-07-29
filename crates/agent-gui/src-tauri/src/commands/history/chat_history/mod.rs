@@ -36,6 +36,7 @@ include!("segments.rs");
 include!("share.rs");
 include!("search.rs");
 include!("commands.rs");
+include!("replace.rs");
 include!("branch.rs");
 include!("delete.rs");
 include!("tests.rs");

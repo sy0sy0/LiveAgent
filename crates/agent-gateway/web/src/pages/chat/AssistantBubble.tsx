@@ -1,6 +1,7 @@
 import { memo, useMemo } from "react";
 import { ChangedFilesCard } from "../../components/chat/ChangedFilesCard";
 import { collectChangedFiles } from "../../lib/chat/changedFiles";
+import type { ChatFileLink } from "../../lib/chat/chatFileLinks";
 import type { UiRound } from "../../lib/chat/uiMessages";
 import { AssistantAvatar } from "./assistant-bubble/AssistantAvatar";
 import { RoundContent } from "./assistant-bubble/RoundContent";
@@ -34,6 +35,8 @@ export const AssistantBubble = memo(function AssistantBubble(props: {
   toolStatusVariant?: "default" | "compaction";
   readOnly?: boolean;
   redactToolContent?: boolean;
+  workdir?: string;
+  onOpenFileLink?: (link: ChatFileLink) => void;
 }) {
   const {
     rounds,
@@ -46,6 +49,8 @@ export const AssistantBubble = memo(function AssistantBubble(props: {
     toolStatusVariant,
     readOnly = false,
     redactToolContent = false,
+    workdir,
+    onOpenFileLink,
   } = props;
   const latestTodoItem = useMemo(() => {
     for (let roundIndex = rounds.length - 1; roundIndex >= 0; roundIndex -= 1) {
@@ -92,6 +97,8 @@ export const AssistantBubble = memo(function AssistantBubble(props: {
             redactToolContent={redactToolContent}
             latestTodoItem={latestTodoItem}
             isAborted={isAborted}
+            workdir={workdir}
+            onOpenFileLink={onOpenFileLink}
           />
         ))}
         {changedFiles ? <ChangedFilesCard summary={changedFiles} /> : null}

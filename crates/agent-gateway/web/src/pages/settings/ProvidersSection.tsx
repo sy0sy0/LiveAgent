@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import {
   Check,
   ClaudeIcon,
+  ClipboardPaste,
   ExternalLink,
   Eye,
   EyeOff,
@@ -39,10 +40,15 @@ import { useVerticalListReorder } from "../../components/ui/useVerticalListReord
 import { useLocale } from "../../i18n";
 import { buildModelOptions } from "../../lib/chat/chatPageHelpers";
 import {
+  CustomHeaderImportError,
+  type CustomHeaderImportErrorCode,
+  type CustomHeaderImportIssue,
   getCustomHeaderKeyPresets,
   isReservedCustomHeaderKey,
   isValidCustomHeaderKey,
   isValidCustomHeaderValue,
+  mergeImportedCustomHeaders,
+  parseCustomHeadersImport,
 } from "../../lib/providers/customHeaders";
 import { parseModelValue, toModelValue } from "../../lib/providers/llm";
 import {
@@ -191,6 +197,14 @@ function UsagePlanLine({ plan }: { plan: UsagePlanDisplay }) {
 
 type ProviderDialogPanel = "general" | "request" | "usage";
 
+type HeaderImportErrorCode = CustomHeaderImportErrorCode | "no-valid" | "failed";
+
+type HeaderImportSummary = {
+  importedCount: number;
+  overwrittenCount: number;
+  issues: CustomHeaderImportIssue[];
+};
+
 type ModelEditDraft = {
   model: ProviderModelConfig;
   contextWindow: string;
@@ -336,6 +350,10 @@ function ProviderModal({
   const [customHeaders, setCustomHeaders] = useState(() =>
     (initialData?.customHeaders ?? []).map((header) => ({ ...header })),
   );
+  const [headerImportOpen, setHeaderImportOpen] = useState(false);
+  const [headerImportText, setHeaderImportText] = useState("");
+  const [headerImportError, setHeaderImportError] = useState<HeaderImportErrorCode | null>(null);
+  const [headerImportSummary, setHeaderImportSummary] = useState<HeaderImportSummary | null>(null);
   const [models, setModels] = useState<ProviderModelConfig[]>(() =>
     normalizeFetchedModels(initialData?.models ?? [], providerType),
   );
@@ -784,6 +802,42 @@ function ProviderModal({
     focusCustomHeader(headerSuggest.index, "value");
   }
 
+  function cancelCustomHeaderImport() {
+    setHeaderImportOpen(false);
+    setHeaderImportText("");
+    setHeaderImportError(null);
+  }
+
+  function handleImportCustomHeaders() {
+    setHeaderImportError(null);
+    setHeaderImportSummary(null);
+    try {
+      const parsed = parseCustomHeadersImport(headerImportText);
+      if (parsed.headers.length === 0) {
+        setHeaderImportError("no-valid");
+        setHeaderImportSummary({
+          importedCount: 0,
+          overwrittenCount: 0,
+          issues: parsed.issues,
+        });
+        return;
+      }
+      const merged = mergeImportedCustomHeaders(customHeaders, parsed.headers);
+      setCustomHeaders(merged.headers);
+      setVisibleHeaderValues(new Set());
+      setHeaderSuggest(null);
+      setHeaderValidationSubmitted(false);
+      setHeaderImportSummary({
+        importedCount: merged.importedCount,
+        overwrittenCount: merged.overwrittenCount,
+        issues: parsed.issues,
+      });
+      setHeaderImportText("");
+      setHeaderImportOpen(false);
+    } catch (error) {
+      setHeaderImportError(error instanceof CustomHeaderImportError ? error.code : "failed");
+    }
+  }
   async function handleSave() {
     if (!name.trim()) return;
     const invalidHeaderIndex = customHeaders.findIndex(
@@ -793,6 +847,8 @@ function ProviderModal({
       setHeaderValidationSubmitted(true);
       exitModelBulkMode();
       setActivePanel("request");
+      // 导入视图会顶掉请求头列表,先切回列表再聚焦,否则目标输入框尚未挂载。
+      setHeaderImportOpen(false);
       focusCustomHeader(
         invalidHeaderIndex,
         getCustomHeaderIssue(customHeaders[invalidHeaderIndex], true) === "invalid-value"
@@ -970,6 +1026,32 @@ function ProviderModal({
     headerSuggestActive,
     Math.max(0, headerSuggestItems.length - 1),
   );
+  const headerImportErrorMessage = headerImportError
+    ? t("settings.customHeaderImportError." + headerImportError)
+    : null;
+  const headerImportSummaryMessage = headerImportSummary
+    ? [
+        t("settings.customHeaderImportSummary.imported") + " " + headerImportSummary.importedCount,
+        t("settings.customHeaderImportSummary.overwritten") +
+          " " +
+          headerImportSummary.overwrittenCount,
+        headerImportSummary.issues.length > 0
+          ? t("settings.customHeaderImportSummary.skipped") +
+            " " +
+            headerImportSummary.issues
+              .map(
+                (issue) =>
+                  (issue.key ?? t("settings.customHeaderImportUnknownItem")) +
+                  " (" +
+                  t("settings.customHeaderImportIssue." + issue.reason) +
+                  ")",
+              )
+              .join(", ")
+          : null,
+      ]
+        .filter(Boolean)
+        .join("; ")
+    : null;
   const firstHeaderIssue =
     customHeaders
       .map((header) => getCustomHeaderIssue(header, headerValidationSubmitted))
@@ -1598,8 +1680,8 @@ function ProviderModal({
                   </div>
                 ) : null}
 
-                <div className="mt-6 flex items-center justify-between gap-3">
-                  <div className="flex min-w-0 items-center gap-2">
+                <div className="mt-6 flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex min-w-0 items-center gap-2 max-[720px]:w-full">
                     <span className="text-sm font-semibold">{t("settings.customHeaders")}</span>
                     {customHeaders.length > 0 ? (
                       <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium tabular-nums text-muted-foreground">
@@ -1607,19 +1689,109 @@ function ProviderModal({
                       </span>
                     ) : null}
                   </div>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="h-8 shrink-0 gap-1.5 max-[720px]:h-10"
-                    onClick={() => addCustomHeader()}
-                  >
-                    <Plus className="h-3.5 w-3.5" />
-                    {t("settings.addCustomHeader")}
-                  </Button>
+                  <div className="flex shrink-0 gap-2 max-[720px]:w-full">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className={cn(
+                        "h-8 shrink-0 gap-1.5 max-[720px]:h-11 max-[720px]:flex-1",
+                        headerImportOpen && "border-primary/50 bg-primary/10 text-primary",
+                      )}
+                      aria-expanded={headerImportOpen}
+                      onClick={() => {
+                        setHeaderImportOpen((open) => !open);
+                        setHeaderImportError(null);
+                        setHeaderImportSummary(null);
+                        setHeaderSuggest(null);
+                      }}
+                    >
+                      <ClipboardPaste className="h-3.5 w-3.5" />
+                      {t("settings.importCustomHeaders")}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-8 shrink-0 gap-1.5 max-[720px]:h-11 max-[720px]:flex-1"
+                      /* 导入视图占据了列表位置,此时新增行不可见,禁用避免静默无响应。 */
+                      disabled={headerImportOpen}
+                      onClick={() => addCustomHeader()}
+                    >
+                      <Plus className="h-3.5 w-3.5" />
+                      {t("settings.addCustomHeader")}
+                    </Button>
+                  </div>
                 </div>
 
-                {customHeaders.length === 0 ? (
+                {headerImportOpen ? (
+                  <div className="provider-panel-enter mt-3 min-w-0 rounded-xl border bg-card p-3">
+                    <Label
+                      htmlFor="provider-custom-header-import"
+                      className="mb-2 block text-xs font-medium"
+                    >
+                      {t("settings.customHeaderImportLabel")}
+                    </Label>
+                    <Textarea
+                      id="provider-custom-header-import"
+                      value={headerImportText}
+                      className="min-h-[120px] w-full min-w-0 resize-y font-mono text-xs leading-relaxed"
+                      placeholder={t("settings.customHeaderImportPlaceholder")}
+                      aria-invalid={headerImportErrorMessage ? true : undefined}
+                      aria-describedby={
+                        headerImportErrorMessage ? "provider-custom-header-import-error" : undefined
+                      }
+                      spellCheck={false}
+                      autoFocus
+                      onChange={(event) => {
+                        setHeaderImportText(event.currentTarget.value);
+                        setHeaderImportError(null);
+                        setHeaderImportSummary(null);
+                      }}
+                    />
+                    {headerImportErrorMessage ? (
+                      <p
+                        id="provider-custom-header-import-error"
+                        className="mt-2 text-xs text-destructive"
+                        role="alert"
+                      >
+                        {headerImportErrorMessage}
+                      </p>
+                    ) : null}
+                    <div className="mt-3 flex flex-wrap justify-end gap-2 max-[720px]:w-full">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-9 max-[720px]:h-11 max-[720px]:flex-1"
+                        onClick={cancelCustomHeaderImport}
+                      >
+                        {t("settings.cancelCustomHeaderImport")}
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        className="h-9 max-[720px]:h-11 max-[720px]:flex-1"
+                        onClick={handleImportCustomHeaders}
+                      >
+                        {t("settings.parseAndImportCustomHeaders")}
+                      </Button>
+                    </div>
+                  </div>
+                ) : null}
+
+                {headerImportSummaryMessage ? (
+                  <p
+                    className="mt-3 rounded-lg border bg-muted/50 px-3 py-2 text-xs text-muted-foreground"
+                    role="status"
+                    aria-live="polite"
+                  >
+                    {headerImportSummaryMessage}
+                  </p>
+                ) : null}
+
+                {/* 导入视图与请求头列表互斥:解析成功后回到列表,直接看到增量导入的结果。 */}
+                {headerImportOpen ? null : customHeaders.length === 0 ? (
                   <button
                     type="button"
                     className="mt-3 flex w-full flex-col items-center gap-1 rounded-xl border border-dashed px-4 py-8 text-center transition-colors hover:border-primary/50 hover:bg-accent/20"
@@ -1789,7 +1961,7 @@ function ProviderModal({
                   </div>
                 )}
 
-                {headerIssueMessage ? (
+                {headerIssueMessage && !headerImportOpen ? (
                   <p className="mt-2 text-xs leading-relaxed text-destructive" role="alert">
                     {headerIssueMessage}
                   </p>

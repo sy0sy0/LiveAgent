@@ -26,6 +26,81 @@ function decodeClientFrame(bytes) {
   return pb.fromBinary(v2.WebClientFrameSchema, bytes);
 }
 
+test("chat file open requests remain agent-scoped and preserve source locations", () => {
+  const encoded = encodeRequestFrame(
+    "file-open-1",
+    "chat.file_open",
+    {
+      conversation_id: "conversation-1",
+      workdir: "C:/work",
+      path: "src/a.ts",
+      source: "relative",
+      line: 12,
+      end_line: 20,
+      column: 4,
+      open_in_file_manager: false,
+    },
+    "agent-1",
+  );
+  const frame = decodeClientFrame(encoded);
+  assert.equal(frame.agentId, "agent-1");
+  assert.equal(frame.payload.case, "agentRequest");
+  assert.equal(frame.payload.value.payload.case, "chatFileOpen");
+  assert.deepEqual(
+    {
+      conversationId: frame.payload.value.payload.value.conversationId,
+      workdir: frame.payload.value.payload.value.workdir,
+      path: frame.payload.value.payload.value.path,
+      source: frame.payload.value.payload.value.source,
+      line: frame.payload.value.payload.value.line,
+      endLine: frame.payload.value.payload.value.endLine,
+      column: frame.payload.value.payload.value.column,
+    },
+    {
+      conversationId: "conversation-1",
+      workdir: "C:/work",
+      path: "src/a.ts",
+      source: "relative",
+      line: 12,
+      endLine: 20,
+      column: 4,
+    },
+  );
+
+  const decoded = decodeServerFrame(
+    roundtrip(
+      serverFrame({
+        request_id: "file-open-1",
+        agent_id: "agent-1",
+        agent_response: {
+          request_id: "file-open-1",
+          chat_file_open_resp: {
+            action: "editor",
+            kind: "file",
+            workdir: "C:/work",
+            path: "src/a.ts",
+            line: 12,
+            end_line: 20,
+            column: 4,
+          },
+        },
+      }),
+    ),
+    { agentOnline: true },
+  );
+  assert.equal(decoded.kind, "response");
+  assert.deepEqual(decoded.payload, {
+    action: "editor",
+    kind: "file",
+    workdir: "C:/work",
+    path: "src/a.ts",
+    line: 12,
+    endLine: 20,
+    column: 4,
+    outsideWorkspace: false,
+  });
+});
+
 test("adapters convert int64/uint64 fields to Number at realistic maxima", () => {
   // 毫秒时间戳（2100 年）与 MAX_SAFE_INTEGER 边界都必须无损转换。
   const year2100Ms = 4102444800000;

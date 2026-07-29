@@ -14,6 +14,7 @@ import {
 import { ImagePreview, type ImagePreviewSlide } from "@/components/chat/ImagePreview";
 import { Markdown } from "@/components/Markdown";
 import { useLocale } from "@/i18n/LocaleContext";
+import type { ChatFileLink } from "@/lib/chat/chatFileLinks";
 import { normalizeLiveToolStatus, VIBING_STATUS } from "@/lib/chat/chatPageHelpers";
 import type { HistoryMessageRef } from "@/lib/chat/conversationState";
 import { getRoundText, getRoundToolTrace } from "@/lib/chat/uiMessages";
@@ -114,6 +115,7 @@ type GatewayTranscriptProps = {
   usageContextWindow?: number;
   workspaceRoot?: string;
   gitClient?: GitClient | null;
+  onOpenFileLink?: (link: ChatFileLink) => void;
   onLoadUploadedImagePreview?: UploadedImagePreviewLoader;
   onResendFromEdit?: (
     messageRef: HistoryMessageRef,
@@ -1193,6 +1195,7 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
   usageContextWindow?: number;
   workspaceRoot?: string;
   gitClient?: GitClient | null;
+  onOpenFileLink?: (link: ChatFileLink) => void;
   onLoadUploadedImagePreview?: UploadedImagePreviewLoader;
   onResendFromEdit?: (
     messageRef: HistoryMessageRef,
@@ -1226,6 +1229,7 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
     usageContextWindow,
     workspaceRoot,
     gitClient,
+    onOpenFileLink,
     onLoadUploadedImagePreview,
     onResendFromEdit,
     onBranchConversation,
@@ -1721,6 +1725,8 @@ const GatewayTranscriptListRegion = memo(function GatewayTranscriptListRegion(pr
                   renderMode={rowRenderMode(row)}
                   readOnly={readOnly}
                   redactToolContent={redactToolContent}
+                  workdir={workspaceRoot}
+                  onOpenFileLink={onOpenFileLink}
                 />
                 {shouldShowLiveStatus ? <LiveStatusFooter status={liveStatusText} /> : null}
                 {isLatestLiveStreaming &&
@@ -1809,6 +1815,7 @@ export function GatewayTranscript({
   usageContextWindow,
   workspaceRoot,
   gitClient,
+  onOpenFileLink,
   onLoadUploadedImagePreview,
   onResendFromEdit,
   onBranchConversation,
@@ -1888,6 +1895,7 @@ export function GatewayTranscript({
           usageContextWindow={usageContextWindow}
           workspaceRoot={workspaceRoot}
           gitClient={gitClient}
+          onOpenFileLink={onOpenFileLink}
           onLoadUploadedImagePreview={onLoadUploadedImagePreview}
           onResendFromEdit={onResendFromEdit}
           onBranchConversation={onBranchConversation}

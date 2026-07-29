@@ -205,6 +205,17 @@ type FsReadWorkspaceImageResponse = {
   contentHash: string;
 };
 
+export type ChatFileOpenResponse = {
+  action: "directory" | "editor" | "opened" | "preview" | "revealed";
+  kind: "directory" | "file";
+  workdir?: string;
+  path?: string;
+  line?: number;
+  endLine?: number;
+  column?: number;
+  outsideWorkspace: boolean;
+};
+
 type FsCreateDirResponse = {
   path: string;
   kind: "dir";
@@ -2651,6 +2662,28 @@ export class GatewayWebSocketClient {
     });
   }
 
+  async openChatFile(params: {
+    conversationId: string;
+    workdir: string;
+    path: string;
+    source: string;
+    line?: number;
+    endLine?: number;
+    column?: number;
+    openInFileManager?: boolean;
+  }): Promise<ChatFileOpenResponse> {
+    return this.request<ChatFileOpenResponse>("chat.file_open", {
+      conversation_id: params.conversationId,
+      workdir: params.workdir,
+      path: params.path,
+      source: params.source,
+      line: params.line,
+      end_line: params.endLine,
+      column: params.column,
+      open_in_file_manager: params.openInFileManager,
+    });
+  }
+
   async createDir(workdir: string, path: string): Promise<FsCreateDirResponse> {
     return this.request<FsCreateDirResponse>("fs.create_dir", { workdir, path });
   }
@@ -3811,6 +3844,16 @@ export type GatewayWebSocketClientLike = {
   }): Promise<FsWriteTextResponse>;
   readEditableTextFile(workdir: string, path: string): Promise<FsReadEditableTextResponse>;
   readWorkspaceImageFile(workdir: string, path: string): Promise<FsReadWorkspaceImageResponse>;
+  openChatFile(params: {
+    conversationId: string;
+    workdir: string;
+    path: string;
+    source: string;
+    line?: number;
+    endLine?: number;
+    column?: number;
+    openInFileManager?: boolean;
+  }): Promise<ChatFileOpenResponse>;
   createDir(workdir: string, path: string): Promise<FsCreateDirResponse>;
   renamePath(workdir: string, fromPath: string, toPath: string): Promise<FsRenameResponse>;
   deletePath(workdir: string, path: string): Promise<FsDeleteResponse>;

@@ -68,6 +68,9 @@ export type WorkspaceCodeEditorOpenRequest = {
   projectPathKey: string;
   workdir: string;
   path: string;
+  line?: number;
+  endLine?: number;
+  column?: number;
 };
 
 type ReadEditableTextResponse = {
@@ -300,6 +303,7 @@ export function WorkspaceCodeEditorOverlay(props: WorkspaceCodeEditorOverlayProp
   const modelsRef = useRef(new Map<string, monaco.editor.ITextModel>());
   const viewStatesRef = useRef(new Map<string, monaco.editor.ICodeEditorViewState | null>());
   const editorModelKeyRef = useRef("");
+  const linkedLocationKeyRef = useRef("");
   const activeKeyRef = useRef("");
   const openRequestIdRef = useRef<number | null>(null);
   const closeRequestIdRef = useRef<number | null>(null);
@@ -798,6 +802,34 @@ export function WorkspaceCodeEditorOverlay(props: WorkspaceCodeEditorOverlayProp
     }
     editorModelKeyRef.current = activeTab.key;
   }, [activeTab]);
+
+  const activeTabKey = activeTab?.key;
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor || !activeTabKey || !openRequest?.line) return;
+    if (activeTabKey !== editorTabKey(openRequest.projectPathKey, openRequest.path)) return;
+    const locationKey = `${openRequest.id}\u0000${activeTabKey}`;
+    if (linkedLocationKeyRef.current === locationKey) return;
+    const model = editor.getModel();
+    if (!model) return;
+    const line = Math.min(Math.max(1, openRequest.line), model.getLineCount());
+    const endLine = Math.min(Math.max(line, openRequest.endLine ?? line), model.getLineCount());
+    const column = Math.min(Math.max(1, openRequest.column ?? 1), model.getLineMaxColumn(line));
+    const endColumn = openRequest.endLine ? model.getLineMaxColumn(endLine) : column;
+    const range = new monaco.Range(line, column, endLine, endColumn);
+    editor.setSelection(range);
+    editor.revealRangeInCenter(range);
+    editor.focus();
+    linkedLocationKeyRef.current = locationKey;
+  }, [
+    activeTabKey,
+    openRequest?.column,
+    openRequest?.endLine,
+    openRequest?.id,
+    openRequest?.line,
+    openRequest?.path,
+    openRequest?.projectPathKey,
+  ]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
