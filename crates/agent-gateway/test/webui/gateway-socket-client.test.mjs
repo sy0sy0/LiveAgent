@@ -1043,6 +1043,44 @@ test("GatewayWebSocketClient sends history branch requests with the base message
   resetGatewayWebSocketClient();
 });
 
+test("GatewayWebSocketClient sends history cwd update requests", async () => {
+  installBrowser();
+  const { codec, getGatewayWebSocketClient, resetGatewayWebSocketClient } = loadGatewaySocket();
+  resetGatewayWebSocketClient();
+
+  const client = getGatewayWebSocketClient("token");
+  const updatePromise = client.setHistoryCwd("conversation-1", "/tmp/project-b");
+  const socket = await connectAndAuth(codec);
+  await waitFor(() => findAgentRequest(codec, socket, "history_set_cwd"), "history cwd frame");
+  const request = findAgentRequest(codec, socket, "history_set_cwd");
+  assert.deepEqual(request.json.agent_request.history_set_cwd, {
+    conversation_id: "conversation-1",
+    cwd: "/tmp/project-b",
+  });
+  socket.receiveBinary(
+    codec.encodeServerFrame({
+      request_id: request.requestId,
+      agent_response: {
+        history_set_cwd_resp: {
+          conversation: {
+            id: "conversation-1",
+            title: "Moved conversation",
+            cwd: "/tmp/project-b",
+            message_count: 6,
+            created_at: 1700000000100,
+            updated_at: 1700000000200,
+          },
+        },
+      },
+    }),
+  );
+  const updated = await updatePromise;
+  assert.equal(updated.id, "conversation-1");
+  assert.equal(updated.cwd, "/tmp/project-b");
+
+  resetGatewayWebSocketClient();
+});
+
 test("GatewayWebSocketClient reconnects before read requests when an authenticated socket goes stale", async () => {
   installBrowser();
   const { codec, getGatewayWebSocketClient, resetGatewayWebSocketClient } = loadGatewaySocket();
@@ -1265,7 +1303,6 @@ test("GatewayWebSocketClient chatCommand sends the command frame and parses the 
     systemSettings: {
       executionMode: "agent",
       workdir: "/workspace/project",
-      selectedSystemTools: ["Bash"],
     },
   });
   const socket = await connectAndAuth(codec);
@@ -1277,7 +1314,6 @@ test("GatewayWebSocketClient chatCommand sends the command frame and parses the 
   assert.equal(command.json.chat_command.request.client_request_id, "req-1");
   assert.equal(command.json.chat_command.request.queue_policy, "append");
   assert.equal(command.json.chat_command.request.workdir, "/workspace/project");
-  assert.deepEqual(command.json.chat_command.request.selected_system_tools, ["Bash"]);
 
   socket.receiveBinary(
     codec.encodeServerFrame({

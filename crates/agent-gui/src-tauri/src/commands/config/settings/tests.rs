@@ -31,6 +31,7 @@ mod tests {
             SSH_SETTINGS_TABLE,
             REMOTE_SETTINGS_TABLE,
             MEMORY_SETTINGS_TABLE,
+            MODEL_FAILOVER_SETTINGS_TABLE,
             SSH_PROJECT_HOST_ASSOCIATIONS_TABLE,
             SSH_KNOWN_HOSTS_TABLE,
         ] {
@@ -1097,7 +1098,7 @@ mod tests {
             json!({
                 "executionMode": "tools",
                 "workdir": "E:/Code/test_directory/003",
-                "selectedSystemTools": ["http_get_test"]
+                "toolPolicies": { "Bash": "ask", "server:docs-mcp": "deny" }
             }),
         )
         .expect("save system");
@@ -1120,7 +1121,7 @@ mod tests {
         };
         let loaded = load_system(&conn).expect("load system");
 
-        assert_eq!(row_count, 9);
+        assert_eq!(row_count, 10);
         assert_eq!(
             keys,
             vec![
@@ -1129,10 +1130,11 @@ mod tests {
                 SYSTEM_EXECUTION_MODE_KEY.to_string(),
                 SYSTEM_HIDDEN_WORKSPACE_PROJECT_PATHS_KEY.to_string(),
                 SYSTEM_MISSING_WORKSPACE_PROJECT_PATHS_KEY.to_string(),
-                SYSTEM_SELECTED_TOOLS_KEY.to_string(),
                 SYSTEM_SYSTEM_PROXY_KEY.to_string(),
+                SYSTEM_TOOL_POLICIES_KEY.to_string(),
                 SYSTEM_WORKDIR_KEY.to_string(),
                 SYSTEM_WORKSPACE_PROJECTS_KEY.to_string(),
+                SYSTEM_WORKSPACE_RESOURCE_SETTINGS_KEY.to_string(),
             ]
         );
         assert_eq!(
@@ -1143,9 +1145,10 @@ mod tests {
                 "hiddenWorkspaceProjectPaths": [],
                 "missingWorkspaceProjectPaths": [],
                 "archivedWorkspaceProjectPaths": [],
+                "workspaceResourceSettings": {},
                 "systemProxy": default_system_proxy_json(),
                 "workdir": default_workdir.clone(),
-                "selectedSystemTools": ["http_get_test"],
+                "toolPolicies": { "Bash": "ask", "server:docs-mcp": "deny" },
                 "workspaceProjects": [
                     {
                         "id": DEFAULT_WORKSPACE_PROJECT_ID,
@@ -1168,7 +1171,6 @@ mod tests {
             json!({
                 "executionMode": "tools",
                 "workdir": "/tmp/liveagent-default-project",
-                "selectedSystemTools": [],
                 "archivedWorkspaceProjectPaths": [
                     " /tmp/project-a ",
                     "/tmp/project-a",
@@ -1190,6 +1192,192 @@ mod tests {
     }
 
     #[test]
+    fn save_system_normalizes_workspace_resource_settings() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_millis() as u64;
+        let mut conn = open_memory_db();
+        save_system_with_default_workdir(
+            &mut conn,
+            json!({
+                "executionMode": "tools",
+                "workdir": "/tmp/liveagent-default-project",
+                "workspaceResourceSettings": {
+                    "/tmp/project-a/": {
+                        "mode": "custom",
+                        "skillNames": ["review", "review", ""],
+                        "mcpServerIds": ["github", "github", 42],
+                        "stateVersion": 3,
+                        "writerId": " client-a ",
+                        "updatedAt": 100
+                    },
+                    "/tmp/project-b": {
+                        "mode": "inherit",
+                        "skillNames": ["ignored"],
+                        "mcpServerIds": ["ignored"],
+                        "stateVersion": 4,
+                        "writerId": "client-b",
+                        "updatedAt": now
+                    }
+                }
+            }),
+            "/tmp/liveagent-default-project",
+        )
+        .expect("save system");
+
+        let loaded = load_system(&conn)
+            .expect("load system")
+            .expect("system settings");
+        assert_eq!(
+            loaded.get(SYSTEM_WORKSPACE_RESOURCE_SETTINGS_KEY),
+            Some(&json!({
+                "/tmp/project-a": {
+                    "mode": "custom",
+                    "skillNames": ["review"],
+                    "mcpServerIds": ["github"],
+                    "stateVersion": 3,
+                    "writerId": "client-a",
+                    "updatedAt": 100
+                },
+                "/tmp/project-b": {
+                    "mode": "inherit",
+                    "skillNames": [],
+                    "mcpServerIds": [],
+                    "stateVersion": 4,
+                    "writerId": "client-b",
+                    "updatedAt": now
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn workspace_resource_settings_are_not_truncated_after_one_hundred_paths() {
+        let entries = (0..150)
+            .map(|index| {
+                (
+                    format!("/tmp/project-{index}"),
+                    json!({
+                        "mode": "custom",
+                        "skillNames": [format!("skill-{index}")],
+                        "mcpServerIds": [],
+                        "stateVersion": 1,
+                        "writerId": "test",
+                        "updatedAt": index + 1
+                    }),
+                )
+            })
+            .collect::<Map<String, Value>>();
+        let normalized = normalize_workspace_resource_settings(Some(&Value::Object(entries)));
+        let normalized = normalized.as_object().expect("normalized workspace resources");
+        assert_eq!(normalized.len(), 150);
+        assert_eq!(
+            normalized["/tmp/project-149"]["skillNames"],
+            json!(["skill-149"])
+        );
+    }
+
+    #[test]
+    fn workspace_resource_settings_expire_only_old_inherit_tombstones() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_millis() as u64;
+        let old = now - WORKSPACE_RESOURCE_TOMBSTONE_TTL_MS - 1;
+        let normalized = normalize_workspace_resource_settings(Some(&json!({
+            "/tmp/old-tombstone": {
+                "mode": "inherit",
+                "stateVersion": 1,
+                "updatedAt": old
+            },
+            "/tmp/custom": {
+                "mode": "custom",
+                "skillNames": ["kept"],
+                "stateVersion": 1,
+                "updatedAt": old
+            },
+            "/tmp/off": {
+                "mode": "off",
+                "stateVersion": 1,
+                "updatedAt": old
+            },
+            "/tmp/recent-tombstone": {
+                "mode": "inherit",
+                "stateVersion": 1,
+                "updatedAt": now
+            }
+        })));
+        let normalized = normalized.as_object().expect("normalized workspace resources");
+        assert!(!normalized.contains_key("/tmp/old-tombstone"));
+        assert_eq!(normalized["/tmp/custom"]["mode"], "custom");
+        assert_eq!(normalized["/tmp/off"]["mode"], "off");
+        assert_eq!(normalized["/tmp/recent-tombstone"]["mode"], "inherit");
+    }
+
+    #[test]
+    fn workspace_resource_overflow_prefers_active_entries_and_newest_tombstones() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_millis() as u64;
+        let mut entries = Map::new();
+        for index in 0..250_u64 {
+            entries.insert(
+                format!("/tmp/tombstone-{index:03}"),
+                json!({
+                    "mode": "inherit",
+                    "stateVersion": 1,
+                    "updatedAt": now - index
+                }),
+            );
+        }
+        for index in 0..20_u64 {
+            entries.insert(
+                format!("/tmp/custom-{index:02}"),
+                json!({
+                    "mode": if index % 2 == 0 { "custom" } else { "off" },
+                    "skillNames": [format!("skill-{index}")],
+                    "stateVersion": 1,
+                    "updatedAt": now - 1_000_000 - index
+                }),
+            );
+        }
+        let normalized = normalize_workspace_resource_settings(Some(&Value::Object(entries)));
+        let normalized = normalized.as_object().expect("normalized workspace resources");
+        assert_eq!(normalized.len(), MAX_WORKSPACE_RESOURCE_SETTINGS);
+        for index in 0..20 {
+            assert!(normalized.contains_key(&format!("/tmp/custom-{index:02}")));
+        }
+        assert!(normalized.contains_key("/tmp/tombstone-235"));
+        assert!(!normalized.contains_key("/tmp/tombstone-236"));
+    }
+
+    #[test]
+    fn workspace_resource_overflow_uses_unicode_code_point_ordering() {
+        let mut entries = Map::new();
+        for index in 0..253 {
+            entries.insert(
+                format!("/tmp/{index:03}"),
+                json!({ "mode": "off", "stateVersion": 1, "updatedAt": 1 }),
+            );
+        }
+        for suffix in ["A", "_", "a", "ä"] {
+            entries.insert(
+                format!("/tmp/{suffix}"),
+                json!({ "mode": "off", "stateVersion": 1, "updatedAt": 1 }),
+            );
+        }
+        let normalized = normalize_workspace_resource_settings(Some(&Value::Object(entries)));
+        let normalized = normalized.as_object().expect("normalized workspace resources");
+        assert_eq!(normalized.len(), MAX_WORKSPACE_RESOURCE_SETTINGS);
+        assert!(normalized.contains_key("/tmp/A"));
+        assert!(normalized.contains_key("/tmp/_"));
+        assert!(normalized.contains_key("/tmp/a"));
+        assert!(!normalized.contains_key("/tmp/ä"));
+    }
+
+    #[test]
     fn save_system_backfills_empty_workdir_with_default_project() {
         let mut conn = open_memory_db();
         save_system_with_default_workdir(
@@ -1197,7 +1385,6 @@ mod tests {
             json!({
                 "executionMode": "tools",
                 "workdir": "",
-                "selectedSystemTools": []
             }),
             "/tmp/liveagent-default-project",
         )
@@ -1212,9 +1399,10 @@ mod tests {
                 "hiddenWorkspaceProjectPaths": [],
                 "missingWorkspaceProjectPaths": [],
                 "archivedWorkspaceProjectPaths": [],
+                "workspaceResourceSettings": {},
                 "systemProxy": default_system_proxy_json(),
                 "workdir": "/tmp/liveagent-default-project",
-                "selectedSystemTools": [],
+                "toolPolicies": null,
                 "workspaceProjects": [
                     {
                         "id": DEFAULT_WORKSPACE_PROJECT_ID,
@@ -1237,7 +1425,6 @@ mod tests {
             json!({
                 "executionMode": "tools",
                 "workdir": "/tmp/liveagent-default-project",
-                "selectedSystemTools": [],
                 "workspaceProjects": [
                     {
                         "id": DEFAULT_WORKSPACE_PROJECT_ID,
@@ -1264,9 +1451,10 @@ mod tests {
                 "hiddenWorkspaceProjectPaths": [],
                 "missingWorkspaceProjectPaths": [],
                 "archivedWorkspaceProjectPaths": [],
+                "workspaceResourceSettings": {},
                 "systemProxy": default_system_proxy_json(),
                 "workdir": "/tmp/liveagent-default-project",
-                "selectedSystemTools": [],
+                "toolPolicies": null,
                 "workspaceProjects": [
                     {
                         "id": DEFAULT_WORKSPACE_PROJECT_ID,
@@ -1297,9 +1485,9 @@ mod tests {
                 "hiddenWorkspaceProjectPaths": [],
                 "missingWorkspaceProjectPaths": [],
                 "archivedWorkspaceProjectPaths": [],
+                "workspaceResourceSettings": {},
                 "systemProxy": default_system_proxy_json(),
                 "workdir": "/tmp/liveagent-default-project",
-                "selectedSystemTools": [],
                 "workspaceProjects": [
                     {
                         "id": DEFAULT_WORKSPACE_PROJECT_ID,

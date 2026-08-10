@@ -5,9 +5,7 @@ import { createTsModuleLoader } from "../helpers/load-ts-module.mjs";
 
 const loader = createTsModuleLoader();
 const pathUtils = loader.loadModule("src/lib/tools/pathUtils.ts");
-const systemTools = loader.loadModule("src/lib/tools/customSystemTools.ts");
-const systemToolOptions = loader.loadModule("src/lib/tools/systemToolOptions.ts");
-const skillBuiltinHelpers = loader.loadModule("src/lib/skills/builtin.ts");
+const skillBuiltinHelpers = loader.loadModule("@liveagent/ui/lib/skills/builtin.ts");
 
 test("ToolPathResolver accepts broad workspace path inputs", async () => {
   const resolver = new pathUtils.ToolPathResolver({ workdir: "/workspace/project" });
@@ -2008,6 +2006,17 @@ test("SkillsManager management can auto-enable installed Skills without exposing
               numLines: 4,
             };
           }
+          if (action === "delete") {
+            assert.equal(args.payload.name, "new-skill");
+            return {
+              action: "delete",
+              rootDir: "/Users/me/.liveagent/skills",
+              deleted: {
+                name: "new-skill",
+                target: "/Users/me/.liveagent/skills/new-skill",
+              },
+            };
+          }
           if (action === "list") {
             return {
               action: "list",
@@ -2130,7 +2139,22 @@ test("SkillsManager management can auto-enable installed Skills without exposing
     });
     assert.equal(readResult.isError, false);
     assert.equal(readResult.details.path, "new-skill/SKILL.md");
-    assert.deepEqual(events, ["liveagent:skills-discovery-updated"]);
+    const deleteResult = await bundle.executeToolCall({
+      type: "toolCall",
+      id: "delete-new-skill",
+      name: "SkillsManager",
+      arguments: { action: "delete", name: " new-skill " },
+    });
+    assert.equal(deleteResult.isError, false);
+    assert.deepEqual(changes.at(-1), {
+      action: "delete",
+      names: ["new-skill"],
+      baseDirs: [],
+    });
+    assert.deepEqual(events, [
+      "liveagent:skills-discovery-updated",
+      "liveagent:skills-discovery-updated",
+    ]);
   } finally {
     if (typeof previousWindow === "undefined") {
       delete globalThis.window;
@@ -2960,58 +2984,6 @@ test("Image generic source infers raw base64 image input", async () => {
     invocations.map((call) => [call.command, call.args.source_type, call.args.mime_type]),
     [["fs_read_image_source", "base64", "image/png"]],
   );
-});
-
-test("custom system tools expose only selected tools for the requested runtime scope", async () => {
-  const bundle = systemTools.createCustomSystemTools({
-    selectedToolIds: ["http_get_test"],
-    runtimeScope: "chat",
-    currentChatModel: { customProviderId: "p", model: "m" },
-  });
-
-  assert.equal(bundle.groupId, "system");
-  assert.deepEqual(bundle.tools.map((tool) => tool.name), ["HttpGetTest"]);
-  assert.equal(bundle.metadataByName.get("HttpGetTest").isReadOnly, true);
-  assert.equal(bundle.metadataByName.get("HttpGetTest").displayCategory, "system");
-
-  const aborted = new AbortController();
-  aborted.abort();
-  const abortedResult = await bundle.executeToolCall(
-    { id: "call-1", name: "HttpGetTest", arguments: {} },
-    aborted.signal,
-  );
-  assert.equal(abortedResult.isError, true);
-  assert.equal(abortedResult.content[0].text, "Cancelled");
-
-  const unknownResult = await bundle.executeToolCall({
-    id: "call-2",
-    name: "MissingTool",
-    arguments: {},
-  });
-  assert.equal(unknownResult.isError, true);
-  assert.match(unknownResult.content[0].text, /Unknown tool/);
-});
-
-test("custom system tool options remain in sync with selectable definitions", () => {
-  assert.deepEqual(systemTools.CUSTOM_SYSTEM_TOOL_OPTIONS, [
-    {
-      id: "http_get_test",
-      label: "本地 HTTP Test",
-      description: "Call the network test endpoint and return the response body.",
-    },
-  ]);
-});
-
-test("system tool options include user-selectable tools", () => {
-  assert.deepEqual(systemToolOptions.SYSTEM_TOOL_OPTIONS, [
-    {
-      id: "http_get_test",
-      label: "本地 HTTP Test",
-      description: "Call the network test endpoint and return the response body.",
-      kind: "custom",
-      runtimeScopes: ["chat", "cron_auto_prompt"],
-    },
-  ]);
 });
 
 test("Write rejection for external paths echoes the resolved path and a corrected example", async () => {

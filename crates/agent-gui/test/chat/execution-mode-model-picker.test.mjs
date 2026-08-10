@@ -4,11 +4,7 @@ import test from "node:test";
 
 const headerSources = [
   readFileSync(
-    new URL("../../src/pages/chat/components/ChatHeader.tsx", import.meta.url),
-    "utf8",
-  ),
-  readFileSync(
-    new URL("../../../agent-gateway/web/src/pages/chat/ChatHeader.tsx", import.meta.url),
+    new URL("../../../agent-ui/src/components/chat/ChatHeader.tsx", import.meta.url),
     "utf8",
   ),
 ];
@@ -51,5 +47,22 @@ test("model pickers search models and providers", () => {
     assert.match(source, /\w+\.model\.toLowerCase\(\)\.includes\(normalizedSearch\)/);
     assert.match(source, /\w+\.providerName\.toLowerCase\(\)\.includes\(normalizedSearch\)/);
     assert.match(source, /t\("chat\.noModelFound"\)/);
+  }
+});
+
+test("provider groups reveal the edit affordance before the count on hover", () => {
+  for (const source of headerSources) {
+    assert.match(source, /\bPencil\b/);
+    assert.match(source, /t\("settings\.editProvider"\)/);
+    assert.doesNotMatch(source, /title=\{`\$\{t\("settings\.editProvider"\)/);
+    assert.doesNotMatch(source, /title=\{\s*expanded \? t\("chat\.collapseProvider"\)/);
+    assert.match(source, /pointer-events-none flex w-7 max-w-0/);
+    assert.match(source, /group-hover:max-w-7/);
+    assert.match(source, /group-focus-within:max-w-7/);
+    assert.ok(source.indexOf("<Pencil") < source.indexOf("{group.opts.length}"));
+    assert.match(
+      source,
+      /setIsModelPickerOpen\(false\);\s+onOpenSettings\("providers", group\.id\);/,
+    );
   }
 });

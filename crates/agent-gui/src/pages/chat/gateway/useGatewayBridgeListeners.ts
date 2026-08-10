@@ -1,10 +1,9 @@
+import { createUuid } from "@liveagent/ui/lib/shared/id";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useRef } from "react";
-
 import type { HistoryMessageRef } from "../../../lib/chat/conversation/conversationState";
-import { normalizeChatRuntimeControls, normalizeSystemToolSelection } from "../../../lib/settings";
-import { createUuid } from "../../../lib/shared/id";
+import { normalizeChatRuntimeControls } from "../../../lib/settings";
 import {
   type ActiveGatewayBridgeRequest,
   type GatewayBridgeRuntimeRefs,
@@ -483,7 +482,6 @@ export function useGatewayBridgeListeners(params: UseGatewayBridgeListenersParam
             : undefined,
           executionModeOverride: normalizeGatewayExecutionMode(payload.executionMode),
           workdirOverride: normalizeGatewayWorkdir(payload.workdir),
-          selectedSystemToolIdsOverride: normalizeSystemToolSelection(payload.selectedSystemTools),
         });
         const markRuntimeStarted = async () => {
           await invoke("gateway_chat_mark_started", {
@@ -498,7 +496,6 @@ export function useGatewayBridgeListeners(params: UseGatewayBridgeListenersParam
           conversationIdOverride: resolvedConversationId,
           executionModeOverride: gatewayBridgeRequest.executionModeOverride,
           workdirOverride: gatewayBridgeRequest.workdirOverride,
-          selectedSystemToolIdsOverride: gatewayBridgeRequest.selectedSystemToolIdsOverride,
           runtimeControlsOverride: gatewayBridgeRequest.runtimeControlsOverride,
           gatewayBridgeRequestOverride: gatewayBridgeRequest,
           editResendBaseMessageRef: baseMessageRef,

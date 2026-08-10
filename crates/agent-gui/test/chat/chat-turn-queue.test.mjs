@@ -26,7 +26,6 @@ function turn(id, conversationId, text) {
     uploadedFiles: [],
     executionMode: "tools",
     workdir: "/workspace",
-    selectedSystemToolIds: ["shell"],
     runtimeControls: {
       thinkingEnabled: false,
       reasoning: "off",
@@ -138,7 +137,7 @@ test("queued chat turn preview keeps structured draft hints compact", () => {
     },
   ]);
 
-  assert.equal(queue.buildQueuedChatTurnPreview(richDraft), "hello pasted.txt$reviewer");
+  assert.equal(queue.buildQueuedChatTurnPreview(richDraft), "hello pasted.txt/reviewer");
   assert.equal(queue.queuedChatTurnHasContent(richDraft, []), true);
   assert.equal(queue.queuedChatTurnHasContent(draft(""), [{ fileName: "a.txt" }]), true);
 });

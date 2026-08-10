@@ -5,7 +5,7 @@ import type {
   ToolCall,
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
-import { ASK_USER_QUESTION_TOOL_NAME } from "../../../lib/chat/askUserQuestion";
+import { ASK_USER_QUESTION_TOOL_NAME } from "@liveagent/ui/lib/chat/askUserQuestion";
 import type { CompactionController } from "../../../lib/chat/compaction/controller";
 import { estimateTextTokenUnits } from "../../../lib/chat/compaction/tokenLedger";
 import type { ProviderRuntimeConfig } from "../../../lib/chat/compaction/types";
@@ -45,7 +45,10 @@ import {
   upsertHostedSearchToRound,
   upsertToolCallToRound,
 } from "../../../lib/chat/messages/uiMessages";
-import { runAssistantWithTools } from "../../../lib/chat/runner/agentRunner";
+import {
+  type AgentRunnerFailoverParams,
+  runAssistantWithTools,
+} from "../../../lib/chat/runner/agentRunner";
 import type { StreamDebugLogger } from "../../../lib/debug/agentDebug";
 import { assistantMessageToText } from "../../../lib/providers/llm";
 import { resolveRuntimePlatform } from "../../../lib/runtimePlatform";
@@ -54,7 +57,6 @@ import {
   type McpSettingsOp,
   type ProviderId,
   type SshHostConfig,
-  type SystemToolId,
   selectEnabledMcpServers,
   workspaceProjectPathKey,
 } from "../../../lib/settings";
@@ -73,10 +75,15 @@ import type { BuiltinToolExecutionContext } from "../../../lib/tools/builtinType
 import { createFileToolState } from "../../../lib/tools/fileToolState";
 import type { SkillAccessPolicy } from "../../../lib/tools/skillAccessPolicy";
 import type { SshManagerSessionChange } from "../../../lib/tools/sshManagerTools";
-import { getOrCreateTodoToolState } from "../../../lib/tools/todoTools";
+import { formatTaskListRuntimeContext, type TaskStateStore } from "../../../lib/tools/taskTools";
+import { isSessionApproved, requestToolApproval } from "../../../lib/tools/toolApproval";
+import { resolveToolPolicy } from "../../../lib/tools/toolPolicy";
 import type { TunnelManagerChange } from "../../../lib/tools/tunnelManagerTools";
 import { appendSystemPrompt, buildPartialAssistantMessage } from "../runtime/chatPageRuntime";
-import { buildGatewayToolCallPreviewArguments } from "./gatewayToolPreview";
+import {
+  buildGatewayToolCallPreviewArguments,
+  summarizeToolCallForApproval,
+} from "./gatewayToolPreview";
 
 export type RuntimeModel = {
   api: AssistantMessage["api"];
@@ -202,6 +209,7 @@ export type RunAgentConversationTurnParams = {
   providerId: ProviderId;
   model: string;
   runtime: ProviderRuntimeConfig;
+  failover?: AgentRunnerFailoverParams;
   runtimeModel: RuntimeModel;
   selectedModel: {
     customProviderId: string;
@@ -213,13 +221,14 @@ export type RunAgentConversationTurnParams = {
   skillsRootDir?: string;
   skillAccessPolicy?: SkillAccessPolicy;
   onManagedSkillsChanged?: (change: {
-    action: "install" | "create";
+    action: "install" | "create" | "delete";
     names: string[];
     baseDirs: string[];
   }) => void | Promise<void>;
   agentTemplates: AppSettings["agents"];
-  selectedSystemToolIds: SystemToolId[];
   getMcpSettings: () => AppSettings["mcp"];
+  /** 工具审批策略的实时读取(权威 settingsRef,非 turn 级快照),缺省视为空表。 */
+  getToolPolicies?: () => AppSettings["system"]["toolPolicies"];
   applyMcpOps?: (ops: McpSettingsOp[]) => void;
   remoteWebTunnelsEnabled?: boolean;
   tunnelPublicBaseUrl?: string;
@@ -229,6 +238,8 @@ export type RunAgentConversationTurnParams = {
   sshManagerRemoteAllowed?: boolean;
   onSshSessionsChanged?: (change: SshManagerSessionChange) => void;
   sessionId: string;
+  /** Run 级任务状态存储：由 send 管线构建，提交走非终态持久化。 */
+  taskStateStore: TaskStateStore;
   conversationId: string;
   conversationCwd?: string;
   fallbackTitle: string;
@@ -282,8 +293,8 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
     skillAccessPolicy,
     onManagedSkillsChanged,
     agentTemplates,
-    selectedSystemToolIds,
     getMcpSettings,
+    getToolPolicies,
     applyMcpOps,
     remoteWebTunnelsEnabled,
     tunnelPublicBaseUrl,
@@ -293,6 +304,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
     sshManagerRemoteAllowed,
     onSshSessionsChanged,
     sessionId,
+    taskStateStore,
     conversationId,
     conversationCwd,
     fallbackTitle,
@@ -371,13 +383,22 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
     parentMessageBusSnapshot = await loadParentBusSnapshot();
     return parentMessageBusSnapshot;
   };
-  const withSubagentRuntimeContext = (context: Context): Context => {
+  const withAgentRuntimeContext = (context: Context): Context => {
     let systemPrompt = context.systemPrompt;
     if (subagentReminder) {
       systemPrompt = appendSystemPrompt(systemPrompt, subagentReminder);
     }
     if (parentMessageBusSnapshot) {
       systemPrompt = appendSystemPrompt(systemPrompt, parentMessageBusSnapshot);
+    }
+    // 只注入本 Run 的权威任务状态：edit-resend 等路径可能把上一 Run 持久化的
+    // taskList 带回 meta，工具层按 runId 视其为不存在，注入必须同口径。
+    const taskList = getNextConversationState().meta.taskList;
+    if (taskList && taskList.runId === taskStateStore.runId) {
+      const taskListContext = formatTaskListRuntimeContext(taskList);
+      if (taskListContext) {
+        systemPrompt = appendSystemPrompt(systemPrompt, taskListContext);
+      }
     }
     return systemPrompt !== context.systemPrompt
       ? {
@@ -387,7 +408,6 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
       : context;
   };
   const fileState = createFileToolState();
-  const todoState = getOrCreateTodoToolState(conversationId);
   const subagentScheduler = createSubagentScheduler();
   const runtimePlatform = await resolveRuntimePlatform();
   const buildRegistryStartedAt = perfNowMs();
@@ -396,7 +416,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
     providerId,
     runtimePlatform,
     fileState,
-    todoState,
+    taskStateStore,
     askUserQuestionConversationId: conversationId,
     skillsEnabled: effectiveSkillsEnabled,
     skillsRootDir,
@@ -404,7 +424,6 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
     onManagedSkillsChanged,
     runtimeScope: "chat",
     currentChatModel: selectedModel,
-    selectedSystemToolIds,
     getMcpSettings,
     applyMcpOps,
     remoteWebTunnelsEnabled,
@@ -436,11 +455,21 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
     toolCount: builtinRegistry.tools.length,
     enabledMcpServerCount: selectEnabledMcpServers(getMcpSettings()).length,
   });
-  const combinedTools = builtinRegistry.tools;
+  // 策略为 deny 的工具干脆不发给模型:省 token,且模型不会白白尝试再被拦。
+  // resolveToolGate 的 deny 分支保留为后备(理论上模型已看不到,不会触发)。
+  const toolPoliciesSnapshot = getToolPolicies?.();
+  const combinedTools = builtinRegistry.tools.filter(
+    (tool) =>
+      resolveToolPolicy(
+        tool.name,
+        builtinRegistry.metadataByName.get(tool.name),
+        toolPoliciesSnapshot,
+      ) !== "deny",
+  );
 
   const preCompactionStartedAt = perfNowMs();
   await compaction.maybeCompactPreSend({
-    budgetContext: withSubagentRuntimeContext(
+    budgetContext: withAgentRuntimeContext(
       buildPreparedContext(getNextConversationState(), combinedTools, {
         includeUploadedFilesMetadata: true,
       }),
@@ -463,6 +492,70 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
     context?: BuiltinToolExecutionContext,
   ) => Promise<Message> = (tc, signal, context) =>
     builtinRegistry.executeToolCall(tc, signal, context);
+
+  // 工具审批门:按实时策略裁决每次调用。deny → 直接拦;ask → 挂起等用户在
+  // 聊天审批卡片作决定(本会话已“记住”的工具免审);allow → 放行。
+  const resolveToolGate = async (
+    toolCall: ToolCall,
+    signal?: AbortSignal,
+  ): Promise<{ allow: true } | { allow: false; reason: string }> => {
+    const policy = resolveToolPolicy(
+      toolCall.name,
+      builtinRegistry.metadataByName.get(toolCall.name),
+      getToolPolicies?.(),
+    );
+    if (policy === "deny") {
+      return {
+        allow: false,
+        reason: `工具 ${toolCall.name} 已被用户的权限策略禁止(deny)。不要重试;如确需使用,请让用户在设置的工具权限中放行。`,
+      };
+    }
+    if (policy !== "ask") {
+      return { allow: true };
+    }
+    if (isSessionApproved(conversationId, toolCall.name)) {
+      return { allow: true };
+    }
+    // 待审批标记必须走事件流下发,不能只靠运行时快照:审批在 beforeToolCall 处
+    // 挂起、不追加任何聊天事件,快照的 as_of_seq 停在上一条 tool_call 事件处,
+    // 会被 WebUI「陈旧快照不回滚」的 seq 门丢弃(transcriptStore snapshot 分支)。
+    // 补发一条 tool_call 事件即可拿到新 seq:pending 已登记时参数带标记 → 远端
+    // 渲染审批卡片;消解后再补发一条(pending 已清)覆盖回无标记 → 卡片隐藏。
+    // 桌面本地由 pending 表经 useSyncExternalStore 响应式驱动,不依赖此事件。
+    const emitApprovalMarkerEvent = () => {
+      if (!shouldShowToolEvent(toolCall)) return;
+      gatewayBridgeEvents.queueEvent({
+        type: "tool_call",
+        id: toolCall.id,
+        name: toolCall.name,
+        arguments: buildGatewayToolCallPreviewArguments(toolCall),
+        round: activeAgentRound,
+        conversation_id: conversationId,
+      });
+    };
+    // requestToolApproval 在返回 Promise 前已同步登记 pending,故紧接着的补发
+    // 即可读到 pending 并盖上标记;settle 会先删 pending 再 resolve,finally
+    // 里的补发因而必得到无标记参数。
+    const approvalPromise = requestToolApproval({
+      toolCallId: toolCall.id,
+      toolName: toolCall.name,
+      summary: summarizeToolCallForApproval(toolCall),
+      conversationId,
+      signal,
+    });
+    emitApprovalMarkerEvent();
+    const settlement = await approvalPromise.finally(emitApprovalMarkerEvent);
+    if (settlement.kind === "decided" && settlement.decision !== "deny") {
+      return { allow: true };
+    }
+    const reason =
+      settlement.kind === "timeout"
+        ? `工具 ${toolCall.name} 的审批在等待窗口内未获用户确认,已按拒绝处理。不要重试。`
+        : settlement.kind === "cancelled"
+          ? `用户在批准 ${toolCall.name} 前停止了本轮。不要假设已获批准。`
+          : `用户拒绝了工具 ${toolCall.name} 的执行。不要重试;可改用其他方式或询问用户。`;
+    return { allow: false, reason };
+  };
 
   hookLifecycle.startAgent();
   let result: Awaited<ReturnType<typeof runAssistantWithTools>> | null = null;
@@ -620,8 +713,9 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
 
   function queueToolCallDelta(toolCall: ToolCall, round: number) {
     if (!shouldShowToolEvent(toolCall)) return;
-    // 提问卡必须等问题与选项全部生成完毕再显示：跳过流式增量，双端
-    // （GUI 回合与网关 tool_call_delta）都只在 onToolCall 拿到完整参数后出现。
+    // 提问卡必须等问题与选项全部生成完毕且工具真正开始执行后再显示：
+    // 流式增量与 onToolCall 都只做内部记账，双端统一由
+    // onToolExecutionStart 发布可交互卡片。
     if (toolCall.name === ASK_USER_QUESTION_TOOL_NAME) return;
     pendingToolCallDeltas.set(toolCallDeltaKey(round, toolCall.id), { round, toolCall });
     schedulePendingToolCallDeltaFlush();
@@ -643,7 +737,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
     let midStreamCompactionRequested = false;
     let sawToolCallInRound = false;
     const nativeWebSearchEnabled = runtime.nativeWebSearchEnabled !== false;
-    const agentContext = withSubagentRuntimeContext(
+    const agentContext = withAgentRuntimeContext(
       pendingAgentContext ??
         buildPreparedContext(getNextConversationState(), combinedTools, {
           includeUploadedFilesMetadata: true,
@@ -661,6 +755,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
         providerId,
         model,
         runtime,
+        failover: params.failover,
         runtimePlatform,
         context: agentContext,
         workdir: effectiveWorkdir,
@@ -669,6 +764,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
         tools: combinedTools,
         subagentScheduler,
         executeToolCall: combinedExecutor,
+        resolveToolGate,
         onTurnStart: (round) => {
           activeAgentRound = round;
           streamedAgentText = "";
@@ -741,6 +837,10 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
         onToolCall: (toolCall, round) => {
           sawToolCallInRound = true;
           discardPendingToolCallDelta(toolCall, round);
+          // isRunning 只表示工具已出现在当前轮次，不代表提问已经进入权威
+          // pending 表。提问卡延迟到 onToolExecutionStart，避免用户在
+          // executeToolCall 建立 pending 前抢先提交。
+          if (toolCall.name === ASK_USER_QUESTION_TOOL_NAME) return;
           if (!shouldShowToolEvent(toolCall)) return;
           gatewayBridgeEvents.queueEvent({
             type: "tool_call",
@@ -850,7 +950,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
             getNextConversationState(),
             emittedMessages,
           );
-          const tempContext = withSubagentRuntimeContext(
+          const tempContext = withAgentRuntimeContext(
             buildPreparedContext(tempState, combinedTools, {
               includeUploadedFilesMetadata: true,
             }),
@@ -873,7 +973,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
           latestAgentEmittedMessages = [];
           clearPersistableAgentProgress();
           return {
-            context: withSubagentRuntimeContext(compactedContext),
+            context: withAgentRuntimeContext(compactedContext),
             emittedMessages: [],
           };
         },
@@ -916,7 +1016,7 @@ export async function runAgentConversationTurn(params: RunAgentConversationTurnP
       const compactionResult = await compaction.compactDuringRun({
         trigger: "mid-stream",
         state: tempState,
-        budgetContext: withSubagentRuntimeContext(
+        budgetContext: withAgentRuntimeContext(
           buildPreparedContext(tempState, combinedTools, {
             includeAbortedMessages: true,
             includeUploadedFilesMetadata: true,

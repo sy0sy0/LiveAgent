@@ -25,15 +25,19 @@ const SSH_PROJECT_HOST_ASSOCIATIONS_TABLE: &str = "ssh_project_host_associations
 const SSH_KNOWN_HOSTS_TABLE: &str = "ssh_known_hosts";
 const REMOTE_SETTINGS_TABLE: &str = "remote_settings";
 const MEMORY_SETTINGS_TABLE: &str = "memory_settings";
+const MODEL_FAILOVER_SETTINGS_TABLE: &str = "model_failover_settings";
 
 const SYSTEM_EXECUTION_MODE_KEY: &str = "executionMode";
 const SYSTEM_WORKDIR_KEY: &str = "workdir";
-const SYSTEM_SELECTED_TOOLS_KEY: &str = "selectedSystemTools";
+// 工具审批策略(按工具名/`group:`/`server:` 键 → allow/ask/deny)。此前未纳入
+// 保存白名单,导致重启后设置丢失;补入本键持久化。
+const SYSTEM_TOOL_POLICIES_KEY: &str = "toolPolicies";
 const SYSTEM_WORKSPACE_PROJECTS_KEY: &str = "workspaceProjects";
 const SYSTEM_ACTIVE_WORKSPACE_PROJECT_ID_KEY: &str = "activeWorkspaceProjectId";
 const SYSTEM_HIDDEN_WORKSPACE_PROJECT_PATHS_KEY: &str = "hiddenWorkspaceProjectPaths";
 const SYSTEM_MISSING_WORKSPACE_PROJECT_PATHS_KEY: &str = "missingWorkspaceProjectPaths";
 const SYSTEM_ARCHIVED_WORKSPACE_PROJECT_PATHS_KEY: &str = "archivedWorkspaceProjectPaths";
+const SYSTEM_WORKSPACE_RESOURCE_SETTINGS_KEY: &str = "workspaceResourceSettings";
 const SYSTEM_SYSTEM_PROXY_KEY: &str = "systemProxy";
 const DEFAULT_WORKSPACE_PROJECT_ID: &str = "default-project";
 const DEFAULT_WORKSPACE_PROJECT_NAME: &str = "Default Project";
@@ -158,6 +162,7 @@ include!("agents.rs");
 include!("system.rs");
 include!("mcp.rs");
 include!("memory_settings.rs");
+include!("model_failover.rs");
 include!("gateway_sync.rs");
 include!("ssh/mod.rs");
 include!("commands.rs");

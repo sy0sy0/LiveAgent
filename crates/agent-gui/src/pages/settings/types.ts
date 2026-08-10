@@ -23,6 +23,7 @@ export type SettingsPageProps = {
   saveState: SettingsSaveState;
   onBack: () => void;
   initialSection?: SectionId;
+  initialProviderId?: string;
   hiddenSections?: SectionId[];
   appUpdate: AppUpdateController;
 };

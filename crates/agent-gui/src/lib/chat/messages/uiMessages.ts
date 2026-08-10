@@ -5,17 +5,17 @@ import type {
   ToolResultMessage,
   Usage,
 } from "@earendil-works/pi-ai";
+import {
+  buildSubagentCardToolCallId,
+  type SubagentBatchDetails,
+  type SubagentCardDetails,
+} from "@liveagent/ui/lib/subagents/protocol";
 import { assistantMessageToText } from "../../providers/llm";
 import {
   isProviderNativeWebFetchToolName,
   isProviderNativeWebSearchToolName,
 } from "../../providers/nativeWebSearch";
 import { isSubagentCardToolCall } from "../../subagents/card";
-import {
-  buildSubagentCardToolCallId,
-  type SubagentBatchDetails,
-  type SubagentCardDetails,
-} from "../../subagents/protocol";
 import { GLOBAL_BASH_MAX_TIMEOUT_MS, MIN_BASH_TIMEOUT_MS } from "../../tools/bashTimeoutPolicy";
 import {
   enrichHostedSearchContentWithText,
@@ -520,6 +520,8 @@ export function toolCallArgsForDisplay(toolCall: ToolCall) {
       const out: Record<string, unknown> = {};
       for (const [key, value] of Object.entries(args)) {
         if (key === LIVE_TOOL_PREVIEW_META_KEY) continue;
+        // 合成参数(网关同步注入的截止时间/审批标记等,约定以 __ 前缀)不入展示。
+        if (key.startsWith("__")) continue;
         if (typeof value === "string" && value.length > 800) {
           out[key] = `${value.slice(0, 800)}...（len=${value.length}）`;
         } else {

@@ -1,17 +1,22 @@
 import type { Context } from "@earendil-works/pi-ai";
+import { AppErrorBoundary } from "@liveagent/ui/components/AppErrorBoundary";
+import { LocaleContext, t as translate } from "@liveagent/ui/i18n/index";
+import { initAutomation } from "@liveagent/ui/lib/automation/index";
+import {
+  applyGatewaySettingsSyncPayload,
+  buildGatewaySettingsSyncPayload,
+  type GatewaySettingsSyncPayload,
+} from "@liveagent/ui/lib/settings/sync";
+import { SettingsPage } from "@liveagent/ui/pages/settings/SettingsPage";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AppErrorBoundary } from "./components/AppErrorBoundary";
-import { CliIdentityUpdateHost } from "./components/CliIdentityUpdateHost";
 import { CronPromptRunner } from "./components/cron/CronPromptRunner";
 import { Pin } from "./components/icons";
 import { useNativeInputContextMenu } from "./components/input-context-menu/NativeInputContextMenu";
 import { MemoryOrganizerHost } from "./components/memory/useMemoryOrganizer";
 import { WindowsTitleBar } from "./components/WindowsTitleBar";
-import { LocaleContext, t as translate } from "./i18n";
 import { useAppUpdateController } from "./lib/appUpdates";
-import { initAutomation } from "./lib/automation";
 import {
   type AppSettings,
   getDefaultSettings,
@@ -29,15 +34,9 @@ import {
   publishGatewaySettingsSync,
   type SettingsSaveState,
 } from "./lib/settings/storage";
-import {
-  applyGatewaySettingsSyncPayload,
-  buildGatewaySettingsSyncPayload,
-  type GatewaySettingsSyncPayload,
-} from "./lib/settings/sync";
 import { applyStoredGlobalShortcuts } from "./lib/shortcuts/globalShortcuts";
 import { applyFontFamilies } from "./lib/system/fontFamily";
 import { ChatPage } from "./pages/ChatPage";
-import { SettingsPage } from "./pages/SettingsPage";
 import type { SectionId } from "./pages/settings/types";
 
 function getDefaultContext(): Context {
@@ -169,6 +168,7 @@ function applyRuntimeSystemDefaults(settings: AppSettings, defaultWorkdir: strin
 export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SectionId>("system");
+  const [settingsProviderId, setSettingsProviderId] = useState<string>();
   const [settingsReady, setSettingsReady] = useState(false);
   const [settings, setSettingsState] = useState<AppSettings>(() => getDefaultSettings());
   const [settingsSaveState, setSettingsSaveState] = useState<SettingsSaveState>({
@@ -377,6 +377,7 @@ export default function App() {
   // synchronously by setSettings, so read-modify-write sequences that stay in
   // one synchronous segment can never observe a stale snapshot.
   const getMcpSettings = useCallback(() => settingsRef.current.mcp, []);
+  const getToolPolicies = useCallback(() => settingsRef.current.system.toolPolicies, []);
 
   const reloadPersistedSettings = useCallback(async () => {
     await saveChainRef.current.catch(() => undefined);
@@ -404,8 +405,9 @@ export default function App() {
   );
 
   const openSettings = useCallback(
-    (section: SectionId = "system") => {
+    (section: SectionId = "system", providerId?: string) => {
       setSettingsSection(section);
+      setSettingsProviderId(section === "providers" ? providerId : undefined);
       setSettingsOpen(true);
       setOverlay("entering");
       requestAnimationFrame(() => requestAnimationFrame(() => setOverlay("open")));
@@ -586,7 +588,6 @@ export default function App() {
   return (
     <LocaleContext.Provider value={localeContextValue}>
       <AppChrome>
-        <CliIdentityUpdateHost settings={settings} setSettings={setSettings} />
         <CronPromptRunner settings={settings} />
         <MemoryOrganizerHost settings={settings} setSettings={setSettings} />
         <AppErrorBoundary>
@@ -594,6 +595,7 @@ export default function App() {
             settings={settings}
             setSettings={setSettings}
             getMcpSettings={getMcpSettings}
+            getToolPolicies={getToolPolicies}
             context={context}
             setContext={setContext}
             onOpenSettings={openSettings}
@@ -615,6 +617,7 @@ export default function App() {
                 saveState={settingsSaveState}
                 onBack={closeSettings}
                 initialSection={settingsSection}
+                initialProviderId={settingsProviderId}
                 appUpdate={appUpdate}
               />
             </AppErrorBoundary>

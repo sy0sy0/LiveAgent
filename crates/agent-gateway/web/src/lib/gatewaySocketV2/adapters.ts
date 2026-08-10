@@ -60,6 +60,7 @@ import {
   HistoryPinRequestSchema,
   HistoryPrefixRequestSchema,
   HistoryRenameRequestSchema,
+  HistorySetCwdRequestSchema,
   HistoryShareGetRequestSchema,
   HistoryShareSetRequestSchema,
   HistoryWorkdirsRequestSchema,
@@ -334,9 +335,6 @@ function buildChatCommand(body: J) {
         : undefined,
       executionMode: str(inner.execution_mode),
       workdir: str(inner.workdir),
-      selectedSystemTools: Array.isArray(inner.selected_system_tools)
-        ? inner.selected_system_tools.map((item) => str(item))
-        : [],
       uploadedFiles: uploadedFiles.map((file) => {
         const raw = rec(file);
         return create(ChatUploadedFileSchema, {
@@ -543,6 +541,14 @@ function agentRequestPayload(type: string, body: J): GatewayEnvelope["payload"] 
         value: create(HistoryPinRequestSchema, {
           conversationId: trimStr(body.conversation_id),
           isPinned: bool(body.is_pinned),
+        }),
+      };
+    case "history.set_cwd":
+      return {
+        case: "historySetCwd",
+        value: create(HistorySetCwdRequestSchema, {
+          conversationId: trimStr(body.conversation_id),
+          cwd: trimStr(body.cwd),
         }),
       };
     case "history.share.get":
@@ -1013,6 +1019,7 @@ function decodeAgentResponse(envelope: AgentEnvelope, options: { agentOnline: bo
     case "historyRenameResp":
     case "historyBranchResp":
     case "historyPinResp":
+    case "historySetCwdResp":
       if (!payload.value.conversation) {
         frameError("unexpected agent response");
       }

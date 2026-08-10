@@ -1,4 +1,5 @@
 import type { ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
+import type { SystemToolRuntimeScope } from "@liveagent/ui/lib/tools/systemToolOptions";
 import { homeDir } from "@tauri-apps/api/path";
 import type { RuntimePlatform } from "../runtimePlatform";
 import {
@@ -21,7 +22,6 @@ import type {
   BuiltinToolMetadata,
 } from "./builtinTypes";
 import { createCronTools } from "./cronTools";
-import { createCustomSystemTools } from "./customSystemTools";
 import { createFileToolState, type FileToolState } from "./fileToolState";
 import { createFsTools } from "./fsTools";
 import { createMcpManagerTools } from "./mcpManagerTools";
@@ -31,9 +31,8 @@ import { createShellTools } from "./shellTools";
 import type { SkillAccessPolicy } from "./skillAccessPolicy";
 import { createSkillTools } from "./skillTools";
 import { createSSHManagerTools, type SshManagerSessionChange } from "./sshManagerTools";
-import type { SystemToolId, SystemToolRuntimeScope } from "./systemToolOptions";
+import { createTaskTools, type TaskStateStore } from "./taskTools";
 import { createTerminalTools } from "./terminalTools";
-import { createTodoTools, type TodoToolState } from "./todoTools";
 import { createTunnelManagerTools, type TunnelManagerChange } from "./tunnelManagerTools";
 
 export type BuiltinToolRegistry = {
@@ -47,10 +46,16 @@ export type BuiltinToolRegistry = {
   hasTool: (toolName: string) => boolean;
 };
 
+// 第三方来源(MCP server / 插件)的工具名不受我们控制,可能撞车。撞车时不能像
+// 内置工具那样 throw 打断整轮——那等于让一个坏插件废掉整个对话。改为:先到先
+// 得、跳过后来者并告警;仅当两侧都是可信内置组时才 throw(那是编译期的开发 bug)。
+const UNTRUSTED_TOOL_GROUPS: ReadonlySet<BuiltinToolBundle["groupId"]> = new Set(["mcp"]);
+
 function createBuiltinToolRegistry(bundles: BuiltinToolBundle[]): BuiltinToolRegistry {
   const tools: BuiltinToolBundle["tools"] = [];
   const metadataByName = new Map<string, BuiltinToolMetadata>();
   const executorsByName = new Map<string, BuiltinToolBundle["executeToolCall"]>();
+  const groupIdByToolName = new Map<string, BuiltinToolBundle["groupId"]>();
   const canonicalToolNameByLookupKey = new Map<string, string | null>();
 
   const registerCanonicalToolName = (toolName: string) => {
@@ -73,10 +78,25 @@ function createBuiltinToolRegistry(bundles: BuiltinToolBundle[]): BuiltinToolReg
   for (const bundle of bundles) {
     for (const tool of bundle.tools) {
       if (executorsByName.has(tool.name)) {
-        throw new Error(`Duplicate builtin tool name detected: ${tool.name}`);
+        const existingGroup = groupIdByToolName.get(tool.name);
+        const bothTrusted =
+          !UNTRUSTED_TOOL_GROUPS.has(bundle.groupId) &&
+          existingGroup !== undefined &&
+          !UNTRUSTED_TOOL_GROUPS.has(existingGroup);
+        if (bothTrusted) {
+          // 两个内置工具同名:编译期就该修的开发 bug,继续保持强失败。
+          throw new Error(`Duplicate builtin tool name detected: ${tool.name}`);
+        }
+        // 涉及 MCP/插件的撞车:先到先得,跳过后来者,绝不打断整轮。
+        console.warn(
+          `[tools] Tool name "${tool.name}" from group "${bundle.groupId}" collides with an ` +
+            `already-registered tool (group "${existingGroup ?? "unknown"}"); skipping the newcomer.`,
+        );
+        continue;
       }
       tools.push(tool);
       executorsByName.set(tool.name, bundle.executeToolCall);
+      groupIdByToolName.set(tool.name, bundle.groupId);
       registerCanonicalToolName(tool.name);
       const metadata = bundle.metadataByName.get(tool.name);
       if (metadata) {
@@ -130,7 +150,7 @@ type BuildBuiltinBaseToolRegistryParams = {
   skillsRootDir?: string;
   skillAccessPolicy?: SkillAccessPolicy;
   onManagedSkillsChanged?: (change: {
-    action: "install" | "create";
+    action: "install" | "create" | "delete";
     names: string[];
     baseDirs: string[];
   }) => void | Promise<void>;
@@ -139,7 +159,6 @@ type BuildBuiltinBaseToolRegistryParams = {
     customProviderId: string;
     model: string;
   };
-  selectedSystemToolIds: SystemToolId[];
   /** Live read of the authoritative MCP settings (never a turn-level snapshot). */
   getMcpSettings: () => McpSettings;
   /** Id-keyed merge commit into the authoritative settings; absent in read-only scopes. */
@@ -199,11 +218,6 @@ async function buildBaseBuiltinToolBundles(params: BuildBuiltinBaseToolRegistryP
       runtimeScope: params.runtimeScope,
       resolveHomeDir,
     }),
-    createCustomSystemTools({
-      selectedToolIds: params.selectedSystemToolIds,
-      runtimeScope: params.runtimeScope,
-      currentChatModel: params.currentChatModel,
-    }),
     createMemoryTools({
       workdir: params.workdir,
       mode: params.memoryToolMode ?? "rw",
@@ -254,21 +268,21 @@ async function buildBaseBuiltinToolBundles(params: BuildBuiltinBaseToolRegistryP
 export async function buildBuiltinToolRegistry(
   params: BuildBuiltinBaseToolRegistryParams & {
     subagentRuntime?: SubagentRuntimeConfig;
-    todoState?: TodoToolState;
+    taskStateStore?: TaskStateStore;
     /** chat 场景注入交互式提问工具；子代理/自动化场景无人值守，不注册。 */
     askUserQuestionConversationId?: string;
   },
 ) {
   const baseBundles = await buildBaseBuiltinToolBundles(params);
-  const todoBundles =
-    params.runtimeScope === "chat" && params.todoState
-      ? [createTodoTools({ state: params.todoState })]
+  const taskBundles =
+    params.runtimeScope === "chat" && params.taskStateStore
+      ? [createTaskTools(params.taskStateStore)]
       : [];
   const askUserQuestionBundles =
     params.runtimeScope === "chat" && params.askUserQuestionConversationId
       ? [createAskUserQuestionTools({ conversationId: params.askUserQuestionConversationId })]
       : [];
-  const chatBundles = [...todoBundles, ...askUserQuestionBundles];
+  const chatBundles = [...taskBundles, ...askUserQuestionBundles];
 
   const subagentRuntime = params.subagentRuntime;
   if (!subagentRuntime) {
@@ -317,7 +331,6 @@ export async function buildBuiltinToolRegistry(
             fileState: createFileToolState(),
             skillsEnabled: false,
             applyMcpOps: undefined,
-            selectedSystemToolIds: [],
             mcpLoadFailureMode: "continue",
             memoryToolMode: "ro",
           }),
