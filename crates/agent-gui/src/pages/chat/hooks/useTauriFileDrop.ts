@@ -1,22 +1,38 @@
 import { isTauri } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { type Dispatch, type SetStateAction, useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import {
+  type NativeFileDropTarget,
+  nativeDropPositionScaleFactor,
+  resolveFinalNativeFileDropTarget,
+  resolveNativeFileDropTarget,
+  resolveNativeUploadConversationId,
+} from "./nativeFileDropRouting";
 
 type UseTauriFileDropParams = {
-  canDropUpload: boolean;
-  fileDropTitle: string;
-  importReadableFilePaths: (paths: string[]) => Promise<void>;
-  setErrorMessage: Dispatch<SetStateAction<string | null>>;
+  importUploadZonePaths: (paths: string[], targetConversationId?: string) => Promise<void>;
+  importWorkspaceFolderPaths: (paths: string[]) => Promise<void>;
+  /**
+   * Logical (CSS pixel) hover position while a native drag is over the
+   * window, null when it leaves or drops. The session workbench uses this to
+   * focus the hovered conversation pane so the drop lands in it.
+   */
+  onDropPositionChange?: (point: { x: number; y: number } | null) => void;
 };
 
 /**
- * Tauri webview drag-drop listener: tracks the drop-overlay visibility and
- * routes dropped paths into the upload pipeline (or an error toast while
- * uploads are unavailable).
+ * Tauri webview drag-drop listener: routes native paths by their visual drop
+ * target. Workspace-zone drops add folders as projects, the composer dialog
+ * hands the mixed payload to the upload-zone dispatcher (files become
+ * attachments, folders become project roots), and every other application
+ * surface ignores the drop.
  */
 export function useTauriFileDrop(params: UseTauriFileDropParams) {
-  const { canDropUpload, fileDropTitle, importReadableFilePaths, setErrorMessage } = params;
-  const [isFileDropActive, setIsFileDropActive] = useState(false);
+  const { importUploadZonePaths, importWorkspaceFolderPaths, onDropPositionChange } = params;
+  const [activeDropTarget, setActiveDropTarget] = useState<NativeFileDropTarget>(null);
+  const activeDropTargetRef = useRef<NativeFileDropTarget>(null);
+  const onDropPositionChangeRef = useRef(onDropPositionChange);
+  onDropPositionChangeRef.current = onDropPositionChange;
 
   useEffect(() => {
     // The Vite page can also be opened directly in a browser during
@@ -30,21 +46,49 @@ export function useTauriFileDrop(params: UseTauriFileDropParams) {
     getCurrentWebview()
       .onDragDropEvent((event) => {
         if (event.payload.type === "enter" || event.payload.type === "over") {
-          setIsFileDropActive(true);
+          const scaleFactor = nativeDropPositionScaleFactor(
+            window.navigator.userAgent,
+            window.devicePixelRatio,
+          );
+          const nextTarget = resolveNativeFileDropTarget(event.payload.position, { scaleFactor });
+          activeDropTargetRef.current = nextTarget;
+          setActiveDropTarget(nextTarget);
+          onDropPositionChangeRef.current?.({
+            x: event.payload.position.x / (scaleFactor || 1),
+            y: event.payload.position.y / (scaleFactor || 1),
+          });
           return;
         }
 
         if (event.payload.type === "drop") {
-          setIsFileDropActive(false);
-          if (!canDropUpload) {
-            setErrorMessage(fileDropTitle);
+          const scaleFactor = nativeDropPositionScaleFactor(
+            window.navigator.userAgent,
+            window.devicePixelRatio,
+          );
+          const dropTarget = resolveFinalNativeFileDropTarget(
+            activeDropTargetRef.current,
+            event.payload.position,
+            { scaleFactor },
+          );
+          setActiveDropTarget(null);
+          activeDropTargetRef.current = null;
+          onDropPositionChangeRef.current?.(null);
+          if (dropTarget === "workspace") {
+            void importWorkspaceFolderPaths(event.payload.paths);
             return;
           }
-          void importReadableFilePaths(event.payload.paths);
+          if (dropTarget !== "upload") return;
+          const targetConversationId = resolveNativeUploadConversationId(event.payload.position, {
+            scaleFactor,
+          });
+          if (!targetConversationId) return;
+          void importUploadZonePaths(event.payload.paths, targetConversationId);
           return;
         }
 
-        setIsFileDropActive(false);
+        setActiveDropTarget(null);
+        activeDropTargetRef.current = null;
+        onDropPositionChangeRef.current?.(null);
       })
       .then((nextUnlisten) => {
         if (cancelled) {
@@ -63,7 +107,10 @@ export function useTauriFileDrop(params: UseTauriFileDropParams) {
         unlisten();
       }
     };
-  }, [canDropUpload, fileDropTitle, importReadableFilePaths, setErrorMessage]);
+  }, [importUploadZonePaths, importWorkspaceFolderPaths]);
 
-  return { isFileDropActive };
+  return {
+    isFileDropActive: activeDropTarget === "upload",
+    isWorkspaceFolderDropActive: activeDropTarget === "workspace",
+  };
 }

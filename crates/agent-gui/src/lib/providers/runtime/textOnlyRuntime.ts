@@ -4,7 +4,7 @@ import {
   type HostedSearchBlock,
   type HostedSearchOrderedBlock,
   mergeHostedSearchBlocks,
-} from "../../chat/messages/hostedSearch";
+} from "@liveagent/ui/lib/chat/hostedSearch";
 import { buildStreamRequestDebugPayload, type StreamDebugLogger } from "../../debug/agentDebug";
 import type { ProviderId } from "../../settings";
 import { withPowerActivity } from "../../system/powerActivity";
@@ -102,9 +102,15 @@ function buildTextOnlyStreamOptions(params: {
       ((params.providerId === "codex" || params.providerId === "xai") &&
         (params.model.api === "openai-responses" || params.model.api === "openai-completions")) ||
       (params.providerId === "claude_code" && params.model.api === "anthropic-messages") ||
-      (params.providerId === "gemini" && params.model.api === "google-generative-ai")
+      (params.providerId === "gemini" && params.model.api === "google-generative-ai") ||
+      params.providerId === "deepseek"
         ? toSimpleStreamReasoning(params.runtime.reasoning)
         : undefined,
+    deepSeekThinking:
+      params.providerId === "deepseek" && params.runtime.reasoning === "off"
+        ? "disabled"
+        : undefined,
+    workdir: params.workdir,
     // Text-only mode cannot execute local tools. Provider-native web search is
     // hosted by the upstream provider, so it can stay on auto when explicitly enabled.
     toolChoice: usesOpenAIChatNativeWebSearch ? undefined : nativeWebSearch ? "auto" : "none",
@@ -121,6 +127,8 @@ function buildTextOnlyStreamOptions(params: {
     model: params.model,
     workdir: params.workdir,
     nativeWebSearch: params.nativeWebSearch,
+    promptCacheHintMode:
+      params.runtime.modelConfig?.promptCacheHintMode ?? params.runtime.promptCacheHintMode,
     debugLogger: params.debugLogger,
     extra: { sessionId },
   });
@@ -164,12 +172,25 @@ export async function streamAssistantMessage(params: {
   onHostedSearch?: (block: HostedSearchBlock) => void;
   onRetryStatus?: (attempt: number, maxAttempts: number, errorMessage: string) => void;
   onRetryRecovered?: () => void;
+  /** Exact text-only provider boundary after its mandatory system suffix is appended. */
+  onRequestStart?: (info: { context: Context; systemSuffix: string }) => void;
   failover?: TextStreamFailoverParams;
 }) {
   const modelId = params.model.trim();
   if (!modelId) throw new Error("No model selected");
   if (!params.runtime.baseUrl.trim()) throw new Error("Base URL cannot be empty");
   if (!params.runtime.apiKey.trim()) throw new Error("API Key cannot be empty");
+
+  const systemSuffix = buildTextOnlySystemSuffix(params.allowJsonOutput);
+  const callContext = buildTextOnlyCallContext(params.context, {
+    allowJsonOutput: params.allowJsonOutput,
+  });
+  try {
+    params.onRequestStart?.({ context: callContext, systemSuffix });
+  } catch (error) {
+    // Diagnostic observers must never stop the provider request.
+    console.warn("text-only request observer failed; continuing without diagnostics", error);
+  }
 
   const proxyRequest = await prepareProviderRequest(params.providerId, params.runtime, {
     sessionId: params.sessionId,
@@ -184,9 +205,6 @@ export async function streamAssistantMessage(params: {
     params.runtime.baseUrl.trim(),
   );
 
-  const callContext = buildTextOnlyCallContext(params.context, {
-    allowJsonOutput: params.allowJsonOutput,
-  });
   const shouldProbeHostedSearch =
     Boolean(params.nativeWebSearch) &&
     providerSupportsNativeWebSearch(params.providerId, m.api, {

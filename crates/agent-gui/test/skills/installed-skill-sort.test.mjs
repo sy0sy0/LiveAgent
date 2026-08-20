@@ -7,7 +7,16 @@ const implementations = [
   {
     label: "共享 Skills Hub",
     loader: createTsModuleLoader(),
-    page: new URL("../../../agent-ui/src/pages/skills-hub/SkillsHubPage.tsx", import.meta.url),
+    sources: [
+      "SkillsHubPage.tsx",
+      "InstalledSkillCard.tsx",
+      "InstalledSkillPreviewDrawer.tsx",
+      "SkillsImportView.tsx",
+      "SkillsStoreView.tsx",
+      "useFlipGrid.ts",
+    ].map(
+      (file) => new URL(`../../../agent-ui/src/pages/skills-hub/${file}`, import.meta.url),
+    ),
   },
 ];
 
@@ -21,7 +30,7 @@ function skill(name, installedAt = null) {
   };
 }
 
-for (const { label, loader, page } of implementations) {
+for (const { label, loader, sources } of implementations) {
   const sorting = loader.loadModule("@liveagent/ui/lib/skills/installedSort.ts");
 
   test(`${label} keeps built-ins ahead of enabled and disabled skills`, () => {
@@ -90,7 +99,7 @@ for (const { label, loader, page } of implementations) {
   });
 
   test(`${label} wires visual order, selection order, persistence, and reduced-motion FLIP`, () => {
-    const source = readFileSync(page, "utf8");
+    const source = sources.map((file) => readFileSync(file, "utf8")).join("\n");
 
     assert.match(source, /skillsHub\.installedSort/);
     assert.match(source, /sortInstalledSkillItems\(filtered, installedSort, selected/);
@@ -99,8 +108,8 @@ for (const { label, loader, page } of implementations) {
     assert.match(source, /ref=\{installedGridRef\}/);
     assert.equal(source.match(/data-flip-key=\{key\}/g)?.length, 2);
     assert.match(source, /prefers-reduced-motion: reduce/);
-    assert.match(source, /\[color-scheme:light\][^"]*dark:\[color-scheme:dark\]/);
-    assert.match(source, /<option[\s\S]*className="bg-background text-foreground"/);
+    assert.match(source, /<Select[\s\S]*value=\{installedSort\}/);
+    assert.match(source, /<SelectItem[\s\S]*value=\{option\.value\}/);
     assert.match(source, /followElement\?\.scrollIntoView\(\{/);
     assert.match(source, /block: "nearest"/);
     assert.match(source, /behavior: reducedMotion \? "auto" : "smooth"/);
@@ -144,32 +153,48 @@ for (const { label, loader, page } of implementations) {
     assert.match(source, /element\.style\.zIndex = ""/);
     assert.match(source, /clearAnimation\(\);[\s\S]*const grid = gridRef\.current/);
     assert.match(source, /element\.style\.translate/);
-    assert.match(source, /h-10 max-w-\[11rem\][^"]*bg-background\/95/);
-    assert.match(source, /h-10 w-full[^"]*bg-background\/95/);
-    assert.match(source, /dark:bg-popover\/95/);
-    assert.match(source, /hub-panel-enter flex items-center justify-between gap-3 max-sm:flex-col max-sm:items-stretch max-sm:gap-2/);
-    assert.match(source, /max-sm:max-w-full max-sm:overflow-x-auto max-sm:\[scrollbar-width:none\] max-sm:\[&::-webkit-scrollbar\]:hidden/);
-    assert.match(source, /max-sm:max-w-\[7\.5rem\] max-sm:px-2/);
-    assert.match(source, /relative w-full min-w-0 max-w-md max-sm:flex-1/);
+    assert.match(
+      source,
+      /<SelectTrigger[\s\S]*h-8 w-auto max-w-\[11rem\][^"]*bg-transparent/,
+    );
+    assert.match(source, /<Input[\s\S]*h-11 rounded-full[^"]*bg-background/);
+    assert.match(source, /from "@liveagent\/ui\/components\/ui\/select"/);
+    assert.match(
+      source,
+      /hub-panel-enter flex min-h-11 items-center justify-between gap-3 max-sm:flex-col/,
+    );
+    assert.match(
+      source,
+      /max-w-full[^"]*overflow-x-auto[^"]*\[scrollbar-width:none\] \[&::-webkit-scrollbar\]:hidden/,
+    );
+    assert.match(source, /max-sm:max-w-\[8rem\]/);
+    assert.match(source, /hub-panel-enter relative mb-5/);
+    assert.equal(source.match(/2xl:grid-cols-5/g)?.length, 5);
     assert.match(source, /pb-\[calc\(10rem\+env\(safe-area-inset-bottom\)\)\] sm:pb-24/);
     assert.equal(
       source.match(/max-sm:bottom-\[calc\(1rem\+env\(safe-area-inset-bottom\)\)\]/g)?.length,
       2,
     );
-    assert.match(source, /max-sm:bottom-\[calc\(0\.75rem\+env\(safe-area-inset-bottom\)\)\]/);
-    assert.equal(source.match(/fixed inset-0 z-50 flex justify-end bg-background\/55/g)?.length, 2);
+    assert.match(source, /max-sm:bottom-\[calc\(0\.25rem\+env\(safe-area-inset-bottom\)\)\]/);
+    assert.equal(source.match(/<SheetPopup/g)?.length, 2);
+    assert.equal(source.match(/variant="inset"/g)?.length, 2);
+    assert.equal(source.match(/<SheetPanel/g)?.length, 2);
+    assert.match(source, /from "@liveagent\/ui\/components\/ui\/sheet"/);
+    assert.doesNotMatch(source, /createPortal/);
     assert.equal(
       source.match(/hub-panel-enter pointer-events-auto[^"]*bg-background\/95/g)?.length,
       3,
     );
-    assert.match(source, /notify-toast-enter[^"]*bg-amber-50/);
+    assert.match(
+      source,
+      /notify-toast-enter[^"]*border-amber-500\/30[^"]*bg-background/,
+    );
     assert.doesNotMatch(source, /<select[^>]*backdrop-blur/);
     assert.doesNotMatch(source, /<input[^>]*backdrop-blur/);
     assert.doesNotMatch(source, /hub-skill-card[^"]*backdrop-blur/);
     assert.doesNotMatch(source, /skill-card-enter group flex h-full[^"]*backdrop-blur/);
     assert.doesNotMatch(source, /hub-panel-enter pointer-events-auto[^"]*backdrop-blur/);
     assert.doesNotMatch(source, /notify-toast-enter[^"]*backdrop-blur/);
-    assert.doesNotMatch(source, /fixed inset-0 z-50 flex justify-end[^"]*backdrop-blur/);
-    assert.doesNotMatch(source, /flex h-full w-full flex-col border-l[^"]*backdrop-blur/);
+    assert.doesNotMatch(source, /fixed inset-0 z-50 flex justify-end/);
   });
 }

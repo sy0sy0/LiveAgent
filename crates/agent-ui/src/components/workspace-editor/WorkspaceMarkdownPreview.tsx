@@ -12,7 +12,8 @@ import {
 } from "react";
 import type { Components, ExtraProps } from "streamdown";
 import { invokeFs } from "../../lib/tools/fsBackend";
-import { ExternalLinkModal, Markdown } from "../Markdown";
+import { ExternalLinkModal } from "../Markdown";
+import { DocumentMarkdown } from "../markdown/DocumentMarkdown";
 import {
   classifyWorkspaceMarkdownTarget,
   workspaceMarkdownHeadingSlug,
@@ -281,10 +282,11 @@ export const WorkspaceMarkdownPreview = memo(function WorkspaceMarkdownPreview(
     () => ({ workdir, markdownPath, onOpenWorkspacePath }),
     [markdownPath, onOpenWorkspacePath, workdir],
   );
+  // select-text 覆盖宿主全局的 user-select: none，允许在预览中选中复制文本。
   return (
-    <div data-workspace-markdown-preview="">
+    <div data-workspace-markdown-preview="" className="select-text">
       <WorkspaceMarkdownPreviewContext.Provider value={contextValue}>
-        <Markdown
+        <DocumentMarkdown
           content={content}
           className={className}
           readOnly

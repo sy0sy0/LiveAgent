@@ -14,6 +14,7 @@ use crate::runtime::platform::{
     expand_tilde_path, maybe_augment_macos_path, shell_basename, strip_windows_verbatim_prefix,
 };
 use crate::runtime::process::{configure_child_process_group, terminate_child_process_tree};
+use crate::runtime::sandbox::{self, SandboxOptions, SandboxSpec};
 
 const MAX_STDOUT_BYTES: usize = 400 * 1024; // 400KB
 const MAX_STDERR_BYTES: usize = 400 * 1024; // 400KB
@@ -111,6 +112,10 @@ pub struct ShellRunResponse {
     pub platform: String,
     pub profile: String,
     pub shell_family: String,
+    /// 沙箱机制("seatbelt"/"bubblewrap"/"low-integrity-token"/"appcontainer"),
+    /// 未启用沙箱时为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
     pub stdout: String,
     pub stderr: String,
     pub stdout_truncated: bool,
@@ -179,6 +184,13 @@ fn canonicalize_workdir(workdir: &str) -> Result<PathBuf, ShellError> {
     Ok(strip_windows_verbatim_prefix(fs::canonicalize(&p)?))
 }
 
+/// Canonical workspace root for runtime entry points that need to construct a
+/// sandbox spec. Keep the internal error type private while sharing the exact
+/// validation/canonicalization semantics with the one-shot runner.
+pub(crate) fn canonical_workdir(workdir: &str) -> Result<PathBuf, String> {
+    canonicalize_workdir(workdir).map_err(|error| error.to_string())
+}
+
 fn normalize_rel_path_input(input: &str) -> String {
     input.trim().replace('\\', "/")
 }
@@ -244,6 +256,30 @@ fn resolve_absolute_cwd(value: &str) -> Result<PathBuf, ShellError> {
         return Err(invalid());
     }
     Ok(canon)
+}
+
+pub(crate) fn resolve_shell_cwd(workdir: &str, cwd: Option<&str>) -> Result<PathBuf, String> {
+    let wd = canonicalize_workdir(workdir).map_err(|error| error.to_string())?;
+    match cwd {
+        None => Ok(wd),
+        Some(value) if is_absolute_cwd_input(value.trim()) => {
+            resolve_absolute_cwd(value.trim()).map_err(|error| error.to_string())
+        }
+        Some(value) => match sanitize_rel_path_core(value).map_err(|error| error.to_string())? {
+            None => Ok(wd),
+            Some(rel) => {
+                let target = ensure_within_workdir_existing(&wd, &wd.join(rel))
+                    .map_err(|error| error.to_string())?;
+                let metadata = fs::metadata(&target).map_err(|error| error.to_string())?;
+                if !metadata.is_dir() {
+                    return Err(
+                        ShellError::Other("cwd must be a directory".to_string()).to_string()
+                    );
+                }
+                Ok(target)
+            }
+        },
+    }
 }
 
 #[derive(Default)]
@@ -348,6 +384,9 @@ fn windows_powershell_command(cmd: &str) -> String {
         "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)",
         "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
         "$OutputEncoding = [Console]::OutputEncoding",
+        // 重定向到文件时 PowerShell 的 Console.Out 默认块缓冲,ManagedProcess
+        // 周期性 Write-Output/echo 在进程退出前不会出现在日志里。
+        "try { [Console]::Out.AutoFlush = $true; [Console]::Error.AutoFlush = $true } catch {}",
         cmd,
     ]
     .join("; ")
@@ -359,16 +398,75 @@ fn windows_cmd_command(cmd: &str) -> String {
 }
 
 #[cfg(windows)]
-fn is_windows_system32_dir(dir: &Path) -> bool {
+fn normalize_windows_dir_for_compare(p: &Path) -> String {
+    strip_windows_verbatim_prefix(p.to_path_buf())
+        .to_string_lossy()
+        .trim_end_matches(['\\', '/'])
+        .to_ascii_lowercase()
+}
+
+#[cfg(windows)]
+fn windows_dirs_equal(left: &Path, right: &Path) -> bool {
+    if normalize_windows_dir_for_compare(left) == normalize_windows_dir_for_compare(right) {
+        return true;
+    }
+    let Ok(left) = fs::canonicalize(left) else {
+        return false;
+    };
+    let Ok(right) = fs::canonicalize(right) else {
+        return false;
+    };
+    normalize_windows_dir_for_compare(&left) == normalize_windows_dir_for_compare(&right)
+}
+
+#[cfg(windows)]
+fn is_windows_system_bash_alias_dir(dir: &Path) -> bool {
     let Some(root) = std::env::var_os("SystemRoot") else {
         return false;
     };
-    let normalize = |p: &Path| {
-        p.to_string_lossy()
-            .trim_end_matches(['\\', '/'])
-            .to_ascii_lowercase()
+    ["System32", "Sysnative"]
+        .iter()
+        .any(|name| windows_dirs_equal(dir, &Path::new(&root).join(name)))
+}
+
+#[cfg(windows)]
+fn is_windows_apps_alias_dir(dir: &Path) -> bool {
+    let Some(local) = std::env::var_os("LOCALAPPDATA") else {
+        return false;
     };
-    normalize(dir) == normalize(&Path::new(&root).join("System32"))
+    windows_dirs_equal(
+        dir,
+        &Path::new(&local).join("Microsoft").join("WindowsApps"),
+    )
+}
+
+/// Store 应用注册的 App-Execution-Alias 是 0 字节的 reparse point，`is_file()`
+/// 对它返回 true；真正的 Git Bash 可执行文件不可能是 0 字节。
+#[cfg(windows)]
+fn is_app_execution_alias(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|md| md.len() == 0)
+}
+
+#[cfg(windows)]
+fn is_git_bash_candidate(path: &Path) -> bool {
+    if !path.is_file() || is_app_execution_alias(path) {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    !is_windows_system_bash_alias_dir(parent) && !is_windows_apps_alias_dir(parent)
+}
+
+#[cfg(windows)]
+fn find_git_bash_on_path(path_var: &std::ffi::OsStr) -> Option<PathBuf> {
+    for dir in std::env::split_paths(path_var) {
+        let candidate = dir.join("bash.exe");
+        if is_git_bash_candidate(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Git Bash 解析（对标 Claude Code）：env 覆盖 → PATH → Git for Windows 默认安装路径。
@@ -379,7 +477,7 @@ fn find_git_bash() -> Option<PathBuf> {
             let trimmed = raw.trim().trim_matches('"');
             if !trimmed.is_empty() {
                 let path = expand_tilde_path(trimmed);
-                if path.is_file() {
+                if is_git_bash_candidate(&path) {
                     return Some(path);
                 }
             }
@@ -387,15 +485,8 @@ fn find_git_bash() -> Option<PathBuf> {
     }
 
     let path_var = std::env::var_os("PATH").unwrap_or_default();
-    for dir in std::env::split_paths(&path_var) {
-        // System32 下的 bash.exe 是 WSL 启动器，不是 Git Bash。
-        if is_windows_system32_dir(&dir) {
-            continue;
-        }
-        let candidate = dir.join("bash.exe");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
+    if let Some(found) = find_git_bash_on_path(&path_var) {
+        return Some(found);
     }
 
     let roots = ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
@@ -409,7 +500,7 @@ fn find_git_bash() -> Option<PathBuf> {
         // bin\bash.exe 是带 MSYS 环境注入的启动器，优先于 usr\bin 的裸 bash。
         for rel in [r"Git\bin\bash.exe", r"Git\usr\bin\bash.exe"] {
             let candidate = root.join(rel);
-            if candidate.is_file() {
+            if is_git_bash_candidate(&candidate) {
                 return Some(candidate);
             }
         }
@@ -435,6 +526,8 @@ struct ShellCandidate {
 pub(crate) struct SpawnedPlatformShell {
     pub child: std::process::Child,
     pub profile: ShellExecutionProfile,
+    /// 生效的沙箱机制;None 表示未启用沙箱。
+    pub sandbox: Option<&'static str>,
 }
 
 fn platform_shell_candidates(cmd: &str) -> Vec<ShellCandidate> {
@@ -604,10 +697,247 @@ fn default_platform_shell_profile() -> ShellExecutionProfile {
         })
 }
 
+/// 沙箱下 shell 候选可用性的进程级缓存。key = (候选程序路径, 沙箱机制):同一 shell 在
+/// Low IL token 与 AppContainer 两种机制下兼容性可能不同,须分别记录;探测结果与工作区无关
+/// (loader 死亡源于令牌/内核对象语义,非路径),故 key 不含 write_root。
+#[cfg(windows)]
+static SANDBOX_SHELL_PROBE_CACHE: std::sync::OnceLock<
+    Mutex<HashMap<(PathBuf, &'static str), bool>>,
+> = std::sync::OnceLock::new();
+
+/// 子进程启动即死、不能当沙箱 shell 的退出码:
+/// - 0xC0000142 DLL 初始化失败(msys/cygwin 在沙箱上下文下的典型死法)
+/// - 0xC0000135 DLL 缺失
+/// - 0xC0000022 拒绝访问(NTSTATUS)
+/// - 0xE0434352 CLR 未处理异常(PowerShell 把 CNG NTE_PROVIDER_DLL_FAIL 包装成
+///   “BCrypt.dll 加载失败”;进程已进 CLR,故不是 NTSTATUS loader 码)
+/// - 0x8009001D NTE_PROVIDER_DLL_FAIL 本体
+/// - 0x80070005 HRESULT E_ACCESSDENIED(Windows PowerShell / .NET Framework
+///   写 CLR 用户缓存失败;与 0xC0000022 / 0xE0434352 不是同一条路径)
+/// - 0xFFFF0000 PowerShell 宿主在 CLR 初始化失败(内部 HRESULT 80070005)时的
+///   包装退出码。漏掉这两个码会把已崩溃的 powershell.exe 探测成可用
+///
+/// 命中 ⇒ 该候选在此沙箱机制下起不来,落到下一候选。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_loader_failure_exit(code: i32) -> bool {
+    matches!(
+        code as u32,
+        0xC000_0142
+            | 0xC000_0135
+            | 0xC000_0022
+            | 0xE043_4352
+            | 0x8009_001D
+            | 0x8007_0005
+            | 0xFFFF_0000
+    )
+}
+
+/// 探测裁决:给定探测进程的退出码(None = 超时/被杀/无退出码),该候选是否可用。
+/// 只有明确的启动即死码判不可用;其余(超时、普通非零退出)一律放行,由真实
+/// spawn 自行失败并走既有错误链——探测只负责识别“启动即死”这一类硬不兼容。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn sandbox_probe_verdict(exit_code: Option<i32>) -> bool {
+    !exit_code.is_some_and(is_loader_failure_exit)
+}
+
+/// PATH 上的第一个同名二进制若落在 WindowsApps,沙箱安全上下文无法直接启动它。
+#[cfg(windows)]
+fn candidate_resolves_to_windowsapps(program: &Path) -> bool {
+    if sandbox::is_msix_windowsapps_path(program) {
+        return true;
+    }
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    sandbox::resolve_program_in_path(program, &path_env, &pathext, &|p| p.is_file())
+        .is_some_and(|p| sandbox::is_msix_windowsapps_path(&p))
+}
+
+/// Windows 沙箱下探测某 shell 候选能否活过启动(结果进程级缓存)。
+///
+/// 经启动器 spawn 一条 `exit 0` 的最小命令,等待 ≤2s:退出码命中启动即死
+/// (Git Bash 的 0xC0000142,PowerShell/CNG 的 0xE0434352,或 CLR 的 0x80070005)⇒ 不可用,调用方落到
+/// 下一候选。pwsh/powershell 在写围栏下并不必然可用;cmd.exe 不走 CNG,通常是最后
+/// 兜底。探测本身失败(wrap/spawn 出错)判可用:让真实 spawn 复现错误并走既有
+/// fail-closed/错误报告路径,探测不吞错。
+#[cfg(windows)]
+fn sandbox_candidate_usable(
+    spec: &SandboxSpec,
+    candidate: &ShellCandidate,
+    mechanism: &'static str,
+) -> bool {
+    use wait_timeout::ChildExt;
+
+    if candidate_resolves_to_windowsapps(&candidate.program) {
+        return false;
+    }
+
+    let cache = SANDBOX_SHELL_PROBE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (candidate.program.clone(), mechanism);
+    if let Ok(map) = cache.lock() {
+        if let Some(&usable) = map.get(&key) {
+            return usable;
+        }
+    }
+
+    let probe_args: Vec<String> = match candidate.profile.profile {
+        "windows-git-bash" => vec!["-c".to_string(), "exit 0".to_string()],
+        "windows-pwsh" | "windows-powershell" => vec![
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            "exit 0".to_string(),
+        ],
+        _ => vec!["/D".to_string(), "/C".to_string(), "exit 0".to_string()],
+    };
+
+    let usable = match sandbox::wrap_command(spec, &candidate.program, &probe_args) {
+        Ok((program, args, _)) => {
+            let exit_code = Command::new(&program)
+                .args(&args)
+                .current_dir(&spec.write_root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok()
+                .and_then(
+                    |mut child| match child.wait_timeout(Duration::from_secs(2)) {
+                        Ok(Some(status)) => status.code(),
+                        _ => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            None
+                        }
+                    },
+                );
+            sandbox_probe_verdict(exit_code)
+        }
+        Err(_) => true,
+    };
+    if let Ok(mut map) = cache.lock() {
+        map.insert(key, usable);
+    }
+    usable
+}
+
+/// `stdbuf` 在 Git Bash 上通常位于 `Git\usr\bin`,与 `Git\bin\bash.exe` 不在同一目录。
+fn find_stdbuf_near(shell: &Path) -> Option<PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["stdbuf.exe", "stdbuf"]
+    } else {
+        &["stdbuf"]
+    };
+    let mut dirs = Vec::new();
+    if let Some(parent) = shell.parent().filter(|p| !p.as_os_str().is_empty()) {
+        dirs.push(parent.to_path_buf());
+        dirs.push(parent.join("usr").join("bin"));
+        if let Some(grand) = parent.parent() {
+            dirs.push(grand.join("usr").join("bin"));
+        }
+    }
+    dirs.push(PathBuf::from("/usr/bin"));
+    dirs.push(PathBuf::from("/bin"));
+    for dir in dirs {
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Quote a string for POSIX `sh` single quotes so it can be embedded in `-c`.
+fn posix_single_quote(value: &str) -> String {
+    let mut out = String::from("'");
+    let mut first = true;
+    for part in value.split('\'') {
+        if !first {
+            out.push_str("'\\''");
+        }
+        first = false;
+        out.push_str(part);
+    }
+    out.push('\'');
+    out
+}
+
+fn path_for_posix_shell(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        let raw = path.to_string_lossy();
+        let trimmed = raw.trim().trim_start_matches(r"\\?\");
+        let bytes = trimmed.as_bytes();
+        if bytes.len() >= 2 && bytes[1] == b':' {
+            let drive = (bytes[0] as char).to_ascii_lowercase();
+            let rest = trimmed[2..].replace('\\', "/");
+            return format!("/{drive}{rest}");
+        }
+        trimmed.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string_lossy().into_owned()
+    }
+}
+
+/// POSIX 托管进程用 `stdbuf -oL` 包一层,让 echo 循环等周期输出在重定向到
+/// 日志文件时按行可见。映像仍是 bash/zsh/sh,Windows 沙箱对 Git Bash 的
+/// Everyone SID / msys 盖章才能继续命中。
+fn posix_line_buffered_script(
+    shell: &str,
+    command: &str,
+    stdbuf: Option<&Path>,
+    log_path: Option<&Path>,
+) -> String {
+    let quoted = posix_single_quote(command);
+    let redirect = log_path
+        .map(|path| {
+            format!(
+                " >> {} 2>&1",
+                posix_single_quote(&path_for_posix_shell(path))
+            )
+        })
+        .unwrap_or_default();
+    if let Some(stdbuf) = stdbuf {
+        let stdbuf_q = posix_single_quote(&path_for_posix_shell(stdbuf));
+        return format!("exec {stdbuf_q} -oL -eL {shell} -c {quoted}{redirect}");
+    }
+    format!(
+        "if command -v stdbuf >/dev/null 2>&1; then exec stdbuf -oL -eL {shell} -c {quoted}{redirect}; fi\n{{ {command}; }}{redirect}"
+    )
+}
+
+fn apply_line_buffered_stdio(
+    command: &str,
+    candidate: &ShellCandidate,
+    log_path: Option<&Path>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let mut args = candidate.args.clone();
+    let extra_envs = vec![("PYTHONUNBUFFERED".to_string(), "1".to_string())];
+    if candidate.profile.shell_family == "posix" {
+        let stdbuf = find_stdbuf_near(&candidate.program);
+        if let Some(script) = args.last_mut() {
+            *script = posix_line_buffered_script(
+                candidate.profile.display_shell,
+                command,
+                stdbuf.as_deref(),
+                log_path,
+            );
+        }
+    }
+    (args, extra_envs)
+}
+
 pub(crate) fn spawn_platform_shell_command<F>(
     command: &str,
     cwd: &Path,
     envs: &[(String, String)],
+    sandbox_spec: Option<&SandboxSpec>,
+    line_buffered: bool,
+    log_path: Option<&Path>,
     mut stdio_factory: F,
 ) -> Result<SpawnedPlatformShell, String>
 where
@@ -617,16 +947,50 @@ where
     let system_proxy_envs = crate::services::system_proxy::shell_proxy_envs()?;
 
     for candidate in platform_shell_candidates(command) {
+        let (candidate_args, extra_envs) = if line_buffered {
+            apply_line_buffered_stdio(command, &candidate, log_path)
+        } else {
+            (candidate.args.clone(), Vec::new())
+        };
+        // 沙箱包裹在 shell candidate 选定后、spawn 前进行,fail-closed:包裹
+        // 失败(平台不支持/依赖缺失)直接报错,绝不回退为无沙箱执行。
+        // sandbox-exec/bwrap 按名字解析 shell 时同样遵循 PATH,语义不变。
+        let (spawn_program, spawn_args, sandbox_mechanism) = match sandbox_spec {
+            Some(spec) => {
+                let (program, args, mechanism) =
+                    sandbox::wrap_command(spec, &candidate.program, &candidate_args)?;
+                (program, args, Some(mechanism))
+            }
+            None => (candidate.program.clone(), candidate_args, None),
+        };
+        // Windows 沙箱专属:候选回退链平时靠 spawn 失败推进,但沙箱下 spawn 的永远是
+        // LiveAgent.exe 启动器(总能成功),loader 级不兼容(如 Git Bash 的 msys 依赖
+        // 在沙箱上下文下 0xC0000142)只体现为命令“执行了但立即死”。用一次缓存的探测
+        // (`exit 0`)提前识别,落到下一候选,不给模型返回死 shell。pwsh 在沙箱里也会
+        // 因 CNG 用户证书库不可写而以 CLR 0xE0434352 崩溃,不能假定“原生 PE 必然可用”。
+        #[cfg(windows)]
+        if let (Some(spec), Some(mechanism)) = (sandbox_spec, sandbox_mechanism) {
+            if !sandbox_candidate_usable(spec, &candidate, mechanism) {
+                errors.push(format!(
+                    "{} ({}) skipped: incompatible with the {mechanism} sandbox (startup \
+                     failure under the sandbox security context, e.g. STATUS_DLL_INIT_FAILED, CLR \
+                     0xE0434352 / 0xFFFF0000, or HRESULT 0x80070005)",
+                    candidate.profile.profile, candidate.profile.display_shell
+                ));
+                continue;
+            }
+        }
         let (stdout, stderr) =
             stdio_factory().map_err(|err| format!("Failed to prepare shell stdio: {err}"))?;
-        let mut c = Command::new(&candidate.program);
-        c.args(&candidate.args);
+        let mut c = Command::new(&spawn_program);
+        c.args(&spawn_args);
         // 系统代理 env 先注入，调用方 envs（如 LIVEAGENT_HOOK_*）后写保持更高优先级。
         for (key, value) in &system_proxy_envs {
             c.env(key, value);
         }
         c.envs(
             envs.iter()
+                .chain(extra_envs.iter())
                 .map(|(key, value)| (key.as_str(), value.as_str())),
         );
         if candidate.augment_macos_path {
@@ -645,6 +1009,7 @@ where
                 return Ok(SpawnedPlatformShell {
                     child,
                     profile: candidate.profile,
+                    sandbox: sandbox_mechanism,
                 });
             }
             Err(err) => errors.push(format!(
@@ -662,6 +1027,9 @@ where
     Err(ShellError::Other(format!("Failed to start command: {detail}")).to_string())
 }
 
+/// 无 env 注入、无沙箱的最简入口。生产链路一律走 `run_shell_script_with_envs` 并显式
+/// 传入沙箱参数(P1#2:Cron 曾因这里的 `None` 而恒以无沙箱方式执行),故此入口仅供测试。
+#[cfg(test)]
 pub(crate) fn run_shell_script(
     workdir: String,
     command: String,
@@ -680,6 +1048,7 @@ pub(crate) fn run_shell_script(
         provider_id,
         cancel_token,
         &[],
+        None,
     )
 }
 
@@ -693,45 +1062,40 @@ pub(crate) fn run_shell_script_with_envs(
     _provider_id: Option<String>,
     cancel_token: Option<ShellCancelToken>,
     envs: &[(String, String)],
+    sandbox_options: Option<SandboxOptions>,
 ) -> Result<ShellRunResponse, String> {
-    let wd = canonicalize_workdir(&workdir).map_err(|e| e.to_string())?;
-
     let cmd = command.trim();
     if cmd.is_empty() {
         return Err(ShellError::Other("command cannot be empty".to_string()).to_string());
     }
 
-    let actual_cwd = match cwd {
-        None => wd.clone(),
-        Some(cwd_value) if is_absolute_cwd_input(cwd_value.trim()) => {
-            resolve_absolute_cwd(cwd_value.trim()).map_err(|e| e.to_string())?
-        }
-        Some(cwd_rel) => match sanitize_rel_path_core(&cwd_rel).map_err(|e| e.to_string())? {
-            None => wd.clone(),
-            Some(rel) => {
-                let target = wd.join(rel);
-                let target =
-                    ensure_within_workdir_existing(&wd, &target).map_err(|e| e.to_string())?;
-                let md = fs::metadata(&target).map_err(|e| e.to_string())?;
-                if !md.is_dir() {
-                    return Err(
-                        ShellError::Other("cwd must be a directory".to_string()).to_string()
-                    );
-                }
-                target
-            }
-        },
-    };
+    let actual_cwd = resolve_shell_cwd(&workdir, cwd.as_deref())?;
 
     let effective_timeout_ms = normalize_timeout_ms(timeout_ms, max_timeout_ms);
     let timeout = Duration::from_millis(effective_timeout_ms);
     let start = Instant::now();
 
-    let spawned = spawn_platform_shell_command(cmd, &actual_cwd, envs, || {
-        Ok((Stdio::piped(), Stdio::piped()))
-    })?;
+    // 沙箱写围栏锚定 workdir(工作区根)而非 cwd:cwd 可能是子目录,但工具语义
+    // 允许写整个工作区。
+    let sandbox_spec = match sandbox_options {
+        Some(options) => {
+            let wd = canonicalize_workdir(&workdir).map_err(|e| e.to_string())?;
+            Some(SandboxSpec::from_options(wd, options))
+        }
+        None => None,
+    };
+    let spawned = spawn_platform_shell_command(
+        cmd,
+        &actual_cwd,
+        envs,
+        sandbox_spec.as_ref(),
+        false,
+        None,
+        || Ok((Stdio::piped(), Stdio::piped())),
+    )?;
     let mut child = spawned.child;
     let shell_profile = spawned.profile;
+    let sandbox_mechanism = spawned.sandbox;
     let shell_name = shell_basename(shell_profile.display_shell);
 
     let stdout = child
@@ -814,6 +1178,7 @@ process output to a log file, for example: `nohup command > /tmp/liveagent-task.
         platform: shell_profile.platform.to_string(),
         profile: shell_profile.profile.to_string(),
         shell_family: shell_profile.shell_family.to_string(),
+        sandbox: sandbox_mechanism.map(str::to_string),
         stdout: stdout_str,
         stderr: stderr_str,
         stdout_truncated,
@@ -829,14 +1194,45 @@ process output to a log file, for example: `nohup command > /tmp/liveagent-task.
 #[cfg(test)]
 mod tests {
     use super::{
-        default_platform_shell_profile, normalize_timeout_ms, run_shell_script,
-        sanitize_rel_path_core, ShellRunRegistry, DEFAULT_SHELL_TIMEOUT_MS, MAX_SHELL_TIMEOUT_MS,
-        MIN_SHELL_TIMEOUT_MS,
+        default_platform_shell_profile, is_loader_failure_exit, normalize_timeout_ms,
+        run_shell_script, sandbox_probe_verdict, sanitize_rel_path_core, ShellRunRegistry,
+        DEFAULT_SHELL_TIMEOUT_MS, MAX_SHELL_TIMEOUT_MS, MIN_SHELL_TIMEOUT_MS,
     };
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    // 沙箱候选探测的裁决逻辑(纯函数,平台无关):只有启动即死码判不可用;
+    // 超时/普通失败一律放行交由真实 spawn 走既有错误链。
+    #[test]
+    fn sandbox_probe_verdict_only_rejects_loader_ntstatus() {
+        // loader 死亡三码(as i32 后为负数,与 std ExitStatus::code() 的表示一致)。
+        assert!(is_loader_failure_exit(0xC000_0142_u32 as i32)); // STATUS_DLL_INIT_FAILED
+        assert!(is_loader_failure_exit(0xC000_0135_u32 as i32)); // STATUS_DLL_NOT_FOUND
+        assert!(is_loader_failure_exit(0xC000_0022_u32 as i32)); // STATUS_ACCESS_DENIED
+        assert!(!sandbox_probe_verdict(Some(0xC000_0142_u32 as i32)));
+        // PowerShell/CNG:BCrypt“加载失败”其实是 CLR 未处理异常,不是 NTSTATUS。
+        assert_eq!((-532_462_766i32) as u32, 0xE043_4352);
+        assert!(is_loader_failure_exit(-532_462_766));
+        assert!(!sandbox_probe_verdict(Some(-532_462_766)));
+        assert!(is_loader_failure_exit(0x8009_001D_u32 as i32)); // NTE_PROVIDER_DLL_FAIL
+        assert!(!sandbox_probe_verdict(Some(0x8009_001D_u32 as i32)));
+        // Windows PowerShell / .NET Framework:CLR 用户缓存写拒绝是 HRESULT,不是 NTSTATUS。
+        assert_eq!((-2_147_024_891i32) as u32, 0x8007_0005);
+        assert!(is_loader_failure_exit(-2_147_024_891));
+        assert!(!sandbox_probe_verdict(Some(-2_147_024_891)));
+        // PowerShell 宿主把 CLR 80070005 包装成 0xFFFF0000(-65536)。
+        assert_eq!((-65536i32) as u32, 0xFFFF_0000);
+        assert!(is_loader_failure_exit(-65536));
+        assert!(!sandbox_probe_verdict(Some(-65536)));
+        // 正常退出、普通失败、其它 NTSTATUS、超时(None)都不构成“候选不可用”。
+        assert!(sandbox_probe_verdict(Some(0)));
+        assert!(sandbox_probe_verdict(Some(1)));
+        assert!(sandbox_probe_verdict(Some(127)));
+        assert!(sandbox_probe_verdict(Some(0xC000_0005_u32 as i32))); // ACCESS_VIOLATION:运行期崩溃,非启动即死
+        assert!(sandbox_probe_verdict(None));
+    }
 
     #[test]
     fn sanitize_rel_path_accepts_windows_style_separators() {
@@ -912,17 +1308,68 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_path_scan_skips_zero_byte_app_execution_alias() {
+        // WindowsApps 的 WSL bash.exe 别名是 0 字节 reparse point；用 0 字节
+        // 普通文件模拟“is_file() 为 true 但不是真 bash”的形态。
+        let alias_dir = tempfile::tempdir().expect("alias dir");
+        let real_dir = tempfile::tempdir().expect("real dir");
+        fs::write(alias_dir.path().join("bash.exe"), b"").unwrap();
+        fs::write(real_dir.path().join("bash.exe"), b"MZfake-git-bash").unwrap();
+
+        // 别名目录在前：应跳过 0 字节候选，命中后面的真实文件。
+        let path_var =
+            std::env::join_paths([alias_dir.path(), real_dir.path()]).expect("join paths");
+        assert_eq!(
+            super::find_git_bash_on_path(&path_var),
+            Some(real_dir.path().join("bash.exe"))
+        );
+
+        // 只有别名时不应误选，让候选链回退到 Program Files 探测 / PowerShell。
+        let alias_only = std::env::join_paths([alias_dir.path()]).expect("join paths");
+        assert_eq!(super::find_git_bash_on_path(&alias_only), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_known_wsl_alias_dirs_are_rejected() {
+        // 即使 WindowsApps 目录下出现非 0 字节的 bash.exe，也不应从该目录选取。
+        let local_appdata = std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA");
+        let windows_apps = std::path::Path::new(&local_appdata)
+            .join("Microsoft")
+            .join("WindowsApps");
+        assert!(super::is_windows_apps_alias_dir(&windows_apps));
+        // 大小写与结尾斜杠不影响判定。
+        let with_slash = format!("{}\\", windows_apps.display().to_string().to_uppercase());
+        assert!(super::is_windows_apps_alias_dir(std::path::Path::new(
+            &with_slash
+        )));
+
+        let system_root = std::env::var_os("SystemRoot").expect("SystemRoot");
+        for name in ["System32", "Sysnative"] {
+            let alias_dir = std::path::Path::new(&system_root).join(name);
+            assert!(super::is_windows_system_bash_alias_dir(&alias_dir));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn find_git_bash_env_override_prefers_liveagent_var() {
         // 单个测试函数串行覆盖所有 env 场景，避免并行 env 竞态。
         let dir = tempfile::tempdir().expect("tempdir");
         let liveagent_bash = dir.path().join("liveagent-bash.exe");
         let claude_bash = dir.path().join("claude-bash.exe");
-        fs::write(&liveagent_bash, b"").unwrap();
-        fs::write(&claude_bash, b"").unwrap();
+        let app_execution_alias = dir.path().join("wsl-bash.exe");
+        fs::write(&liveagent_bash, b"MZliveagent-git-bash").unwrap();
+        fs::write(&claude_bash, b"MZclaude-git-bash").unwrap();
+        fs::write(&app_execution_alias, b"").unwrap();
 
         std::env::set_var("LIVEAGENT_GIT_BASH_PATH", &liveagent_bash);
         std::env::set_var("CLAUDE_CODE_GIT_BASH_PATH", &claude_bash);
         assert_eq!(super::find_git_bash(), Some(liveagent_bash.clone()));
+
+        // LIVEAGENT 指向 App-Execution-Alias 时也必须回退 CLAUDE_CODE。
+        std::env::set_var("LIVEAGENT_GIT_BASH_PATH", &app_execution_alias);
+        assert_eq!(super::find_git_bash(), Some(claude_bash.clone()));
 
         // LIVEAGENT 指向不存在的文件时回退 CLAUDE_CODE。
         std::env::set_var(
@@ -1116,5 +1563,26 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&workdir);
+    }
+
+    #[test]
+    fn posix_line_buffered_script_embeds_quoted_command_and_stdbuf() {
+        let stdbuf = PathBuf::from(r"C:\Program Files\Git\usr\bin\stdbuf.exe");
+        let log_path = PathBuf::from(r"C:\Users\me\.liveagent\process-logs\proc.log");
+        let script = super::posix_line_buffered_script(
+            "bash",
+            "echo ready; sleep 1",
+            Some(stdbuf.as_path()),
+            Some(log_path.as_path()),
+        );
+        assert!(script.contains("stdbuf.exe"));
+        assert!(script.contains("-oL -eL bash -c"));
+        assert!(script.contains("'echo ready; sleep 1'"));
+        assert!(script.contains(" >> "));
+        #[cfg(windows)]
+        {
+            assert!(script.contains("/c/Program Files/Git/usr/bin/stdbuf.exe"));
+            assert!(script.contains("/c/Users/me/.liveagent/process-logs/proc.log"));
+        }
     }
 }

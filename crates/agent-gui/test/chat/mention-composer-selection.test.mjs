@@ -7,18 +7,24 @@ const sourceRoots = [
 ];
 const sharedProjectToolsRoot = new URL("../../../agent-ui/src/components/", import.meta.url);
 
+function composerSource(root) {
+  return ["chat/MentionComposer.tsx", "chat/MentionComposerInternals.tsx"]
+    .map((relativePath) => source(root, relativePath))
+    .join("\n");
+}
+
 function source(root, relativePath) {
   return readFileSync(new URL(relativePath, root), "utf8");
 }
 
 test("the shared composer restores the last editor selection before external mention insertion", () => {
   for (const root of sourceRoots) {
-    const composer = source(root, "chat/MentionComposer.tsx");
+    const composer = composerSource(root);
     assert.match(composer, /lastEditorSelectionRef = useRef<Range \| null>\(null\)/);
     assert.match(composer, /document\.addEventListener\("selectionchange", rememberEditorSelection\)/);
     assert.equal(
       (composer.match(/focusEditorAtSavedSelection\(\);/g) ?? []).length,
-      5,
+      6,
     );
   }
 });
@@ -33,7 +39,7 @@ function extractFunction(src, name) {
 
 test("insertNodeAtCursor hops chip-inner boundaries and normalizes the caret anchor", () => {
   const bodies = sourceRoots.map((root) =>
-    extractFunction(source(root, "chat/MentionComposer.tsx"), "insertNodeAtCursor"),
+    extractFunction(composerSource(root), "insertNodeAtCursor"),
   );
   const body = bodies[0];
   // A saved selection restored before external insertion can sit inside a
@@ -61,7 +67,7 @@ test("shared right-dock context menus preserve composer selection", () => {
 
 test("composer caret measurement never splits text nodes and restores the selection", () => {
   const bodies = sourceRoots.map((root) =>
-    extractFunction(source(root, "chat/MentionComposer.tsx"), "measureComposerCaretRect"),
+    extractFunction(composerSource(root), "measureComposerCaretRect"),
   );
   const body = bodies[0];
   // Range.insertNode() splits the text node under a line-boundary caret; the
@@ -74,8 +80,32 @@ test("composer caret measurement never splits text nodes and restores the select
   assert.match(body, /sel\.collapse\(startContainer, startOffset\)/);
 
   const scrollBodies = sourceRoots.map((root) =>
-    extractFunction(source(root, "chat/MentionComposer.tsx"), "scrollSelectionIntoComposerView"),
+    extractFunction(composerSource(root), "scrollSelectionIntoComposerView"),
   );
   assert.match(scrollBodies[0], /measureComposerCaretRect\(range\)/);
   assert.doesNotMatch(scrollBodies[0], /cloneRange\(\)/);
+});
+
+test("composer transient text exposes an anchored marker transaction", () => {
+  const composer = composerSource(sourceRoots[0]);
+  const transient = composer.slice(composer.indexOf("beginTransientText:"), composer.indexOf("focus: ()"));
+  assert.match(transient, /clearTransientText\(false\)/);
+  assert.match(transient, /activeRange\.insertNode\(end\)/);
+  assert.match(transient, /activeRange\.insertNode\(textNode\)/);
+  assert.match(transient, /activeRange\.insertNode\(start\)/);
+  assert.match(transient, /transientTextRef\.current = \{ textNode, start, end \}/);
+  assert.match(transient, /active\.textNode\.data = normalizeLogicalLineEndings\(text\)/);
+  assert.match(transient, /range\.setStartAfter\(active\.end\)/);
+  assert.match(transient, /clearTransientText\(true\)/);
+  assert.match(transient, /clearTransientText\(options\?\.preserveLastText === true\)/);
+});
+
+test("transient cleanup protects mention nodes and locks composer controls during STT", () => {
+  const composer = composerSource(sourceRoots[0]);
+  assert.match(composer, /clearTransientText\(false\);[\s\S]*?setBusy\(false\)/);
+  assert.match(composer, /closestComposerChipFromNode/);
+  const bar = source(new URL("../../../agent-ui/src/pages/chat/", import.meta.url), "ChatComposerBar.tsx");
+  assert.match(bar, /disabled=\{isInputDisabled \|\| stt\.active\}/);
+  assert.match(bar, /disabled=\{controlsDisabled\}/);
+  assert.match(bar, /const sendDisabled = isInputDisabled \|\| stt\.active \|\| isUploadingFiles \|\| !hasSendableDraft/);
 });

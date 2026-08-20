@@ -60,3 +60,138 @@ func TestVetAgentRequestRejectsMalformedChatFileOpen(t *testing.T) {
 		}
 	}
 }
+
+func TestVetAgentRequestAllowsWorkspaceRootGrantListApplyAndRevoke(t *testing.T) {
+	id := "grant-1"
+	requests := []*gatewayv2.WorkspaceRootGrantsRequest{
+		{Action: "list", ProjectId: "project-1", ProjectPath: "/work/project"},
+		{
+			Action:      "apply",
+			ProjectId:   "project-1",
+			ProjectPath: "/work/project",
+			Grants: []*gatewayv2.WorkspaceRootGrantDraft{
+				{Id: &id, Alias: "shared", DisplayPath: "/work/shared", Access: "read"},
+			},
+		},
+		{Action: "revoke", ProjectId: "project-1"},
+	}
+
+	for _, request := range requests {
+		env := &gatewayv2.GatewayEnvelope{
+			Payload: &gatewayv2.GatewayEnvelope_WorkspaceRootGrants{
+				WorkspaceRootGrants: request,
+			},
+		}
+		if err := vetAgentRequest(session.AgentView{}, env); err != nil {
+			t.Fatalf("vetAgentRequest(%+v) error = %v", request, err)
+		}
+	}
+}
+
+func TestVetAgentRequestRejectsMalformedWorkspaceRootGrants(t *testing.T) {
+	emptyID := " "
+	requests := []*gatewayv2.WorkspaceRootGrantsRequest{
+		nil,
+		{Action: "list", ProjectId: "", ProjectPath: "/work/project"},
+		{Action: "list", ProjectId: "project-1", ProjectPath: ""},
+		{
+			Action:      "list",
+			ProjectId:   "project-1",
+			ProjectPath: "/work/project",
+			Grants:      []*gatewayv2.WorkspaceRootGrantDraft{{Alias: "shared"}},
+		},
+		{
+			Action:      "apply",
+			ProjectId:   "project-1",
+			ProjectPath: "/work/project",
+			Grants: []*gatewayv2.WorkspaceRootGrantDraft{
+				{Id: &emptyID, Alias: "shared", DisplayPath: "/work/shared", Access: "read"},
+			},
+		},
+		{
+			Action:      "apply",
+			ProjectId:   "project-1",
+			ProjectPath: "/work/project",
+			Grants: []*gatewayv2.WorkspaceRootGrantDraft{
+				{Alias: "shared", DisplayPath: "/work/shared", Access: "admin"},
+			},
+		},
+		{Action: "revoke", ProjectId: "project-1", ProjectPath: "/work/project"},
+		{
+			Action:    "revoke",
+			ProjectId: "project-1",
+			Grants:    []*gatewayv2.WorkspaceRootGrantDraft{{Alias: "shared"}},
+		},
+	}
+
+	for _, request := range requests {
+		env := &gatewayv2.GatewayEnvelope{
+			Payload: &gatewayv2.GatewayEnvelope_WorkspaceRootGrants{
+				WorkspaceRootGrants: request,
+			},
+		}
+		if err := vetAgentRequest(session.AgentView{}, env); err == nil {
+			t.Fatalf("vetAgentRequest(%+v) unexpectedly succeeded", request)
+		}
+	}
+}
+
+func TestVetAgentRequestAllowsCheckpointActions(t *testing.T) {
+	requests := []*gatewayv2.CheckpointRequest{
+		{Action: "list", ConversationId: "conversation-1"},
+		{Action: "diff", ConversationId: "conversation-1", TurnSeq: 2, AuthorizedRoots: []string{"/work"}},
+		{
+			Action:          "rewind",
+			ConversationId:  "conversation-1",
+			TurnSeq:         2,
+			AuthorizedRoots: []string{"/work"},
+			Expected:        []*gatewayv2.CheckpointExpectedEntry{{Key: "/work\x01a.txt", CurrentHash: "abc"}},
+		},
+	}
+
+	for _, request := range requests {
+		env := &gatewayv2.GatewayEnvelope{
+			Payload: &gatewayv2.GatewayEnvelope_Checkpoint{Checkpoint: request},
+		}
+		if err := vetAgentRequest(session.AgentView{}, env); err != nil {
+			t.Fatalf("vetAgentRequest(%+v) error = %v", request, err)
+		}
+	}
+}
+
+func TestVetAgentRequestRejectsMalformedCheckpoint(t *testing.T) {
+	tooManyRoots := make([]string, 65)
+	for index := range tooManyRoots {
+		tooManyRoots[index] = "/work"
+	}
+	requests := []*gatewayv2.CheckpointRequest{
+		nil,
+		{Action: "list", ConversationId: "conversation-1", TurnSeq: 1},
+		{Action: "diff", ConversationId: "conversation-1"},
+		{Action: "rewind", ConversationId: "conversation-1"},
+		{Action: "unknown", ConversationId: "conversation-1"},
+		{Action: "diff", ConversationId: "conversation-1", TurnSeq: 1, AuthorizedRoots: []string{" "}},
+		{Action: "diff", ConversationId: "conversation-1", TurnSeq: 1, AuthorizedRoots: tooManyRoots},
+		{
+			Action:         "rewind",
+			ConversationId: "conversation-1",
+			TurnSeq:        1,
+			Expected:       []*gatewayv2.CheckpointExpectedEntry{{Key: " ", CurrentHash: "abc"}},
+		},
+		{
+			Action:         "rewind",
+			ConversationId: "conversation-1",
+			TurnSeq:        1,
+			Expected:       []*gatewayv2.CheckpointExpectedEntry{{Key: "/work\x01a.txt"}},
+		},
+	}
+
+	for _, request := range requests {
+		env := &gatewayv2.GatewayEnvelope{
+			Payload: &gatewayv2.GatewayEnvelope_Checkpoint{Checkpoint: request},
+		}
+		if err := vetAgentRequest(session.AgentView{}, env); err == nil {
+			t.Fatalf("vetAgentRequest(%+v) unexpectedly succeeded", request)
+		}
+	}
+}

@@ -1,14 +1,15 @@
+import type { ProviderId } from "@liveagent/app/lib/settings/index";
 import {
   Check,
   ChevronDown,
   ClaudeIcon,
+  DeepseekIcon,
   GeminiIcon,
   GrokIcon,
   OpenaiChatgptIcon,
   Search,
   Sparkles,
-} from "@liveagent/app/components/icons";
-import type { ProviderId } from "@liveagent/app/lib/settings/index";
+} from "@liveagent/ui/components/IconSet";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -27,6 +28,7 @@ import { useEffect, useRef, useState } from "react";
 export type ModelPickerOption = {
   value: string;
   label: string;
+  description?: string;
   providerName: string;
   providerId?: string;
   providerType?: ProviderId;
@@ -37,6 +39,7 @@ function ProviderBrandIcon({ type, className }: { type?: ProviderId; className?:
   if (type === "claude_code") return <ClaudeIcon className={cls} />;
   if (type === "gemini") return <GeminiIcon className={cls} />;
   if (type === "xai") return <GrokIcon className={cls} />;
+  if (type === "deepseek") return <DeepseekIcon className={cls} />;
   return <OpenaiChatgptIcon className={cn(cls, "fill-current dark:text-white")} />;
 }
 
@@ -72,6 +75,9 @@ export function ModelPicker({
   noneLabel,
   ariaLabel,
   triggerClassName,
+  collapsibleGroups = true,
+  searchPlaceholder,
+  emptyLabel,
 }: {
   options: ModelPickerOption[];
   value: string;
@@ -83,6 +89,12 @@ export function ModelPicker({
   noneLabel?: string;
   ariaLabel?: string;
   triggerClassName?: string;
+  /** When false, render grouped options directly without a collapsible group header. */
+  collapsibleGroups?: boolean;
+  /** Search input placeholder; defaults to the shared model-search translation. */
+  searchPlaceholder?: string;
+  /** Empty search result label; defaults to the shared model-empty translation. */
+  emptyLabel?: string;
 }) {
   const { t } = useLocale();
   const [isOpen, setIsOpen] = useState(false);
@@ -122,7 +134,8 @@ export function ModelPicker({
           opts: group.opts.filter(
             (option) =>
               option.label.toLowerCase().includes(normalizedSearch) ||
-              option.providerName.toLowerCase().includes(normalizedSearch),
+              option.providerName.toLowerCase().includes(normalizedSearch) ||
+              option.description?.toLowerCase().includes(normalizedSearch),
           ),
         }))
         .filter((group) => group.opts.length > 0)
@@ -168,7 +181,7 @@ export function ModelPicker({
         align="start"
         sideOffset={4}
         collisionPadding={8}
-        className="z-[80] w-(--anchor-width) overflow-hidden rounded-xl p-0 text-xs"
+        className="w-(--anchor-width) overflow-hidden rounded-xl p-0 text-xs"
       >
         <div className="px-2 py-1.5">
           <div className="flex items-center gap-1.5 rounded-md border border-border/50 bg-muted/40 px-2 py-1">
@@ -177,7 +190,7 @@ export function ModelPicker({
               ref={searchInputRef}
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder={t("chat.searchModel")}
+              placeholder={searchPlaceholder ?? t("chat.searchModel")}
               className="min-w-0 flex-1 bg-transparent text-xs text-foreground outline-none placeholder:text-muted-foreground/60"
               onKeyDown={(e) => e.stopPropagation()}
             />
@@ -204,7 +217,7 @@ export function ModelPicker({
           ) : null}
           {filteredGroups.length === 0 ? (
             <div className="px-2 py-6 text-center text-xs text-muted-foreground">
-              {t("chat.noModelFound")}
+              {emptyLabel ?? t("chat.noModelFound")}
             </div>
           ) : (
             filteredGroups.map((group, groupIndex) => {
@@ -214,29 +227,31 @@ export function ModelPicker({
                   {groupIndex > 0 || (noneLabel && !normalizedSearch) ? (
                     <DropdownMenuSeparator className="bg-border/30" />
                   ) : null}
-                  <DropdownMenuItem
-                    closeOnClick={false}
-                    onSelect={() => toggleGroup(group.id)}
-                    aria-expanded={expanded}
-                    title={expanded ? t("chat.collapseProvider") : t("chat.expandProvider")}
-                    className="sticky top-0 z-10 flex h-[30px] shrink-0 cursor-pointer items-center gap-1.5 rounded-md bg-popover/60 px-2 py-0 text-xs font-medium text-muted-foreground/80 backdrop-blur-xl transition-colors data-[highlighted]:bg-muted/40 supports-[backdrop-filter]:bg-popover/40"
-                  >
-                    <ProviderBrandIcon
-                      type={group.providerType}
-                      className="h-3.5 w-3.5 opacity-90"
-                    />
-                    <span className="min-w-0 flex-1 truncate">{group.name}</span>
-                    <span className="inline-flex h-4 min-w-[1.1rem] shrink-0 items-center justify-center rounded-full bg-muted/70 px-1 text-[10px] tabular-nums">
-                      {group.opts.length}
-                    </span>
-                    <ChevronDown
-                      className={cn(
-                        "h-3.5 w-3.5 shrink-0 transition-transform duration-200",
-                        expanded && "rotate-180",
-                      )}
-                    />
-                  </DropdownMenuItem>
-                  {expanded
+                  {collapsibleGroups ? (
+                    <DropdownMenuItem
+                      closeOnClick={false}
+                      onSelect={() => toggleGroup(group.id)}
+                      aria-expanded={expanded}
+                      title={expanded ? t("chat.collapseProvider") : t("chat.expandProvider")}
+                      className="sticky top-0 z-10 flex h-[30px] shrink-0 cursor-pointer items-center gap-1.5 rounded-md bg-popover/60 px-2 py-0 text-xs font-medium text-muted-foreground/80 backdrop-blur-xl transition-colors data-[highlighted]:bg-muted/40 supports-[backdrop-filter]:bg-popover/40"
+                    >
+                      <ProviderBrandIcon
+                        type={group.providerType}
+                        className="h-3.5 w-3.5 opacity-90"
+                      />
+                      <span className="min-w-0 flex-1 truncate">{group.name}</span>
+                      <span className="inline-flex h-4 min-w-[1.1rem] shrink-0 items-center justify-center rounded-full bg-muted/70 px-1 text-[10px] tabular-nums">
+                        {group.opts.length}
+                      </span>
+                      <ChevronDown
+                        className={cn(
+                          "h-3.5 w-3.5 shrink-0 transition-transform duration-200",
+                          expanded && "rotate-180",
+                        )}
+                      />
+                    </DropdownMenuItem>
+                  ) : null}
+                  {!collapsibleGroups || expanded
                     ? group.opts.map((option) => {
                         const isSelected = option.value === value;
                         return (
@@ -255,6 +270,11 @@ export function ModelPicker({
                                 className={cn("opacity-70", isSelected && "opacity-100")}
                               />
                               <span className="min-w-0 truncate">{option.label}</span>
+                              {option.description ? (
+                                <span className="min-w-0 truncate text-[11px] text-muted-foreground/70">
+                                  {option.description}
+                                </span>
+                              ) : null}
                             </span>
                             {isSelected ? (
                               <Check className="h-4 w-4 shrink-0 text-primary" />

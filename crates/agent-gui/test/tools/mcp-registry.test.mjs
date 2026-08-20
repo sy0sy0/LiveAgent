@@ -139,7 +139,7 @@ test("official registry npm stdio packages become LiveAgent MCP drafts", async (
 
 test("smithery search cards resolve detail endpoint before install", async () => {
   const fetchImpl = mockFetch((url) => {
-    if (url === "https://api.smithery.ai/servers?q=drive&pageSize=18&page=1") {
+    if (url === "https://api.smithery.ai/servers?q=drive&pageSize=24&page=1") {
       return {
         body: {
           servers: [

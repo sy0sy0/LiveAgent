@@ -277,16 +277,42 @@ export function formatTokenCount(value: number): string {
   return `${Number.isInteger(millions) ? String(millions) : millions.toFixed(1)}M`;
 }
 
-function normalizeModelBaseUrl(type: ProviderId, baseUrl: string) {
+function deriveModelsBaseUrlFromFullUrl(baseUrl: string) {
+  let parsed: URL;
+  try {
+    parsed = new URL(baseUrl.trim());
+  } catch {
+    return normalizeBaseUrl(baseUrl);
+  }
+  parsed.search = "";
+  parsed.hash = "";
+
+  const path = parsed.pathname.replace(/\/+$/, "");
+  const versionIndex = path.toLowerCase().indexOf("/v1/");
+  if (versionIndex >= 0) {
+    parsed.pathname = path.slice(0, versionIndex + "/v1".length);
+  } else {
+    const separatorIndex = path.lastIndexOf("/");
+    parsed.pathname = separatorIndex > 0 ? path.slice(0, separatorIndex) : "/";
+  }
+  return normalizeBaseUrl(parsed.toString());
+}
+
+export function normalizeProviderModelsBaseUrl(
+  type: ProviderId,
+  baseUrl: string,
+  isFullUrl = false,
+) {
+  if (isFullUrl) return deriveModelsBaseUrlFromFullUrl(baseUrl);
   let normalizedUrl = normalizeBaseUrl(baseUrl);
 
-  if (type !== "codex" && type !== "xai" && type !== "gemini") {
+  if (type !== "codex" && type !== "xai" && type !== "deepseek" && type !== "gemini") {
     return normalizedUrl;
   }
 
   const lower = normalizedUrl.toLowerCase();
 
-  if (type === "codex" || type === "xai") {
+  if (type === "codex" || type === "xai" || type === "deepseek") {
     for (const suffix of CODEX_MODELS_SUFFIXES) {
       if (lower.endsWith(suffix)) {
         normalizedUrl = normalizedUrl.slice(0, -suffix.length);
@@ -376,7 +402,7 @@ export function buildProviderModelsAttempts(
     { kind: "default", headers: buildModelsHeaders(type, apiKey, "default") },
     { kind: "official", headers: buildModelsHeaders(type, apiKey, "official") },
   ];
-  // codex/xai 的官方形式与首次尝试完全一致（URL 仅 gemini 随 kind 变化，且其请求头
+  // codex/xai/deepseek 的官方形式与首次尝试完全一致（URL 仅 gemini 随 kind 变化，且其请求头
   // 必不同），重复请求同一端点没有意义，收敛为一次。
   return JSON.stringify(attempts[0].headers) === JSON.stringify(attempts[1].headers)
     ? [attempts[0]]
@@ -429,6 +455,9 @@ async function fetchModelsThroughGateway(
   baseUrl: string,
   apiKey: string,
   useSystemProxy: boolean,
+  modelsUrl: string,
+  providerId: string,
+  isFullUrl: boolean,
 ): Promise<ProviderModelConfig[]> {
   const token =
     typeof window !== "undefined"
@@ -443,6 +472,9 @@ async function fetchModelsThroughGateway(
     base_url: baseUrl,
     api_key: apiKey,
     use_system_proxy: useSystemProxy,
+    models_url: modelsUrl,
+    provider_id: providerId,
+    is_full_url: isFullUrl,
   });
 
   const items = extractModelListItems(data);
@@ -523,11 +555,14 @@ function normalizeGeminiFetchedModels(items: unknown): ProviderModelConfig[] {
     const ownedBy =
       (typeof obj.ownedBy === "string" ? obj.ownedBy.trim() : "") ||
       (typeof obj.owned_by === "string" ? obj.owned_by.trim() : "");
+    const contextWindow = normalizePositiveInteger(obj.inputTokenLimit);
+    const maxOutputToken = normalizePositiveInteger(obj.outputTokenLimit);
     out.push({
       id,
       ...(ownedBy ? { ownedBy } : {}),
-      contextWindow: normalizePositiveInteger(obj.inputTokenLimit) ?? draft.contextWindow,
-      maxOutputToken: normalizePositiveInteger(obj.outputTokenLimit) ?? draft.maxOutputToken,
+      contextWindow: contextWindow ?? draft.contextWindow,
+      maxOutputToken: maxOutputToken ?? draft.maxOutputToken,
+      limitsSource: contextWindow && maxOutputToken ? "provider" : draft.limitsSource,
     });
   }
 
@@ -551,11 +586,24 @@ export function mergeFetchedModels(
       model.contextWindow === 1_000_000 &&
       existingModel.contextWindow < 1_000_000 &&
       Math.round(existingModel.contextWindow / 1_000) === 1_000;
+    // 供应商本次响应自带真实限额字段（provider 来源）：比落库的目录/兜底值
+    // 更新鲜，直接采信；用户手改（user）来源任何时候都不被自动覆盖。
+    const shouldAdoptFreshProviderLimits =
+      existingModel !== undefined &&
+      model.limitsSource === "provider" &&
+      existingModel.limitsSource !== "user";
     merged.push(
       existingModel
         ? {
             ...existingModel,
             ...(shouldNormalizeOneMillion ? { contextWindow: model.contextWindow } : {}),
+            ...(shouldAdoptFreshProviderLimits
+              ? {
+                  contextWindow: model.contextWindow,
+                  maxOutputToken: model.maxOutputToken,
+                  limitsSource: "provider",
+                }
+              : {}),
             ...(model.ownedBy ? { ownedBy: model.ownedBy } : {}),
           }
         : model,
@@ -608,40 +656,61 @@ export function buildProviderModelsFetchKey(
   baseUrl: string,
   apiKey: string,
   useSystemProxy: boolean,
+  isFullUrl = false,
+  modelsUrl = "",
 ): string {
-  return `${baseUrl.trim()}||${apiKey.trim()}||${useSystemProxy ? "proxy" : "direct"}`;
+  const routing = useSystemProxy ? "proxy" : "direct";
+  const override = modelsUrl.trim();
+  return `${baseUrl.trim()}||${apiKey.trim()}||${routing}${isFullUrl ? "||full-url" : ""}${override ? `||models:${override}` : ""}`;
 }
 
 export async function fetchModelsFromApi(
   type: ProviderId,
   baseUrl: string,
   apiKey: string,
-  options?: { useSystemProxy?: boolean },
+  options?: {
+    useSystemProxy?: boolean;
+    isFullUrl?: boolean;
+    modelsUrl?: string;
+    providerId?: string;
+  },
 ): Promise<ProviderModelConfig[]> {
-  const normalizedUrl = normalizeModelBaseUrl(type, baseUrl);
+  const modelsUrlOverride = type === "gemini" ? "" : (options?.modelsUrl?.trim() ?? "");
   const normalizedApiKey = apiKey.trim();
   if (isGatewayWebuiRuntime()) {
     return fetchModelsThroughGateway(
       type,
-      normalizedUrl,
+      baseUrl.trim(),
       normalizedApiKey,
       options?.useSystemProxy === true,
+      modelsUrlOverride,
+      options?.providerId?.trim() ?? "",
+      options?.isFullUrl === true,
     );
   }
 
+  const normalizedUrl = normalizeProviderModelsBaseUrl(type, baseUrl, options?.isFullUrl === true);
   const attempts = buildProviderModelsAttempts(type, normalizedApiKey);
   const failures: ProviderModelsFailure[] = [];
   let emptyResult: ProviderModelConfig[] | null = null;
 
   for (const attempt of attempts) {
-    const proxyRequest = await prepareProxyRequest(type, normalizedUrl, attempt.headers, {
-      useSystemProxy: options?.useSystemProxy === true,
-    });
-    const modelsUrl = buildProviderModelsUrl(type, proxyRequest.baseUrl, attempt.kind);
+    const proxyRequest = await prepareProxyRequest(
+      type,
+      modelsUrlOverride || normalizedUrl,
+      attempt.headers,
+      {
+        useSystemProxy: options?.useSystemProxy === true,
+        isFullUrl: modelsUrlOverride.length > 0,
+      },
+    );
+    const requestUrl = modelsUrlOverride
+      ? proxyRequest.baseUrl
+      : buildProviderModelsUrl(type, proxyRequest.baseUrl, attempt.kind);
 
     let response: Response;
     try {
-      response = await fetch(modelsUrl, { headers: proxyRequest.headers });
+      response = await fetch(requestUrl, { headers: proxyRequest.headers });
     } catch (error) {
       failures.push({
         status: null,

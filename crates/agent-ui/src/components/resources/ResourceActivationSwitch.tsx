@@ -1,5 +1,5 @@
-import type { MouseEvent } from "react";
 import { cn } from "@liveagent/ui/lib/shared/utils";
+import type { SyntheticEvent } from "react";
 
 export function ResourceActivationSwitch(props: {
   checked: boolean;
@@ -10,6 +10,10 @@ export function ResourceActivationSwitch(props: {
   onCheckedChange: (checked: boolean) => void;
 }) {
   const compact = props.compact === true;
+  const stopEventPropagation = (event: SyntheticEvent) => {
+    if (props.stopPropagation) event.stopPropagation();
+  };
+
   return (
     <button
       type="button"
@@ -18,13 +22,13 @@ export function ResourceActivationSwitch(props: {
       aria-label={props.label}
       title={props.label}
       disabled={props.disabled}
-      onClick={(event: MouseEvent<HTMLButtonElement>) => {
-        if (props.stopPropagation) event.stopPropagation();
+      onPointerDown={stopEventPropagation}
+      onMouseDown={stopEventPropagation}
+      onClick={(event) => {
+        stopEventPropagation(event);
         props.onCheckedChange(!props.checked);
       }}
-      onKeyDown={(event) => {
-        if (props.stopPropagation) event.stopPropagation();
-      }}
+      onKeyDown={stopEventPropagation}
       className={cn(
         "relative inline-flex shrink-0 items-center rounded-full ring-1 transition-all",
         "disabled:cursor-not-allowed disabled:opacity-45",

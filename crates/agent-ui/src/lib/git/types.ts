@@ -45,6 +45,15 @@ export type GitBranch = {
 export type GitBranchesResponse = {
   state: GitRepositoryState;
   branches: GitBranch[];
+  // 仓库登记的 worktree（路径 + 检出分支），用于识别被 worktree 检出的分支。
+  worktrees: GitWorktreeInfo[];
+};
+
+export type GitWorktreeInfo = {
+  path: string;
+  branch: string;
+  mainWorktreePath: string;
+  isCurrent: boolean;
 };
 
 export type GitDiffResponse = {
@@ -120,10 +129,48 @@ export type GitOperationResponse = {
   message: string;
 };
 
+export type GitWorktreeResponse = {
+  ok: boolean;
+  state: GitRepositoryState;
+  worktreePath: string;
+  branch: string;
+  directoryName: string;
+  mainWorktreePath: string;
+  stdout: string;
+  stderr: string;
+  message: string;
+};
+
+export type GitRemoveWorktreeResponse = {
+  ok: boolean;
+  state: GitRepositoryState;
+  worktreePath: string;
+  mainWorktreePath: string;
+  branch: string;
+  worktreeRemoved: boolean;
+  branchDeleteRequested: boolean;
+  branchDeleted: boolean;
+  stdout: string;
+  stderr: string;
+  message: string;
+};
+
 export type GitInitOptions = {
   branch?: string;
   userName?: string;
   userEmail?: string;
+};
+
+export type GitCreateWorktreeOptions = {
+  branch: string;
+  directoryName: string;
+  parentDirectory?: string;
+  startPoint?: string;
+};
+
+export type GitRemoveWorktreeOptions = {
+  force?: boolean;
+  deleteBranch?: boolean;
 };
 
 export type GitLogOptions = {
@@ -166,7 +213,11 @@ export type GitClient = {
   init(workdir: string, options?: GitInitOptions): Promise<GitOperationResponse>;
   switchBranch(workdir: string, branch: string, kind?: string): Promise<GitOperationResponse>;
   createBranch(workdir: string, branch: string, startPoint?: string): Promise<GitOperationResponse>;
-  diff(workdir: string, mode: "branch" | "working_tree", path?: string): Promise<GitDiffResponse>;
+  diff(
+    workdir: string,
+    mode: "branch" | "working_tree" | "staged",
+    path?: string,
+  ): Promise<GitDiffResponse>;
   log(workdir: string, options?: GitLogOptions): Promise<GitLogResponse>;
   commitDetails(workdir: string, commit: string): Promise<GitCommitDetailsResponse>;
   compareCommitWithRemote(workdir: string, commit: string): Promise<GitDiffResponse>;
@@ -186,6 +237,12 @@ export type GitClient = {
   push(workdir: string): Promise<GitOperationResponse>;
   deleteBranch(workdir: string, branch: string, force?: boolean): Promise<GitOperationResponse>;
   renameBranch(workdir: string, branch: string, newBranch: string): Promise<GitOperationResponse>;
+  createWorktree?(workdir: string, options: GitCreateWorktreeOptions): Promise<GitWorktreeResponse>;
+  removeWorktree?(
+    workdir: string,
+    worktreePath: string,
+    options?: GitRemoveWorktreeOptions,
+  ): Promise<GitRemoveWorktreeResponse>;
   stashPush(workdir: string, message?: string): Promise<GitOperationResponse>;
   stashPop(workdir: string): Promise<GitOperationResponse>;
 };
@@ -302,6 +359,19 @@ export function normalizeGitBranchesResponse(input: unknown, workdir = ""): GitB
   return {
     state: normalizeGitRepositoryState(source.state, workdir),
     branches: Array.isArray(source.branches) ? source.branches.map(normalizeGitBranch) : [],
+    worktrees: Array.isArray(source.worktrees)
+      ? source.worktrees.map(normalizeGitWorktreeInfo).filter((item) => item.path)
+      : [],
+  };
+}
+
+export function normalizeGitWorktreeInfo(input: unknown): GitWorktreeInfo {
+  const source = asObject(input);
+  return {
+    path: asString(source.path),
+    branch: asString(source.branch),
+    mainWorktreePath: asString(source.mainWorktreePath ?? source.main_worktree_path),
+    isCurrent: asBoolean(source.isCurrent ?? source.is_current),
   };
 }
 
@@ -402,6 +472,51 @@ export function normalizeGitOperationResponse(input: unknown, workdir = ""): Git
   return {
     ok: asBoolean(source.ok),
     state: normalizeGitRepositoryState(source.state, workdir),
+    stdout: asString(source.stdout),
+    stderr: asString(source.stderr),
+    message: asString(source.message),
+  };
+}
+
+/**
+ * Worktree 已成功移除，但其未完全合并的分支无法被普通删除；此时应
+ * 直接引导用户确认强制删除分支，而不是重试已经注销的 Worktree。
+ */
+export function isGitWorktreeBranchNotFullyMergedError(message: string): boolean {
+  return /worktree .*分支删除失败/i.test(message) && /not fully merged/i.test(message);
+}
+
+export function normalizeGitWorktreeResponse(input: unknown, workdir = ""): GitWorktreeResponse {
+  const source = asObject(input);
+  return {
+    ok: asBoolean(source.ok),
+    state: normalizeGitRepositoryState(source.state, workdir),
+    worktreePath: asString(source.worktreePath ?? source.worktree_path),
+    branch: asString(source.branch),
+    directoryName: asString(source.directoryName ?? source.directory_name),
+    mainWorktreePath: asString(source.mainWorktreePath ?? source.main_worktree_path),
+    stdout: asString(source.stdout),
+    stderr: asString(source.stderr),
+    message: asString(source.message),
+  };
+}
+
+export function normalizeGitRemoveWorktreeResponse(
+  input: unknown,
+  workdir = "",
+): GitRemoveWorktreeResponse {
+  const source = asObject(input);
+  return {
+    ok: asBoolean(source.ok),
+    state: normalizeGitRepositoryState(source.state, workdir),
+    worktreePath: asString(source.worktreePath ?? source.worktree_path),
+    mainWorktreePath: asString(source.mainWorktreePath ?? source.main_worktree_path),
+    branch: asString(source.branch),
+    worktreeRemoved: asBoolean(source.worktreeRemoved ?? source.worktree_removed),
+    branchDeleteRequested: asBoolean(
+      source.branchDeleteRequested ?? source.branch_delete_requested,
+    ),
+    branchDeleted: asBoolean(source.branchDeleted ?? source.branch_deleted),
     stdout: asString(source.stdout),
     stderr: asString(source.stderr),
     message: asString(source.message),

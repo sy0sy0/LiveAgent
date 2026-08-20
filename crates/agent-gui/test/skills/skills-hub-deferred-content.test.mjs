@@ -1,12 +1,19 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { createTsModuleLoader } from "../helpers/load-ts-module.mjs";
 
 const page = new URL("../../../agent-ui/src/pages/skills-hub/SkillsHubPage.tsx", import.meta.url);
 const source = readFileSync(page, "utf8");
-const localeFiles = [
-  new URL("../../src/i18n/config.ts", import.meta.url),
-  new URL("../../../agent-gateway/web/src/i18n/config.ts", import.meta.url),
+const guiLoader = createTsModuleLoader();
+const webRoot = fileURLToPath(new URL("../../../agent-gateway/web/", import.meta.url));
+const hostTranslations = [
+  ["GUI", guiLoader.loadModule("src/i18n/config.ts").translations],
+  [
+    "WebUI",
+    createTsModuleLoader({ rootDir: webRoot }).loadModule("src/i18n/config.ts").translations,
+  ],
 ];
 
 test("the shared Skills Hub defers the initial installed list behind a loading state", () => {
@@ -23,10 +30,9 @@ test("the shared Skills Hub defers the initial installed list behind a loading s
 test("the shared Skills Hub derives installed Skills from the deferred snapshot", () => {
     assert.match(
       source,
-      /(?:if \(!text\) return deferredSkills|const matchedSkills = !text\s*\? deferredSkills)/,
+      /rankFuzzySearchResults\(deferredSkills, deferredFilter/,
     );
-    assert.match(source, /(?:return|:) deferredSkills\.filter/);
-    assert.doesNotMatch(source, /if \(!text\) return skills/);
+    assert.doesNotMatch(source, /rankFuzzySearchResults\(skills, deferredFilter/);
 });
 
 test("the shared Skills Hub avoids discovery signatures during shell render", () => {
@@ -38,9 +44,18 @@ test("the shared Skills Hub avoids discovery signatures during shell render", ()
 });
 
 test("both hosts provide localized deferred-content loading copy", () => {
-  for (const i18n of localeFiles) {
-    const translations = readFileSync(i18n, "utf8");
-    assert.equal(translations.match(/"settings\.skillsHubPreparing":/g)?.length, 2);
-    assert.equal(translations.match(/"settings\.skillsHubPreparingDesc":/g)?.length, 2);
+  for (const [host, translations] of hostTranslations) {
+    for (const locale of ["zh-CN", "en-US"]) {
+      assert.equal(
+        typeof translations[locale]["settings.skillsHubPreparing"],
+        "string",
+        `${host} ${locale} must define settings.skillsHubPreparing`,
+      );
+      assert.equal(
+        typeof translations[locale]["settings.skillsHubPreparingDesc"],
+        "string",
+        `${host} ${locale} must define settings.skillsHubPreparingDesc`,
+      );
+    }
   }
 });

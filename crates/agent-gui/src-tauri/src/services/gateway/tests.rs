@@ -1,13 +1,14 @@
 use super::{
-    build_gateway_runtime_status_envelope, build_local_settings_update_event_payload,
-    effective_agent_id, gateway_connection_needs_restart, gateway_connection_stale_after,
-    gateway_reconnect_backoff, history_share_resolve_error_code, is_chat_runtime_wake_request_id,
+    attach_stt_secret_sync, build_gateway_runtime_status_envelope,
+    build_local_settings_update_event_payload, effective_agent_id,
+    gateway_connection_needs_restart, gateway_connection_stale_after, gateway_reconnect_backoff,
+    history_share_resolve_error_code, is_chat_runtime_wake_request_id,
     merge_settings_sync_snapshot, merge_settings_update_into_snapshot, proto,
-    required_terminal_project_path_key, set_disconnected_status, GatewayChatRequestEvent,
-    GatewayController, GatewayStatusSnapshot, RemoteChatInboxRecord, GATEWAY_CHAT_LEASE_MS,
-    GATEWAY_CHAT_RUNNING_LEASE_MS, GATEWAY_RECONNECT_MAX, GATEWAY_RECONNECT_MIN,
-    GATEWAY_RECONNECT_STABLE_AFTER, GATEWAY_RUNTIME_STATUS_REPUBLISH_MAX_AGE,
-    GATEWAY_WEBVIEW_REPORT_FRESH_WINDOW,
+    removed_workspace_project_ids, required_terminal_project_path_key, set_disconnected_status,
+    GatewayChatRequestEvent, GatewayController, GatewayStatusSnapshot, RemoteChatInboxRecord,
+    GATEWAY_CHAT_LEASE_MS, GATEWAY_CHAT_RUNNING_LEASE_MS, GATEWAY_RECONNECT_MAX,
+    GATEWAY_RECONNECT_MIN, GATEWAY_RECONNECT_STABLE_AFTER,
+    GATEWAY_RUNTIME_STATUS_REPUBLISH_MAX_AGE, GATEWAY_WEBVIEW_REPORT_FRESH_WINDOW,
 };
 use crate::commands::settings::RemoteSettingsPayload;
 use crate::services::gateway_bridge;
@@ -79,6 +80,7 @@ fn gateway_chat_request(
         runtime_controls: None,
         execution_mode: String::new(),
         workdir: String::new(),
+        command_safety_mode: String::new(),
         uploaded_files: Vec::new(),
         queue_policy: String::new(),
     }
@@ -111,6 +113,7 @@ fn gateway_chat_command_mapping_preserves_rebase_signal() {
         message: "edited".to_string(),
         execution_mode: "tools".to_string(),
         workdir: "/workspace".to_string(),
+        command_safety_mode: "sandbox".to_string(),
         ..Default::default()
     };
 
@@ -145,6 +148,7 @@ fn gateway_chat_command_mapping_preserves_rebase_signal() {
     assert_eq!(base_message_ref.content_hash, "fnv1a32:00000000");
     assert_eq!(event.execution_mode, "tools");
     assert_eq!(event.workdir, "/workspace");
+    assert_eq!(event.command_safety_mode, "sandbox");
 }
 
 #[test]
@@ -382,6 +386,46 @@ fn merge_settings_sync_snapshot_without_cache_leaves_ui_only_fields_absent() {
 }
 
 #[test]
+fn settings_sync_attaches_private_stt_only_to_the_outbound_payload() {
+    let public_snapshot = json!({
+        "theme": "dark",
+        "stt": {
+            "provider": "tencent_cloud",
+            "providers": {
+                "tencent_cloud": {
+                    "id": "tencent_cloud",
+                    "configured": true,
+                    "appId": "123",
+                    "secretId": "",
+                    "secretKey": ""
+                }
+            }
+        }
+    });
+    let raw_stt = json!({
+        "provider": "tencent_cloud",
+        "providers": {
+            "tencent_cloud": {
+                "id": "tencent_cloud",
+                "appId": "123",
+                "secretId": "desktop-secret-id",
+                "secretKey": "desktop-secret-key"
+            }
+        }
+    });
+
+    let outbound = attach_stt_secret_sync(public_snapshot.clone(), Some(raw_stt.clone()))
+        .expect("attach private STT settings");
+
+    assert_eq!(outbound["sttSecretSync"], raw_stt);
+    assert_eq!(
+        public_snapshot["stt"]["providers"]["tencent_cloud"]["secretId"],
+        ""
+    );
+    assert!(public_snapshot.get("sttSecretSync").is_none());
+}
+
+#[test]
 fn merge_settings_update_into_snapshot_keeps_unrelated_fields() {
     let full_snapshot = json!({
         "system": { "executionMode": "agent-dev" },
@@ -413,6 +457,55 @@ fn merge_settings_update_into_snapshot_keeps_unrelated_fields() {
     assert_eq!(merged["system"], json!({ "executionMode": "agent-dev" }));
     // Remote settings are desktop-owned and must not be overwritten by clients.
     assert_eq!(merged["remote"], json!({ "enableWebTerminal": true }));
+}
+
+#[test]
+fn settings_update_reports_removed_workspace_project_ids() {
+    let current = json!({
+        "system": {
+            "workspaceProjects": [
+                { "id": "default-project", "path": "/default" },
+                { "id": "project-b", "path": "/b" },
+                { "id": "project-a", "path": "/a" }
+            ]
+        }
+    });
+    let update = json!({
+        "system": {
+            "workspaceProjects": [
+                { "id": "default-project", "path": "/default" },
+                { "id": "project-b", "path": "/b" }
+            ]
+        }
+    });
+
+    assert_eq!(
+        removed_workspace_project_ids(&current, &update).expect("removed ids"),
+        vec!["project-a"]
+    );
+    assert!(
+        removed_workspace_project_ids(&current, &json!({ "theme": "dark" }))
+            .expect("unrelated update")
+            .is_empty()
+    );
+}
+
+#[test]
+fn settings_update_rejects_malformed_workspace_project_ids() {
+    let current = json!({
+        "system": {
+            "workspaceProjects": [{ "id": "project-a", "path": "/a" }]
+        }
+    });
+    let malformed = json!({
+        "system": {
+            "workspaceProjects": [{ "path": "/a" }]
+        }
+    });
+
+    let error = removed_workspace_project_ids(&current, &malformed)
+        .expect_err("missing ids must not trigger accidental revocation");
+    assert!(error.contains("non-empty id"), "{error}");
 }
 
 #[test]

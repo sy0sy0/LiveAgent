@@ -16,6 +16,7 @@ const (
 	maxHistoryListLimit        = 200
 	defaultHistoryListPage     = 1
 	defaultHistoryListPageSize = 80
+	maxWorkspaceRootGrants     = 64
 )
 
 // vetAgentRequest 校验并（必要时）原地修正一条直通请求；返回错误则拒绝转发，错误信息面向客户端。
@@ -63,10 +64,16 @@ func vetAgentRequest(sm session.AgentView, env *gatewayv2.GatewayEnvelope) error
 		*gatewayv2.GatewayEnvelope_FsDelete,
 		*gatewayv2.GatewayEnvelope_FsReadEditableText,
 		*gatewayv2.GatewayEnvelope_FsReadWorkspaceImage,
+		// 轨迹只读：不含任何写能力，也不触碰工作区，直通即可。
+		*gatewayv2.GatewayEnvelope_TrajectoryFetch,
 		*gatewayv2.GatewayEnvelope_ChatQueue:
 		return nil
 	case *gatewayv2.GatewayEnvelope_ChatFileOpen:
 		return vetChatFileOpen(payload.ChatFileOpen)
+	case *gatewayv2.GatewayEnvelope_WorkspaceRootGrants:
+		return vetWorkspaceRootGrants(payload.WorkspaceRootGrants)
+	case *gatewayv2.GatewayEnvelope_Checkpoint:
+		return vetCheckpoint(payload.Checkpoint)
 
 	// ---- 带功能门控 / 限额的直通臂 ----
 	case *gatewayv2.GatewayEnvelope_GitRequest:
@@ -108,6 +115,103 @@ func vetAgentRequest(sm session.AgentView, env *gatewayv2.GatewayEnvelope) error
 	}
 }
 
+func vetCheckpoint(req *gatewayv2.CheckpointRequest) error {
+	if req == nil || strings.TrimSpace(req.GetConversationId()) == "" || len(req.GetConversationId()) > 256 {
+		return errors.New("checkpoint conversation_id is invalid")
+	}
+	switch strings.TrimSpace(req.GetAction()) {
+	case "list":
+		if req.GetTurnSeq() != 0 || len(req.GetAuthorizedRoots()) != 0 || len(req.GetExpected()) != 0 {
+			return errors.New("checkpoint list payload is invalid")
+		}
+	case "diff":
+		if req.GetTurnSeq() == 0 || len(req.GetExpected()) != 0 {
+			return errors.New("checkpoint diff payload is invalid")
+		}
+	case "rewind":
+		if req.GetTurnSeq() == 0 {
+			return errors.New("checkpoint rewind turn_seq is required")
+		}
+	default:
+		return errors.New("checkpoint action is invalid")
+	}
+	if len(req.GetAuthorizedRoots()) > 64 {
+		return errors.New("too many checkpoint authorized roots")
+	}
+	for _, root := range req.GetAuthorizedRoots() {
+		if strings.TrimSpace(root) == "" || len(root) > 32768 {
+			return errors.New("checkpoint authorized root is invalid")
+		}
+	}
+	if len(req.GetExpected()) > 10_000 {
+		return errors.New("too many checkpoint expected entries")
+	}
+	for _, entry := range req.GetExpected() {
+		if entry == nil ||
+			strings.TrimSpace(entry.GetKey()) == "" ||
+			len(entry.GetKey()) > 65536 ||
+			strings.TrimSpace(entry.GetCurrentHash()) == "" ||
+			len(entry.GetCurrentHash()) > 256 {
+			return errors.New("checkpoint expected entry is invalid")
+		}
+	}
+	return nil
+}
+
+func vetWorkspaceRootGrants(req *gatewayv2.WorkspaceRootGrantsRequest) error {
+	if req == nil {
+		return errors.New("workspace root grants request is required")
+	}
+	if strings.TrimSpace(req.GetProjectId()) == "" || len(req.GetProjectId()) > 256 {
+		return errors.New("workspace root grants project_id is invalid")
+	}
+	switch strings.TrimSpace(req.GetAction()) {
+	case "list":
+		if strings.TrimSpace(req.GetProjectPath()) == "" || len(req.GetProjectPath()) > 32768 {
+			return errors.New("workspace root grants project_path is invalid")
+		}
+		if len(req.GetGrants()) != 0 {
+			return errors.New("workspace root grants list cannot include drafts")
+		}
+		return nil
+	case "apply":
+		if strings.TrimSpace(req.GetProjectPath()) == "" || len(req.GetProjectPath()) > 32768 {
+			return errors.New("workspace root grants project_path is invalid")
+		}
+		if len(req.GetGrants()) > maxWorkspaceRootGrants {
+			return errors.New("too many workspace root grants")
+		}
+	case "revoke":
+		if strings.TrimSpace(req.GetProjectPath()) != "" {
+			return errors.New("workspace root grants revoke cannot include project_path")
+		}
+		if len(req.GetGrants()) != 0 {
+			return errors.New("workspace root grants revoke cannot include drafts")
+		}
+		return nil
+	default:
+		return errors.New("workspace root grants action is invalid")
+	}
+
+	for _, grant := range req.GetGrants() {
+		if grant == nil || strings.TrimSpace(grant.GetAlias()) == "" || len(grant.GetAlias()) > 32 {
+			return errors.New("workspace root grant alias is invalid")
+		}
+		if strings.TrimSpace(grant.GetDisplayPath()) == "" || len(grant.GetDisplayPath()) > 32768 {
+			return errors.New("workspace root grant display_path is invalid")
+		}
+		if grant.Id != nil && (strings.TrimSpace(grant.GetId()) == "" || len(grant.GetId()) > 256) {
+			return errors.New("workspace root grant id is invalid")
+		}
+		switch strings.TrimSpace(grant.GetAccess()) {
+		case "read", "write":
+		default:
+			return errors.New("workspace root grant access is invalid")
+		}
+	}
+	return nil
+}
+
 func vetChatFileOpen(req *gatewayv2.ChatFileOpenRequest) error {
 	if req == nil || strings.TrimSpace(req.GetConversationId()) == "" || len(req.GetConversationId()) > 256 {
 		return errors.New("conversation is unavailable")
@@ -141,7 +245,7 @@ func vetChatFileOpen(req *gatewayv2.ChatFileOpenRequest) error {
 // enable_web_git 门控，读操作（status/log/diff 等）始终放行。
 func gitActionIsWrite(action string) bool {
 	switch action {
-	case "clone", "clone_start", "clone_cancel", "clone_dismiss", "init", "switch_branch", "create_branch", "stage", "stage_all", "unstage", "unstage_all", "discard", "discard_all", "add_to_gitignore", "commit", "fetch", "pull", "set_remote", "push", "delete_branch", "rename_branch", "stash_push", "stash_pop":
+	case "clone", "clone_start", "clone_cancel", "clone_dismiss", "init", "switch_branch", "create_branch", "create_worktree", "stage", "stage_all", "unstage", "unstage_all", "discard", "discard_all", "add_to_gitignore", "commit", "fetch", "pull", "set_remote", "push", "delete_branch", "rename_branch", "remove_worktree", "stash_push", "stash_pop":
 		return true
 	default:
 		return false

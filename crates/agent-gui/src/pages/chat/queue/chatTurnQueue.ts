@@ -1,6 +1,13 @@
 import type { MentionComposerDraft } from "@liveagent/ui/components/chat/MentionComposer";
-import type { PendingUploadedFile } from "../../../lib/chat/messages/uploadedFiles";
-import type { ChatRuntimeControls, ExecutionMode } from "../../../lib/settings";
+
+export type {
+  ChatQueueItemDetail,
+  ChatQueueItemSummary,
+  ChatQueueSnapshot,
+} from "@liveagent/ui/contracts/chatQueue";
+
+import type { PendingUploadedFile } from "@liveagent/ui/lib/chat/uploadedFiles";
+import type { ChatRuntimeControls, CommandSafetyMode, ExecutionMode } from "../../../lib/settings";
 import type {
   GatewayChatRuntimeControlsEvent,
   GatewaySelectedModelEvent,
@@ -24,29 +31,10 @@ export type QueuedChatTurn = {
   uploadedFiles: PendingUploadedFile[];
   executionMode: ExecutionMode;
   workdir: string;
+  commandSafetyMode: CommandSafetyMode;
   runtimeControls: ChatRuntimeControls;
   createdAt: number;
   gatewayRequest?: QueuedGatewayChatRequest;
-};
-
-export type ChatQueueItemSummary = {
-  id: string;
-  previewText: string;
-  fileCount: number;
-  createdAt: number;
-  source: "gui" | "webui";
-  editable: boolean;
-};
-
-export type ChatQueueSnapshot = {
-  conversationId: string;
-  revision: number;
-  items: ChatQueueItemSummary[];
-};
-
-export type ChatQueueItemDetail = ChatQueueItemSummary & {
-  draftJson: string;
-  uploadedFilesJson: string;
 };
 
 export type QueuedChatTurnInput = Omit<QueuedChatTurn, "createdAt" | "id"> & {
@@ -70,6 +58,7 @@ export function createQueuedChatTurn(input: QueuedChatTurnInput): QueuedChatTurn
     uploadedFiles: input.uploadedFiles.slice(),
     executionMode: input.executionMode,
     workdir: input.workdir.trim(),
+    commandSafetyMode: input.commandSafetyMode,
     runtimeControls: { ...input.runtimeControls },
     createdAt,
     gatewayRequest: input.gatewayRequest ? { ...input.gatewayRequest } : undefined,

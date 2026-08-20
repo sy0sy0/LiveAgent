@@ -26,6 +26,46 @@ function decodeClientFrame(bytes) {
   return pb.fromBinary(v2.WebClientFrameSchema, bytes);
 }
 
+test("provider model requests carry the stored provider identity to the desktop", () => {
+  const encoded = encodeRequestFrame(
+    "provider-models-1",
+    "provider.models",
+    {
+      type: "codex",
+      base_url: "https://relay.example.com/v1",
+      api_key: "",
+      use_system_proxy: true,
+      models_url: "https://relay.example.com/models",
+      provider_id: "provider-a",
+      is_full_url: true,
+    },
+    "agent-1",
+  );
+  const frame = decodeClientFrame(encoded);
+  assert.equal(frame.agentId, "agent-1");
+  assert.equal(frame.payload.value.payload.case, "providerModels");
+  assert.deepEqual(
+    {
+      providerType: frame.payload.value.payload.value.providerType,
+      baseUrl: frame.payload.value.payload.value.baseUrl,
+      apiKey: frame.payload.value.payload.value.apiKey,
+      useSystemProxy: frame.payload.value.payload.value.useSystemProxy,
+      modelsUrl: frame.payload.value.payload.value.modelsUrl,
+      providerId: frame.payload.value.payload.value.providerId,
+      isFullUrl: frame.payload.value.payload.value.isFullUrl,
+    },
+    {
+      providerType: "codex",
+      baseUrl: "https://relay.example.com/v1",
+      apiKey: "",
+      useSystemProxy: true,
+      modelsUrl: "https://relay.example.com/models",
+      providerId: "provider-a",
+      isFullUrl: true,
+    },
+  );
+});
+
 test("chat file open requests remain agent-scoped and preserve source locations", () => {
   const encoded = encodeRequestFrame(
     "file-open-1",
@@ -99,6 +139,187 @@ test("chat file open requests remain agent-scoped and preserve source locations"
     column: 4,
     outsideWorkspace: false,
   });
+});
+
+test("workspace root grants round-trip through the agent-scoped gateway protocol", () => {
+  const encoded = encodeRequestFrame(
+    "workspace-roots-1",
+    "workspace_root_grants.apply",
+    {
+      project_id: "project-1",
+      project_path: "C:/work/project",
+      grants: [
+        {
+          id: "grant-1",
+          alias: "shared",
+          display_path: "C:/work/shared",
+          access: "read",
+        },
+        {
+          alias: "generated",
+          display_path: "C:/work/generated",
+          access: "write",
+        },
+      ],
+    },
+    "agent-1",
+  );
+  const frame = decodeClientFrame(encoded);
+  assert.equal(frame.agentId, "agent-1");
+  assert.equal(frame.payload.value.payload.case, "workspaceRootGrants");
+  assert.equal(frame.payload.value.payload.value.action, "apply");
+  assert.equal(frame.payload.value.payload.value.grants[0].id, "grant-1");
+  assert.equal(frame.payload.value.payload.value.grants[1].id, undefined);
+  assert.equal(frame.payload.value.payload.value.grants[1].access, "write");
+
+  const decoded = decodeServerFrame(
+    roundtrip(
+      serverFrame({
+        request_id: "workspace-roots-1",
+        agent_id: "agent-1",
+        agent_response: {
+          request_id: "workspace-roots-1",
+          workspace_root_grants_resp: {
+            grants: [
+              {
+                id: "grant-1",
+                project_id: "project-1",
+                project_path_key: "c:/work/project",
+                alias: "shared",
+                display_path: "C:/work/shared",
+                canonical_path: "C:/work/shared",
+                access: "read",
+                state: "active",
+                created_at: 1700000000000,
+                updated_at: 1700000001000,
+              },
+            ],
+          },
+        },
+      }),
+    ),
+    { agentOnline: true },
+  );
+  assert.equal(decoded.kind, "response");
+  assert.deepEqual(decoded.payload.grants[0], {
+    id: "grant-1",
+    projectId: "project-1",
+    projectPathKey: "c:/work/project",
+    alias: "shared",
+    displayPath: "C:/work/shared",
+    canonicalPath: "C:/work/shared",
+    access: "read",
+    state: "active",
+    createdAt: 1700000000000,
+    updatedAt: 1700000001000,
+  });
+
+  const revokeFrame = decodeClientFrame(
+    encodeRequestFrame(
+      "workspace-roots-revoke-1",
+      "workspace_root_grants.revoke",
+      { project_id: "history-a1b2c3" },
+      "agent-1",
+    ),
+  );
+  assert.equal(revokeFrame.agentId, "agent-1");
+  assert.equal(revokeFrame.payload.value.payload.case, "workspaceRootGrants");
+  assert.deepEqual(
+    {
+      action: revokeFrame.payload.value.payload.value.action,
+      projectId: revokeFrame.payload.value.payload.value.projectId,
+      projectPath: revokeFrame.payload.value.payload.value.projectPath,
+      grants: revokeFrame.payload.value.payload.value.grants,
+    },
+    {
+      action: "revoke",
+      projectId: "history-a1b2c3",
+      projectPath: "",
+      grants: [],
+    },
+  );
+});
+
+test("checkpoint requests and responses round-trip through the agent-scoped gateway protocol", () => {
+  const common = {
+    conversation_id: "conversation-1",
+    turn_seq: 7,
+    authorized_roots: ["C:/work/project", "C:/work/shared"],
+  };
+  for (const [type, expectedCount] of [
+    ["checkpoint.list", 0],
+    ["checkpoint.diff", 0],
+    ["checkpoint.rewind", 1],
+  ]) {
+    const encoded = encodeRequestFrame(
+      `checkpoint-${type}`,
+      type,
+      {
+        ...common,
+        expected:
+          expectedCount > 0
+            ? [{ key: "C:/work/project\u0001src/a.ts", current_hash: "hash-at-preview" }]
+            : undefined,
+      },
+      "agent-1",
+    );
+    const frame = decodeClientFrame(encoded);
+    assert.equal(frame.agentId, "agent-1");
+    assert.equal(frame.payload.value.payload.case, "checkpoint");
+    assert.equal(frame.payload.value.payload.value.action, type.slice("checkpoint.".length));
+    assert.equal(frame.payload.value.payload.value.conversationId, common.conversation_id);
+    assert.equal(Number(frame.payload.value.payload.value.turnSeq), common.turn_seq);
+    assert.deepEqual(frame.payload.value.payload.value.authorizedRoots, common.authorized_roots);
+    assert.equal(frame.payload.value.payload.value.expected.length, expectedCount);
+    if (expectedCount > 0) {
+      assert.deepEqual(
+        {
+          key: frame.payload.value.payload.value.expected[0].key,
+          currentHash: frame.payload.value.payload.value.expected[0].currentHash,
+        },
+        {
+          key: "C:/work/project\u0001src/a.ts",
+          currentHash: "hash-at-preview",
+        },
+      );
+    }
+  }
+
+  const decoded = decodeServerFrame(
+    roundtrip(
+      serverFrame({
+        request_id: "checkpoint-list",
+        agent_id: "agent-1",
+        agent_response: {
+          checkpoint_resp: {
+            action: "list",
+            result_json: JSON.stringify([
+              {
+                turnSeq: 7,
+                turnId: "message-7",
+                fileCount: 1,
+                dirCount: 0,
+                incomplete: false,
+                firstCapturedAt: 1700000000000,
+              },
+            ]),
+          },
+        },
+      }),
+    ),
+    { agentOnline: true },
+  );
+  assert.equal(decoded.kind, "response");
+  assert.deepEqual(decoded.payload, [
+    {
+      turnSeq: 7,
+      turnId: "message-7",
+      fileCount: 1,
+      dirCount: 0,
+      incomplete: false,
+      firstCapturedAt: 1700000000000,
+    },
+  ]);
 });
 
 test("adapters convert int64/uint64 fields to Number at realistic maxima", () => {
@@ -361,4 +582,26 @@ test("encodeRequestFrame maps request types onto GatewayEnvelope arms", () => {
     () => encodeRequestFrame("req-4", "not.a.request", {}),
     /unsupported gateway request type/,
   );
+});
+
+test("trajectory fetch keeps prompt section ids and subagent run ids in separate proto fields", () => {
+  const frame = decodeClientFrame(
+    encodeRequestFrame(
+      "trajectory-1",
+      "trajectory.fetch",
+      {
+        conversation_id: "conversation-1",
+        section_ids: ["section-a"],
+        subagent_run_ids: ["run-a", "run-b"],
+        include_subagent_runs: true,
+      },
+      "agent-a",
+    ),
+  );
+
+  assert.equal(frame.payload.value.payload.case, "trajectoryFetch");
+  const request = frame.payload.value.payload.value;
+  assert.deepEqual(request.sectionIds, ["section-a"]);
+  assert.deepEqual(request.subagentRunIds, ["run-a", "run-b"]);
+  assert.equal(request.includeSubagentRuns, true);
 });

@@ -1,8 +1,29 @@
 import { invoke } from "@liveagent/app/shims/tauriCore";
+import {
+  AlertTriangle,
+  File,
+  FolderOpen,
+  HardDrive,
+  Home,
+  Loader2,
+  Plus,
+} from "@liveagent/ui/components/IconSet";
 import { Button } from "@liveagent/ui/components/ui/button";
+import {
+  Dialog,
+  DialogActions,
+  DialogBody,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogSubheader,
+  DialogTitle,
+} from "@liveagent/ui/components/ui/dialog";
 import { Input } from "@liveagent/ui/components/ui/input";
 import { useLocale } from "@liveagent/ui/i18n/index";
-import { useModalMotion } from "@liveagent/ui/lib/shared/modalMotion";
+import { cn } from "@liveagent/ui/lib/shared/utils";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   IndividualTreeViewState,
@@ -11,8 +32,6 @@ import type {
   TreeViewState,
 } from "react-complex-tree";
 import { ControlledTreeEnvironment, Tree } from "react-complex-tree";
-import { createPortal } from "react-dom";
-import { AlertTriangle, File, FolderOpen, HardDrive, Home, Loader2, Plus, X } from "./icons";
 import type { RemoteFsRoot } from "./remotePathPickerPaths";
 import {
   basenameFromPath,
@@ -138,7 +157,9 @@ export function RemotePathPickerModal(props: RemotePathPickerModalProps) {
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [createFolderError, setCreateFolderError] = useState<string | null>(null);
   const didExpandInitialPathRef = useRef(false);
-  const { modalState, requestClose } = useModalMotion(onClose);
+  // Base UI 控制 open：先置 false 播放退场过渡，onOpenChangeComplete 再通知
+  // 调用方卸载（onSelect 已先行 resolve，onClose 的 resolve(null) 为 no-op）。
+  const [open, setOpen] = useState(true);
 
   const modalTitle =
     title ?? (mode === "file" ? t("settings.filePickerTitle") : t("settings.workdirPickerTitle"));
@@ -273,16 +294,6 @@ export function RemotePathPickerModal(props: RemotePathPickerModalProps) {
       cancelled = true;
     };
   }, []);
-
-  useEffect(() => {
-    function onKeyDown(event: KeyboardEvent) {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      requestClose();
-    }
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [requestClose]);
 
   useEffect(() => {
     if (loadingRoots || didExpandInitialPathRef.current) return;
@@ -511,43 +522,40 @@ export function RemotePathPickerModal(props: RemotePathPickerModalProps) {
     }
   }
 
-  const overlay = (
-    <div
-      className="settings-modal-overlay fixed inset-0 z-50 flex items-center justify-center p-4"
-      data-state={modalState}
+  // Nested dialogs share the portal layer; the later portal wins by DOM order.
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={setOpen}
+      onOpenChangeComplete={(nextOpen) => {
+        if (!nextOpen) onClose();
+      }}
     >
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={requestClose} />
-
-      <div className="settings-modal-panel relative z-10 flex max-h-[92vh] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-border/60 bg-background shadow-2xl">
-        <div className="settings-modal-header flex items-center gap-3 border-b border-border/40 px-6 py-4">
+      <DialogContent
+        className="flex h-[min(650px,92vh)] max-h-[92vh] max-w-4xl flex-col p-0"
+        closeLabel={t("settings.cancel")}
+        showCloseButton
+      >
+        <DialogHeader className="flex-row items-center gap-3 px-6">
           <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-primary/10 text-primary">
             {mode === "file" ? <File className="h-5 w-5" /> : <FolderOpen className="h-5 w-5" />}
           </div>
           <div className="min-w-0 flex-1">
-            <h2 className="text-base font-semibold">{modalTitle}</h2>
-            <p className="mt-0.5 text-xs text-muted-foreground">{modalDescription}</p>
+            <DialogTitle>{modalTitle}</DialogTitle>
+            <DialogDescription className="mt-0.5 text-xs">{modalDescription}</DialogDescription>
           </div>
-          <button
-            type="button"
-            onClick={requestClose}
-            title={t("settings.cancel")}
-            aria-label={t("settings.cancel")}
-            className="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
-          >
-            <X className="h-4 w-4" />
-          </button>
-        </div>
+        </DialogHeader>
 
-        <div className="settings-modal-subheader border-b border-border/30 px-6 py-4">
+        <DialogSubheader className="px-6">
           <div className="settings-field-row flex items-center gap-3">
             <div className="w-24 shrink-0 text-xs font-medium text-muted-foreground">
               {mode === "file" ? t("settings.pathPickerPathLabel") : t("settings.workdir")}
             </div>
             <Input value={headerPath} readOnly className="font-mono text-[13px]" />
           </div>
-        </div>
+        </DialogSubheader>
 
-        <div className="settings-modal-body flex min-h-0 flex-1 flex-col gap-3 px-6 py-4">
+        <DialogBody className="flex flex-col gap-3 px-6">
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             <div className="flex items-center gap-1.5">
               <Home className="h-3.5 w-3.5" />
@@ -652,13 +660,14 @@ export function RemotePathPickerModal(props: RemotePathPickerModalProps) {
 
           {statusLine ? (
             <div
-              className={`flex items-start gap-2 rounded-lg border px-3 py-2.5 text-xs ${
+              className={cn(
+                "flex items-start gap-2 rounded-lg border px-3 py-2.5 text-xs",
                 statusLine.kind === "error"
                   ? "border-destructive/30 bg-destructive/5 text-destructive"
                   : statusLine.kind === "warn"
                     ? "border-amber-500/30 bg-amber-500/5 text-amber-700 dark:text-amber-300"
-                    : "border-border/60 bg-background/70 text-muted-foreground"
-              }`}
+                    : "border-border/60 bg-background/70 text-muted-foreground",
+              )}
             >
               {statusLine.kind === "loading" ? (
                 <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin" />
@@ -670,28 +679,29 @@ export function RemotePathPickerModal(props: RemotePathPickerModalProps) {
               <span className="min-w-0 flex-1">{statusLine.text}</span>
             </div>
           ) : null}
-        </div>
+        </DialogBody>
 
-        <div className="settings-modal-footer flex items-center justify-end gap-2 border-t border-border/40 px-6 py-4">
-          <Button variant="outline" onClick={requestClose}>
-            {t("settings.cancel")}
-          </Button>
-          <Button
-            disabled={!canConfirm}
-            onClick={() => {
-              if (!canConfirm || !selectedPath) return;
-              onSelect(selectedPath);
-              requestClose();
-            }}
-          >
-            {t("settings.select")}
-          </Button>
-        </div>
-      </div>
-    </div>
+        <DialogFooter className="px-6">
+          <DialogActions>
+            <DialogClose render={<Button variant="outline" />}>{t("settings.cancel")}</DialogClose>
+            <DialogClose
+              render={
+                <Button
+                  disabled={!canConfirm}
+                  onClick={() => {
+                    if (!canConfirm || !selectedPath) return;
+                    onSelect(selectedPath);
+                  }}
+                />
+              }
+            >
+              {t("settings.select")}
+            </DialogClose>
+          </DialogActions>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
-
-  return createPortal(overlay, document.body);
 }
 
 type PickPathOptions = {
@@ -712,10 +722,12 @@ type PendingPick = PickPathOptions & {
  */
 export function useRemotePathPicker() {
   const [pending, setPending] = useState<PendingPick | null>(null);
+  const selectedPathRef = useRef<string | null>(null);
 
   const pickPath = useCallback(
     (options: PickPathOptions) =>
       new Promise<string | null>((resolve) => {
+        selectedPathRef.current = null;
         setPending({ ...options, resolve });
       }),
     [],
@@ -728,11 +740,13 @@ export function useRemotePathPicker() {
       title={pending.title}
       description={pending.description}
       onSelect={(path) => {
-        pending.resolve(path);
+        selectedPathRef.current = path;
       }}
       onClose={() => {
-        // No-op when a selection already resolved the promise.
-        pending.resolve(null);
+        // Resolve only after the picker finishes its exit transition so a
+        // suspended parent modal cannot reopen underneath the closing picker.
+        pending.resolve(selectedPathRef.current);
+        selectedPathRef.current = null;
         setPending(null);
       }}
     />

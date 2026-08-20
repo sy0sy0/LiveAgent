@@ -9,12 +9,14 @@ import { setPreferredMonacoNlsLocale } from "@liveagent/ui/lib/monacoNls";
 import {
   applyGatewaySettingsSyncPayload,
   buildGatewaySettingsSyncUpdatePayload,
-  type GatewaySettingsSyncPayload,
+  type GatewaySettingsSyncUpdatePayload,
   redactSettingsForWebStorage,
 } from "@liveagent/ui/lib/settings/sync";
+import { applyFontFamilies } from "@liveagent/ui/lib/shared/fontFamily";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { applyFontFamilies } from "@/lib/fontFamily";
+import { type Locale, t } from "@/i18n/config";
 import type { GatewayWebSocketClientLike } from "@/lib/gatewaySocket";
+import { GatewaySettingsUpdateError } from "@/lib/gatewaySocketRpc";
 import {
   type AppSettings,
   normalizeSettings,
@@ -22,10 +24,18 @@ import {
   subscribeToSystemThemePreference,
 } from "@/lib/settings";
 import { loadToken } from "@/lib/storage";
+import { webSttSettingsService } from "@/lib/stt/webSttSettingsService";
 import { loadWebSettings, persistWebSettings, type WebSettingsSaveState } from "@/lib/webSettings";
 
 import { asErrorMessage } from "../chatEventUtils";
 import { hasSettingsSyncChanged, resolveAppWorkspaceProjects } from "../historyUtils";
+
+export function getGatewaySettingsErrorMessage(error: unknown, fallback: string, locale: Locale) {
+  if (error instanceof GatewaySettingsUpdateError && error.code === "settings_changed") {
+    return t("app.settingsSshSettingsChanged", locale);
+  }
+  return asErrorMessage(error, fallback);
+}
 
 export function useGatewaySettingsSync(params: {
   token: string;
@@ -121,6 +131,7 @@ export function useGatewaySettingsSync(params: {
           }
         })
         .catch((error) => {
+          console.error("Failed to persist gateway settings", error);
           if (syncGateway && api) {
             void api
               .getSettings()
@@ -138,7 +149,7 @@ export function useGatewaySettingsSync(params: {
           if (settingsSaveSequenceRef.current === saveSequence) {
             setSettingsSaveState({
               status: "error",
-              message: asErrorMessage(error, fallback),
+              message: getGatewaySettingsErrorMessage(error, fallback, settingsRef.current.locale),
             });
           }
         });
@@ -146,33 +157,40 @@ export function useGatewaySettingsSync(params: {
     [api],
   );
 
-  const applyGatewaySettings = useCallback(
-    (payload: GatewaySettingsSyncPayload) => {
-      // Automation snapshots ride along on the settings-sync channel but are
-      // desktop-owned state with their own revision — feed them straight into
-      // the automation store instead of the settings state.
-      const automation = payload as {
-        automationCron?: CronSnapshot;
-        automationHooks?: HooksSnapshot;
-      };
-      if (automation.automationCron) {
-        feedCronSnapshot(automation.automationCron);
-      }
-      if (automation.automationHooks) {
-        feedHooksSnapshot(automation.automationHooks);
-      }
-      const prev = settingsRef.current;
-      const rawNext = resolveAppWorkspaceProjects(applyGatewaySettingsSyncPayload(prev, payload));
-      const next = redactSettingsForWebStorage(rawNext);
-      if (!hasSettingsSyncChanged(prev, next)) {
-        return;
-      }
-      settingsRef.current = next;
-      setSettingsState(next);
-      queueSettingsSave(prev, next, "同步桌面端设置失败。", false);
-    },
-    [queueSettingsSave],
-  );
+  const applyGatewaySettings = useCallback((payload: GatewaySettingsSyncUpdatePayload) => {
+    // Automation snapshots ride along on the settings-sync channel but are
+    // desktop-owned state with their own revision — feed them straight into
+    // the automation store instead of the settings state.
+    const automation = payload as {
+      automationCron?: CronSnapshot;
+      automationHooks?: HooksSnapshot;
+    };
+    if (automation.automationCron) {
+      feedCronSnapshot(automation.automationCron);
+    }
+    if (automation.automationHooks) {
+      feedHooksSnapshot(automation.automationHooks);
+    }
+    const prev = settingsRef.current;
+    const rawNext = resolveAppWorkspaceProjects(applyGatewaySettingsSyncPayload(prev, payload));
+    const next = redactSettingsForWebStorage(rawNext);
+    if (!hasSettingsSyncChanged(prev, next)) {
+      return;
+    }
+    settingsRef.current = next;
+    setSettingsState(next);
+    // Gateway/desktop pushes are hydration, not user edits. Persist the
+    // already-redacted browser cache directly so opening Settings never
+    // flashes “saving” or sends the hydrated value back to the desktop.
+    try {
+      persistWebSettings(next);
+    } catch (error) {
+      setSettingsSaveState({
+        status: "error",
+        message: asErrorMessage(error, "缓存桌面端设置失败。"),
+      });
+    }
+  }, []);
 
   const setSettings = useCallback(
     (updater: (prev: AppSettings) => AppSettings) => {
@@ -183,7 +201,7 @@ export function useGatewaySettingsSync(params: {
       const next = redactSettingsForWebStorage(rawNext);
       settingsRef.current = next;
       setSettingsState(next);
-      queueSettingsSave(prev, rawNext, "保存 WebUI 设置失败。", true);
+      queueSettingsSave(prev, rawNext, t("app.webSettingsSaveFailed", next.locale), true);
     },
     [queueSettingsSave],
   );
@@ -201,26 +219,50 @@ export function useGatewaySettingsSync(params: {
     // Best-effort: the desktop may be offline; the settings-sync push
     // populates the store once it connects.
     void initAutomation().catch(() => undefined);
-    const unsubscribe = api.subscribeSettings((payload) => {
+    const liveSyncEpochRef = { current: 0 };
+    const applySyncedSettings = (payload: GatewaySettingsSyncUpdatePayload) => {
       if (cancelled) {
         return;
       }
+      liveSyncEpochRef.current += 1;
       applyGatewaySettings(payload);
       setSettingsSyncError(null);
-    });
+    };
+    const unsubscribe = api.subscribeSettings(applySyncedSettings);
 
     void api
       .getSettings()
-      .then((payload) => {
+      .then(async (payload) => {
         if (!cancelled) {
-          applyGatewaySettings(payload);
+          // A live WS push that arrived while GET was in flight is newer.
+          if (liveSyncEpochRef.current === 0) {
+            applySyncedSettings(payload);
+          }
+          // The Gateway STT store is the WebUI runtime authority for whether
+          // redacted credentials are configured. A cached desktop snapshot may
+          // contain an older configured=false value even though Gateway still
+          // has the credentials, so hydrate this once before the app is ready.
+          // Skip the HTTP result if a newer settings push landed during fetch.
+          try {
+            const sttEpoch = liveSyncEpochRef.current;
+            const stt = await webSttSettingsService.get();
+            if (!cancelled && liveSyncEpochRef.current === sttEpoch) {
+              applyGatewaySettings({ stt });
+            }
+          } catch {
+            // General settings sync remains usable when STT is unavailable.
+          }
+        }
+        if (!cancelled) {
           setSettingsSyncReady(true);
           setSettingsSyncError(null);
         }
       })
       .catch((error) => {
         if (!cancelled) {
-          setSettingsSyncError(asErrorMessage(error, "同步桌面端设置失败"));
+          setSettingsSyncError(
+            asErrorMessage(error, t("app.desktopSettingsSyncFailed", settingsRef.current.locale)),
+          );
           setSettingsSyncReady(true);
         }
       });

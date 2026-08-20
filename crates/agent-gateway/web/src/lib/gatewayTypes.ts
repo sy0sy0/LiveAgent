@@ -1,10 +1,19 @@
+import type { ChatQueueItemDetail, ChatQueueSnapshot } from "@liveagent/ui/contracts/chatQueue";
+import type { TrajectoryEvent } from "@liveagent/ui/lib/trajectory/types";
 import type {
   ChatRuntimeControls,
   CodexRequestFormat,
+  PromptCacheHintMode,
   ProviderId,
   ProviderModelConfig,
   ReasoningLevel,
 } from "@/lib/settings";
+
+export type {
+  ChatQueueItemDetail,
+  ChatQueueItemSummary,
+  ChatQueueSnapshot,
+} from "@liveagent/ui/contracts/chatQueue";
 
 export type AgentStatus = {
   online: boolean;
@@ -43,6 +52,7 @@ export type GatewayProviderSummary = {
   requestFormat?: CodexRequestFormat;
   reasoning: ReasoningLevel;
   promptCachingEnabled: boolean;
+  promptCacheHintMode?: PromptCacheHintMode;
   nativeWebSearchEnabled: boolean;
 };
 
@@ -57,6 +67,7 @@ export type ChatCheckpointPayload = {
     model?: string;
     promptVersion?: string;
   };
+  contextUsageTokens?: number;
 };
 
 export type ChatUserMessageEvent = {
@@ -92,6 +103,8 @@ export type ChatEvent = (
       api?: string;
       stopReason?: string;
       usage?: unknown;
+      contextUsageTokens?: number;
+      contextRelevant?: boolean;
       checkpoint?: ChatCheckpointPayload;
       conversation_id?: string;
     }
@@ -149,7 +162,21 @@ export type ChatEvent = (
       round?: number;
       conversation_id?: string;
     }
+  | {
+      type: "manual_compaction_result";
+      operationId: string;
+      status: "compacted" | "failed" | "busy" | "skipped";
+      message?: string;
+      conversation_id?: string;
+    }
   | { type: "error"; message: string; round?: number; conversation_id?: string }
+  | {
+      // 轨迹骨架：`event` 是一条紧凑 TrajectoryEvent。转录区忽略它，只有轨迹页
+      // 消费；分段全文不在这里，由 trajectory.fetch 按需拉。
+      type: "trajectory";
+      event: TrajectoryEvent;
+      conversation_id?: string;
+    }
   | ChatUserMessageEvent
   | ChatRebasedEvent
 ) & { seq?: number; workdir?: string };
@@ -158,26 +185,6 @@ export type CronManagePayload = {
   action: string;
   task_id?: string;
   task_json?: string;
-};
-
-export type ChatQueueItemSummary = {
-  id: string;
-  previewText: string;
-  fileCount: number;
-  createdAt: number;
-  source: "gui" | "webui";
-  editable: boolean;
-};
-
-export type ChatQueueSnapshot = {
-  conversationId: string;
-  revision: number;
-  items: ChatQueueItemSummary[];
-};
-
-export type ChatQueueItemDetail = ChatQueueItemSummary & {
-  draftJson: string;
-  uploadedFilesJson: string;
 };
 
 export type ChatQueueResponse = {

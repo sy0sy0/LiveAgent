@@ -4,7 +4,7 @@
 // never poll.
 //
 // Shared implementation owned by @liveagent/ui. Platform-specific capabilities
-// are supplied by each host's pages/settings/memory/platform.tsx module.
+// remain in their host adapter modules.
 
 import { useEffect, useState } from "react";
 import {
@@ -89,8 +89,10 @@ export function useMemoryPanelData(input: { workdir?: string; t: (key: string) =
           setSelectedEntry(null);
         }
       }
+      return true;
     } catch (err) {
       setError(formatMemoryError(err));
+      return false;
     } finally {
       setLoading(false);
     }

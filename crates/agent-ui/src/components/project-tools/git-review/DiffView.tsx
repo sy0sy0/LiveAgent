@@ -8,7 +8,7 @@
 import { DiffFile } from "@git-diff-view/file";
 import { DiffModeEnum, DiffView } from "@git-diff-view/react";
 import "@git-diff-view/react/styles/diff-view.css";
-import { Copy, FolderTree, GitBranch, Loader2 } from "@liveagent/app/components/icons";
+import { Copy, FolderTree, GitBranch, Loader2 } from "@liveagent/ui/components/IconSet";
 import { useLocale } from "@liveagent/ui/i18n/index";
 import type { GitDiffResponse } from "@liveagent/ui/lib/git/types";
 import {
@@ -977,7 +977,7 @@ export function DiffContent(props: {
             <div
               ref={contextMenuRef}
               role="menu"
-              className="editor-context-menu fixed z-[120] w-max min-w-[9.5rem] max-w-[calc(100vw-1.5rem)] select-none overflow-hidden rounded-xl border border-border/60 bg-popover/80 p-1 text-popover-foreground shadow-2xl ring-1 ring-black/[0.03] backdrop-blur-xl dark:ring-white/[0.06]"
+              className="editor-context-menu layer-popover fixed w-max min-w-[9.5rem] max-w-[calc(100vw-1.5rem)] select-none overflow-hidden rounded-xl border border-border/60 bg-popover/80 p-1 text-popover-foreground shadow-2xl ring-1 ring-black/[0.03] backdrop-blur-xl dark:ring-white/[0.06]"
               style={{
                 left: selectionContextMenu.x,
                 top: selectionContextMenu.y,

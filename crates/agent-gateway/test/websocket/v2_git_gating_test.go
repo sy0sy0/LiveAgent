@@ -62,7 +62,7 @@ func TestV2GitRejectsWriteRequestsWhenDisabled(t *testing.T) {
 	_, _, conn, cleanup := newV2GitBrowserTest(t, false)
 	defer cleanup()
 
-	for _, action := range []string{"clone", "stage", "init", "stage_all", "unstage_all", "discard_all", "push", "commit"} {
+	for _, action := range []string{"clone", "stage", "init", "create_worktree", "remove_worktree", "stage_all", "unstage_all", "discard_all", "push", "commit"} {
 		id := "git-disabled-" + action
 		sendGitAgentRequest(t, conn, id, action)
 
@@ -99,10 +99,12 @@ func TestV2GitAllowsWriteRequestsWhenEnabled(t *testing.T) {
 	_, agentSession, conn, cleanup := newV2GitBrowserTest(t, true)
 	defer cleanup()
 
-	sendGitAgentRequest(t, conn, "git-stage-1", "stage")
+	for _, action := range []string{"stage", "create_worktree", "remove_worktree"} {
+		sendGitAgentRequest(t, conn, "git-write-"+action, action)
 
-	outbound := readOutboundEnvelope(t, agentSession)
-	if outbound.GetGitRequest().GetAction() != "stage" {
-		t.Fatalf("outbound = %#v, want forwarded git stage request", outbound)
+		outbound := readOutboundEnvelope(t, agentSession)
+		if outbound.GetGitRequest().GetAction() != action {
+			t.Fatalf("outbound = %#v, want forwarded git %s request", outbound, action)
+		}
 	}
 }

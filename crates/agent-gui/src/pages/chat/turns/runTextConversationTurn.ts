@@ -1,4 +1,10 @@
 import type { AssistantMessage, Context } from "@earendil-works/pi-ai";
+import type { HostedSearchBlock } from "@liveagent/ui/lib/chat/hostedSearch";
+import {
+  composeTrajectorySystemPrompt,
+  serializeToolCatalog,
+} from "@liveagent/ui/lib/trajectory/sections";
+import type { TrajectoryUsage } from "@liveagent/ui/lib/trajectory/types";
 import type { CompactionController } from "../../../lib/chat/compaction/controller";
 import { estimateTextTokenUnits } from "../../../lib/chat/compaction/tokenLedger";
 import type { ProviderRuntimeConfig } from "../../../lib/chat/compaction/types";
@@ -20,7 +26,6 @@ import type {
   MemoryExtractionModelConfig,
   MemoryExtractionStatusText,
 } from "../../../lib/chat/memory/extractionEngine";
-import type { HostedSearchBlock } from "../../../lib/chat/messages/hostedSearch";
 import {
   appendTextDeltaToRound,
   collapseThinking,
@@ -37,6 +42,11 @@ import {
 import type { StreamDebugLogger } from "../../../lib/debug/agentDebug";
 import { assistantMessageToText, streamAssistantMessage } from "../../../lib/providers/llm";
 import type { ProviderId } from "../../../lib/settings";
+import { trajectoryTerminalInfo } from "../../../lib/trajectory/assistantOutcome";
+import {
+  NOOP_TRAJECTORY_RECORDER,
+  type TrajectoryRecorder,
+} from "../../../lib/trajectory/recorder";
 import { buildPartialAssistantMessage } from "../runtime/chatPageRuntime";
 
 export type RuntimeModel = {
@@ -56,6 +66,22 @@ export type PersistConversationParams = {
   createdAt: number;
   titlePromise: Promise<string | null> | null;
 };
+
+/** Normalize provider usage without inventing zero-valued fields. */
+function toTrajectoryUsage(value: unknown): TrajectoryUsage | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const raw = value as Record<string, unknown>;
+  const pick = (key: string) => (typeof raw[key] === "number" ? (raw[key] as number) : undefined);
+  const usage: TrajectoryUsage = {
+    ...(pick("totalTokens") === undefined ? {} : { totalTokens: pick("totalTokens") }),
+    ...(pick("input") === undefined ? {} : { input: pick("input") }),
+    ...(pick("output") === undefined ? {} : { output: pick("output") }),
+    ...(pick("cacheRead") === undefined ? {} : { cacheRead: pick("cacheRead") }),
+    ...(pick("cacheWrite") === undefined ? {} : { cacheWrite: pick("cacheWrite") }),
+    ...(pick("reasoning") === undefined ? {} : { reasoning: pick("reasoning") }),
+  };
+  return Object.keys(usage).length === 0 ? undefined : usage;
+}
 
 export type RunTextConversationTurnParams = {
   providerId: ProviderId;
@@ -83,7 +109,11 @@ export type RunTextConversationTurnParams = {
   buildPreparedContext: (
     state: ConversationViewState,
     tools?: Context["tools"],
-    options?: { includeAbortedMessages?: boolean; includeUploadedFilesMetadata?: boolean },
+    options?: {
+      includeAbortedMessages?: boolean;
+      includeUploadedFilesMetadata?: boolean;
+      includeMemoryTurnUpdates?: boolean;
+    },
   ) => Context;
   compaction: CompactionController;
   cancellation: TurnCancellation;
@@ -102,6 +132,17 @@ export type RunTextConversationTurnParams = {
   memoryExtractionModel?: MemoryExtractionModelConfig;
   onMemoryExtractionModelFailure?: (model: MemoryExtractionModelConfig) => void;
   memoryExtractionStatusText?: MemoryExtractionStatusText;
+  /** Trajectory instrumentation; optional for isolated tests and non-chat callers. */
+  trajectory?: TrajectoryRecorder;
+  trajectoryTurn?: number;
+  trajectoryMessageIndex?: number;
+  trajectoryMessageId?: string;
+  readTrajectorySlots?: () => {
+    base?: string;
+    agent?: string;
+    skills?: string;
+    memory?: string;
+  };
 };
 
 export async function runTextConversationTurn(params: RunTextConversationTurnParams) {
@@ -142,6 +183,19 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
     memoryExtractionStatusText,
   } = params;
 
+  const trajectory = params.trajectory ?? NOOP_TRAJECTORY_RECORDER;
+  if (params.trajectoryTurn !== undefined) {
+    trajectory.beginTurn({
+      turn: params.trajectoryTurn,
+      ...(params.trajectoryMessageIndex === undefined
+        ? {}
+        : { messageIndex: params.trajectoryMessageIndex }),
+      ...(params.trajectoryMessageId === undefined
+        ? {}
+        : { messageId: params.trajectoryMessageId }),
+    });
+  }
+
   // Reset per-turn dedup state so <already-written-this-turn> reflects only
   // this turn. In-flight extraction from the previous turn keeps running.
   memoryExtraction.noteTurnBoundary(conversationId);
@@ -150,12 +204,15 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
   let contextWithSkills = buildPreparedContext(getNextConversationState());
   let pendingTextContext: Context | null = null;
   let textRound = 1;
+  const startedTrajectorySteps = new Set<number>();
+  let trajectoryFailoverAttempt = 0;
   let protectionCompactionDisabled = false;
   // A failover status stays visible until the winning attempt streams content;
   // the status channel has no other owner between switch and first delta.
   let failoverStatusVisible = false;
 
   function commitAssistantRoundMeta(assistant: AssistantMessage, round: number) {
+    const contextUsageTokens = compaction.observeContextMessages([assistant]);
     gatewayBridgeEvents.queueToken("", {
       round,
       provider: assistant.provider,
@@ -163,6 +220,7 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
       api: assistant.api,
       stopReason: assistant.stopReason,
       usage: assistant.usage,
+      contextUsageTokens,
     });
     batchLiveRoundsUpdate(
       (prev) =>
@@ -175,6 +233,7 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
             stopReason: String(assistant.stopReason ?? ""),
             usage: assistant.usage,
             usageTotalTokens: assistant.usage?.totalTokens,
+            contextUsageTokens,
           },
         })),
       transcriptStore,
@@ -228,6 +287,34 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
     );
   }
 
+  function recordTextRequestStart(context: Context, systemSuffix: string) {
+    const toolCatalog = serializeToolCatalog(context.tools);
+    const segmentedHeader = {
+      ...(params.readTrajectorySlots?.() ?? {}),
+      toolsSuffix: systemSuffix,
+      ...(toolCatalog === undefined ? {} : { toolCatalog }),
+    };
+    const actualSystemPrompt =
+      typeof context.systemPrompt === "string" ? context.systemPrompt : undefined;
+    const reconstructed = composeTrajectorySystemPrompt(segmentedHeader);
+    const headerInput =
+      actualSystemPrompt !== undefined && reconstructed !== actualSystemPrompt
+        ? {
+            runtime: actualSystemPrompt,
+            ...(toolCatalog === undefined ? {} : { toolCatalog }),
+          }
+        : segmentedHeader;
+    if (headerInput !== segmentedHeader) {
+      console.warn(
+        "[trajectory] text-mode segmented system prompt drifted from provider context; recording exact fallback",
+      );
+    }
+    const headerId = trajectory.captureHeader(headerInput);
+    if (startedTrajectorySteps.has(textRound)) return;
+    startedTrajectorySteps.add(textRound);
+    trajectory.stepStart(textRound, headerId);
+  }
+
   await compaction.maybeCompactPreSend({
     budgetContext: buildPreparedContext(getNextConversationState(), undefined, {
       includeUploadedFilesMetadata: true,
@@ -244,8 +331,13 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
       });
     pendingTextContext = null;
     compaction.beginRequest(contextWithSkills, getNextConversationState());
+    gatewayBridgeEvents.queueToken("", {
+      round: textRound,
+      contextUsageTokens: compaction.contextUsageTokens,
+    });
     hookLifecycle.startTurn(textRound);
     textModeUsesLiveRounds = false;
+    trajectoryFailoverAttempt = 0;
 
     let streamedAssistantText = "";
     let streamedAssistantTokenUnits = 0;
@@ -282,7 +374,13 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
                 onSwitched: ({ target, errorMessage }) => {
                   failover.onSwitched?.({ target, round: textRound, errorMessage });
                 },
-                onFailover: ({ fromLabel, toLabel }) => {
+                onFailover: ({ fromLabel, toLabel, errorMessage }) => {
+                  trajectoryFailoverAttempt += 1;
+                  trajectory.noteRetry(textRound, {
+                    attempt: trajectoryFailoverAttempt,
+                    maxRetries: failover.fallbacks.length,
+                    ...(errorMessage === "" ? {} : { error: errorMessage }),
+                  });
                   failoverStatusVisible = true;
                   updateGatewayBridgeToolStatus(
                     `第 ${textRound} 轮：${fromLabel} 不可用，正在切换到 ${toLabel}...`,
@@ -294,7 +392,11 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
           workdir: conversationCwd,
           sessionId,
           nativeWebSearch: nativeWebSearchEnabled,
+          onRequestStart: ({ context, systemSuffix }) => {
+            recordTextRequestStart(context, systemSuffix);
+          },
           onTextDelta: (delta) => {
+            trajectory.firstToken(textRound);
             if (failoverStatusVisible) {
               failoverStatusVisible = false;
               updateGatewayBridgeToolStatus(null);
@@ -324,6 +426,7 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
             scope.controller.abort();
           },
           onHostedSearch: (hostedSearch) => {
+            trajectory.firstToken(textRound);
             if (hostedSearch.status === "searching") {
               nativeWebSearchStatusController.schedule();
             } else {
@@ -334,6 +437,11 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
           signal: scope.controller.signal,
           debugLogger: streamAttempt === 0 ? conversationDebugLogger : recoveryDebugLogger,
           onRetryStatus: (attempt, maxAttempts, errorMessage) => {
+            trajectory.noteRetry(textRound, {
+              attempt,
+              maxRetries: Math.max(0, maxAttempts - 1),
+              ...(errorMessage === "" ? {} : { error: errorMessage }),
+            });
             updateGatewayBridgeToolStatus(`连接已断开，正在重试 (${attempt}/${maxAttempts})...`);
             retryAttemptsForAttempt.push({ attempt, maxAttempts, errorMessage });
             updateRetryAttempts(retryAttemptsForAttempt.slice(), transcriptStore);
@@ -342,10 +450,27 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
             updateGatewayBridgeToolStatus(null);
           },
         });
+        trajectory.firstToken(textRound);
+        const trajectoryUsage = toTrajectoryUsage(finalAssistant.usage);
+        const terminalInfo = trajectoryTerminalInfo(finalAssistant);
+        trajectory.stepEnd(textRound, {
+          ...terminalInfo,
+          ...(trajectoryUsage === undefined ? {} : { usage: trajectoryUsage }),
+          provider: finalAssistant.provider || providerId,
+          model: finalAssistant.model || model,
+          ...(finalAssistant.api ? { api: finalAssistant.api } : {}),
+          ...(typeof finalAssistant.stopReason === "string"
+            ? { stopReason: finalAssistant.stopReason }
+            : {}),
+        });
         nativeWebSearchStatusController.finish();
       } catch (streamErr) {
         nativeWebSearchStatusController.finish();
         if (compactionRequested) {
+          trajectory.stepEnd(textRound, {
+            status: "aborted",
+            error: "Provider request restarted after mid-stream compaction.",
+          });
           hookLifecycle.ensureMessageEnded();
           hookLifecycle.endTurn(textRound);
           resetLiveTranscript(transcriptStore);
@@ -389,6 +514,11 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
 
         if (streamAttempt < 1) {
           streamAttempt += 1;
+          trajectory.noteRetry(textRound, {
+            attempt: streamAttempt,
+            maxRetries: 1,
+            error: streamErr instanceof Error ? streamErr.message : String(streamErr),
+          });
           streamedAssistantText = "";
           streamedAssistantTokenUnits = 0;
           protectionCheckChars = 0;
@@ -420,7 +550,7 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
   settleLiveTranscript(transcriptStore);
   hookLifecycle.ensureMessageEnded();
   hookLifecycle.endAgent();
-  await persistConversationWithHistorySync({
+  const historyPersisted = await persistConversationWithHistorySync({
     conversationId,
     sessionId,
     providerId,
@@ -431,7 +561,12 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
     createdAt,
     titlePromise,
   });
-  if (shouldRunMemoryExtraction) {
+  trajectory.endTurn(trajectoryTerminalInfo(finalAssistant));
+  await trajectory.flush();
+  // Only extract memory after durable history lands; otherwise memory can
+  // retain the answer while a failed final persist leaves chat history on the
+  // user-only snapshot.
+  if (historyPersisted && shouldRunMemoryExtraction) {
     const currentMemoryExtractionModel: MemoryExtractionModelConfig = {
       providerId,
       model,
@@ -447,7 +582,10 @@ export async function runTextConversationTurn(params: RunTextConversationTurnPar
       sessionId,
       conversationId,
       workdir: conversationCwd,
-      messages: buildPreparedContext(finalState).messages,
+      // 抽取子模型看到的必须是用户真正说的话:memory 增量块只服务主模型的缓存,
+      // 混进来会把索引行当成用户发言,既撑破短消息门控又诱发重复写入。
+      messages: buildPreparedContext(finalState, undefined, { includeMemoryTurnUpdates: false })
+        .messages,
       statusText: memoryExtractionStatusText,
       signal: cancellation.userStop.signal,
       debugLogger: conversationDebugLogger,

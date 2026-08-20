@@ -15,7 +15,7 @@
 
 | Bundle | 主要路径 | 工具/能力 |
 |---|---|---|
-| File system | `fsTools.ts`、`fileToolState.ts` | Read/List/Glob/Grep/Write/Edit/Delete/Image 等文件能力，受 workdir 与 skills root 策略约束。 |
+| File system | `fsTools.ts`、`fileToolState.ts` | Read/List/Glob/Grep/Write/Edit/Delete/Image 等文件能力，受项目主目录、skills root 与项目附加目录授权策略约束。 |
 | Edit 容错匹配 | Rust `commands/workspace/edit_match.rs` | Edit 的 `old_string` 定位按严格度递减依次尝试：精确匹配 → CRLF/LF 行尾归一（含 BOM 容错，替换按文件主导行尾风格重渲染）→ 整行行尾空白容错 → 整行统一缩进偏移（替换文本按文件真实缩进重排）。首个命中的 pass 生效，命中非精确 pass 时结果返回 `matchStrategy` 提示模型。注意：行级 pass（行尾空白 / 缩进偏移）用 `new_string` 整体重写命中的整行窗口，窗口内上下文行原有的行尾空白会随之被规范化掉。 |
 | Shell | `shellTools.ts`、`bashTimeoutPolicy.ts` | Bash/Shell 执行，chat scope 可启用 ManagedProcess。 |
 | SkillsManager | `skillTools.ts` | read/list/install/create/validate/package/clawhub_search/clawhub_install。 |
@@ -27,6 +27,40 @@
 | Task tools | `taskTools.ts`、`taskState.ts` | `TaskCreate`/`TaskUpdate`/`TaskList` 按稳定数字 ID 增量维护当前 Run 的权威任务状态；状态随 `context_meta_json` 持久化并跨压缩 checkpoint 保留，仅 `runtimeScope=chat` 可用且不进入子代理注册表。 |
 | Subagent | `src/lib/subagents/*`（适配层 `agentTool.ts`、`sendMessageTool.ts`） | `Agent`/`SendMessage` 内置工具：委托持久化子代理、隔离 worktree、Message Bus。 |
 
+## 长时 Bash 会话
+
+Chat runtime 中的 Bash 采用可恢复 session：初始等待窗口结束后，未完成的命令返回 `session_id` 和绝对 `cursor`；模型通过 `ProcessWait` 等待并增量读取同一进程，通过 `ProcessStop` 终止完整进程树。非 Chat runtime 继续使用原有同步 Shell 路径。
+
+GUI 与 WebUI 均按调用顺序独立展示 `Bash`、`ProcessWait` 和 `ProcessStop`，保留每次调用的参数、状态快照和增量输出，不跨 round 合并或隐藏 session 控制工具。
+
+| 字段/状态 | 语义 |
+|---|---|
+| `session_duration_ms` | 从最初 Bash 启动开始计算的累计时长；不同响应之间不得相加。底层兼容 details 仍使用 `duration_ms`。 |
+| `completed` | 命令正常结束且 exit code 为 0。 |
+| `failed` | 命令启动或执行失败。 |
+| `cancelled` | 由 `ProcessStop`、Chat Stop 或应用生命周期取消。 |
+| `timed_out` | 显式硬超时触发。 |
+| `output_truncated` | Session 环形缓冲已经淘汰调用方请求的历史输出。 |
+
+### 验收提示词
+
+下面的提示词同时验证单次启动、cursor 续读、累计时长语义和 Git 前后基线：
+
+```text
+请在当前 LiveAgent 仓库执行一次长时间 Bash session 验证。
+
+1. 开始前先运行一次只读的 `git status --porcelain=v1`，完整记录为测试前基线。
+2. 只启动一次 `cargo test -p liveagent -- --test-threads=1`，不得重复启动该测试命令。
+3. 如果 Bash 返回 status=running：
+   - 记录 session_id 和 cursor；
+   - 不要重新运行 cargo test，不要执行 Bash sleep 或轮询脚本；
+   - 使用 ProcessWait 等待同一 session，每次传入上一响应的最新 cursor；
+   - 对预计较安静的长任务使用 yield_time_ms=60000。
+4. 一直等待到 completed、failed、cancelled 或 timed_out。session_duration_ms 是从最初 Bash 启动开始计算的累计时长，不得把多次响应的值相加。
+5. 完成后再次运行 `git status --porcelain=v1`，逐行比较测试前后基线是否完全一致。
+6. 报告测试命令启动次数、ProcessWait 次数、session_id、cursor 推进、最终状态、exit_code、最终 session_duration_ms、output_truncated、测试统计和 Git 基线比较结果。
+```
+
 ## 执行边界
 
 | 端 | 是否执行工具 | 说明 |
@@ -34,6 +68,16 @@
 | GUI 本地 Chat | 是 | 工具在桌面端运行，直接调用 Tauri invoke 或前端本地逻辑。 |
 | WebUI Chat | 间接执行 | WebUI 发 Chat Command 到 Gateway，实际工具仍在桌面 GUI/Tauri 运行。 |
 | Gateway | 否 | Gateway 不执行业务工具，只转发 request/event 并维护 buffer。 |
+
+## 项目附加目录
+
+| 能力 | 说明 |
+|---|---|
+| 路径格式 | 模型通过 `root://<alias>/...` 访问项目设置中授权的附加目录；普通相对路径仍以项目主目录为根。 |
+| 权限 | 每个附加目录独立配置只读或可写；只读目录拒绝 Write/Edit/Delete。目录失效、路径漂移或符号链接指向变化时采用失败关闭，必须重新授权。 |
+| 子代理 | 子 Agent 只继承父级附加目录的只读能力，即使父级授权为可写也不会向子 Agent 扩权。 |
+| Shell/进程 | Bash、Shell 与 ManagedProcess 不继承附加目录能力，仍只使用项目主目录及其原有策略。 |
+| 生命周期 | 授权保存在 Desktop，项目或 worktree 删除时按项目 ID 撤销；授权不会作为普通 Settings 内容同步或由 Gateway 持久化。 |
 
 ## MCP 动态工具
 

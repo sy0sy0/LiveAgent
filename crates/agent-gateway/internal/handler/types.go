@@ -35,6 +35,7 @@ type ChatRequestBody struct {
 	RuntimeControls     *ChatRuntimeControlsBody `json:"runtime_controls,omitempty"`
 	ExecutionMode       string                   `json:"execution_mode,omitempty"`
 	Workdir             string                   `json:"workdir,omitempty"`
+	CommandSafetyMode   string                   `json:"command_safety_mode,omitempty"`
 	UploadedFiles       []ChatUploadedFileBody   `json:"uploaded_files,omitempty"`
 	QueuePolicy         string                   `json:"queue_policy,omitempty"`
 }
@@ -93,13 +94,13 @@ func NormalizeChatSelectedModel(
 	}
 
 	switch selectedModel.ProviderType {
-	case "codex", "claude_code", "gemini", "xai":
+	case "codex", "claude_code", "gemini", "xai", "deepseek":
 		return selectedModel, nil
 	case "":
 		return nil, fmt.Errorf("selected_model.provider_type is required")
 	default:
 		return nil, fmt.Errorf(
-			"selected_model.provider_type must be codex, claude_code, gemini, or xai",
+			"selected_model.provider_type must be codex, claude_code, gemini, xai, or deepseek",
 		)
 	}
 }
@@ -141,6 +142,17 @@ func NormalizeExecutionMode(value string) string {
 
 func NormalizeWorkdir(value string) string {
 	return normalizeTrimmedText(value)
+}
+
+// NormalizeCommandSafetyMode 归一化命令安全模式。仅放行四个合法值;空串或未知值
+// 归为空串,表示"远端未指定",桌面端据此回落到本地 settings.system.commandSafetyMode。
+func NormalizeCommandSafetyMode(value string) string {
+	switch normalizeTrimmedText(value) {
+	case "ask", "auto", "sandbox", "sandboxOffline":
+		return normalizeTrimmedText(value)
+	default:
+		return ""
+	}
 }
 
 func NormalizeChatUploadedFiles(input []ChatUploadedFileBody) []ChatUploadedFileBody {

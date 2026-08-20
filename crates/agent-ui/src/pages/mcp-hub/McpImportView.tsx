@@ -1,17 +1,18 @@
+import { type AppSettings, type McpServerConfig, updateMcp } from "@liveagent/app/lib/settings";
+import { invoke } from "@liveagent/app/shims/tauriCore";
 import {
   AlertTriangle,
   Check,
   Download,
   FileText,
-  Folder,
   Globe2,
   Loader2,
   RefreshCw,
   Terminal,
-} from "@liveagent/app/components/icons";
-import { type AppSettings, type McpServerConfig, updateMcp } from "@liveagent/app/lib/settings";
-import { invoke } from "@liveagent/app/shims/tauriCore";
+} from "@liveagent/ui/components/IconSet";
+import { SearchHighlight } from "@liveagent/ui/components/ui/search-highlight";
 import { useLocale } from "@liveagent/ui/i18n/index";
+import { rankFuzzySearchResults } from "@liveagent/ui/lib/shared/fuzzySearch";
 import {
   type ExternalMcpServerEntry,
   type ExternalMcpToolScan,
@@ -22,23 +23,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { GlassPanel } from "../../components/hub/HubChrome";
 import { Button } from "../../components/ui/button";
 import { cn } from "../../lib/shared/utils";
-
-const EXTERNAL_MCP_TOOL_LABELS: Record<string, string> = {
-  "claude-code": "Claude Code",
-  codex: "Codex",
-  "claude-desktop": "Claude Desktop",
-  codebuddy: "CodeBuddy",
-};
-
-/** 与后端 `LOCAL_FILE_MCP_TOOL` 对齐的「从文件导入」来源标识 */
-const LOCAL_FILE_TOOL = "local-file";
+import { LOCAL_FILE_TOOL, McpImportSourcePicker } from "./McpImportSourcePicker";
 
 const DEFAULT_IMPORT_TIMEOUT_MS = 60_000;
-
-function fileScanLabel(scan: ExternalMcpToolScan, fallback: string) {
-  const basename = scan.configPath.split(/[\\/]/).pop();
-  return basename || fallback;
-}
 
 function externalServerKey(tool: string, server: ExternalMcpServerEntry) {
   return `${tool}:${server.id.toLowerCase()}`;
@@ -66,8 +53,9 @@ function toMcpServerConfig(entry: ExternalMcpServerEntry): McpServerConfig {
 export function McpImportView(props: {
   settings: AppSettings;
   setSettings: (updater: (prev: AppSettings) => AppSettings) => void;
+  query: string;
 }) {
-  const { settings, setSettings } = props;
+  const { settings, setSettings, query } = props;
   const { t } = useLocale();
 
   const [scans, setScans] = useState<ExternalMcpToolScan[] | null>(null);
@@ -79,7 +67,9 @@ export function McpImportView(props: {
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [importedCount, setImportedCount] = useState<number | null>(null);
   const [activeTool, setActiveTool] = useState<string>("claude-code");
+  const [rescanComplete, setRescanComplete] = useState(false);
   const userChoseToolRef = useRef(false);
+  const rescanFeedbackTimerRef = useRef<number | null>(null);
 
   const allScans = useMemo(
     () => (fileScan ? [...(scans ?? []), fileScan] : (scans ?? [])),
@@ -109,12 +99,38 @@ export function McpImportView(props: {
         );
         return next.size === prev.size ? prev : next;
       });
+      return true;
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      return false;
     } finally {
       setLoading(false);
     }
   }, []);
+
+  const handleRescan = useCallback(async () => {
+    if (rescanFeedbackTimerRef.current !== null) {
+      window.clearTimeout(rescanFeedbackTimerRef.current);
+      rescanFeedbackTimerRef.current = null;
+    }
+    setRescanComplete(false);
+    const succeeded = await rescan();
+    if (!succeeded) return;
+    setRescanComplete(true);
+    rescanFeedbackTimerRef.current = window.setTimeout(() => {
+      setRescanComplete(false);
+      rescanFeedbackTimerRef.current = null;
+    }, 2400);
+  }, [rescan]);
+
+  useEffect(
+    () => () => {
+      if (rescanFeedbackTimerRef.current !== null) {
+        window.clearTimeout(rescanFeedbackTimerRef.current);
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     if (scans === null && !loading) {
@@ -161,12 +177,23 @@ export function McpImportView(props: {
   }, []);
 
   const activeScan = allScans.find((scan) => scan.tool === activeTool);
-  const importableInActive = useMemo(
+  const visibleServers = useMemo(
     () =>
-      (activeScan?.servers ?? []).filter(
-        (server) => !installedIds.has(server.id.trim().toLowerCase()),
-      ),
-    [activeScan, installedIds],
+      rankFuzzySearchResults(activeScan?.servers ?? [], query, (server) => [
+        server.id,
+        server.transport,
+        server.command,
+        server.url,
+        server.origin,
+        ...server.args,
+        ...Object.keys(server.env),
+        ...Object.keys(server.headers),
+      ]),
+    [activeScan, query],
+  );
+  const importableInActive = useMemo(
+    () => visibleServers.filter((server) => !installedIds.has(server.id.trim().toLowerCase())),
+    [installedIds, visibleServers],
   );
   const selectedInActive = importableInActive.filter((server) =>
     selected.has(externalServerKey(activeTool, server)),
@@ -270,55 +297,14 @@ export function McpImportView(props: {
         ) : (
           <>
             <div className="hub-panel-enter flex flex-wrap items-center justify-between gap-3">
-              <div className="inline-flex shrink-0 rounded-2xl border border-border/40 bg-background/60 p-1 backdrop-blur-xl shadow-[0_1px_0_rgba(255,255,255,0.5)_inset] dark:border-white/[0.06] dark:bg-white/[0.04] dark:shadow-[0_1px_0_rgba(255,255,255,0.04)_inset]">
-                {allScans.map((scan) => {
-                  const isLocalFile = scan.tool === LOCAL_FILE_TOOL;
-                  const toolLabel = isLocalFile
-                    ? fileScanLabel(scan, t("mcpHub.importFileTab"))
-                    : (EXTERNAL_MCP_TOOL_LABELS[scan.tool] ?? scan.tool);
-                  const active = scan.tool === activeTool;
-                  return (
-                    <button
-                      key={scan.tool}
-                      type="button"
-                      title={isLocalFile ? scan.configPath : undefined}
-                      onClick={() => {
-                        userChoseToolRef.current = true;
-                        setActiveTool(scan.tool);
-                      }}
-                      className={cn(
-                        "relative inline-flex h-9 items-center justify-center gap-2 rounded-xl px-4 text-[12.5px] font-medium transition-all",
-                        active
-                          ? "bg-background/85 text-foreground shadow-[0_1px_0_rgba(255,255,255,0.6)_inset,0_4px_12px_-8px_rgba(15,23,42,0.18)] ring-1 ring-border/45 dark:bg-white/[0.08] dark:ring-white/[0.09] dark:shadow-[0_1px_0_rgba(255,255,255,0.07)_inset,0_4px_12px_-8px_rgba(0,0,0,0.55)]"
-                          : "text-muted-foreground hover:bg-background/70 hover:text-foreground",
-                      )}
-                    >
-                      {isLocalFile ? (
-                        <FileText className="h-3.5 w-3.5" />
-                      ) : (
-                        <Folder className="h-3.5 w-3.5" />
-                      )}
-                      <span className="max-w-[10rem] truncate">{toolLabel}</span>
-                      {scan.exists ? (
-                        <span
-                          className={cn(
-                            "ml-0.5 inline-flex h-4 min-w-[1rem] items-center justify-center rounded-full px-1 text-[10px] font-semibold tabular-nums",
-                            active
-                              ? "bg-foreground/[0.08] text-foreground/85"
-                              : "bg-muted/70 text-muted-foreground",
-                          )}
-                        >
-                          {scan.servers.length}
-                        </span>
-                      ) : (
-                        <span className="ml-0.5 text-[10px] text-muted-foreground/70">
-                          {t("mcpHub.importNotDetected")}
-                        </span>
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
+              <McpImportSourcePicker
+                scans={allScans}
+                value={activeTool}
+                onChange={(nextTool) => {
+                  userChoseToolRef.current = true;
+                  setActiveTool(nextTool);
+                }}
+              />
 
               <div className="flex shrink-0 items-center gap-2">
                 <Button
@@ -339,12 +325,25 @@ export function McpImportView(props: {
                 <Button
                   variant="outline"
                   size="sm"
-                  className="gap-1.5 rounded-full"
+                  className="min-w-[6.75rem] justify-center gap-1.5 rounded-full"
                   disabled={loading}
-                  onClick={() => void rescan()}
+                  aria-busy={loading}
+                  onClick={() => void handleRescan()}
                 >
-                  <RefreshCw className={cn("h-3.5 w-3.5", loading && "animate-spin")} />
-                  {t("mcpHub.importRescan")}
+                  {loading ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : rescanComplete ? (
+                    <Check className="h-3.5 w-3.5 text-[hsl(var(--chat-success))]" />
+                  ) : (
+                    <RefreshCw className="h-3.5 w-3.5" />
+                  )}
+                  <span aria-live="polite">
+                    {loading
+                      ? t("mcpHub.importScanning")
+                      : rescanComplete
+                        ? t("settings.skillsScanComplete")
+                        : t("mcpHub.importRescan")}
+                  </span>
                 </Button>
                 <Button
                   size="sm"
@@ -361,7 +360,7 @@ export function McpImportView(props: {
             {activeScan ? (
               <div key={activeScan.tool} className="hub-panel-enter flex flex-col gap-3">
                 <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
-                  <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground/70">
+                  <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
                     <span className="font-mono">{activeScan.configPath}</span>
                     {activeScan.errors.length > 0 ? (
                       <>
@@ -385,15 +384,17 @@ export function McpImportView(props: {
                           .replace("{selected}", String(selectedInActive))
                           .replace("{total}", String(importableInActive.length))}
                       </span>
-                      <button
+                      <Button
                         type="button"
+                        variant="outline"
+                        size="sm"
                         onClick={toggleAllActive}
-                        className="rounded-full border border-border/45 bg-background/70 px-2 py-0.5 text-[11px] font-medium text-foreground/80 transition-colors hover:bg-background/90"
+                        className="h-7 rounded-lg border-border/70 bg-card px-2 text-[11px] shadow-xs"
                       >
                         {allActiveSelected
                           ? t("mcpHub.importDeselectAll")
                           : t("mcpHub.importSelectAll")}
-                      </button>
+                      </Button>
                     </div>
                   ) : null}
                 </div>
@@ -410,9 +411,15 @@ export function McpImportView(props: {
                       {t("mcpHub.importEmpty")}
                     </p>
                   </GlassPanel>
+                ) : visibleServers.length === 0 ? (
+                  <GlassPanel tone="muted">
+                    <p className="py-2 text-center text-xs text-muted-foreground">
+                      {t("mcpHub.importNoMatch")}
+                    </p>
+                  </GlassPanel>
                 ) : (
-                  <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-                    {activeScan.servers.map((server) => {
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                    {visibleServers.map((server) => {
                       const key = externalServerKey(activeScan.tool, server);
                       const alreadyImported = installedIds.has(server.id.trim().toLowerCase());
                       const checked = selected.has(key);
@@ -436,12 +443,12 @@ export function McpImportView(props: {
                           disabled={alreadyImported}
                           onClick={() => toggleServer(activeScan.tool, server)}
                           className={cn(
-                            "group flex items-start gap-2.5 rounded-xl border p-3 text-left transition-all",
+                            "group flex min-h-36 items-start gap-2.5 rounded-xl border p-3.5 text-left transition-[border-color,background-color,box-shadow]",
                             alreadyImported
-                              ? "cursor-not-allowed border-border/35 bg-muted/30 opacity-70"
+                              ? "cursor-not-allowed border-border/70 bg-muted/50"
                               : checked
-                                ? "border-primary/60 bg-primary/5 shadow-sm shadow-primary/10"
-                                : "border-border/40 bg-background/60 hover:border-border/70 hover:bg-background/85",
+                                ? "border-primary/60 bg-primary/10 shadow-xs"
+                                : "border-border bg-card shadow-xs hover:border-foreground/20 hover:bg-muted/30",
                           )}
                         >
                           <span
@@ -457,7 +464,7 @@ export function McpImportView(props: {
                           <span className="min-w-0 flex-1">
                             <span className="flex flex-wrap items-center gap-1.5">
                               <span className="truncate text-[13px] font-medium text-foreground">
-                                {server.id}
+                                <SearchHighlight text={server.id} query={query} />
                               </span>
                               <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-muted/70 px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">
                                 {isStdio ? (
@@ -482,7 +489,7 @@ export function McpImportView(props: {
                               ) : null}
                             </span>
                             <span className="mt-1 block truncate font-mono text-[11px] text-muted-foreground">
-                              {preview}
+                              <SearchHighlight text={preview} query={query} />
                             </span>
                             {extras.length > 0 ? (
                               <span className="mt-1 flex flex-wrap gap-1">

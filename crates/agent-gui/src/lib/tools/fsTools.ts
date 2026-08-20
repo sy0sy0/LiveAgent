@@ -8,6 +8,7 @@ import type {
 import { invokeFs, isFsBackendError } from "@liveagent/ui/lib/tools/fsBackend";
 import { invoke } from "@tauri-apps/api/core";
 import { Type } from "typebox";
+import type { AdditionalProjectRoot } from "./additionalProjectRoots";
 import {
   type BuiltinToolBundle,
   type BuiltinToolResultDetails,
@@ -29,7 +30,12 @@ import {
 } from "./builtinTypes";
 import type { FileToolState } from "./fileToolState";
 import { buildFsErrorText, buildRequiresFullReadText, buildWriteDirectoryText } from "./pathErrors";
-import { formatResolvedTarget, type ResolvedPath, ToolPathResolver } from "./pathUtils";
+import {
+  formatPathWithinResolvedRoot,
+  formatResolvedTarget,
+  type ResolvedPath,
+  ToolPathResolver,
+} from "./pathUtils";
 import type { SkillAccessPolicy } from "./skillAccessPolicy";
 
 type ToolOk<TDetails extends BuiltinToolResultDetails = BuiltinToolResultDetails> = {
@@ -256,6 +262,10 @@ function backendPath(resolved: ResolvedPath) {
   return resolved.relativePath || undefined;
 }
 
+function toolVisibleBackendPath(resolved: ResolvedPath, path: string) {
+  return formatPathWithinResolvedRoot(resolved, path);
+}
+
 async function invokeFsToolCommand<T>(params: {
   toolName: string;
   resolved: ResolvedPath;
@@ -279,8 +289,12 @@ export function createFsTools(params: {
   skillsRootEnabled?: boolean;
   skillsRootDir?: string;
   skillAccessPolicy?: SkillAccessPolicy;
+  additionalRoots?: readonly AdditionalProjectRoot[];
+  /** 会话检查点上下文;缺省时 Write/Edit/Delete 不做前像捕获(如 Cron 场景)。 */
+  checkpoint?: { conversationId: string; turnId: string };
 }): BuiltinToolBundle {
   const { workdir, fileState } = params;
+  const checkpointCtx = params.checkpoint;
   const allowSkillsRoot = params.skillsRootEnabled === true;
   const skillAccessPolicy = params.skillAccessPolicy;
   let cachedSkillsRootDir =
@@ -307,6 +321,7 @@ export function createFsTools(params: {
     skillsRootDir: cachedSkillsRootDir,
     skillAccessPolicy,
     resolveSkillsRootDir,
+    additionalRoots: params.additionalRoots,
   });
 
   // Loop breaker: models sometimes retry a failing call with identical
@@ -384,11 +399,11 @@ export function createFsTools(params: {
   const toolRead: Tool = {
     name: "Read",
     description:
-      "Read a text, image, PDF, notebook, Word, Excel/spreadsheet, or archive file from the workspace or an enabled Skill. Pass the path exactly as returned by other tools. For text files, use start_line (1-based) and limit for pagination. For PDFs, use page_start and page_limit. For notebooks (.ipynb), use cell_start and cell_limit. Word/Excel/archive files return a best-effort text preview or entry listing. Returns version metadata and may return an `unchanged` stub when content has not changed since the previous read. Use Image instead when the user asks to show, view, render, or display an image in the chat UI. Do not use Markdown image syntax or HTML img tags to display files.",
+      "Read a text, image, PDF, notebook, Word, Excel/spreadsheet, or archive file from the workspace, a configured root:// project directory, or an enabled Skill. Pass the path exactly as returned by other tools. For text files, use start_line (1-based) and limit for pagination. For PDFs, use page_start and page_limit. For notebooks (.ipynb), use cell_start and cell_limit. Word/Excel/archive files return a best-effort text preview or entry listing. Returns version metadata and may return an `unchanged` stub when content has not changed since the previous read. Use Image instead when the user asks to show, view, render, or display an image in the chat UI. Do not use Markdown image syntax or HTML img tags to display files.",
     parameters: strictToolParameters({
       path: Type.String({
         description:
-          'Required file path. Prefer the workspace-relative form such as "src/App.tsx" or the skill:// form, exactly as returned by other tools; absolute, ~/..., and file:// forms are auto-normalized.',
+          'Required file path. Prefer the workspace-relative form such as "src/App.tsx", a configured root://<alias>/... path, or the skill:// form, exactly as returned by other tools; absolute, ~/..., and file:// forms are auto-normalized.',
       }),
       start_line: Type.Optional(
         Type.Number({
@@ -432,12 +447,12 @@ export function createFsTools(params: {
   const toolImage: Tool = {
     name: "Image",
     description:
-      "Display one or more images in the chat UI. This is the only supported way for assistant-side image rendering. Call it whenever the user asks to show, view, render, preview, open, or display images, and whenever another tool saves, downloads, screenshots, generates, or returns an image path/URL that the user should see. Supports workspace paths, enabled Skill paths, external absolute paths, http/https URLs, base64 data URLs, and SVG images (file, data URL, or raw XML). Pass local paths exactly as you see them. For remote images, pass url/urls or source/sources directly instead of downloading the image first, unless the user explicitly asks to save it locally. Do not embed images in final text with Markdown image syntax, HTML img tags, file:// URLs, or local relative image paths.",
+      "Display one or more images in the chat UI. This is the only supported way for assistant-side image rendering. Call it whenever the user asks to show, view, render, preview, open, or display images, and whenever another tool saves, downloads, screenshots, generates, or returns an image path/URL that the user should see. Supports workspace paths, configured root:// project paths, enabled Skill paths, external absolute paths, http/https URLs, base64 data URLs, and SVG images (file, data URL, or raw XML). Pass local paths exactly as you see them. For remote images, pass url/urls or source/sources directly instead of downloading the image first, unless the user explicitly asks to save it locally. Do not embed images in final text with Markdown image syntax, HTML img tags, file:// URLs, or local relative image paths.",
     parameters: strictToolParameters({
       path: Type.Optional(
         Type.String({
           description:
-            "Single local image path, exactly as returned by other tools. Workspace-relative, skill://, absolute, ~/..., and file:// forms are accepted; external absolute paths are allowed for images.",
+            "Single local image path, exactly as returned by other tools. Workspace-relative, root://<alias>/..., skill://, absolute, ~/..., and file:// forms are accepted; external absolute paths are allowed for images.",
         }),
       ),
       paths: Type.Optional(
@@ -521,14 +536,14 @@ export function createFsTools(params: {
   const toolWrite: Tool & { prepareArguments?: (args: unknown) => unknown } = {
     name: "Write",
     description:
-      "Create a new text file or fully overwrite an existing workspace or enabled Skill text file. `path` must include the intended filename, for example `notes/todo.txt`; Write creates missing parent directories but does not choose filenames from directory paths. Overwriting an existing file replaces its entire content and is checked against the file's current on-disk state automatically. Use Edit for small changes.",
+      "Create a new text file or fully overwrite an existing text file in the workspace, a writable root:// project directory, or an enabled writable Skill. `path` must include the intended filename, for example `notes/todo.txt`; Write creates missing parent directories but does not choose filenames from directory paths. Overwriting an existing file replaces its entire content and is checked against the file's current on-disk state automatically. Use Edit for small changes.",
     // `path` is declared before `content` on purpose: models tend to emit
     // arguments in schema order, and a path that streams first keeps live
     // previews and transport recovery well-formed for large contents.
     parameters: strictToolParameters({
       path: Type.String({
         description:
-          "Required file path. Prefer the workspace-relative or skill:// form returned by other tools; absolute and ~/... forms are auto-normalized. Must resolve inside the workspace or an enabled Skill.",
+          "Required file path. Prefer the workspace-relative, root://<alias>/..., or skill:// form returned by other tools; absolute and ~/... forms are auto-normalized. A root:// path must name a writable configured root.",
       }),
       content: Type.String({ description: "Entire text content to write" }),
     }),
@@ -551,7 +566,7 @@ export function createFsTools(params: {
     parameters: strictToolParameters({
       path: Type.String({
         description:
-          "Required file path. Prefer the workspace-relative or skill:// form returned by other tools; absolute and ~/... forms are auto-normalized. Must resolve inside the workspace or an enabled Skill.",
+          "Required file path. Prefer the workspace-relative, root://<alias>/..., or skill:// form returned by other tools; absolute and ~/... forms are auto-normalized. A root:// path must name a writable configured root.",
       }),
       old_string: Type.String({ description: "Exact text to replace" }),
       new_string: Type.String({ description: "Replacement text" }),
@@ -574,11 +589,11 @@ export function createFsTools(params: {
   const toolDelete: Tool = {
     name: "Delete",
     description:
-      "The structured, tracked way to intentionally delete a workspace or enabled Skill file/directory. Directories are removed recursively; use one Delete call per target. Always use this instead of Bash, ManagedProcess, shell scripts, or deletion-oriented CLIs such as rm/rmdir/unlink/find -delete/git rm/git clean/PowerShell Remove-Item/cmd del, erase, or rd. Delete results feed LiveAgent's Edited Files and file-ledger tracking.",
+      "The structured, tracked way to intentionally delete a file/directory in the workspace, a writable root:// project directory, or an enabled writable Skill. Directories are removed recursively; use one Delete call per target. Always use this instead of Bash, ManagedProcess, shell scripts, or deletion-oriented CLIs such as rm/rmdir/unlink/find -delete/git rm/git clean/PowerShell Remove-Item/cmd del, erase, or rd. Delete results feed LiveAgent's Edited Files and file-ledger tracking.",
     parameters: strictToolParameters({
       path: Type.String({
         description:
-          "Required path to the file or directory. Prefer the workspace-relative or skill:// form returned by other tools. Must resolve inside the workspace or an enabled Skill.",
+          "Required path to the file or directory. Prefer the workspace-relative, root://<alias>/..., or skill:// form returned by other tools. A root:// path must name a writable configured root.",
       }),
     }),
   };
@@ -586,12 +601,12 @@ export function createFsTools(params: {
   const toolList: Tool = {
     name: "List",
     description:
-      "List files and directories under the workspace or an enabled Skill using ignore-aware traversal. Supports depth-limited traversal and paginated results. Prefer this over `Bash ls` / `find` for workspace or Skill content.",
+      "List files and directories under the workspace, a configured root:// project directory, or an enabled Skill using ignore-aware traversal. Supports depth-limited traversal and paginated results. Prefer this over `Bash ls` / `find` for structured file access.",
     parameters: strictToolParameters({
       path: Type.Optional(
         Type.String({
           description:
-            "Optional directory to list; a file path returns that single entry. Omit to list the workspace root. Prefer the workspace-relative or skill:// form returned by other tools.",
+            "Optional directory to list; a file path returns that single entry. Omit to list the workspace root. Prefer the workspace-relative, root://<alias>/..., or skill:// form returned by other tools.",
         }),
       ),
       depth: Type.Optional(
@@ -612,7 +627,7 @@ export function createFsTools(params: {
   const toolGlob: Tool = {
     name: "Glob",
     description:
-      "Find files by glob pattern using ignore-aware traversal. Results are paginated and sorted by path. Prefer this over `Bash find` for workspace or Skill content.",
+      "Find files by glob pattern under the workspace, a configured root:// project directory, or an enabled Skill using ignore-aware traversal. Results are paginated and sorted by path. Prefer this over `Bash find` for structured file access.",
     parameters: strictToolParameters({
       pattern: Type.String({
         description:
@@ -621,7 +636,7 @@ export function createFsTools(params: {
       path: Type.Optional(
         Type.String({
           description:
-            "Optional base directory to search under. Omit to search from the workspace root. Prefer the workspace-relative or skill:// form returned by other tools.",
+            "Optional base directory to search under. Omit to search from the workspace root. Prefer the workspace-relative, root://<alias>/..., or skill:// form returned by other tools.",
         }),
       ),
       offset: Type.Optional(
@@ -644,13 +659,13 @@ export function createFsTools(params: {
   const toolGrep: Tool = {
     name: "Grep",
     description:
-      "Search file contents using a regular expression with ignore-aware traversal. Supports output_mode=content|files|count, pagination, optional surrounding context, and multiline matching. Prefer this over `Bash grep` / `rg` for any workspace or Skill content.",
+      "Search file contents under the workspace, a configured root:// project directory, or an enabled Skill using a regular expression with ignore-aware traversal. Supports output_mode=content|files|count, pagination, optional surrounding context, and multiline matching. Prefer this over `Bash grep` / `rg` for structured file access.",
     parameters: strictToolParameters({
       pattern: Type.String({ description: "Regular expression to search for in file contents." }),
       path: Type.Optional(
         Type.String({
           description:
-            "Optional directory or single file to search. Omit to search from the workspace root. Prefer the workspace-relative or skill:// form returned by other tools.",
+            "Optional directory or single file to search. Omit to search from the workspace root. Prefer the workspace-relative, root://<alias>/..., or skill:// form returned by other tools.",
         }),
       ),
       file_pattern: Type.Optional(
@@ -1426,6 +1441,7 @@ export function createFsTools(params: {
           mode: "rewrite",
           expected_mtime_ms: primed?.snapshot.mtimeMs,
           expected_content_hash: primed?.snapshot.contentHash,
+          ...(checkpointCtx ? { checkpoint: checkpointCtx } : {}),
         },
       });
     } catch (error) {
@@ -1513,6 +1529,7 @@ export function createFsTools(params: {
           replace_all,
           expected_mtime_ms: snapshot.mtimeMs,
           expected_content_hash: snapshot.contentHash,
+          ...(checkpointCtx ? { checkpoint: checkpointCtx } : {}),
         },
       });
     } catch (error) {
@@ -1578,6 +1595,7 @@ export function createFsTools(params: {
       args: {
         workdir: resolved.root,
         path,
+        ...(checkpointCtx ? { checkpoint: checkpointCtx } : {}),
       },
     });
     fileState.clear(statePathKey(resolved));
@@ -1623,6 +1641,10 @@ export function createFsTools(params: {
       },
     });
 
+    const entries = res.entries.map((entry) => ({
+      ...entry,
+      path: toolVisibleBackendPath(resolved, entry.path),
+    }));
     const details: ListResultDetails = {
       kind: "list",
       ...pathDetails(resolved),
@@ -1632,10 +1654,10 @@ export function createFsTools(params: {
       maxResults: res.maxResults,
       total: res.total,
       hasMore: res.hasMore,
-      entries: res.entries,
+      entries,
     };
 
-    const lines = res.entries.map(
+    const lines = entries.map(
       (entry) => `${entry.kind === "dir" ? "[DIR]" : "[FILE]"} ${entry.path}`,
     );
     const suffix = res.hasMore ? "\n...more entries omitted...\n" : "";
@@ -1688,6 +1710,7 @@ export function createFsTools(params: {
       },
     });
 
+    const paths = res.paths.map((path) => toolVisibleBackendPath(resolved, path));
     const details: GlobResultDetails = {
       kind: "glob",
       ...pathDetails(resolved),
@@ -1698,7 +1721,7 @@ export function createFsTools(params: {
       maxResults: res.maxResults,
       total: res.total,
       hasMore: res.hasMore,
-      paths: res.paths,
+      paths,
     };
     const suffix = res.hasMore ? "\n...more matches omitted...\n" : "";
 
@@ -1712,7 +1735,7 @@ export function createFsTools(params: {
             (res.targetKind === "file"
               ? "note=path is a file; searched its parent directory\n"
               : "") +
-            `${res.paths.join("\n")}${suffix}`,
+            `${paths.join("\n")}${suffix}`,
         },
       ],
       details,
@@ -1759,6 +1782,15 @@ export function createFsTools(params: {
       },
     });
 
+    const matches = res.matches.map((match) => ({
+      ...match,
+      path: toolVisibleBackendPath(resolved, match.path),
+    }));
+    const files = res.files.map((file) => ({
+      path: toolVisibleBackendPath(resolved, file.path),
+      count: file.count,
+      firstLine: typeof file.firstLine === "number" ? file.firstLine : undefined,
+    }));
     const details: GrepResultDetails = {
       kind: "grep",
       ...pathDetails(resolved),
@@ -1774,25 +1806,21 @@ export function createFsTools(params: {
       matchCount: res.matchCount,
       fileCount: res.fileCount,
       hasMore: res.hasMore,
-      matches: res.matches,
-      files: res.files.map((file) => ({
-        path: file.path,
-        count: file.count,
-        firstLine: typeof file.firstLine === "number" ? file.firstLine : undefined,
-      })),
+      matches,
+      files,
     };
 
     const body =
       res.outputMode === "count"
         ? `matches=${res.matchCount}\nfiles=${res.fileCount}`
         : res.outputMode === "files"
-          ? res.files
+          ? files
               .map(
                 (file) =>
                   `${file.path} (${file.count}${typeof file.firstLine === "number" ? `, firstLine=${file.firstLine}` : ""})`,
               )
               .join("\n")
-          : res.matches.map((match) => `${match.path}:${match.line}: ${match.text}`).join("\n");
+          : matches.map((match) => `${match.path}:${match.line}: ${match.text}`).join("\n");
     const suffix = res.hasMore ? "\n...more results omitted...\n" : "";
 
     return {

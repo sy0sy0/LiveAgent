@@ -7,12 +7,18 @@ import {
   Link2,
   Loader2,
   Share2,
-  X,
-} from "@liveagent/app/components/icons";
-import { Button } from "@liveagent/ui/components/ui/button";
+} from "@liveagent/ui/components/IconSet";
+import {
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@liveagent/ui/components/ui/dialog";
+import { buildShareUrl, resolveShareOrigin } from "@liveagent/ui/lib/chat/historyShareOrigin";
 import { cn } from "@liveagent/ui/lib/shared/utils";
 import { useEffect, useId, useMemo, useState } from "react";
-import { createPortal } from "react-dom";
 
 type ShareConversation = {
   title: string;
@@ -34,61 +40,12 @@ type HistoryShareModalProps = {
   isUpdating: boolean;
   errorMessage: string | null;
   shareOrigin?: string;
+  shareOriginPort?: number;
   shareOriginLoading?: boolean;
   onToggle: (enabled: boolean, options?: { redactToolContent?: boolean }) => void;
   onRedactToolContentChange: (redactToolContent: boolean) => void;
   onClose: () => void;
 };
-
-function getBrowserOrigin() {
-  if (typeof window === "undefined") {
-    return "";
-  }
-  return window.location.origin;
-}
-
-function resolveShareOrigin(explicitOrigin?: string) {
-  const rawOrigin = explicitOrigin === undefined ? getBrowserOrigin() : explicitOrigin;
-  const trimmed = rawOrigin.trim();
-  if (!trimmed) {
-    return "";
-  }
-
-  const schemeMatch = /^(https?|wss?):(.*)$/i.exec(trimmed);
-  const withScheme = schemeMatch
-    ? [
-        schemeMatch[1].toLowerCase(),
-        ":",
-        schemeMatch[2].startsWith("//")
-          ? schemeMatch[2]
-          : `//${schemeMatch[2].replace(/^\/+/, "")}`,
-      ].join("")
-    : `https://${trimmed}`;
-  const httpUrl = withScheme.replace(/^wss:\/\//i, "https://").replace(/^ws:\/\//i, "http://");
-
-  try {
-    const url = new URL(httpUrl);
-    if (
-      (url.protocol !== "http:" && url.protocol !== "https:") ||
-      !url.hostname ||
-      url.hostname === "http" ||
-      url.hostname === "https"
-    ) {
-      return "";
-    }
-    return url.origin.replace(/\/$/, "");
-  } catch {
-    return "";
-  }
-}
-
-function buildShareUrl(token: string, origin: string) {
-  const normalizedToken = token.trim();
-  if (!normalizedToken || !origin) {
-    return "";
-  }
-  return `${origin}/share/${encodeURIComponent(normalizedToken)}`;
-}
 
 function RedactionPicker(props: {
   value: boolean;
@@ -183,6 +140,7 @@ export function HistoryShareModal({
   isUpdating,
   errorMessage,
   shareOrigin,
+  shareOriginPort,
   shareOriginLoading = false,
   onToggle,
   onRedactToolContentChange,
@@ -190,7 +148,7 @@ export function HistoryShareModal({
 }: HistoryShareModalProps) {
   const [copied, setCopied] = useState(false);
   const [redactToolContent, setRedactToolContent] = useState(false);
-  const publicOrigin = resolveShareOrigin(shareOrigin);
+  const publicOrigin = resolveShareOrigin(shareOrigin, shareOriginPort);
   const token = share?.enabled === true ? (share.token?.trim() ?? "") : "";
   const shareUrl = useMemo(() => buildShareUrl(token, publicOrigin), [publicOrigin, token]);
   const isEnabled = share?.enabled === true;
@@ -229,45 +187,27 @@ export function HistoryShareModal({
       });
   }
 
-  return createPortal(
-    <div
-      className="fixed inset-0 z-[70] flex items-center justify-center p-4"
-      role="dialog"
-      aria-modal="true"
-      aria-label="分享会话"
-    >
-      <div className="absolute inset-0 bg-black/55 backdrop-blur-sm" onClick={onClose} />
-
-      <div className="relative z-10 w-full max-w-lg overflow-hidden rounded-2xl border border-border/70 bg-background shadow-2xl">
-        <div className="flex items-start justify-between gap-4 border-b border-border/60 px-5 py-4">
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="max-w-lg p-0" closeLabel="关闭" showCloseButton>
+        <DialogHeader className="flex-row items-start gap-4">
           <div className="flex min-w-0 items-start gap-3">
             <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-sky-500/20 bg-sky-500/10 text-sky-500">
               <Share2 className="h-5 w-5" />
             </div>
             <div className="min-w-0">
-              <div className="text-sm font-semibold text-foreground">分享会话</div>
-              <div
+              <DialogTitle className="text-sm leading-normal">分享会话</DialogTitle>
+              <DialogDescription
                 className="mt-1 truncate text-xs text-muted-foreground"
                 title={conversation.title}
               >
                 {conversation.title}
-              </div>
+              </DialogDescription>
             </div>
           </div>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            onClick={onClose}
-            className="h-8 w-8 shrink-0 rounded-xl text-muted-foreground hover:text-foreground"
-            title="关闭"
-            aria-label="关闭"
-          >
-            <X className="h-4 w-4" />
-          </Button>
-        </div>
+        </DialogHeader>
 
-        <div className="space-y-4 px-5 py-5">
+        <DialogBody className="space-y-4 py-5">
           <div className="rounded-2xl border border-border/60 bg-muted/25 px-4 py-3">
             <div className="flex items-center justify-between gap-4">
               <div className="min-w-0">
@@ -405,9 +345,8 @@ export function HistoryShareModal({
               开启分享后会在这里生成公开访问链接。
             </div>
           )}
-        </div>
-      </div>
-    </div>,
-    document.body,
+        </DialogBody>
+      </DialogContent>
+    </Dialog>
   );
 }

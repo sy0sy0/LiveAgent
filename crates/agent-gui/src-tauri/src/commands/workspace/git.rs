@@ -105,6 +105,16 @@ pub struct GitBranch {
 pub struct GitBranchesResponse {
     pub state: GitRepositoryState,
     pub branches: Vec<GitBranch>,
+    pub worktrees: Vec<GitWorktreeInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitWorktreeInfo {
+    pub path: String,
+    pub branch: String,
+    pub main_worktree_path: String,
+    pub is_current: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +211,36 @@ pub struct GitOperationResponse {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitWorktreeResponse {
+    pub ok: bool,
+    pub state: GitRepositoryState,
+    pub worktree_path: String,
+    pub branch: String,
+    pub directory_name: String,
+    pub main_worktree_path: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitRemoveWorktreeResponse {
+    pub ok: bool,
+    pub state: GitRepositoryState,
+    pub worktree_path: String,
+    pub main_worktree_path: String,
+    pub branch: String,
+    pub worktree_removed: bool,
+    pub branch_delete_requested: bool,
+    pub branch_deleted: bool,
+    pub stdout: String,
+    pub stderr: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct GitGatewayArgs {
@@ -216,16 +256,29 @@ struct GitGatewayArgs {
     limit: Option<usize>,
     skip: Option<usize>,
     name: Option<String>,
+    directory_name: Option<String>,
+    parent_directory: Option<String>,
     user_name: Option<String>,
     user_email: Option<String>,
     force: Option<bool>,
     new_branch: Option<String>,
+    worktree_path: Option<String>,
+    delete_branch: Option<bool>,
     task_id: Option<String>,
 }
 
 struct GitOutput {
     stdout: String,
     stderr: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GitWorktreeRecord {
+    path: String,
+    branch: String,
+    is_main: bool,
+    is_current: bool,
+    locked: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1087,6 +1140,7 @@ pub(crate) fn git_branches_sync(workdir: String) -> Result<GitBranchesResponse, 
         return Ok(GitBranchesResponse {
             state,
             branches: Vec::new(),
+            worktrees: Vec::new(),
         });
     }
     let output = git_success(
@@ -1151,7 +1205,87 @@ pub(crate) fn git_branches_sync(workdir: String) -> Result<GitBranchesResponse, 
             .cmp(&right.kind)
             .then_with(|| left.full_name.cmp(&right.full_name))
     });
-    Ok(GitBranchesResponse { state, branches })
+    // worktree 列表用于 UI 识别“被 worktree 检出的分支”（删除分支前需先
+    // 移除 worktree）。查询失败时降级为空列表，不影响分支主流程。
+    let worktrees = git_worktrees_sync(&state.repo_root).unwrap_or_default();
+    Ok(GitBranchesResponse {
+        state,
+        branches,
+        worktrees,
+    })
+}
+
+fn normalized_worktree_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn worktree_paths_match(left: &Path, right: &Path) -> bool {
+    normalized_worktree_path(left) == normalized_worktree_path(right)
+}
+
+/// `--porcelain -z` 让字段与记录都由 NUL 分隔，路径中的换行符不会破坏解析。
+/// 第一条记录由 Git 定义为主工作树；detached / prunable / locked 字段可直接忽略。
+fn parse_git_worktree_records(output: &str, current_repo_root: &str) -> Vec<GitWorktreeRecord> {
+    let mut records = Vec::new();
+    let mut record = GitWorktreeRecord::default();
+
+    for field in output.split('\0') {
+        if field.is_empty() {
+            if !record.path.is_empty() {
+                records.push(std::mem::take(&mut record));
+            }
+            continue;
+        }
+        if let Some(path) = field.strip_prefix("worktree ") {
+            if !record.path.is_empty() {
+                records.push(std::mem::take(&mut record));
+            }
+            record.path = path.to_string();
+        } else if let Some(branch) = field.strip_prefix("branch refs/heads/") {
+            record.branch = branch.to_string();
+        } else if field == "locked" || field.starts_with("locked ") {
+            record.locked = true;
+        }
+    }
+    if !record.path.is_empty() {
+        records.push(record);
+    }
+
+    let current_path = Path::new(current_repo_root);
+    for (index, record) in records.iter_mut().enumerate() {
+        record.is_main = index == 0;
+        record.is_current = worktree_paths_match(Path::new(&record.path), current_path);
+    }
+    records
+}
+
+fn git_worktree_records_sync(repo_root: &str) -> Result<Vec<GitWorktreeRecord>, String> {
+    let output = git_success(repo_root, &["worktree", "list", "--porcelain", "-z"])?;
+    let records = parse_git_worktree_records(&output.stdout, repo_root);
+    if records.is_empty() {
+        return Err("Git 未返回 Worktree 登记信息。".to_string());
+    }
+    Ok(records)
+}
+
+/// 返回 linked worktree，主工作树不暴露为可删除项；每条记录携带稳定的主工作树
+/// 路径与“当前项目”标记，调用方从 linked worktree 内查询时也能正确识别自身。
+fn git_worktrees_sync(repo_root: &str) -> Result<Vec<GitWorktreeInfo>, String> {
+    let records = git_worktree_records_sync(repo_root)?;
+    let main_worktree_path = records
+        .first()
+        .map(|record| record.path.clone())
+        .ok_or_else(|| "Git 未返回主 Worktree。".to_string())?;
+    Ok(records
+        .into_iter()
+        .filter(|record| !record.is_main)
+        .map(|record| GitWorktreeInfo {
+            path: record.path,
+            branch: record.branch,
+            main_worktree_path: main_worktree_path.clone(),
+            is_current: record.is_current,
+        })
+        .collect())
 }
 
 fn ensure_ready_state(workdir: &str) -> Result<GitRepositoryState, String> {
@@ -1694,6 +1828,210 @@ pub(crate) fn git_create_branch_sync(
         git_success(&state.repo_root, &args),
         "分支已创建并检出。",
     )
+}
+
+/// Worktree 存储基目录（`~/.liveagent/worktree`）。Worktree 是仓库的检出
+/// 副本，落在应用存储域，避免污染工作区目录结构。
+fn worktree_storage_base() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or_else(|| "无法定位用户目录。".to_string())?;
+    let dir = home.join(".liveagent").join("worktree");
+    fs::create_dir_all(&dir).map_err(|error| format!("创建 worktree 目录失败：{error}"))?;
+    Ok(dir)
+}
+
+/// 稳定且唯一的 repo id：`<sanitized-basename>-<fnv1a64 完整 64 位 hex>`。
+/// 同一仓库根路径永远映射到同一 id，目录可读；64 位哈希碰撞概率可忽略。
+fn repo_worktree_id(repo_root: &str) -> String {
+    let basename = Path::new(repo_root)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| repo_root.to_string());
+    let sanitized = sanitize_repo_id_component(&basename);
+    format!("{sanitized}-{:016x}", fnv1a64(repo_root.as_bytes()))
+}
+
+fn sanitize_repo_id_component(input: &str) -> String {
+    let mut out = String::new();
+    for ch in input.trim().chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            out.push(ch);
+        } else {
+            out.push('-');
+        }
+    }
+    let compact = out
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let trimmed = compact
+        .trim_matches(|ch| ch == '-' || ch == '.')
+        .to_string();
+    if trimmed.is_empty() {
+        "repo".to_string()
+    } else {
+        trimmed.chars().take(80).collect()
+    }
+}
+
+/// FNV-1a 64 位哈希，与前端展示无关、仅用于目录命名，无需引入额外依赖。
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn validate_worktree_parent_directory(parent: &str) -> Result<PathBuf, String> {
+    let parent = parent.trim();
+    if parent.is_empty() {
+        return Err("Worktree 父目录不能为空。".to_string());
+    }
+    let parent_path = PathBuf::from(parent);
+    if !parent_path.is_absolute() {
+        return Err(format!("Worktree 父目录必须是绝对路径：{parent}"));
+    }
+    let metadata =
+        fs::metadata(&parent_path).map_err(|error| format!("Worktree 父目录不可访问：{error}"))?;
+    if !metadata.is_dir() {
+        return Err("Worktree 父目录必须是文件夹。".to_string());
+    }
+    fs::read_dir(&parent_path).map_err(|error| format!("Worktree 父目录不可访问：{error}"))?;
+    fs::canonicalize(&parent_path).map_err(|error| format!("无法解析 Worktree 父目录：{error}"))
+}
+
+pub(crate) fn git_create_worktree_sync(
+    workdir: String,
+    branch: String,
+    directory_name: String,
+    parent_directory: Option<String>,
+    start_point: Option<String>,
+) -> Result<GitWorktreeResponse, String> {
+    let managed_base = if parent_directory.is_none() {
+        Some(worktree_storage_base()?)
+    } else {
+        None
+    };
+    git_create_worktree_with_base(
+        workdir,
+        branch,
+        directory_name,
+        parent_directory,
+        start_point,
+        managed_base.as_deref(),
+    )
+}
+
+/// 默认基目录由调用方注入（生产为 `~/.liveagent/worktree`，测试传临时目录）；
+/// 显式 parent_directory 存在时直接使用经过校验的用户目录。
+fn git_create_worktree_with_base(
+    workdir: String,
+    branch: String,
+    directory_name: String,
+    parent_directory: Option<String>,
+    start_point: Option<String>,
+    managed_base: Option<&Path>,
+) -> Result<GitWorktreeResponse, String> {
+    let state = ensure_ready_state(&workdir)?;
+    let repo_root =
+        fs::canonicalize(&state.repo_root).map_err(|error| format!("无法解析仓库路径：{error}"))?;
+    let repo_root_str = repo_root.to_string_lossy().into_owned();
+    let records = git_worktree_records_sync(&repo_root_str)?;
+    let main_worktree_path = records
+        .first()
+        .map(|record| normalized_worktree_path(Path::new(&record.path)))
+        .ok_or_else(|| "Git 未返回主 Worktree。".to_string())?;
+    let main_worktree_path = main_worktree_path.to_string_lossy().into_owned();
+    let branch = validate_branch_name(&repo_root_str, &branch)?;
+    let directory_name = validate_project_folder_name(&directory_name)?.to_string();
+    let target_parent = match parent_directory.as_deref() {
+        Some(parent) => validate_worktree_parent_directory(parent)?,
+        None => {
+            let base = managed_base.ok_or_else(|| "缺少默认 Worktree 存储目录。".to_string())?;
+            let repo_dir = base.join(repo_worktree_id(&main_worktree_path));
+            fs::create_dir_all(&repo_dir)
+                .map_err(|error| format!("创建 Worktree 目录失败：{error}"))?;
+            fs::canonicalize(&repo_dir)
+                .map_err(|error| format!("无法解析 Worktree 目录：{error}"))?
+        }
+    };
+    let target = target_parent.join(&directory_name);
+    if target
+        .try_exists()
+        .map_err(|error| format!("无法检查 Worktree 目标：{error}"))?
+    {
+        return Err(format!("Worktree 目标已存在：{}", target.display()));
+    }
+    if records
+        .iter()
+        .any(|record| target.starts_with(normalized_worktree_path(Path::new(&record.path))))
+    {
+        return Err("Worktree 目标不能位于现有 Worktree 目录内。".to_string());
+    }
+
+    let validated_start_point = start_point
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| validate_start_point(&repo_root_str, value))
+        .transpose()?;
+    let start_point = validated_start_point.unwrap_or_else(|| "HEAD".to_string());
+    let target_path = target.to_string_lossy().into_owned();
+    let result = git_success(
+        &repo_root_str,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            branch.as_str(),
+            target_path.as_str(),
+            start_point.as_str(),
+        ],
+    );
+
+    let response_state = git_status_sync(workdir)?;
+    match result {
+        Ok(output) => {
+            let worktree_path = fs::canonicalize(&target)
+                .map_err(|error| format!("无法解析 Worktree 路径：{error}"))?
+                .to_string_lossy()
+                .into_owned();
+            Ok(GitWorktreeResponse {
+                ok: true,
+                state: response_state,
+                worktree_path,
+                branch,
+                directory_name,
+                main_worktree_path,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                message: "Worktree 已创建。".to_string(),
+            })
+        }
+        Err(error) => Ok(GitWorktreeResponse {
+            ok: false,
+            state: response_state,
+            worktree_path: target_path,
+            branch,
+            directory_name,
+            main_worktree_path,
+            stdout: String::new(),
+            stderr: error.clone(),
+            message: error,
+        }),
+    }
+}
+
+#[cfg(test)]
+fn git_create_worktree_in_base(
+    workdir: String,
+    name: String,
+    start_point: Option<String>,
+    base: &Path,
+) -> Result<GitWorktreeResponse, String> {
+    git_create_worktree_with_base(workdir, name.clone(), name, None, start_point, Some(base))
 }
 
 pub(crate) fn git_init_sync(
@@ -2575,7 +2913,8 @@ pub(crate) fn git_diff_sync(
         .iter()
         .map(|entry| entry.path.clone())
         .collect();
-    if mode == "working_tree" && !ref_exists(&state.repo_root, "HEAD") {
+    let has_head = ref_exists(&state.repo_root, "HEAD");
+    if mode == "working_tree" && !has_head {
         let mut patch = String::new();
         let mut binary_files = Vec::new();
         append_initial_worktree_file_patches(
@@ -2606,6 +2945,14 @@ pub(crate) fn git_diff_sync(
     ];
     if mode == "working_tree" {
         args.push("HEAD".to_string());
+    } else if mode == "staged" {
+        args.push("--cached".to_string());
+        base_ref = if has_head {
+            "HEAD".to_string()
+        } else {
+            "ROOT".to_string()
+        };
+        head_ref = "INDEX".to_string();
     } else {
         base_ref = resolve_review_base(&state);
         if base_ref.is_empty() {
@@ -2944,11 +3291,165 @@ pub(crate) fn git_delete_branch_sync(
         return Err("不能删除当前检出的分支。".to_string());
     }
     let delete_flag = if force == Some(true) { "-D" } else { "-d" };
-    operation_response(
-        &workdir,
-        git_success(&state.repo_root, &["branch", delete_flag, branch.as_str()]),
-        "分支已删除。",
-    )
+    let result = git_success(&state.repo_root, &["worktree", "prune", "--expire", "now"])
+        .and_then(|_| git_success(&state.repo_root, &["branch", delete_flag, branch.as_str()]));
+    operation_response(&workdir, result, "分支已删除。")
+}
+
+fn select_worktree_control_path(
+    records: &[GitWorktreeRecord],
+    target: &GitWorktreeRecord,
+) -> Result<String, String> {
+    records
+        .iter()
+        .find(|record| {
+            !worktree_paths_match(Path::new(&record.path), Path::new(&target.path))
+                && Path::new(&record.path).is_dir()
+        })
+        .map(|record| record.path.clone())
+        .ok_or_else(|| "找不到可用于移除 Worktree 的存活工作树。".to_string())
+}
+
+/// 移除 Worktree，成功后可选删除其真实关联分支。调用方只能提供布尔选项，
+/// 分支名必须来自 Git 的 Worktree 登记；主工作树永远不可删除。
+pub(crate) fn git_remove_worktree_sync(
+    workdir: String,
+    worktree_path: String,
+    force: Option<bool>,
+    delete_branch: Option<bool>,
+) -> Result<GitRemoveWorktreeResponse, String> {
+    let state = ensure_ready_state(&workdir)?;
+    let trimmed = worktree_path.trim();
+    if trimmed.is_empty() {
+        return Err("Worktree 路径不能为空。".to_string());
+    }
+    let requested_path = PathBuf::from(trimmed);
+    if !requested_path.is_absolute() {
+        return Err("Worktree 路径必须是绝对路径。".to_string());
+    }
+
+    let records = git_worktree_records_sync(&state.repo_root)?;
+    let target = records
+        .iter()
+        .find(|record| worktree_paths_match(Path::new(&record.path), &requested_path))
+        .cloned()
+        .ok_or_else(|| "目标路径不是当前仓库已登记的 Worktree。".to_string())?;
+    if target.is_main {
+        return Err("不能删除主 Worktree。".to_string());
+    }
+
+    let control_workdir = if target.is_current {
+        select_worktree_control_path(&records, &target)?
+    } else {
+        state.repo_root.clone()
+    };
+    let main_worktree_path = records
+        .first()
+        .map(|record| normalized_worktree_path(Path::new(&record.path)))
+        .ok_or_else(|| "Git 未返回主 Worktree。".to_string())?
+        .to_string_lossy()
+        .into_owned();
+    let registered_path = target.path.clone();
+    let branch = target.branch.clone();
+    let branch_delete_requested = delete_branch == Some(true);
+    let mut args = vec!["worktree", "remove"];
+    if force == Some(true) {
+        args.push("--force");
+        if target.locked {
+            args.push("--force");
+        }
+    }
+    args.extend(["--", registered_path.as_str()]);
+
+    let remove_result = git_success(&control_workdir, &args);
+    match remove_result {
+        Err(error) => {
+            let still_registered = git_worktree_records_sync(&control_workdir)
+                .map(|records| {
+                    records.iter().any(|record| {
+                        worktree_paths_match(Path::new(&record.path), Path::new(&registered_path))
+                    })
+                })
+                .unwrap_or(true);
+            let worktree_removed = !still_registered;
+            let message = if worktree_removed {
+                format!("Worktree 登记已移除，但目录清理失败：{error}")
+            } else {
+                error.clone()
+            };
+            Ok(GitRemoveWorktreeResponse {
+                ok: false,
+                state: git_status_sync(control_workdir)?,
+                worktree_path: registered_path,
+                main_worktree_path,
+                branch,
+                worktree_removed,
+                branch_delete_requested,
+                branch_deleted: false,
+                stdout: String::new(),
+                stderr: error,
+                message,
+            })
+        }
+        Ok(remove_output) => {
+            let (ok, branch_deleted, stdout, stderr, message) = if branch_delete_requested
+                && !branch.is_empty()
+            {
+                match git_success(&control_workdir, &["branch", "-d", "--", branch.as_str()]) {
+                    Ok(branch_output) => {
+                        let stdout = [remove_output.stdout.as_str(), branch_output.stdout.as_str()]
+                            .into_iter()
+                            .filter(|value| !value.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        (
+                            true,
+                            true,
+                            stdout,
+                            branch_output.stderr,
+                            "Worktree 与分支已删除。".to_string(),
+                        )
+                    }
+                    Err(error) => (
+                        false,
+                        false,
+                        remove_output.stdout,
+                        error.clone(),
+                        format!("Worktree 已移除，但分支删除失败：{error}"),
+                    ),
+                }
+            } else if branch_delete_requested {
+                (
+                    true,
+                    false,
+                    remove_output.stdout,
+                    remove_output.stderr,
+                    "Worktree 已移除；该 Worktree 未检出本地分支。".to_string(),
+                )
+            } else {
+                (
+                    true,
+                    false,
+                    remove_output.stdout,
+                    remove_output.stderr,
+                    "Worktree 已移除。".to_string(),
+                )
+            };
+            Ok(GitRemoveWorktreeResponse {
+                ok,
+                state: git_status_sync(control_workdir)?,
+                worktree_path: registered_path,
+                main_worktree_path,
+                branch,
+                worktree_removed: true,
+                branch_delete_requested,
+                branch_deleted,
+                stdout,
+                stderr,
+                message,
+            })
+        }
+    }
 }
 
 pub(crate) fn git_rename_branch_sync(
@@ -3039,6 +3540,16 @@ pub(crate) fn git_gateway_action_sync(
             args.branch.unwrap_or_default(),
             args.start_point,
         )?),
+        "create_worktree" => {
+            let legacy_name = args.name.unwrap_or_default();
+            serde_json::to_value(git_create_worktree_sync(
+                workdir,
+                args.branch.unwrap_or_else(|| legacy_name.clone()),
+                args.directory_name.unwrap_or(legacy_name),
+                args.parent_directory,
+                args.start_point,
+            )?)
+        }
         "log" => serde_json::to_value(git_log_sync(workdir, args.limit, args.skip)?),
         "commit_details" => serde_json::to_value(git_commit_details_sync(
             workdir,
@@ -3093,6 +3604,12 @@ pub(crate) fn git_gateway_action_sync(
             workdir,
             args.branch.unwrap_or_default(),
             args.new_branch.unwrap_or_default(),
+        )?),
+        "remove_worktree" => serde_json::to_value(git_remove_worktree_sync(
+            workdir,
+            args.worktree_path.unwrap_or_default(),
+            args.force,
+            args.delete_branch,
         )?),
         "stash_push" => serde_json::to_value(git_stash_push_sync(workdir, args.message)?),
         "stash_pop" => serde_json::to_value(git_stash_pop_sync(workdir)?),
@@ -3177,6 +3694,28 @@ pub async fn git_create_branch(
     .map_err(|error| format!("git_create_branch join 失败：{error}"))?
 }
 
+#[tauri::command(rename_all = "snake_case")]
+pub async fn git_create_worktree(
+    workdir: String,
+    branch: Option<String>,
+    directory_name: Option<String>,
+    parent_directory: Option<String>,
+    start_point: Option<String>,
+    name: Option<String>,
+) -> Result<GitWorktreeResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let legacy_name = name.unwrap_or_default();
+        git_create_worktree_sync(
+            workdir,
+            branch.unwrap_or_else(|| legacy_name.clone()),
+            directory_name.unwrap_or(legacy_name),
+            parent_directory,
+            start_point,
+        )
+    })
+    .await
+    .map_err(|error| format!("git_create_worktree join 失败：{error}"))?
+}
 #[tauri::command(rename_all = "snake_case")]
 pub async fn git_init(
     workdir: String,
@@ -3422,6 +3961,20 @@ pub async fn git_delete_branch(
     tauri::async_runtime::spawn_blocking(move || git_delete_branch_sync(workdir, branch, force))
         .await
         .map_err(|error| format!("git_delete_branch join 失败：{error}"))?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn git_remove_worktree(
+    workdir: String,
+    worktree_path: String,
+    force: Option<bool>,
+    delete_branch: Option<bool>,
+) -> Result<GitRemoveWorktreeResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        git_remove_worktree_sync(workdir, worktree_path, force, delete_branch)
+    })
+    .await
+    .map_err(|error| format!("git_remove_worktree join 失败：{error}"))?
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -3977,6 +4530,43 @@ mod tests {
     }
 
     #[test]
+    fn git_staged_diff_handles_unborn_head_repo() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temp repo");
+        let workdir = temp.path().to_string_lossy().to_string();
+        let initialized =
+            git_init_sync(workdir.clone(), "main".to_string(), None, None).expect("init repo");
+        assert!(initialized.ok, "init failed: {}", initialized.message);
+
+        fs::write(temp.path().join("draft.txt"), "staged\n").expect("write staged draft");
+        let staged = git_stage_sync(workdir.clone(), "draft.txt".to_string()).expect("stage draft");
+        assert!(staged.ok, "stage failed: {}", staged.message);
+        fs::write(temp.path().join("draft.txt"), "staged\nunstaged\n")
+            .expect("write unstaged draft");
+
+        let diff = git_diff_sync(
+            workdir,
+            Some("staged".to_string()),
+            Some("draft.txt".to_string()),
+        )
+        .expect("staged diff in unborn repo");
+        assert_eq!(diff.base_ref, "ROOT");
+        assert_eq!(diff.head_ref, "INDEX");
+        assert!(
+            diff.patch.contains("+staged"),
+            "staged diff patch:\n{}",
+            diff.patch
+        );
+        assert!(
+            !diff.patch.contains("+unstaged"),
+            "staged diff included worktree-only content:\n{}",
+            diff.patch
+        );
+    }
+
+    #[test]
     fn git_branches_includes_unborn_current_branch() {
         if Command::new("git").arg("--version").output().is_err() {
             return;
@@ -4214,6 +4804,21 @@ mod tests {
             staged_work.message
         );
         assert_eq!(staged_work.state.dirty_counts.staged, 1);
+        fs::write(repo.path().join("work.txt"), "draft\nunstaged\n")
+            .expect("modify staged worktree file");
+        let staged_diff = git_diff_sync(
+            workdir.clone(),
+            Some("staged".to_string()),
+            Some("work.txt".to_string()),
+        )
+        .expect("staged diff");
+        assert_eq!(staged_diff.base_ref, "HEAD");
+        assert_eq!(staged_diff.head_ref, "INDEX");
+        assert!(
+            staged_diff.patch.contains("+draft") && !staged_diff.patch.contains("+unstaged"),
+            "staged diff patch:\n{}",
+            staged_diff.patch
+        );
 
         let unstaged_work = git_unstage_sync(workdir.clone(), "work.txt".to_string())
             .expect("unstage worktree file");
@@ -4548,6 +5153,548 @@ mod tests {
             .expect("read branch head")
             .stdout;
         assert_eq!(branch_head, initial_sha);
+    }
+
+    #[test]
+    fn parse_git_worktree_records_handles_nul_fields_and_prunable_entries() {
+        let output = concat!(
+            "worktree /repo/main\0",
+            "HEAD abc\0",
+            "branch refs/heads/main\0\0",
+            "worktree /repo/linked path\0",
+            "HEAD def\0",
+            "branch refs/heads/feature/test\0",
+            "locked reason\0",
+            "prunable gitdir file points to non-existent location\0\0",
+        );
+        let records = parse_git_worktree_records(output, "/repo/linked path");
+        assert_eq!(records.len(), 2);
+        assert!(records[0].is_main);
+        assert!(!records[0].is_current);
+        assert_eq!(records[1].branch, "feature/test");
+        assert!(records[1].is_current);
+        assert!(records[1].locked);
+    }
+
+    #[test]
+    fn git_create_worktree_uses_liveagent_layout_and_checks_out_branch() {
+        let Some(repo) = init_temp_repo() else {
+            return;
+        };
+        let workdir = repo.path().to_string_lossy().to_string();
+        let worktree_root = tempfile::tempdir().expect("worktree root");
+        let initial_branch = git_success(&workdir, &["branch", "--show-current"])
+            .expect("read initial branch")
+            .stdout
+            .trim()
+            .to_string();
+
+        let created = git_create_worktree_in_base(
+            workdir.clone(),
+            "feature-alpha".to_string(),
+            None,
+            worktree_root.path(),
+        )
+        .expect("create worktree");
+        assert!(created.ok, "create worktree failed: {}", created.message);
+
+        // 路径布局：<worktree 基目录>/<repo_id>/<name>
+        let repo_root =
+            fs::canonicalize(git_status_sync(workdir.clone()).expect("status").repo_root)
+                .expect("canonicalize repo root");
+        let expected = fs::canonicalize(
+            worktree_root
+                .path()
+                .join(repo_worktree_id(&repo_root.to_string_lossy()))
+                .join("feature-alpha"),
+        )
+        .expect("resolve expected worktree path");
+        assert_eq!(PathBuf::from(&created.worktree_path), expected);
+        assert!(expected.is_dir(), "worktree directory should exist");
+
+        // 新 worktree 检出到同名新分支
+        let branch = git_success(&created.worktree_path, &["branch", "--show-current"])
+            .expect("branch of worktree");
+        assert_eq!(branch.stdout.trim(), "feature-alpha");
+        // 原仓库留在原分支
+        assert_eq!(created.state.head, initial_branch);
+    }
+
+    #[test]
+    fn git_create_worktree_supports_separate_branch_directory_and_custom_parent() {
+        let Some(repo) = init_temp_repo() else {
+            return;
+        };
+        let workdir = repo.path().to_string_lossy().to_string();
+        let default_root = tempfile::tempdir().expect("default worktree root");
+        let custom_parent = tempfile::tempdir().expect("custom worktree parent");
+        let created = git_create_worktree_with_base(
+            workdir.clone(),
+            "feature/custom-parent".to_string(),
+            "custom-folder".to_string(),
+            Some(custom_parent.path().to_string_lossy().into_owned()),
+            None,
+            Some(default_root.path()),
+        )
+        .expect("create custom worktree");
+
+        assert!(created.ok, "create worktree failed: {}", created.message);
+        assert_eq!(created.branch, "feature/custom-parent");
+        assert_eq!(created.directory_name, "custom-folder");
+        assert_eq!(
+            PathBuf::from(&created.worktree_path),
+            fs::canonicalize(custom_parent.path().join("custom-folder"))
+                .expect("canonical custom worktree"),
+        );
+        assert!(
+            !default_root
+                .path()
+                .join(repo_worktree_id(&created.main_worktree_path))
+                .exists(),
+            "custom parent should bypass the managed default directory",
+        );
+        let branch = git_success(&created.worktree_path, &["branch", "--show-current"])
+            .expect("read custom worktree branch");
+        assert_eq!(branch.stdout, "feature/custom-parent");
+    }
+
+    #[test]
+    fn validate_worktree_parent_directory_rejects_invalid_locations() {
+        let temp = tempfile::tempdir().expect("parent validation tempdir");
+        let file = temp.path().join("file.txt");
+        fs::write(&file, "file").expect("write validation file");
+        assert!(validate_worktree_parent_directory("").is_err());
+        assert!(validate_worktree_parent_directory("relative/path").is_err());
+        assert!(validate_worktree_parent_directory(&file.to_string_lossy()).is_err());
+        assert!(
+            validate_worktree_parent_directory(&temp.path().join("missing").to_string_lossy(),)
+                .is_err(),
+        );
+    }
+
+    #[test]
+    fn git_create_worktree_rejects_targets_inside_existing_worktrees() {
+        let Some(repo) = init_temp_repo() else {
+            return;
+        };
+        let workdir = repo.path().to_string_lossy().to_string();
+        let default_root = tempfile::tempdir().expect("default worktree root");
+        let result = git_create_worktree_with_base(
+            workdir,
+            "feature/nested".to_string(),
+            "nested".to_string(),
+            Some(repo.path().to_string_lossy().into_owned()),
+            None,
+            Some(default_root.path()),
+        );
+        assert!(result
+            .expect_err("nested worktree target must fail")
+            .contains("不能位于现有 Worktree 目录内"),);
+    }
+
+    #[test]
+    fn git_create_worktree_can_start_from_another_branch() {
+        let Some(repo) = init_temp_repo() else {
+            return;
+        };
+        let workdir = repo.path().to_string_lossy().to_string();
+        let worktree_root = tempfile::tempdir().expect("worktree root");
+
+        run_temp_git(repo.path(), &["checkout", "-b", "second"]);
+        fs::write(repo.path().join("second.txt"), "second\n").expect("write second file");
+        run_temp_git(repo.path(), &["add", "second.txt"]);
+        run_temp_git(repo.path(), &["commit", "-m", "second"]);
+        run_temp_git(repo.path(), &["checkout", "-"]);
+
+        let created = git_create_worktree_in_base(
+            workdir.clone(),
+            "from-second".to_string(),
+            Some("second".to_string()),
+            worktree_root.path(),
+        )
+        .expect("create worktree from branch");
+        assert!(created.ok, "create worktree failed: {}", created.message);
+
+        let branch = git_success(&created.worktree_path, &["branch", "--show-current"])
+            .expect("branch of worktree");
+        assert_eq!(branch.stdout.trim(), "from-second");
+        let log = git_success(&created.worktree_path, &["log", "--oneline", "-1"])
+            .expect("worktree head");
+        assert!(
+            log.stdout.contains("second"),
+            "worktree should start from second commit: {}",
+            log.stdout
+        );
+    }
+
+    #[test]
+    fn git_create_worktree_rejects_duplicate_name() {
+        let Some(repo) = init_temp_repo() else {
+            return;
+        };
+        let workdir = repo.path().to_string_lossy().to_string();
+        let worktree_root = tempfile::tempdir().expect("worktree root");
+
+        let first = git_create_worktree_in_base(
+            workdir.clone(),
+            "dup-alpha".to_string(),
+            None,
+            worktree_root.path(),
+        )
+        .expect("first create");
+        assert!(first.ok, "first create failed: {}", first.message);
+
+        let second = git_create_worktree_in_base(
+            workdir.clone(),
+            "dup-alpha".to_string(),
+            None,
+            worktree_root.path(),
+        );
+        assert!(second.is_err(), "duplicate worktree name must be rejected");
+    }
+
+    #[test]
+    fn git_create_worktree_rejects_invalid_names() {
+        let Some(repo) = init_temp_repo() else {
+            return;
+        };
+        let workdir = repo.path().to_string_lossy().to_string();
+        let worktree_root = tempfile::tempdir().expect("worktree root");
+
+        for invalid in ["", "a/b", "a\\b", "..", ".", "bad name", "HEAD"] {
+            let result = git_create_worktree_in_base(
+                workdir.clone(),
+                invalid.to_string(),
+                None,
+                worktree_root.path(),
+            );
+            assert!(result.is_err(), "invalid name {invalid:?} must fail");
+        }
+    }
+
+    #[test]
+    fn git_worktrees_lists_created_worktree_branches() {
+        let Some(repo) = init_temp_repo() else {
+            return;
+        };
+        let workdir = repo.path().to_string_lossy().to_string();
+        let worktree_root = tempfile::tempdir().expect("worktree root");
+        let created = git_create_worktree_in_base(
+            workdir.clone(),
+            "wt-alpha".to_string(),
+            None,
+            worktree_root.path(),
+        )
+        .expect("create worktree");
+        assert!(created.ok, "create worktree failed: {}", created.message);
+
+        let state = git_status_sync(workdir.clone()).expect("status");
+        let worktrees = git_worktrees_sync(&state.repo_root).expect("worktree list");
+        let wt = worktrees
+            .iter()
+            .find(|info| info.path == created.worktree_path)
+            .expect("created worktree listed");
+        assert_eq!(wt.branch, "wt-alpha");
+        assert!(!wt.is_current);
+        assert_eq!(
+            normalized_worktree_path(Path::new(&wt.main_worktree_path)),
+            normalized_worktree_path(Path::new(&state.repo_root)),
+        );
+        let linked_view = git_worktrees_sync(&created.worktree_path).expect("linked worktree list");
+        let current = linked_view
+            .iter()
+            .find(|info| info.path == created.worktree_path)
+            .expect("current linked worktree listed");
+        assert!(current.is_current);
+    }
+    #[test]
+    fn git_worktrees_excludes_main_worktree() {
+        let Some(repo) = init_temp_repo() else {
+            return;
+        };
+        let workdir = repo.path().to_string_lossy().to_string();
+        let state = git_status_sync(workdir.clone()).expect("status");
+        let worktrees = git_worktrees_sync(&state.repo_root).expect("worktree list");
+        let main = fs::canonicalize(&state.repo_root).expect("canonicalize main");
+        assert!(
+            !worktrees.iter().any(|info| {
+                fs::canonicalize(&info.path)
+                    .map(|path| path == main)
+                    .unwrap_or(false)
+            }),
+            "main worktree must not be listed as a linked worktree: {:#?}",
+            worktrees
+        );
+    }
+
+    #[test]
+    fn git_remove_worktree_removes_worktree_and_branch() {
+        let Some(repo) = init_temp_repo() else {
+            return;
+        };
+        let workdir = repo.path().to_string_lossy().to_string();
+        let worktree_root = tempfile::tempdir().expect("worktree root");
+        let created = git_create_worktree_in_base(
+            workdir.clone(),
+            "wt-remove".to_string(),
+            None,
+            worktree_root.path(),
+        )
+        .expect("create worktree");
+        assert!(created.ok, "create worktree failed: {}", created.message);
+
+        let removed = git_remove_worktree_sync(
+            workdir.clone(),
+            created.worktree_path.clone(),
+            None,
+            Some(true),
+        )
+        .expect("remove worktree");
+        assert!(removed.ok, "remove worktree failed: {}", removed.message);
+        assert!(removed.worktree_removed);
+        assert!(removed.branch_deleted);
+        assert_eq!(removed.branch, "wt-remove");
+        assert!(
+            !PathBuf::from(&created.worktree_path).exists(),
+            "worktree directory should be gone"
+        );
+
+        // 分支应随之删除
+        let state = git_status_sync(workdir.clone()).expect("status");
+        let worktrees = git_worktrees_sync(&state.repo_root).expect("worktree list");
+        assert!(
+            !worktrees
+                .iter()
+                .any(|info| info.path == created.worktree_path),
+            "worktree should be unregistered"
+        );
+        let branches = git_branches_sync(workdir.clone()).expect("branches");
+        assert!(
+            !branches
+                .branches
+                .iter()
+                .any(|branch| branch.full_name == "wt-remove"),
+            "branch should be deleted with the worktree"
+        );
+    }
+
+    #[test]
+    fn git_remove_worktree_reports_unmerged_branch_after_removing_worktree() {
+        let Some(repo) = init_temp_repo() else {
+            return;
+        };
+        let workdir = repo.path().to_string_lossy().to_string();
+        let worktree_root = tempfile::tempdir().expect("worktree root");
+        let created = git_create_worktree_in_base(
+            workdir.clone(),
+            "wt-unmerged".to_string(),
+            None,
+            worktree_root.path(),
+        )
+        .expect("create worktree");
+        let worktree_path = PathBuf::from(&created.worktree_path);
+        fs::write(worktree_path.join("unmerged.txt"), "unmerged\n").expect("write worktree file");
+        run_temp_git(&worktree_path, &["add", "unmerged.txt"]);
+        run_temp_git(
+            &worktree_path,
+            &["commit", "-m", "unmerged worktree commit"],
+        );
+
+        let result = git_remove_worktree_sync(
+            workdir.clone(),
+            created.worktree_path.clone(),
+            None,
+            Some(true),
+        )
+        .expect("worktree removal should return an operation response");
+
+        assert!(
+            !result.ok,
+            "unmerged branch deletion should report an error"
+        );
+        assert!(result.worktree_removed);
+        assert!(!result.branch_deleted);
+        assert_eq!(result.branch, "wt-unmerged");
+        assert!(
+            result.message.contains("Worktree 已移除，但分支删除失败")
+                && result.message.contains("not fully merged"),
+            "unexpected removal error: {}",
+            result.message
+        );
+        assert!(
+            !worktree_path.exists(),
+            "worktree should already be removed"
+        );
+        let branches = git_branches_sync(workdir).expect("branches");
+        assert!(
+            branches
+                .branches
+                .iter()
+                .any(|branch| branch.full_name == "wt-unmerged"),
+            "the unmerged branch should remain available for force deletion"
+        );
+    }
+
+    #[test]
+    fn git_remove_worktree_force_preserves_unmerged_branch_for_confirmation() {
+        let Some(repo) = init_temp_repo() else {
+            return;
+        };
+        let workdir = repo.path().to_string_lossy().to_string();
+        let worktree_root = tempfile::tempdir().expect("worktree root");
+        let created = git_create_worktree_in_base(
+            workdir.clone(),
+            "wt-force-unmerged".to_string(),
+            None,
+            worktree_root.path(),
+        )
+        .expect("create worktree");
+        let worktree_path = PathBuf::from(&created.worktree_path);
+        fs::write(worktree_path.join("unmerged.txt"), "unmerged\n").expect("write worktree file");
+        run_temp_git(&worktree_path, &["add", "unmerged.txt"]);
+        run_temp_git(
+            &worktree_path,
+            &["commit", "-m", "unmerged worktree commit"],
+        );
+
+        let result = git_remove_worktree_sync(
+            workdir.clone(),
+            created.worktree_path.clone(),
+            Some(true),
+            Some(true),
+        )
+        .expect("force remove worktree");
+
+        assert!(
+            !result.ok,
+            "force removal must not delete an unmerged branch"
+        );
+        assert!(
+            result.message.contains("Worktree 已移除，但分支删除失败")
+                && result.message.contains("not fully merged"),
+            "unexpected force removal error: {}",
+            result.message
+        );
+        assert!(!worktree_path.exists(), "worktree should be removed");
+        let branches = git_branches_sync(workdir).expect("branches");
+        assert!(
+            branches
+                .branches
+                .iter()
+                .any(|branch| branch.full_name == "wt-force-unmerged"),
+            "force removal should preserve the unmerged branch for confirmation"
+        );
+    }
+
+    #[test]
+    fn git_remove_worktree_preserves_non_target_control_worktree() {
+        let Some(repo) = init_temp_repo() else {
+            return;
+        };
+        let main_workdir = repo.path().to_string_lossy().to_string();
+        let worktree_root = tempfile::tempdir().expect("worktree root");
+        let control = git_create_worktree_in_base(
+            main_workdir.clone(),
+            "wt-control-a".to_string(),
+            None,
+            worktree_root.path(),
+        )
+        .expect("create control worktree");
+        let target = git_create_worktree_in_base(
+            main_workdir.clone(),
+            "wt-control-b".to_string(),
+            None,
+            worktree_root.path(),
+        )
+        .expect("create target worktree");
+
+        let removed = git_remove_worktree_sync(
+            control.worktree_path.clone(),
+            target.worktree_path.clone(),
+            None,
+            Some(false),
+        )
+        .expect("remove non-current worktree");
+        assert!(removed.ok, "remove target failed: {}", removed.message);
+        assert_eq!(
+            normalized_worktree_path(Path::new(&removed.state.repo_root)),
+            normalized_worktree_path(Path::new(&control.worktree_path)),
+        );
+        assert!(Path::new(&control.worktree_path).is_dir());
+
+        let deleted_target_branch = git_delete_branch_sync(
+            control.worktree_path.clone(),
+            "wt-control-b".to_string(),
+            Some(true),
+        )
+        .expect("delete target branch");
+        assert!(deleted_target_branch.ok);
+        let cleanup =
+            git_remove_worktree_sync(main_workdir, control.worktree_path, None, Some(true))
+                .expect("cleanup control worktree");
+        assert!(cleanup.ok, "cleanup failed: {}", cleanup.message);
+    }
+
+    #[test]
+    fn git_remove_worktree_can_remove_the_current_linked_worktree() {
+        let Some(repo) = init_temp_repo() else {
+            return;
+        };
+        let main_workdir = repo.path().to_string_lossy().to_string();
+        let worktree_root = tempfile::tempdir().expect("worktree root");
+        let created = git_create_worktree_in_base(
+            main_workdir.clone(),
+            "wt-current".to_string(),
+            None,
+            worktree_root.path(),
+        )
+        .expect("create current worktree");
+
+        let removed = git_remove_worktree_sync(
+            created.worktree_path.clone(),
+            created.worktree_path.clone(),
+            None,
+            Some(true),
+        )
+        .expect("remove current linked worktree");
+        assert!(removed.ok, "self removal failed: {}", removed.message);
+        assert!(removed.worktree_removed);
+        assert!(removed.branch_deleted);
+        assert_eq!(
+            normalized_worktree_path(Path::new(&removed.state.repo_root)),
+            normalized_worktree_path(repo.path()),
+        );
+    }
+
+    #[test]
+    fn git_remove_worktree_rejects_main_worktree() {
+        let Some(repo) = init_temp_repo() else {
+            return;
+        };
+        let workdir = repo.path().to_string_lossy().to_string();
+        let result = git_remove_worktree_sync(workdir.clone(), workdir, None, Some(false));
+        assert!(result
+            .expect_err("main worktree removal must fail")
+            .contains("不能删除主 Worktree"),);
+    }
+
+    #[test]
+    fn git_remove_worktree_rejects_unregistered_path() {
+        let Some(repo) = init_temp_repo() else {
+            return;
+        };
+        let workdir = repo.path().to_string_lossy().to_string();
+        let outside = tempfile::tempdir().expect("outside dir");
+        let result = git_remove_worktree_sync(
+            workdir.clone(),
+            outside.path().to_string_lossy().to_string(),
+            None,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "unregistered worktree path must be rejected"
+        );
     }
 
     #[test]
@@ -5021,6 +6168,114 @@ mod tests {
             force_deleted.ok,
             "force delete failed: {}",
             force_deleted.message
+        );
+    }
+
+    #[test]
+    fn git_delete_branch_prunes_manually_deleted_worktree() {
+        let Some(repo) = init_temp_repo() else {
+            return;
+        };
+        let workdir = repo.path().to_string_lossy().to_string();
+        let worktree_root = tempfile::tempdir().expect("worktree root");
+        let worktree_path = worktree_root.path().join("stale-worktree");
+        let worktree_path_str = worktree_path.to_string_lossy().into_owned();
+
+        run_temp_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "stale-worktree",
+                worktree_path_str.as_str(),
+            ],
+        );
+        fs::remove_dir_all(&worktree_path).expect("manually delete worktree directory");
+
+        let stale_list = git_success(
+            repo.path().to_string_lossy().as_ref(),
+            &["worktree", "list", "--porcelain"],
+        )
+        .expect("list stale worktrees");
+        assert!(
+            stale_list.stdout.contains("refs/heads/stale-worktree"),
+            "stale worktree registration should exist before delete: {}",
+            stale_list.stdout
+        );
+
+        let deleted = git_delete_branch_sync(workdir, "stale-worktree".to_string(), None)
+            .expect("delete stale worktree branch");
+        assert!(
+            deleted.ok,
+            "delete should prune stale worktree: {}",
+            deleted.message
+        );
+        assert!(
+            !ref_exists(
+                repo.path().to_string_lossy().as_ref(),
+                "refs/heads/stale-worktree"
+            ),
+            "stale worktree branch should be deleted"
+        );
+
+        let pruned_list = git_success(
+            repo.path().to_string_lossy().as_ref(),
+            &["worktree", "list", "--porcelain"],
+        )
+        .expect("list pruned worktrees");
+        assert!(
+            !pruned_list.stdout.contains("refs/heads/stale-worktree"),
+            "stale worktree registration should be pruned: {}",
+            pruned_list.stdout
+        );
+    }
+
+    #[test]
+    fn git_delete_branch_keeps_existing_worktree_protected_when_forced() {
+        let Some(repo) = init_temp_repo() else {
+            return;
+        };
+        let workdir = repo.path().to_string_lossy().to_string();
+        let worktree_root = tempfile::tempdir().expect("worktree root");
+        let worktree_path = worktree_root.path().join("active-worktree");
+        let worktree_path_str = worktree_path.to_string_lossy().into_owned();
+
+        run_temp_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "active-worktree",
+                worktree_path_str.as_str(),
+            ],
+        );
+
+        let refused = git_delete_branch_sync(workdir, "active-worktree".to_string(), Some(true))
+            .expect("force delete active worktree branch");
+        assert!(!refused.ok, "active worktree branch must remain protected");
+        assert!(
+            worktree_path.is_dir(),
+            "active worktree directory should remain"
+        );
+        assert!(
+            ref_exists(
+                repo.path().to_string_lossy().as_ref(),
+                "refs/heads/active-worktree"
+            ),
+            "active worktree branch should remain"
+        );
+
+        let worktree_list = git_success(
+            repo.path().to_string_lossy().as_ref(),
+            &["worktree", "list", "--porcelain"],
+        )
+        .expect("list active worktrees");
+        assert!(
+            worktree_list.stdout.contains("refs/heads/active-worktree"),
+            "active worktree registration should remain: {}",
+            worktree_list.stdout
         );
     }
 

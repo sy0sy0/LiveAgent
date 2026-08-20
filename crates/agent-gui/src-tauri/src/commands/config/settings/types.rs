@@ -7,6 +7,7 @@ pub struct SettingsLoadResponse {
     pub agents: Option<Value>,
     pub ssh: Option<Value>,
     pub remote: Option<Value>,
+    pub stt: Option<Value>,
     pub memory: Option<Value>,
     pub model_failover: Option<Value>,
     pub default_workdir: String,
@@ -16,7 +17,21 @@ pub struct SettingsLoadResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SshPatchApplyResponse {
     pub ssh: Value,
-    pub conflict: Option<String>,
+    pub conflict: Option<SshPatchConflictCode>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SshPatchConflictCode {
+    SettingsChanged,
+}
+
+impl SshPatchConflictCode {
+    pub(crate) const fn gateway_message(self) -> &'static str {
+        match self {
+            Self::SettingsChanged => "settings_changed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

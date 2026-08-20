@@ -23,6 +23,28 @@ func TestNormalizeExecutionMode(t *testing.T) {
 	}
 }
 
+func TestNormalizeCommandSafetyMode(t *testing.T) {
+	t.Parallel()
+
+	// 空串/未知值归为空串(表示"远端未指定"),桌面端据此回落本地设置;
+	// 绝不默认成某个具体模式,以免静默下调桌面端已选的更严格模式。
+	cases := map[string]string{
+		"":               "",
+		"unknown":        "",
+		" ask ":          "ask",
+		"ask":            "ask",
+		"auto":           "auto",
+		"sandbox":        "sandbox",
+		"sandboxOffline": "sandboxOffline",
+	}
+
+	for input, want := range cases {
+		if got := NormalizeCommandSafetyMode(input); got != want {
+			t.Fatalf("NormalizeCommandSafetyMode(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 func TestNormalizeChatSelectedModelAcceptsGemini(t *testing.T) {
 	t.Parallel()
 
@@ -55,6 +77,24 @@ func TestNormalizeChatSelectedModelAcceptsXai(t *testing.T) {
 	if got.CustomProviderID != "builtin-xai" ||
 		got.Model != "grok-4.5" ||
 		got.ProviderType != "xai" {
+		t.Fatalf("NormalizeChatSelectedModel() = %#v", got)
+	}
+}
+
+func TestNormalizeChatSelectedModelAcceptsDeepSeek(t *testing.T) {
+	t.Parallel()
+
+	got, err := NormalizeChatSelectedModel(&ChatSelectedModelBody{
+		CustomProviderID: " builtin-deepseek ",
+		Model:            " deepseek-reasoner ",
+		ProviderType:     " deepseek ",
+	})
+	if err != nil {
+		t.Fatalf("NormalizeChatSelectedModel() error = %v", err)
+	}
+	if got.CustomProviderID != "builtin-deepseek" ||
+		got.Model != "deepseek-reasoner" ||
+		got.ProviderType != "deepseek" {
 		t.Fatalf("NormalizeChatSelectedModel() = %#v", got)
 	}
 }

@@ -1,6 +1,7 @@
 package session
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -131,7 +132,7 @@ func TestSnapshotRevisionIsMonotonic(t *testing.T) {
 	}
 }
 
-func TestAcquireTunnelLifecycleAndLimits(t *testing.T) {
+func TestAcquireTunnelLifecycle(t *testing.T) {
 	m := newTunnelTestManager(t)
 	m.ApplyDesiredState("test-agent", desiredState(
 		&gatewayv2.TunnelSpec{Id: "tun-a", TargetUrl: "http://localhost:3000"},
@@ -142,19 +143,17 @@ func TestAcquireTunnelLifecycleAndLimits(t *testing.T) {
 		t.Fatalf("acquire missing = %v, want ErrTunnelNotFound", err)
 	}
 
-	leases := make([]*TunnelStreamLease, 0, maxTunnelConnections)
-	for i := 0; i < maxTunnelConnections; i++ {
-		lease, err := m.AcquireTunnel(slug, "s-"+string(rune('a'+i)))
+	const concurrentConnections = 64
+	leases := make([]*TunnelStreamLease, 0, concurrentConnections)
+	for i := 0; i < concurrentConnections; i++ {
+		lease, err := m.AcquireTunnel(slug, "s-"+strconv.Itoa(i))
 		if err != nil {
 			t.Fatalf("acquire %d: %v", i, err)
 		}
 		leases = append(leases, lease)
 	}
-	if _, err := m.AcquireTunnel(slug, "s-over"); err != ErrTunnelOverLimit {
-		t.Fatalf("over-limit acquire = %v, want ErrTunnelOverLimit", err)
-	}
-	if got := m.TunnelStateSnapshot("test-agent").GetTunnels()[0].GetActiveConnections(); got != maxTunnelConnections {
-		t.Fatalf("active connections = %d, want %d", got, maxTunnelConnections)
+	if got := m.TunnelStateSnapshot("test-agent").GetTunnels()[0].GetActiveConnections(); got != concurrentConnections {
+		t.Fatalf("active connections = %d, want %d", got, concurrentConnections)
 	}
 	for _, lease := range leases {
 		lease.Release()
@@ -281,6 +280,49 @@ func TestForgetAgentPurgesOfflineTunnelRecordsAndRoutes(t *testing.T) {
 	m.tunnels.mu.Unlock()
 	if relayRestored {
 		t.Fatal("late relay probe must not restore deleted agent state")
+	}
+}
+
+func TestSetRelayHealthChecksRegistrationWhileHoldingTunnelLock(t *testing.T) {
+	m := newTunnelTestManager(t)
+	m.registry.mu.Lock()
+	registryLocked := true
+	defer func() {
+		if registryLocked {
+			m.registry.mu.Unlock()
+		}
+	}()
+
+	relayUpdated := make(chan struct{})
+	go func() {
+		m.setRelayHealth("test-agent", &gatewayv2.TunnelHealth{Status: "late"})
+		close(relayUpdated)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for m.tunnels.mu.TryLock() {
+		m.tunnels.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("relay health update did not acquire the tunnel lock before checking registration")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	delete(m.registry.agents, "test-agent")
+	m.registry.mu.Unlock()
+	registryLocked = false
+
+	select {
+	case <-relayUpdated:
+	case <-time.After(time.Second):
+		t.Fatal("relay health update did not finish")
+	}
+
+	m.tunnels.mu.Lock()
+	_, relayRestored := m.tunnels.relays["test-agent"]
+	m.tunnels.mu.Unlock()
+	if relayRestored {
+		t.Fatal("relay health update restored deleted agent state")
 	}
 }
 

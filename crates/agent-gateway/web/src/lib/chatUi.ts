@@ -1,13 +1,22 @@
+import type { SharedChatEntry } from "@liveagent/ui/contracts/chatEntry";
+import { positiveTokenCount } from "@liveagent/ui/lib/chat/contextUsage";
 import { createUuid } from "@liveagent/ui/lib/shared/id";
-import type { Message, ToolCall, ToolResultMessage, Usage } from "@/lib/agentTypes";
-import type { HistoryMessageRef } from "@/lib/chat/conversationState";
-import { type HostedSearchBlock, normalizeHostedSearchBlock } from "@/lib/chat/hostedSearch";
-import { summarizeToolCall as summarizeDesktopToolCall, type UiRound } from "@/lib/chat/uiMessages";
+
+export { hashText } from "@liveagent/ui/lib/shared/hash";
+
+import {
+  type HostedSearchBlock,
+  normalizeHostedSearchBlock,
+} from "@liveagent/ui/lib/chat/hostedSearch";
 import {
   getUserMessageAttachments,
   getUserMessageDisplayText,
   type PendingUploadedFile,
-} from "@/lib/chat/uploadedFiles";
+} from "@liveagent/ui/lib/chat/uploadedFiles";
+import { hashText } from "@liveagent/ui/lib/shared/hash";
+import type { Message, ToolCall, ToolResultMessage, Usage } from "@/lib/agentTypes";
+import type { HistoryMessageRef } from "@/lib/chat/conversationState";
+import { summarizeToolCall as summarizeDesktopToolCall, type UiRound } from "@/lib/chat/uiMessages";
 
 import type { ChatCheckpointPayload, ChatEvent, ConversationSummary } from "./gatewayTypes";
 
@@ -19,16 +28,16 @@ export type GatewayTranscriptRound = UiRound & {
   thinkingOpen?: boolean;
 };
 
+type SharedGatewayChatEntry = SharedChatEntry<
+  ToolCall,
+  ToolResultMessage,
+  AssistantMeta,
+  { messageId?: string; messageRef?: HistoryMessageRef; timestamp?: number },
+  { timestamp?: number }
+>;
+
 export type ChatEntry =
-  | {
-      id: string;
-      kind: "user";
-      text: string;
-      attachments: PendingUploadedFile[];
-      messageId?: string;
-      messageRef?: HistoryMessageRef;
-      timestamp?: number;
-    }
+  | SharedGatewayChatEntry
   | {
       id: string;
       kind: "checkpoint";
@@ -40,40 +49,9 @@ export type ChatEntry =
         model: string;
         promptVersion?: string;
       };
+      contextUsageTokens?: number;
       timestamp?: number;
-    }
-  | {
-      id: string;
-      kind: "assistant";
-      text: string;
-      round?: number;
-      meta?: AssistantMeta;
-      timestamp?: number;
-    }
-  | { id: string; kind: "thinking"; text: string; round?: number }
-  | {
-      id: string;
-      kind: "tool_call";
-      round?: number;
-      toolCall: ToolCall;
-      summary?: string;
-      text: string;
-    }
-  | {
-      id: string;
-      kind: "tool_result";
-      round?: number;
-      toolResult: ToolResultMessage;
-      summary?: string;
-      text: string;
-    }
-  | {
-      id: string;
-      kind: "hosted_search";
-      round?: number;
-      hostedSearch: HostedSearchBlock;
-    }
-  | { id: string; kind: "error"; text: string };
+    };
 
 type StoredMessage = {
   role?: unknown;
@@ -91,6 +69,7 @@ type StoredMessage = {
   timestamp?: unknown;
   summaryMeta?: unknown;
   liveAgentHistoryRef?: unknown;
+  liveAgentContextUsage?: unknown;
 };
 
 function readMessageTimestamp(value: unknown): number | undefined {
@@ -137,15 +116,6 @@ function randomId(prefix: string) {
   return `${prefix}-${createUuid()}`;
 }
 
-export function hashText(value: string) {
-  let hash = 2166136261;
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-  return (hash >>> 0).toString(36);
-}
-
 export function hashValue(value: unknown) {
   return hashText(safeStringify(value));
 }
@@ -177,12 +147,6 @@ function readString(value: unknown) {
 
 function readNumber(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-function readRound(value: unknown) {
-  const round = readNumber(value);
-  if (typeof round !== "number") return undefined;
-  return round > 0 ? Math.floor(round) : undefined;
 }
 
 function normalizeLiveUploadedFile(value: unknown): PendingUploadedFile | null {
@@ -397,20 +361,34 @@ export function buildAssistantMeta(params: {
   api?: unknown;
   stopReason?: unknown;
   usage?: unknown;
+  contextUsageTokens?: unknown;
+  contextRelevant?: unknown;
 }) {
   const usage =
     params.usage && typeof params.usage === "object" ? (params.usage as Usage) : undefined;
 
-  const meta: AssistantMeta = {
-    provider: readString(params.provider) || undefined,
-    model: readString(params.model) || undefined,
-    api: readString(params.api) || undefined,
-    stopReason: readString(params.stopReason) || undefined,
-    usage,
-    usageTotalTokens: getUsageTotalTokens(params.usage),
-  };
+  // 增量构建：只 set 已定义的字段，绝不物化出 own-property undefined 键。后者在
+  // `{ ...target.meta, ...meta }` 合并时会用 undefined 覆盖此前事件送达的
+  // contextUsageTokens/usageTotalTokens 等锚点，导致用量环塌值（issue #359 缺陷 #2）。
+  const meta: AssistantMeta = {};
+  const provider = readString(params.provider) || undefined;
+  if (provider !== undefined) meta.provider = provider;
+  const model = readString(params.model) || undefined;
+  if (model !== undefined) meta.model = model;
+  const api = readString(params.api) || undefined;
+  if (api !== undefined) meta.api = api;
+  const stopReason = readString(params.stopReason) || undefined;
+  if (stopReason !== undefined) meta.stopReason = stopReason;
+  if (usage !== undefined) meta.usage = usage;
+  const usageTotalTokens = getUsageTotalTokens(params.usage);
+  if (usageTotalTokens !== undefined) meta.usageTotalTokens = usageTotalTokens;
+  const contextUsageTokens = positiveTokenCount(params.contextUsageTokens);
+  if (contextUsageTokens !== undefined) meta.contextUsageTokens = contextUsageTokens;
+  if (typeof params.contextRelevant === "boolean") {
+    meta.contextRelevant = params.contextRelevant;
+  }
 
-  return Object.values(meta).some((value) => value !== undefined) ? meta : undefined;
+  return Object.keys(meta).length > 0 ? meta : undefined;
 }
 
 export function normalizeCheckpointEntry(params: {
@@ -439,17 +417,16 @@ export function normalizeCheckpointEntry(params: {
     typeof params.checkpoint?.coveredMessageCount === "number"
       ? params.checkpoint.coveredMessageCount
       : summaryMetaRecord.coveredMessageCount;
-  const coveredMessageCount =
-    typeof coveredMessageCountCandidate === "number" &&
-    Number.isFinite(coveredMessageCountCandidate) &&
-    coveredMessageCountCandidate > 0
-      ? Math.floor(coveredMessageCountCandidate)
-      : 0;
+  const coveredMessageCount = positiveTokenCount(coveredMessageCountCandidate) ?? 0;
   const providerId = readString(generatedByRecord.providerId).trim() || "liveagent";
   const model = readString(generatedByRecord.model).trim() || "summary";
   const promptVersion = readString(generatedByRecord.promptVersion).trim() || undefined;
   const timestamp =
     readNumber(params.checkpoint?.timestamp) ?? readNumber(params.timestamp) ?? Date.now();
+  const summaryStatsRecord = asRecord(summaryMetaRecord.stats);
+  const contextUsageTokens = positiveTokenCount(
+    params.checkpoint?.contextUsageTokens ?? summaryStatsRecord.contextTokensAfter,
+  );
 
   return {
     id: `checkpoint-${summaryId}`,
@@ -462,6 +439,7 @@ export function normalizeCheckpointEntry(params: {
       model,
       promptVersion,
     },
+    contextUsageTokens,
     timestamp,
   };
 }
@@ -769,12 +747,20 @@ export function parseHistoryMessagesJson(raw: string): ChatEntry[] {
       const round = currentRound;
       const messageTimestamp = readMessageTimestamp(message.timestamp);
       const blocks = normalizeAssistantBlocks(message.content);
+      // 重建 meta 不带 contextRelevant 是有意为之（issue #359 缺陷 #8）：桌面端只对
+      // render-only 轮次（记忆抽取等）标 contextRelevant:false，而这类轮次仅经
+      // appendRenderOnlyMessagesToConversation 进入 UI transcript.items 供展示，
+      // 从不写入持久化的 segment.messages（见 chatHistory.ts writeConversationRuntime）。
+      // 因此历史 JSON 里根本不存在 render-only 轮次，也就没有可辨识标记可供重建；
+      // 用量环倒扫（deriveContextUsageTokens）不会误锚定在抽取请求的小 usage 上。
+      // 若将来 render-only 轮次开始入历史 JSON，须在此按其标记重建 meta.contextRelevant。
       const meta = buildAssistantMeta({
         provider: message.provider,
         model: message.model,
         api: message.api,
         stopReason: message.stopReason,
         usage: message.usage,
+        contextUsageTokens: asRecord(message.liveAgentContextUsage).totalTokens,
       });
       let textBuffer = "";
       let metaEmitted = false;

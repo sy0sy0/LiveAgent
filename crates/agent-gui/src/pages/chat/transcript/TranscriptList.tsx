@@ -1,6 +1,8 @@
-import { Markdown } from "@liveagent/ui/components/Markdown";
-import { useLocale } from "@liveagent/ui/i18n/index";
+import { ContextCheckpointCard } from "@liveagent/ui/components/chat/ContextCheckpointCard";
+import { normalizeLiveToolStatus } from "@liveagent/ui/lib/chat/assistantStatus";
 import type { ChatFileLink } from "@liveagent/ui/lib/chat/chatFileLinks";
+import type { PendingUploadedFile } from "@liveagent/ui/lib/chat/uploadedFiles";
+import { useCommitDetailsLoader } from "@liveagent/ui/lib/chat/useCommitDetailsLoader";
 import type { GitClient } from "@liveagent/ui/lib/git/types";
 import { createEntranceRegistry } from "@liveagent/ui/lib/transcript-virtual/entranceOnce";
 import { createLiveRowScrollAdjustPolicy } from "@liveagent/ui/lib/transcript-virtual/liveScrollAdjustPolicy";
@@ -8,6 +10,10 @@ import {
   buildTranscriptLayoutKey,
   createTranscriptMeasurementsLru,
 } from "@liveagent/ui/lib/transcript-virtual/measurementsLru";
+import {
+  type TranscriptNavigationHandle,
+  useTranscriptNavigation,
+} from "@liveagent/ui/lib/transcript-virtual/useTranscriptNavigation";
 import { type Range, useVirtualizer } from "@tanstack/react-virtual";
 import {
   type MutableRefObject,
@@ -21,20 +27,12 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import { CheckCircle2, ChevronDown } from "../../../components/icons";
 import type {
   HistoryMessageRef,
   RenderSummaryCard,
   RenderTimelineItem,
 } from "../../../lib/chat/conversation/conversationState";
 import type { LiveTranscriptStore } from "../../../lib/chat/conversation/liveTranscriptStore";
-import type { PendingUploadedFile } from "../../../lib/chat/messages/uploadedFiles";
-import {
-  buildGitHubCommitUrl,
-  type CommitDetailsLoader,
-  type CommitDisplayReference,
-} from "../../../lib/chat/messages/userMessageContent";
-import { normalizeLiveToolStatus } from "../../../lib/chat/page/chatPageHelpers";
 import { AssistantActivityRow } from "./AssistantActivityRow";
 import { AssistantRenderUnit } from "./AssistantRenderUnit";
 import { extractRenderUnitRange } from "./renderUnitRangeExtractor";
@@ -55,52 +53,20 @@ const transcriptMeasurementsLru = createTranscriptMeasurementsLru();
 
 const SummaryCard = memo(function SummaryCard(props: { item: RenderSummaryCard }) {
   const { item } = props;
-  const { locale } = useLocale();
-  const [expanded, setExpanded] = useState(false);
-  const isEn = locale === "en-US";
 
   return (
     <div className="flex justify-center px-2">
-      <div className="checkpoint-card w-full max-w-3xl overflow-hidden rounded-[14px] border border-black/[0.06] bg-white/[0.85] shadow-[0_1px_3px_rgba(0,0,0,0.04),0_4px_12px_rgba(0,0,0,0.03)] dark:border-white/[0.1] dark:bg-white/[0.06] dark:shadow-[0_1px_3px_rgba(0,0,0,0.2),0_4px_12px_rgba(0,0,0,0.15)]">
-        <button
-          type="button"
-          onClick={() => setExpanded((prev) => !prev)}
-          className="flex w-full items-center gap-3 px-3.5 py-3 text-left transition-colors duration-150 hover:bg-black/[0.02] dark:hover:bg-white/[0.03]"
-        >
-          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[8px] bg-black/[0.04] dark:bg-white/[0.08]">
-            <CheckCircle2 size={16} strokeWidth={1.8} className="text-muted-foreground" />
-          </div>
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2">
-              <span className="text-[calc(13px*var(--zone-font-scale,1))] font-medium text-foreground/90">
-                {isEn ? "Context Checkpoint" : "上下文检查点"}
-              </span>
-              <span className="inline-flex items-center rounded-md bg-black/[0.05] px-1.5 py-[1px] text-[calc(11px*var(--zone-font-scale,1))] font-normal tabular-nums text-muted-foreground dark:bg-white/[0.08]">
-                {item.coveredMessageCount} {isEn ? "msgs" : "条消息"}
-              </span>
-            </div>
-            <div className="mt-[2px] text-[calc(11px*var(--zone-font-scale,1))] text-muted-foreground/70">
-              {item.generatedBy.providerId} · {item.generatedBy.model}
-            </div>
-          </div>
-          <ChevronDown
-            className={`h-3.5 w-3.5 shrink-0 text-muted-foreground/50 transition-transform duration-200 ${expanded ? "rotate-0" : "-rotate-90"}`}
-          />
-        </button>
-        {expanded ? (
-          <div className="checkpoint-expand border-t border-black/[0.05] px-3.5 py-3 dark:border-white/[0.06]">
-            <Markdown content={item.content} className="font-chat text-sm" />
-          </div>
-        ) : null}
-      </div>
+      <ContextCheckpointCard
+        content={item.content}
+        coveredMessageCount={item.coveredMessageCount}
+        generatedBy={item.generatedBy}
+        className="max-w-3xl"
+      />
     </div>
   );
 });
 
-export type TranscriptNavHandle = {
-  /** 按行 key 跳转到对应消息（动态行高下会连帧重对准确保落位）。 */
-  scrollToRowKey: (rowKey: string) => void;
-};
+export type TranscriptNavHandle = TranscriptNavigationHandle;
 
 export type TranscriptListProps = {
   conversationId: string;
@@ -179,9 +145,12 @@ export const TranscriptList = memo(function TranscriptList(props: TranscriptList
     }),
   );
 
+  // 手动压缩空闲态只置 isCompactionRunning、不置 isSending，仍要显示「正在
+  // 压缩」live tail：把它并入可见性 gate（只影响 live tail 是否显示，不改动
+  // 其他 isSending 语义）。
   const { rows, liveStartIndex } = useMemo(
-    () => rowModel.build(historyItems, { ...liveState, isSending }),
-    [rowModel, historyItems, liveState, isSending],
+    () => rowModel.build(historyItems, { ...liveState, isSending, isCompactionRunning }),
+    [rowModel, historyItems, liveState, isSending, isCompactionRunning],
   );
 
   const rowsRef = useRef(rows);
@@ -202,7 +171,6 @@ export const TranscriptList = memo(function TranscriptList(props: TranscriptList
   );
 
   const [editingMessageKey, setEditingMessageKey] = useState<string | null>(null);
-  const commitDetailsCacheRef = useRef(new Map<string, CommitDisplayReference>());
 
   useEffect(() => {
     if (!editingMessageKey) {
@@ -216,41 +184,7 @@ export const TranscriptList = memo(function TranscriptList(props: TranscriptList
     }
   }, [editingMessageKey, historyItems]);
 
-  const loadCommitDetails = useCallback<CommitDetailsLoader>(
-    async (commit) => {
-      const workdir = workspaceRoot?.trim() ?? "";
-      const sha = commit.sha.trim();
-      if (!gitClient || !workdir || !sha) return null;
-      const cacheKey = `${workdir}\n${sha}`;
-      const cached = commitDetailsCacheRef.current.get(cacheKey);
-      if (cached) return cached;
-      const response = await gitClient.commitDetails(workdir, sha);
-      const details = response.commit;
-      const resolved: CommitDisplayReference = {
-        sha: details.sha,
-        shortSha: details.shortSha,
-        subject: details.subject,
-        body: details.body,
-        authorName: details.authorName,
-        authorEmail: details.authorEmail,
-        authorDate: details.authorDate,
-        fileCount: details.fileCount,
-        filesChanged: details.filesChanged,
-        insertions: details.insertions,
-        deletions: details.deletions,
-        stat: details.stat,
-        remoteName: details.remoteName,
-        remoteUrl: details.remoteUrl,
-        githubUrl:
-          commit.githubUrl ||
-          buildGitHubCommitUrl(details.remoteUrl || response.state.remoteUrl, details.sha) ||
-          undefined,
-      };
-      commitDetailsCacheRef.current.set(cacheKey, resolved);
-      return resolved;
-    },
-    [gitClient, workspaceRoot],
-  );
+  const loadCommitDetails = useCommitDetailsLoader(workspaceRoot, gitClient);
 
   const handleStartEdit = useCallback((key: string) => {
     setEditingMessageKey(key);
@@ -311,114 +245,20 @@ export const TranscriptList = memo(function TranscriptList(props: TranscriptList
   // 测量会不断修正总高度，连续若干帧重新对准，让滚动收敛在目标行顶部
   // （对准同一 index 是收敛操作，不会震荡）。收敛期间用户的滚轮/触摸/按键
   // 立即取消收敛；新跳转替换旧收敛；卸载时一并清理。
-  const cancelJumpSettleRef = useRef<() => void>(() => {});
-  useLayoutEffect(() => {
-    if (!navRef) return;
-    const handle: TranscriptNavHandle = {
-      scrollToRowKey: (rowKey) => {
-        cancelJumpSettleRef.current();
-        const alignToRow = () => {
-          const index = rowsRef.current.findIndex((row) => row.key === rowKey);
-          if (index < 0) return false;
-          virtualizer.scrollToIndex(index, { align: "start" });
-          return true;
-        };
-        if (!alignToRow()) return;
-        let rafId: number | null = null;
-        const stopSettle = () => {
-          if (rafId !== null) {
-            cancelAnimationFrame(rafId);
-            rafId = null;
-          }
-          scrollViewport?.removeEventListener("wheel", stopSettle);
-          scrollViewport?.removeEventListener("touchstart", stopSettle);
-          scrollViewport?.removeEventListener("keydown", stopSettle);
-          if (cancelJumpSettleRef.current === stopSettle) {
-            cancelJumpSettleRef.current = () => {};
-          }
-        };
-        cancelJumpSettleRef.current = stopSettle;
-        scrollViewport?.addEventListener("wheel", stopSettle, { passive: true });
-        scrollViewport?.addEventListener("touchstart", stopSettle, { passive: true });
-        scrollViewport?.addEventListener("keydown", stopSettle);
-        let remainingFrames = 6;
-        const settle = () => {
-          rafId = null;
-          if (!alignToRow()) {
-            stopSettle();
-            return;
-          }
-          remainingFrames -= 1;
-          if (remainingFrames > 0) {
-            rafId = requestAnimationFrame(settle);
-          } else {
-            stopSettle();
-          }
-        };
-        rafId = requestAnimationFrame(settle);
-      },
-    };
-    navRef.current = handle;
-    return () => {
-      cancelJumpSettleRef.current();
-      if (navRef.current === handle) {
-        navRef.current = null;
-      }
-    };
-  }, [navRef, virtualizer, scrollViewport]);
-
   // 楼层导航当前楼层：以「视口顶缘（+8px 容差）」所落在的用户消息为准——与
   // 跳转的 align:"start" 落位一致，跳转后高亮的必然是刚点的楼层；视口贴近
   // 内容底部时直接取最后一层（否则短对话拼满一屏时底部楼层永远无法成为当前
   // 层）。贴底判定用 scrollHeight（与 scrollTop/clientHeight 同一坐标系，
   // 含底部输入框保留区），避免与 getTotalSize 的列表局部坐标错位。
-  const lastAnchorRef = useRef<string | null>(null);
-  const onAnchorUserRowChangeRef = useRef(onAnchorUserRowChange);
-  onAnchorUserRowChangeRef.current = onAnchorUserRowChange;
-  const reportAnchorRef = useRef(() => {});
-  reportAnchorRef.current = () => {
-    const callback = onAnchorUserRowChangeRef.current;
-    if (!callback || !scrollViewport) return;
-    const rowList = rowsRef.current;
-    let anchorKey: string | null = null;
-    if (rowList.length > 0) {
-      const scrollTop = scrollViewport.scrollTop;
-      const viewportHeight = scrollViewport.clientHeight;
-      const nearBottom = scrollTop + viewportHeight >= scrollViewport.scrollHeight - 32;
-      let anchorIndex = -1;
-      if (nearBottom) {
-        anchorIndex = rowList.length - 1;
-      } else {
-        const anchorLine = scrollTop + 8;
-        const items = virtualizer.getVirtualItems();
-        for (const item of items) {
-          if (item.start > anchorLine) break;
-          anchorIndex = item.index;
-        }
-        if (anchorIndex === -1) anchorIndex = items[0]?.index ?? -1;
-      }
-      anchorKey = rowList[Math.min(anchorIndex, rowList.length - 1)]?.anchorUserKey ?? null;
-    }
-    if (anchorKey !== lastAnchorRef.current) {
-      lastAnchorRef.current = anchorKey;
-      callback(anchorKey);
-    }
-  };
-
-  useEffect(() => {
-    if (!scrollViewport) return;
-    const handler = () => reportAnchorRef.current();
-    handler();
-    scrollViewport.addEventListener("scroll", handler, { passive: true });
-    return () => scrollViewport.removeEventListener("scroll", handler);
-  }, [scrollViewport]);
-
-  // 行集合变化（消息追加、流式落定）后兜底重算一次；依赖 rows 而不是每次
-  // 渲染都跑，避免「上报 → 父级重渲染 → 再上报」的空转循环。
-  useEffect(() => {
-    rowsRef.current = rows;
-    reportAnchorRef.current();
-  }, [rows]);
+  useTranscriptNavigation({
+    items: rows,
+    getItemKey: (row) => row.key,
+    getAnchorKey: (rowList, anchorIndex) => rowList[anchorIndex]?.anchorUserKey ?? null,
+    virtualizer,
+    scrollViewport,
+    navRef,
+    onAnchorChange: onAnchorUserRowChange,
+  });
 
   // First paint of a conversation lands at the bottom before the user sees
   // anything: scrollToEnd re-targets as dynamic measurements land, replacing
@@ -435,15 +275,15 @@ export const TranscriptList = memo(function TranscriptList(props: TranscriptList
 
   // First-layout settle watch: the transcript stays hidden (parent-gated)
   // until the initial scroll-to-end and its estimate→measure corrections
-  // have converged — scroll offset and total size unchanged across two
-  // frames — then reveals in one shot. Streaming conversations and empty
-  // transcripts reveal immediately; a hard cap always reveals.
+  // have converged — scroll offset and total size unchanged across one frame
+  // — then reveals in one shot. The caller enables this only for large static
+  // transcripts, and a short hard cap keeps startup responsive.
   const hasRows = rows.length > 0;
   const settledRef = useRef(false);
   const onFirstLayoutSettledRef = useRef(onFirstLayoutSettled);
   onFirstLayoutSettledRef.current = onFirstLayoutSettled;
   useLayoutEffect(() => {
-    if (settledRef.current || scrollViewport === null) {
+    if (settledRef.current || scrollViewport === null || !onFirstLayoutSettled) {
       return;
     }
     const settle = () => {
@@ -466,14 +306,14 @@ export const TranscriptList = memo(function TranscriptList(props: TranscriptList
         totalSize === previousTotalSize && scrollTop === previousScrollTop ? stableFrames + 1 : 0;
       previousTotalSize = totalSize;
       previousScrollTop = scrollTop;
-      if (stableFrames >= 2 || performance.now() - startedAt > 800) {
+      if (stableFrames >= 1 || performance.now() - startedAt > 240) {
         settle();
         return;
       }
       frame = requestAnimationFrame(check);
     });
     return () => cancelAnimationFrame(frame);
-  }, [hasRows, isSending, scrollViewport, virtualizer]);
+  }, [hasRows, isSending, onFirstLayoutSettled, scrollViewport, virtualizer]);
 
   // Snapshot measured heights for the next open of this conversation.
   const saveMeasurementsRef = useRef(() => {});

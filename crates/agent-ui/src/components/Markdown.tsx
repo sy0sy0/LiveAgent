@@ -1,18 +1,5 @@
-import {
-  Check,
-  ChevronDown,
-  ChevronUp,
-  Copy,
-  ExternalLink,
-  X,
-} from "@liveagent/app/components/icons";
-import {
-  type ChatFileLink,
-  decodeChatFileLinkPayload,
-  encodeChatFileLink,
-  parseChatFileLink,
-} from "../lib/chat/chatFileLinks";
 import { openUrl } from "@liveagent/app/shims/tauriOpener";
+import { ChevronDown, ChevronUp, Copy, ExternalLink } from "@liveagent/ui/components/IconSet";
 import { useLocale } from "@liveagent/ui/i18n/index";
 import { cjk } from "@streamdown/cjk";
 import { code } from "@streamdown/code";
@@ -28,7 +15,6 @@ import {
   useMemo,
   useState,
 } from "react";
-import { createPortal } from "react-dom";
 import remarkBreaks from "remark-breaks";
 import {
   type Components,
@@ -40,12 +26,29 @@ import {
   type StreamdownTranslations,
 } from "streamdown";
 import {
+  type ChatFileLink,
+  decodeChatFileLinkPayload,
+  encodeChatFileLink,
+  parseChatFileLink,
+} from "../lib/chat/chatFileLinks";
+import {
   getCollapsedCodeBlockPreview,
   resolveCodeBlockRenderPolicy,
 } from "../lib/markdownCodeBlockPolicy";
 import { normalizeLatexDelimiters } from "../lib/normalizeLatexDelimiters";
 import { cn } from "../lib/shared/utils";
+import { MermaidFullscreenButton } from "./MarkdownMermaidFullscreen";
 import { Button } from "./ui/button";
+import { CopyButton } from "./ui/copy-button";
+import {
+  Dialog,
+  DialogActions,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "./ui/dialog";
 
 const CHAT_FILE_NODE_DATA_KEY = "liveagentChatFileLink";
 const LIVEAGENT_FILE_PROTOCOL = "liveagent-file:";
@@ -220,7 +223,9 @@ function createSanitizedRehypePlugins(options: {
       ...(options.preserveRelativeUrls ? [] : [defaultRehypePlugins.harden]),
     ] as StreamdownRehypePlugins;
   }
-  const schema = (sanitize[1] ?? {}) as { protocols?: Record<string, unknown[]> };
+  const schema = (sanitize[1] ?? {}) as {
+    protocols?: Record<string, unknown[]>;
+  };
   const srcProtocols = schema.protocols?.src;
   const hrefProtocols = schema.protocols?.href;
   const protocols = {
@@ -358,6 +363,7 @@ function MarkdownReadOnlyLink(props: MarkdownAnchorFallbackProps) {
 export const markdownReadOnlyComponents: Components = {
   ...markdownComponents,
   a: MarkdownReadOnlyLink,
+  pre: ReadOnlyCollapsibleCodePre,
 };
 
 function MarkdownExternalLink(props: MarkdownAnchorFallbackProps) {
@@ -400,16 +406,6 @@ export function MarkdownLink(props: MarkdownFileLinkProps) {
   return <MarkdownExternalLink {...props} />;
 }
 
-async function copyCodeBlockText(text: string) {
-  try {
-    await navigator.clipboard.writeText(text);
-    return true;
-  } catch (error) {
-    console.error("Failed to copy code block", error);
-    return false;
-  }
-}
-
 function getCodeTextFromChild(child: ReactElement<StreamdownCodeChildProps>) {
   const raw = child.props.children;
   if (typeof raw === "string") return raw;
@@ -432,32 +428,31 @@ function ensureCodeBlockLanguage(child: ReactElement<StreamdownCodeChildProps>) 
 
 function CodeBlockActions({ code }: { code: string }) {
   const { t } = useLocale();
-  const [copied, setCopied] = useState(false);
-
-  const handleCopy = async () => {
-    if (!(await copyCodeBlockText(code))) return;
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1600);
-  };
 
   return (
     <div className="pointer-events-none absolute right-0 top-0 z-20 flex h-8 items-center justify-end">
-      <div className="pointer-events-auto flex shrink-0 items-center gap-2 rounded-md bg-background/95 px-1.5 py-1">
-        <button
-          type="button"
-          aria-label={copied ? t("chat.markdown.copied") : t("chat.markdown.copyCode")}
-          title={copied ? t("chat.markdown.copied") : t("chat.markdown.copyCode")}
-          className="inline-flex h-6 w-6 items-center justify-center rounded-md p-1 text-muted-foreground transition-colors hover:bg-foreground/[0.04] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/35"
-          onClick={() => void handleCopy()}
-        >
-          {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-        </button>
+      <div className="pointer-events-auto flex shrink-0 items-center rounded-md bg-background/95 px-1.5 py-1">
+        <CopyButton
+          value={code}
+          label={t("chat.markdown.copyCode")}
+          copiedLabel={t("chat.markdown.copied")}
+          className="h-6 w-6 p-1 hover:bg-foreground/[0.04]"
+        />
       </div>
     </div>
   );
 }
 
-export function CollapsibleCodePre({ children }: MarkdownPreProps) {
+type CollapsibleCodePreProps = MarkdownPreProps & { allowMermaidFullscreen?: boolean };
+
+function ReadOnlyCollapsibleCodePre(props: MarkdownPreProps) {
+  return <CollapsibleCodePre {...props} allowMermaidFullscreen={false} />;
+}
+
+export function CollapsibleCodePre({
+  children,
+  allowMermaidFullscreen = true,
+}: CollapsibleCodePreProps) {
   const { t } = useLocale();
   const childElement = isValidElement<StreamdownCodeChildProps>(children)
     ? ensureCodeBlockLanguage(children)
@@ -466,6 +461,7 @@ export function CollapsibleCodePre({ children }: MarkdownPreProps) {
   const language = childElement ? getCodeLanguage(childElement.props.className) : "";
   const { lineCount, shouldCollapse } = resolveCodeBlockRenderPolicy(codeContent);
   const isMermaid = language === "mermaid" || language === "mmd";
+  const isRenderedMermaid = language === "mermaid";
   const isCollapsible = Boolean(childElement && !isMermaid && shouldCollapse);
   const [expanded, setExpanded] = useState(false);
 
@@ -475,6 +471,9 @@ export function CollapsibleCodePre({ children }: MarkdownPreProps) {
     const codeBlock = cloneElement(childElement, { "data-block": "true" });
     return (
       <div className="relative w-full">
+        {isRenderedMermaid && allowMermaidFullscreen ? (
+          <MermaidFullscreenButton chart={codeContent} className="absolute right-7 top-1.5 z-30" />
+        ) : null}
         {isMermaid ? null : <CodeBlockActions code={codeContent} />}
         {codeBlock}
       </div>
@@ -584,43 +583,27 @@ export function ExternalLinkModal({ isOpen, onClose, onConfirm, url }: LinkSafet
     }
   };
 
-  const modal = (
-    <div
-      className="external-link-modal-overlay fixed inset-0 z-[100] flex items-center justify-center px-4 py-6"
-      data-state="open"
-    >
-      <button
-        type="button"
-        className="absolute inset-0 cursor-default bg-black/25 backdrop-blur-[2px]"
-        onClick={onClose}
-        aria-label={streamdownTranslations.close}
-      />
-      <div
-        className="external-link-modal-panel relative w-full max-w-[28rem] overflow-hidden rounded-2xl border border-border/60 bg-background shadow-[0_20px_60px_-28px_rgba(0,0,0,0.45)]"
-        role="dialog"
-        aria-modal="true"
-        aria-label={streamdownTranslations.openExternalLink}
+  return (
+    <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent
+        className="max-w-md p-0"
+        closeLabel={streamdownTranslations.close}
+        showCloseButton
       >
-        <div className="flex items-start justify-between gap-4 px-5 pb-3 pt-5">
+        <DialogHeader className="border-b-0 pb-3">
           <div className="min-w-0 space-y-1.5">
             <div className="flex items-center gap-2 text-sm font-medium text-foreground">
               <ExternalLink className="size-4 text-muted-foreground" />
-              <span>{streamdownTranslations.openExternalLink}</span>
+              <DialogTitle className="text-sm">
+                {streamdownTranslations.openExternalLink}
+              </DialogTitle>
             </div>
-            <p className="text-xs leading-5 text-muted-foreground">
+            <DialogDescription className="text-xs leading-5">
               {streamdownTranslations.externalLinkWarning}
-            </p>
+            </DialogDescription>
           </div>
-          <button
-            type="button"
-            className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-            onClick={onClose}
-            aria-label={streamdownTranslations.close}
-          >
-            <X className="size-3.5" />
-          </button>
-        </div>
-        <div className="px-5 pb-5">
+        </DialogHeader>
+        <DialogBody className="overflow-visible pb-5 pt-0">
           <div className="flex min-h-10 items-center gap-2 rounded-xl bg-muted/55 px-3 py-2.5 text-muted-foreground">
             <ExternalLink className="size-3.5 shrink-0" />
             <p
@@ -630,7 +613,7 @@ export function ExternalLinkModal({ isOpen, onClose, onConfirm, url }: LinkSafet
               {url}
             </p>
           </div>
-          <div className="mt-4 flex items-center justify-end gap-2">
+          <DialogActions className="mt-4">
             <Button
               type="button"
               variant="ghost"
@@ -649,13 +632,11 @@ export function ExternalLinkModal({ isOpen, onClose, onConfirm, url }: LinkSafet
               <ExternalLink className="size-3.5" />
               <span>{streamdownTranslations.openLink}</span>
             </Button>
-          </div>
-        </div>
-      </div>
-    </div>
+          </DialogActions>
+        </DialogBody>
+      </DialogContent>
+    </Dialog>
   );
-
-  return createPortal(modal, document.body);
 }
 
 const MARKDOWN_EMBED_CLASSNAME = cn(
@@ -751,7 +732,12 @@ export const Markdown = memo(function Markdown(props: MarkdownProps) {
         shikiTheme={["github-light", "github-dark"] as const}
         controls={{
           code: false,
-          mermaid: { copy: !readOnly, download: false, fullscreen: !readOnly, panZoom: !readOnly },
+          mermaid: {
+            copy: !readOnly,
+            download: false,
+            fullscreen: false,
+            panZoom: !readOnly,
+          },
           table: false,
         }}
         translations={streamdownTranslations}

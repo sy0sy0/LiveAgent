@@ -191,6 +191,35 @@ impl GatewayController {
                 });
                 Ok(())
             }
+            Some(proto::gateway_envelope::Payload::TrajectoryFetch(request)) => {
+                let controller = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let result = match gateway_bridge::handle_trajectory_fetch(request).await {
+                        Ok(response) => {
+                            controller
+                                .send_agent_envelope(proto::AgentEnvelope {
+                                    request_id: request_id.clone(),
+                                    timestamp: now_unix_seconds(),
+                                    payload: Some(
+                                        proto::agent_envelope::Payload::TrajectoryFetchResp(
+                                            response,
+                                        ),
+                                    ),
+                                })
+                                .await
+                        }
+                        Err(error) => {
+                            controller
+                                .send_error_response(request_id.clone(), 500, error)
+                                .await
+                        }
+                    };
+                    if let Err(err) = result {
+                        eprintln!("gateway trajectory.fetch handler failed: {err}");
+                    }
+                });
+                Ok(())
+            }
             Some(proto::gateway_envelope::Payload::HistoryPrefix(request)) => {
                 let controller = Arc::clone(self);
                 tauri::async_runtime::spawn(async move {
@@ -594,7 +623,7 @@ impl GatewayController {
                                             proto::agent_envelope::Payload::SettingsUpdateResp(
                                                 proto::SettingsUpdateResponse {
                                                     accepted: false,
-                                                    message: conflict,
+                                                    message: conflict.gateway_message().to_string(),
                                                 },
                                             ),
                                         ),
@@ -676,6 +705,15 @@ impl GatewayController {
                                 return self.send_error_response(request_id, 500, error).await;
                             }
                         };
+                        let removed_project_ids = match removed_workspace_project_ids(
+                            &current_snapshot,
+                            &public_update,
+                        ) {
+                            Ok(project_ids) => project_ids,
+                            Err(error) => {
+                                return self.send_error_response(request_id, 400, error).await;
+                            }
+                        };
                         let merged_snapshot = match merge_settings_update_into_snapshot(
                             current_snapshot,
                             public_update,
@@ -685,6 +723,14 @@ impl GatewayController {
                                 return self.send_error_response(request_id, 400, error).await;
                             }
                         };
+                        if let Err(error) =
+                            crate::commands::root_grants::revoke_workspace_root_grants_for_projects(
+                                removed_project_ids,
+                            )
+                            .await
+                        {
+                            return self.send_error_response(request_id, 500, error).await;
+                        }
                         if let Err(error) = self.store_settings_snapshot(merged_snapshot) {
                             return self.send_error_response(request_id, 500, error).await;
                         }
@@ -762,6 +808,34 @@ impl GatewayController {
                         .await
                     }
                     Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::WorkspaceRootGrants(request)) => {
+                match gateway_bridge::handle_workspace_root_grants(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::WorkspaceRootGrantsResp(
+                                response,
+                            )),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 400, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::Checkpoint(request)) => {
+                match gateway_bridge::handle_checkpoint(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::CheckpointResp(response)),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 400, error).await,
                 }
             }
             Some(proto::gateway_envelope::Payload::FsListDirs(request)) => {
@@ -953,6 +1027,21 @@ impl GatewayController {
                         .await
                     }
                     Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::ImportDirectory(request)) => {
+                match gateway_bridge::handle_import_directory(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::ImportDirectoryResp(
+                                response,
+                            )),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 400, error).await,
                 }
             }
             Some(proto::gateway_envelope::Payload::UploadedImagePreview(request)) => {

@@ -1,29 +1,17 @@
-import { Tooltip } from "@base-ui/react";
-import {
-  ChevronDown,
-  ChevronUp,
-  Clock3,
-  Globe,
-  GlobeOff,
-  Lightbulb,
-  LightbulbOff,
-  Loader2,
-  Maximize2,
-  Minimize2,
-  Paperclip,
-  Play,
-  Send,
-  Sparkle,
-  Square,
-  SquarePen,
-  Trash2,
-} from "@liveagent/app/components/icons";
 import {
   type ChatRuntimeControls,
-  DEFAULT_CHAT_RUNTIME_CONTROLS,
+  type CommandSafetyMode,
+  type ExecutionMode,
+  isAgentExecutionMode,
+  type ProviderId,
   type ReasoningLevel,
+  type SelectedModel,
+  type SttProviderId,
 } from "@liveagent/app/lib/settings";
+import { CommandSafetyModeSelector } from "@liveagent/ui/components/chat/CommandSafetyModeSelector";
 import { ComposerAttachmentCard } from "@liveagent/ui/components/chat/ComposerAttachmentCard";
+import { ComposerModelControls } from "@liveagent/ui/components/chat/ComposerModelControls";
+import { ContextUsageRing } from "@liveagent/ui/components/chat/ContextUsageRing";
 import { getUploadedFileTypeIcon } from "@liveagent/ui/components/chat/fileTypeIcons";
 import {
   MentionComposer,
@@ -31,17 +19,28 @@ import {
   type MentionComposerSkill,
 } from "@liveagent/ui/components/chat/MentionComposer";
 import { GitBranchSelector } from "@liveagent/ui/components/git/GitBranchSelector";
-import { Button } from "@liveagent/ui/components/ui/button";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@liveagent/ui/components/ui/select";
+  ChevronDown,
+  ChevronUp,
+  Clock3,
+  Loader2,
+  Maximize2,
+  Mic,
+  Minimize2,
+  Paperclip,
+  Play,
+  Send,
+  Square,
+  SquarePen,
+  Trash2,
+} from "@liveagent/ui/components/IconSet";
+import { Button } from "@liveagent/ui/components/ui/button";
+import { LabelTooltip as RuntimeControlTooltip } from "@liveagent/ui/components/ui/label-tooltip";
 import { useLocale } from "@liveagent/ui/i18n/index";
 import type { GitClient } from "@liveagent/ui/lib/git/types";
+import type { SharedModelOption } from "@liveagent/ui/lib/models/modelOptions";
 import { cn } from "@liveagent/ui/lib/shared/utils";
+import type { SttTransport } from "@liveagent/ui/lib/stt/types";
 import type { WorkspaceActivityClient } from "@liveagent/ui/lib/workspace-activity/types";
 import {
   type MutableRefObject,
@@ -53,6 +52,7 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import {
   getUploadedImagePreviewCacheKey,
@@ -61,45 +61,7 @@ import {
   type UploadedImagePreviewLoader,
 } from "../../lib/chat/uploadedImagePreview";
 import type { PendingUploadedFile } from "../../lib/chat/uploadTypes";
-
-const REASONING_I18N_KEYS: Record<ReasoningLevel, string> = {
-  off: "settings.reasoning.off",
-  minimal: "settings.reasoning.minimal",
-  low: "settings.reasoning.low",
-  medium: "settings.reasoning.medium",
-  high: "settings.reasoning.high",
-  xhigh: "settings.reasoning.xhigh",
-  max: "settings.reasoning.max",
-};
-
-function isReasoningLevel(value: unknown): value is ReasoningLevel {
-  return typeof value === "string" && Object.hasOwn(REASONING_I18N_KEYS, value);
-}
-
-function RuntimeControlTooltip(props: { label: string; children: ReactNode }) {
-  return (
-    <Tooltip.Root>
-      <Tooltip.Trigger
-        delay={0}
-        closeOnClick
-        render={<span className="inline-flex shrink-0">{props.children}</span>}
-      />
-      <Tooltip.Portal>
-        <Tooltip.Positioner
-          side="top"
-          align="center"
-          sideOffset={6}
-          collisionPadding={8}
-          className="z-[9999]"
-        >
-          <Tooltip.Popup className="max-w-64 rounded-xl border border-border/60 bg-popover px-3 py-2 text-xs font-medium leading-4 text-popover-foreground shadow-lg outline-hidden data-[open]:animate-in data-[closed]:animate-out data-[closed]:fade-out-0 data-[open]:fade-in-0 data-[closed]:zoom-out-95 data-[open]:zoom-in-95">
-            {props.label}
-          </Tooltip.Popup>
-        </Tooltip.Positioner>
-      </Tooltip.Portal>
-    </Tooltip.Root>
-  );
-}
+import { useComposerStt } from "./useComposerStt";
 
 function useComposerUploadedImagePreview(
   file: PendingUploadedFile,
@@ -175,6 +137,8 @@ function PendingComposerAttachment(props: {
 
   return (
     <ComposerAttachmentCard
+      file={file}
+      workspaceRoot={workdir}
       fileName={file.fileName}
       pathTitle={file.relativePath}
       imageSrc={imageSrc}
@@ -211,6 +175,40 @@ const DEFAULT_QUEUE_SCROLLBAR_STATE: QueueScrollbarState = {
 const COMPOSER_EXPAND_ANIMATION_MS = 280;
 const COMPOSER_EXPAND_EASING = "cubic-bezier(0.32, 0.72, 0.22, 1)";
 
+/** 用量环实时读数订阅源（getContextUsageTokens 必须对同一底层状态返回稳定值）。 */
+export type ContextUsageTokensSource = {
+  subscribe: (listener: () => void) => () => void;
+  getContextUsageTokens: () => number | undefined;
+};
+
+const noopSubscribe = () => () => {};
+
+// 环的实时读数在独立小组件里订阅：流式期间每帧的读数变化只重渲染这枚
+// SVG 环，不触发 ChatComposerBar/整页回流。
+function ComposerContextUsageRing(props: {
+  source?: ContextUsageTokensSource;
+  totalTokens?: number;
+  contextWindow?: number;
+  disabled?: boolean;
+  onConfirm?: (() => void) | (() => Promise<unknown>);
+}) {
+  const { source, totalTokens, contextWindow, disabled, onConfirm } = props;
+  const readStatic = useCallback(() => totalTokens, [totalTokens]);
+  const liveTokens = useSyncExternalStore(
+    source?.subscribe ?? noopSubscribe,
+    source?.getContextUsageTokens ?? readStatic,
+    source?.getContextUsageTokens ?? readStatic,
+  );
+  return (
+    <ContextUsageRing
+      totalTokens={source ? liveTokens : totalTokens}
+      contextWindow={contextWindow}
+      disabled={disabled}
+      onConfirm={onConfirm}
+    />
+  );
+}
+
 function prefersReducedMotion() {
   return (
     typeof window.matchMedia === "function" &&
@@ -220,25 +218,64 @@ function prefersReducedMotion() {
 
 export type ChatComposerBarProps = {
   surface: "desktop" | "web";
+  conversationId: string;
   composerRef: MutableRefObject<MentionComposerHandle | null>;
   isSending: boolean;
   isUploadingFiles: boolean;
   isInputDisabled: boolean;
+  sttProvider?: SttProviderId | null;
+  sttProviderConfigured?: boolean;
+  sttTransport?: SttTransport;
+  /** 当前会话身份；切换会话时取消进行中的语音识别。 */
+  sttSessionKey?: string;
+  /** STT 失败（麦克风不可用、连接超时等）上报给宿主以 toast 形式提示。 */
+  onSttError?: (message: string) => void;
+  /**
+   * 只读视图（如轨迹页）挂起输入区：整体 display:none 但保持挂载，
+   * 半打的草稿与队列状态在切回聊天页时原样恢复。
+   */
+  hidden?: boolean;
   inputPlaceholder: string;
   workdir: string;
   enabledSkills: MentionComposerSkill[];
-  isAgentMode: boolean;
+  executionMode: ExecutionMode;
+  hasModels: boolean;
+  currentModelLabel: string;
+  modelOptions: SharedModelOption<ProviderId>[];
+  selectedValue?: string;
   chatRuntimeControls: ChatRuntimeControls;
+  /** 命令执行方式(ask/auto/sandbox/sandboxOffline);缺省不渲染选择器。 */
+  commandSafetyMode?: CommandSafetyMode;
+  onCommandSafetyModeChange?: (mode: CommandSafetyMode) => void;
   reasoningOptions: ReasoningLevel[];
   thinkingAlwaysOn: boolean;
   gitClient?: GitClient | null;
   gitWriteEnabled?: boolean;
   gitDisabledMessage?: string;
+  /** 当前会话上下文占用 token；与 contextWindow 齐备时显示用量环。 */
+  contextUsageTokens?: number;
+  /**
+   * 可选的用量环实时订阅源：流式期间读数每帧都在变，经此订阅只重渲染环
+   * 本身而不回流整页（GUI 用；WebUI 传静态 contextUsageTokens 即可）。
+   * 提供时优先于 contextUsageTokens。
+   */
+  contextUsageTokensSource?: ContextUsageTokensSource;
+  contextWindow?: number;
+  /** 用量环确认后触发手动压缩；缺省时环为纯展示。 */
+  onManualCompactConfirm?: (() => void) | (() => Promise<unknown>);
+  /** 压缩进行中/请求在途时禁点用量环。 */
+  manualCompactBlocked?: boolean;
   workspaceActivityClient?: WorkspaceActivityClient | null;
+  /** 创建 worktree 成功后，把后端返回的路径与仓库身份加入侧边栏。 */
+  onOpenWorktree?: (worktree: { path: string; repositoryPath: string; branch: string }) => void;
+  onWorktreeRemoved?: (worktree: { path: string; repositoryPath: string; branch: string }) => void;
   onSend: () => void;
   onStop: () => void;
   onPrepareChatRuntime?: () => void;
   onComposerBusyChange: (isBusy: boolean) => void;
+  onSelectModel: (selection: SelectedModel) => void;
+  onSelectExecutionMode: (mode: "text" | "tools") => void;
+  onOpenSettings: (section?: "providers", providerId?: string) => void;
   onChatRuntimeControlsChange: (patch: Partial<ChatRuntimeControls>) => void;
   onPickReadableFiles: () => void;
   onPasteFiles: (files: File[]) => void;
@@ -257,30 +294,55 @@ export type ChatComposerBarProps = {
   taskProgressBar?: ReactNode;
   /** 输入框上方的集中审批栏(待审批时由上层注入,渲染在队列面板之上)。 */
   approvalBar?: ReactNode;
+  /** 文件拖入命中输入框时显示的局部反馈层。 */
+  fileDropOverlay?: ReactNode;
 };
 
 export const ChatComposerBar = memo(function ChatComposerBar(props: ChatComposerBarProps) {
   const {
     surface,
+    conversationId,
     composerRef,
     isSending,
     isUploadingFiles,
     isInputDisabled,
+    sttProvider = null,
+    sttProviderConfigured,
+    sttTransport,
+    sttSessionKey,
+    onSttError,
+    hidden = false,
     inputPlaceholder,
     workdir,
     enabledSkills,
-    isAgentMode,
+    executionMode,
+    hasModels,
+    currentModelLabel,
+    modelOptions,
+    selectedValue,
     chatRuntimeControls,
+    commandSafetyMode,
+    onCommandSafetyModeChange,
     reasoningOptions,
     thinkingAlwaysOn,
     gitClient,
     gitWriteEnabled = true,
     gitDisabledMessage,
+    contextUsageTokens,
+    contextUsageTokensSource,
+    contextWindow,
+    onManualCompactConfirm,
+    manualCompactBlocked,
     workspaceActivityClient,
+    onOpenWorktree,
+    onWorktreeRemoved,
     onSend,
     onStop,
     onPrepareChatRuntime,
     onComposerBusyChange,
+    onSelectModel,
+    onSelectExecutionMode,
+    onOpenSettings,
     onChatRuntimeControlsChange,
     onPickReadableFiles,
     onPasteFiles,
@@ -296,9 +358,20 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: ChatComposer
     onHeightChange,
     taskProgressBar,
     approvalBar,
+    fileDropOverlay,
   } = props;
   const { t } = useLocale();
   const [composerIsEmpty, setComposerIsEmpty] = useState(true);
+  const stt = useComposerStt({
+    composerRef,
+    provider: sttProvider,
+    providerConfigured: sttProviderConfigured,
+    transport: sttTransport,
+    disabled: isInputDisabled,
+    sessionKey: sttSessionKey,
+    hidden,
+    onError: onSttError,
+  });
   const [isComposerExpanded, setIsComposerExpanded] = useState(false);
   const isComposerExpandedRef = useRef(false);
   const glassCardRef = useRef<HTMLDivElement | null>(null);
@@ -322,26 +395,18 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: ChatComposer
   const [queueScrollbar, setQueueScrollbar] = useState<QueueScrollbarState>(
     DEFAULT_QUEUE_SCROLLBAR_STATE,
   );
-  const uploadDisabled = isInputDisabled || isUploadingFiles || !isAgentMode || !workdir;
-  const controlsDisabled = isInputDisabled;
+  const isAgentMode = isAgentExecutionMode(executionMode);
+  const uploadDisabled =
+    isInputDisabled || stt.active || isUploadingFiles || !isAgentMode || !workdir;
+  const controlsDisabled = isInputDisabled || stt.active;
   const hasSendableDraft = !composerIsEmpty || pendingUploadedFiles.length > 0;
-  // 档位为空但恒开（deepseek-reasoner 型"恒开不可调"）也算支持思考——
-  // 亮灯但开关与档位均不可操作；两者皆无才是真不支持。
-  const thinkingSupported = reasoningOptions.length > 0 || thinkingAlwaysOn;
-  const sendDisabled = isInputDisabled || isUploadingFiles || !hasSendableDraft;
+  const sendDisabled = isInputDisabled || stt.active || isUploadingFiles || !hasSendableDraft;
   const canQueueDraftWhileSending = isSending && !sendDisabled;
   const primaryActionTitle = canQueueDraftWhileSending
     ? t("chat.queue.addToQueue")
     : isSending
       ? t("chat.stopGeneration")
       : t("chat.sendMessage");
-  // controls 已经过 normalizeChatRuntimeControlsForProvider 钳制；这里兜底
-  // 取表内最高档，绝不给 Select 喂表外值。
-  const selectedReasoning = reasoningOptions.includes(chatRuntimeControls.reasoning)
-    ? chatRuntimeControls.reasoning
-    : reasoningOptions.includes(DEFAULT_CHAT_RUNTIME_CONTROLS.reasoning)
-      ? DEFAULT_CHAT_RUNTIME_CONTROLS.reasoning
-      : (reasoningOptions[reasoningOptions.length - 1] ?? DEFAULT_CHAT_RUNTIME_CONTROLS.reasoning);
   const uploadTooltip = isUploadingFiles
     ? t("chat.upload.uploading")
     : !isAgentMode
@@ -349,10 +414,6 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: ChatComposer
       : !workdir
         ? t("chat.upload.requireWorkdir")
         : t("chat.upload.button");
-  const thinkingTooltip = !thinkingSupported
-    ? t("chat.runtime.thinkingUnavailable")
-    : t("chat.runtime.thinkingTooltip");
-  const webSearchTooltip = t("chat.runtime.webSearchTooltip");
   const toggleQueueTooltip = queueCollapsed ? t("chat.queue.expand") : t("chat.queue.collapse");
   const toggleComposerExpandTooltip = isComposerExpanded
     ? t("chat.composer.collapse")
@@ -559,29 +620,6 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: ChatComposer
   }, [updateQueueScrollbar]);
 
   useEffect(() => {
-    const reasoningNeedsReset =
-      !(reasoningOptions.length > 0 && reasoningOptions.includes(chatRuntimeControls.reasoning)) &&
-      !(
-        reasoningOptions.length === 0 &&
-        chatRuntimeControls.reasoning === DEFAULT_CHAT_RUNTIME_CONTROLS.reasoning
-      );
-    const thinkingNeedsEnable = thinkingAlwaysOn && !chatRuntimeControls.thinkingEnabled;
-    if (!reasoningNeedsReset && !thinkingNeedsEnable) {
-      return;
-    }
-    onChatRuntimeControlsChange({
-      ...(reasoningNeedsReset ? { reasoning: DEFAULT_CHAT_RUNTIME_CONTROLS.reasoning } : {}),
-      ...(thinkingNeedsEnable ? { thinkingEnabled: true } : {}),
-    });
-  }, [
-    chatRuntimeControls.reasoning,
-    chatRuntimeControls.thinkingEnabled,
-    onChatRuntimeControlsChange,
-    reasoningOptions,
-    thinkingAlwaysOn,
-  ]);
-
-  useEffect(() => {
     const composerLayer = composerLayerRef.current;
     if (!composerLayer) return;
 
@@ -664,6 +702,7 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: ChatComposer
           ? "pointer-events-none absolute inset-x-0 bottom-0 z-20 flex justify-center px-4 pb-4"
           : "gateway-composer-layer pointer-events-none absolute inset-x-0 bottom-0 z-20 flex justify-center",
         isComposerExpanded && (surface === "desktop" ? "top-14" : "top-0 pt-3"),
+        hidden && "hidden",
       )}
     >
       {surface === "desktop" ? (
@@ -827,6 +866,8 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: ChatComposer
         {/* biome-ignore lint/a11y/noStaticElementInteractions: Escape 捕获仅在展开态生效，焦点始终在内部 textbox 上，包装层不参与 Tab 序。 */}
         <div
           ref={glassCardRef}
+          data-file-upload-drop-zone=""
+          data-file-upload-conversation-id={conversationId}
           onKeyDown={
             isComposerExpanded
               ? (event) => {
@@ -842,7 +883,7 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: ChatComposer
             // 展开态切换 flex-grow 时会被一并动画，导致卡片先跳顶再长满的闪动。
             // 常驻 flex-col：FLIP 动画把卡片钳在中间高度时，flex-1 的编辑器
             // 区吸收多余空间，工具栏才能始终贴住卡片底边。
-            "composer-glass-card relative flex flex-col overflow-hidden rounded-[24px] border border-black/[0.055] bg-white/70 shadow-[0_12px_40px_-14px_rgba(15,23,42,0.22),0_2px_6px_-2px_rgba(15,23,42,0.08),inset_0_1px_0_rgba(255,255,255,0.74)] backdrop-blur-2xl backdrop-saturate-[165%] transition-[background-color,border-color,box-shadow] focus-within:border-black/[0.075] focus-within:bg-white/74 focus-within:shadow-[0_16px_46px_-14px_rgba(15,23,42,0.26),0_4px_12px_-4px_rgba(15,23,42,0.10),inset_0_1px_0_rgba(255,255,255,0.78)] dark:border-white/[0.10] dark:bg-white/[0.06] dark:shadow-[0_12px_40px_-14px_rgba(0,0,0,0.72),0_2px_6px_-2px_rgba(0,0,0,0.42),inset_0_1px_0_rgba(255,255,255,0.08)] dark:focus-within:border-white/[0.15] dark:focus-within:bg-white/[0.08]",
+            "composer-glass-card @container relative flex flex-col overflow-hidden rounded-3xl border border-black/[0.055] bg-white/70 shadow-[0_12px_40px_-14px_rgba(15,23,42,0.22),0_2px_6px_-2px_rgba(15,23,42,0.08),inset_0_1px_0_rgba(255,255,255,0.74)] backdrop-blur-2xl backdrop-saturate-[165%] transition-[background-color,border-color,box-shadow] focus-within:border-black/[0.075] focus-within:bg-white/74 focus-within:shadow-[0_16px_46px_-14px_rgba(15,23,42,0.26),0_4px_12px_-4px_rgba(15,23,42,0.10),inset_0_1px_0_rgba(255,255,255,0.78)] dark:border-white/[0.10] dark:bg-white/[0.06] dark:shadow-[0_12px_40px_-14px_rgba(0,0,0,0.72),0_2px_6px_-2px_rgba(0,0,0,0.42),inset_0_1px_0_rgba(255,255,255,0.08)] dark:focus-within:border-white/[0.15] dark:focus-within:bg-white/[0.08]",
             surface === "desktop" && "z-10",
             isComposerExpanded && "min-h-0 flex-1",
           )}
@@ -855,7 +896,7 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: ChatComposer
           {/* subtle inner gloss gradient */}
           <div
             aria-hidden
-            className="pointer-events-none absolute inset-0 rounded-[24px] bg-gradient-to-b from-white/18 to-transparent opacity-70 dark:from-white/[0.04] dark:opacity-100"
+            className="pointer-events-none absolute inset-0 rounded-3xl bg-gradient-to-b from-white/18 to-transparent opacity-70 dark:from-white/[0.04] dark:opacity-100"
           />
 
           {pendingUploadedFiles.length > 0 ? (
@@ -868,7 +909,7 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: ChatComposer
                   key={`${file.relativePath}-${file.absolutePath ?? file.fileName}`}
                   file={file}
                   workdir={workdir}
-                  disabled={isInputDisabled}
+                  disabled={controlsDisabled}
                   removeLabel={t("chat.upload.removeFile")}
                   previewLabel={t("chat.upload.previewImage")}
                   closePreviewLabel={t("chat.upload.closePreview")}
@@ -894,12 +935,30 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: ChatComposer
             )}
           </button>
 
+          {/* 用量环位于卡片右侧控制列的垂直中心，保持在展开与发送按钮之间。 */}
+          <div className="absolute right-3 top-1/2 z-20 -translate-y-1/2">
+            <ComposerContextUsageRing
+              source={contextUsageTokensSource}
+              totalTokens={contextUsageTokens}
+              contextWindow={contextWindow}
+              disabled={controlsDisabled || isSending || manualCompactBlocked}
+              onConfirm={onManualCompactConfirm}
+            />
+          </div>
+
           {/* 常驻 flex-1：动画把卡片钳在中间高度时由本区吸收伸缩，工具栏才能
               全程贴住卡片底边。min-h-0 只在展开态加——折叠态靠自动最小高度
-              (= 编辑器钳制高) 撑起卡片的固有高度，加了会塌缩。 */}
+              (= 编辑器钳制高) 撑起卡片的固有高度，加了会塌缩。
+
+              pr-12 让出右侧控制列：展开/用量环/发送都是 right-3 + w-8，占据卡片
+              右缘 44px 宽的竖直轨道。让位必须做在本容器上，**不能只给编辑器加
+              pr-8**——padding 不改变滚动条位置（滚动条恒贴 border box 右缘），
+              只挡文字不挡滚动条，溢出时那条 6px 轨会直接压在环与展开图标上。
+              收窄编辑器 border box 才能把滚动条一并推到轨道左侧；48px = 44 轨道
+              + 4px 间隙，文本可用宽度与原先 px-4 + 编辑器 pr-8 完全一致。 */}
           <div
             className={cn(
-              "relative flex flex-1 px-4",
+              "relative flex flex-1 pl-4 pr-12",
               pendingUploadedFiles.length > 0 ? "pt-1.5" : "pt-3.5",
               isComposerExpanded && "min-h-0",
             )}
@@ -913,11 +972,13 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: ChatComposer
               onPasteFiles={onPasteFiles}
               loadHistoryPrompts={loadHistoryPrompts}
               placeholder={inputPlaceholder}
-              disabled={isInputDisabled}
+              disabled={isInputDisabled || stt.active}
               workdir={workdir}
               enabledSkills={enabledSkills}
               className={cn(
-                "px-0 py-0 pr-8",
+                // 右让位由外层容器 pr-12 统一承担（见上），此处不再补 pr——
+                // 编辑器自身的右内距只会把文字推开、留下滚动条压在控制列上。
+                "px-0 py-0",
                 isComposerExpanded &&
                   (surface === "desktop" ? "h-full max-h-none" : "h-full! max-h-none!"),
               )}
@@ -964,130 +1025,58 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: ChatComposer
                 </button>
               </RuntimeControlTooltip>
 
-              <RuntimeControlTooltip label={webSearchTooltip}>
-                <button
-                  type="button"
-                  disabled={controlsDisabled}
-                  onClick={() =>
-                    onChatRuntimeControlsChange({
-                      nativeWebSearchEnabled: !chatRuntimeControls.nativeWebSearchEnabled,
-                    })
-                  }
-                  aria-label={
-                    chatRuntimeControls.nativeWebSearchEnabled
-                      ? t("chat.runtime.webSearchOn")
-                      : t("chat.runtime.webSearchOff")
-                  }
-                  className={cn(
-                    "composer-toolbar-action inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full outline-hidden transition-colors hover:bg-muted/60 focus-visible:bg-muted/60",
-                    "disabled:pointer-events-none disabled:opacity-40",
-                    chatRuntimeControls.nativeWebSearchEnabled
-                      ? "text-emerald-600 hover:text-emerald-700 dark:text-emerald-300 dark:hover:text-emerald-200"
-                      : "text-muted-foreground hover:text-foreground dark:hover:text-white",
-                  )}
-                >
-                  {chatRuntimeControls.nativeWebSearchEnabled ? (
-                    <Globe className="h-4 w-4" />
-                  ) : (
-                    <GlobeOff className="h-4 w-4" />
-                  )}
-                </button>
-              </RuntimeControlTooltip>
-
-              <RuntimeControlTooltip label={thinkingTooltip}>
-                <button
-                  type="button"
-                  disabled={controlsDisabled || !thinkingSupported || thinkingAlwaysOn}
-                  onClick={() =>
-                    onChatRuntimeControlsChange({
-                      thinkingEnabled: !chatRuntimeControls.thinkingEnabled,
-                    })
-                  }
-                  aria-label={
-                    !thinkingSupported
-                      ? t("chat.runtime.thinkingUnavailable")
-                      : chatRuntimeControls.thinkingEnabled
-                        ? t("chat.runtime.thinkingOn")
-                        : t("chat.runtime.thinkingOff")
-                  }
-                  className={cn(
-                    "composer-toolbar-action inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full outline-hidden transition-colors hover:bg-muted/60 focus-visible:bg-muted/60",
-                    "disabled:pointer-events-none disabled:opacity-40",
-                    chatRuntimeControls.thinkingEnabled && thinkingSupported
-                      ? "text-amber-600 hover:text-amber-700 dark:text-amber-300 dark:hover:text-amber-200"
-                      : "text-muted-foreground hover:text-foreground dark:hover:text-white",
-                  )}
-                >
-                  {chatRuntimeControls.thinkingEnabled && thinkingSupported ? (
-                    <Lightbulb className="h-4 w-4" />
-                  ) : (
-                    <LightbulbOff className="h-4 w-4" />
-                  )}
-                </button>
-              </RuntimeControlTooltip>
-
-              {reasoningOptions.length > 1 ? (
-                <div
-                  aria-hidden={!chatRuntimeControls.thinkingEnabled}
-                  className={cn(
-                    "shrink-0 overflow-hidden transition-[max-width,margin-left,opacity] duration-200 ease-out",
-                    chatRuntimeControls.thinkingEnabled
-                      ? "ml-0 max-w-40 opacity-100"
-                      : "pointer-events-none -ml-1 max-w-0 opacity-0",
-                  )}
-                >
-                  <Select
-                    value={selectedReasoning}
-                    onValueChange={(value) =>
-                      onChatRuntimeControlsChange({ reasoning: value as ReasoningLevel })
-                    }
-                    disabled={controlsDisabled || !chatRuntimeControls.thinkingEnabled}
+              {stt.available ? (
+                <RuntimeControlTooltip label={stt.active ? "停止语音输入" : "开始语音输入"}>
+                  <button
+                    type="button"
+                    disabled={isInputDisabled}
+                    onClick={stt.toggle}
+                    aria-label={stt.active ? "停止语音输入" : "开始语音输入"}
+                    aria-pressed={stt.active}
+                    className={cn(
+                      "composer-toolbar-action inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full outline-hidden transition-colors hover:bg-muted/60 focus-visible:bg-muted/60",
+                      "disabled:pointer-events-none disabled:opacity-40",
+                      stt.active
+                        ? "bg-red-500/10 text-red-600"
+                        : "text-muted-foreground hover:text-foreground",
+                    )}
                   >
-                    <SelectTrigger
-                      className={cn(
-                        "composer-reasoning-trigger group/reasoning h-8 w-auto shrink-0 gap-0.5 rounded-full border-0 bg-violet-50/55 pl-2 pr-1.5 text-xs font-medium text-foreground shadow-none outline-hidden transition-all duration-200 ease-out hover:bg-violet-50/80 disabled:opacity-45 dark:bg-violet-400/[0.07] dark:text-foreground dark:hover:bg-violet-400/[0.13]",
-                        surface === "desktop"
-                          ? "[&_svg:last-child]:h-3 [&_svg:last-child]:w-3 [&_svg:last-child]:opacity-50 [&_svg:last-child]:transition-transform [&_svg:last-child]:duration-200 [&[data-popup-open]_svg:last-child]:rotate-180"
-                          : "[&>svg:last-child]:h-3 [&>svg:last-child]:w-3 [&>svg:last-child]:opacity-50 [&>svg:last-child]:transition-transform [&>svg:last-child]:duration-200 [&[data-state=open]>svg:last-child]:rotate-180",
-                      )}
-                      aria-label={t("chat.runtime.reasoning")}
-                    >
-                      <span className="flex min-w-0 items-center gap-1">
-                        <Sparkle className="h-3.5 w-3.5 shrink-0 text-violet-500 transition-colors dark:text-violet-400" />
-                        <SelectValue>
-                          {(value) =>
-                            t(
-                              REASONING_I18N_KEYS[
-                                isReasoningLevel(value) ? value : selectedReasoning
-                              ],
-                            )
-                          }
-                        </SelectValue>
-                      </span>
-                    </SelectTrigger>
-                    <SelectContent className="sidebar-context-menu min-w-40 rounded-xl border-0">
-                      {reasoningOptions.map((value) => (
-                        <SelectItem
-                          key={value}
-                          value={value}
-                          className={cn(
-                            "mb-0.5 h-[30px] rounded-md py-0 text-[calc(14px*var(--zone-font-scale,1))] font-normal leading-5 transition-none last:mb-0",
-                            surface === "desktop"
-                              ? "data-[highlighted]:bg-foreground/[0.05] data-[highlighted]:text-foreground"
-                              : "focus:bg-foreground/[0.05] focus:text-foreground",
-                            value === selectedReasoning &&
-                              (surface === "desktop"
-                                ? "bg-foreground/[0.07] data-[highlighted]:bg-foreground/[0.09]"
-                                : "bg-foreground/[0.07] focus:bg-foreground/[0.09]"),
-                          )}
-                        >
-                          {t(REASONING_I18N_KEYS[value])}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
+                    {stt.state === "requesting-permission" ||
+                    stt.state === "buffering" ||
+                    stt.state === "stopping" ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : stt.active ? (
+                      <Square className="h-3.5 w-3.5 fill-current" />
+                    ) : (
+                      <Mic className="h-4 w-4" />
+                    )}
+                  </button>
+                </RuntimeControlTooltip>
               ) : null}
+
+              {isAgentMode && commandSafetyMode && onCommandSafetyModeChange ? (
+                <CommandSafetyModeSelector
+                  value={commandSafetyMode}
+                  disabled={controlsDisabled}
+                  onChange={onCommandSafetyModeChange}
+                />
+              ) : null}
+
+              <ComposerModelControls
+                executionMode={executionMode}
+                hasModels={hasModels}
+                currentModelLabel={currentModelLabel}
+                modelOptions={modelOptions}
+                selectedValue={selectedValue}
+                chatRuntimeControls={chatRuntimeControls}
+                reasoningOptions={reasoningOptions}
+                thinkingAlwaysOn={thinkingAlwaysOn}
+                disabled={controlsDisabled}
+                onSelectModel={onSelectModel}
+                onSelectExecutionMode={onSelectExecutionMode}
+                onOpenSettings={onOpenSettings}
+                onChatRuntimeControlsChange={onChatRuntimeControlsChange}
+              />
 
               <GitBranchSelector
                 workdir={workdir}
@@ -1096,6 +1085,8 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: ChatComposer
                 disabled={controlsDisabled}
                 canWrite={gitWriteEnabled}
                 disabledMessage={gitDisabledMessage}
+                onOpenWorktree={onOpenWorktree}
+                onWorktreeRemoved={onWorktreeRemoved}
               />
             </div>
 
@@ -1151,6 +1142,7 @@ export const ChatComposerBar = memo(function ChatComposerBar(props: ChatComposer
               </Button>
             </div>
           </div>
+          {fileDropOverlay}
         </div>
       </div>
     </div>

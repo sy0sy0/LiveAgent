@@ -1,9 +1,9 @@
+import { Maximize2, Minimize2, Minus, X } from "@liveagent/ui/components/IconSet";
 import { useLocale } from "@liveagent/ui/i18n/index";
 import { cn } from "@liveagent/ui/lib/shared/utils";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { type MouseEvent, useCallback, useEffect, useRef, useState } from "react";
 import iconSimpleUrl from "../../src-tauri/icons/icon-simple.png";
-import { Maximize2, Minimize2, Minus, X } from "./icons";
 
 type TauriRuntimeWindow = Window & {
   __TAURI__?: unknown;
@@ -186,7 +186,7 @@ export function WindowsTitleBar() {
         <img
           src={iconSimpleUrl}
           alt=""
-          className="h-[15px] w-[15px] shrink-0 rounded-[3.5px]"
+          className="h-[15px] w-[15px] shrink-0 rounded-xs"
           draggable={false}
         />
         <span className="truncate text-[12px] font-medium leading-[1.45] tracking-[0.01em] text-foreground/80">

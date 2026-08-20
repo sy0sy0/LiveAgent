@@ -106,6 +106,14 @@ async function replayCancelledHistoryScenario(params) {
 }
 
 let runAssistantWithToolsScenario = replayCancelledHistoryScenario;
+let taskListRuntimeContextScenario = "";
+let memoryExtractionRequestScenario = async () => ({
+  ok: true,
+  acceptedCount: 0,
+  rejectedCount: 0,
+  writtenSlugs: [],
+  emittedMessages: [],
+});
 
 const loader = createTsModuleLoader({
   mocks: {
@@ -135,6 +143,9 @@ const loader = createTsModuleLoader({
     [memoryExtractionPath]: {
       memoryExtraction: {
         noteTurnBoundary() {},
+        requestExtraction(params) {
+          return memoryExtractionRequestScenario(params);
+        },
       },
     },
     [fileToolStatePath]: {
@@ -144,7 +155,7 @@ const loader = createTsModuleLoader({
     },
     [taskToolsPath]: {
       formatTaskListRuntimeContext() {
-        return "";
+        return taskListRuntimeContextScenario;
       },
     },
   },
@@ -154,19 +165,360 @@ const { runAgentConversationTurn } = loader.loadModule(
   "src/pages/chat/turns/runAgentConversationTurn.ts",
 );
 const conversationState = loader.loadModule("src/lib/chat/conversation/conversationState.ts");
+const { composeTrajectorySystemPrompt } = loader.loadModule(
+  "@liveagent/ui/lib/trajectory/sections.ts",
+);
 
 function noOp() {}
 
 function createHookLifecycle() {
   return {
     startAgent: noOp,
+    endAgent: noOp,
     startTurn: noOp,
+    endTurn: noOp,
     ensureMessageEnded: noOp,
     assistantMessageCompleted: noOp,
     toolExecutionStarted: noOp,
     toolResultReceived: noOp,
   };
 }
+
+function createCompletedAgentDevTurnParams({
+  state,
+  applyConversationState = noOp,
+  persistConversationWithHistorySync,
+  gatewayTokens = [],
+  extra = {},
+}) {
+  const userStop = new AbortController();
+  return {
+    providerId: "codex",
+    model: "gpt-5",
+    runtime: {},
+    runtimeModel: {
+      provider: "codex",
+      api: "openai-responses",
+      id: "gpt-5",
+    },
+    selectedModel: { customProviderId: "codex", model: "gpt-5" },
+    effectiveWorkdir: "C:/workspace",
+    effectiveSkillsEnabled: false,
+    showSilentMemoryExtraction: true,
+    agentTemplates: [],
+    getMcpSettings: () => ({ servers: [], selected: [] }),
+    sessionId: "session-1",
+    taskStateStore: {
+      runId: "run-1",
+      getState: () => undefined,
+      async commitState() {},
+    },
+    conversationId: "conversation-agent-dev",
+    fallbackTitle: "title",
+    createdAt: 1,
+    titlePromise: null,
+    transcriptStore: {},
+    gatewayBridgeEvents: {
+      hasForwardedText: () => false,
+      queueToken(text, meta) {
+        gatewayTokens.push({ text, meta });
+      },
+      queueEvent: noOp,
+      queueToolStatus: noOp,
+    },
+    hookLifecycle: createHookLifecycle(),
+    conversationDebugLogger: { enabled: false, logResult: noOp },
+    getNextConversationState: () => state,
+    applyConversationState,
+    buildPreparedContext: (currentState) => ({
+      systemPrompt: "",
+      messages: currentState.segments.flatMap((segment) => segment.messages),
+    }),
+    compaction: {
+      async maybeCompactPreSend() {},
+      beginRequest: noOp,
+      observeContextMessages: () => 0,
+      shouldProtectMidStream: () => false,
+      async compactDuringRun() {
+        return { context: null, shouldDisableProtection: false };
+      },
+    },
+    cancellation: {
+      userStop,
+      deriveScope() {
+        return { controller: new AbortController(), release: noOp };
+      },
+    },
+    resetLiveTranscript: noOp,
+    settleLiveTranscript: noOp,
+    batchLiveRoundsUpdate: noOp,
+    updateToolStatus: noOp,
+    updateRetryAttempts: noOp,
+    updatePersistableAgentProgress: noOp,
+    commitVisibleAbortedConversation: () => false,
+    freezeGatewayFinalProjection: noOp,
+    persistConversationWithHistorySync,
+    ...extra,
+  };
+}
+
+function trajectoryRecorderSpy(calls) {
+  return {
+    beginTurn: (info) => calls.push(["beginTurn", info]),
+    noteContext: (info) => calls.push(["noteContext", info]),
+    captureHeader: (input) => {
+      calls.push(["captureHeader", input]);
+      return "header-1";
+    },
+    stepStart: (step, headerId) => calls.push(["stepStart", { step, headerId }]),
+    firstToken: (step) => calls.push(["firstToken", step]),
+    stepEnd: (step, info) => calls.push(["stepEnd", { step, info }]),
+    noteRetry: noOp,
+    toolStart: noOp,
+    toolEnd: noOp,
+    compactionStart: noOp,
+    compactionEnd: noOp,
+    endTurn: noOp,
+    flush: async () => {},
+    dispose: async () => {},
+    discard: noOp,
+  };
+}
+
+test("trajectory captures the exact runtime prompt, tool-first TTFT, and failover metadata", async () => {
+  const calls = [];
+  const state = conversationState.createConversationStateFromContext({
+    systemPrompt: "BASE",
+    messages: [],
+  });
+  state.meta.taskList = { runId: "run-1", items: [] };
+  taskListRuntimeContextScenario = " TASKS ";
+  const actualAssistant = {
+    role: "assistant",
+    provider: "deepseek",
+    api: "openai-completions",
+    model: "deepseek-reasoner",
+    content: [{ type: "text", text: "done" }],
+    stopReason: "stop",
+    timestamp: 2,
+  };
+  const toolCall = {
+    type: "toolCall",
+    id: "call-tool-first",
+    name: "Read",
+    arguments: { path: "README.md" },
+  };
+  runAssistantWithToolsScenario = async (params) => {
+    const toolsSuffix = "TOOL RULES";
+    params.onRequestStart?.({
+      round: 1,
+      context: {
+        ...params.context,
+        systemPrompt: `${params.context.systemPrompt}\n\n${toolsSuffix}`,
+        tools: [],
+      },
+      toolsSuffix,
+    });
+    params.onTurnStart?.(1);
+    params.onToolCall?.(toolCall, 1);
+    params.onAssistantMessage?.(actualAssistant, 1);
+    return {
+      assistant: actualAssistant,
+      messages: [actualAssistant],
+      emittedMessages: [actualAssistant],
+    };
+  };
+
+  try {
+    await runAgentConversationTurn(
+      createCompletedAgentDevTurnParams({
+        state,
+        persistConversationWithHistorySync: async () => true,
+        extra: {
+          trajectory: trajectoryRecorderSpy(calls),
+          trajectoryTurn: 7,
+          trajectoryMessageId: "user-7",
+          readTrajectorySlots: () => ({ base: "BASE", agent: "AGENT" }),
+          buildPreparedContext: () => ({
+            systemPrompt: "BASE\n\nAGENT",
+            messages: [],
+          }),
+        },
+      }),
+    );
+  } finally {
+    runAssistantWithToolsScenario = replayCancelledHistoryScenario;
+    taskListRuntimeContextScenario = "";
+  }
+
+  const contextCall = calls.find(([kind]) => kind === "noteContext");
+  assert.deepEqual(contextCall, ["noteContext", { source: "task-list", text: "TASKS" }]);
+  const header = calls.find(([kind]) => kind === "captureHeader")[1];
+  assert.equal(header.runtime, "TASKS");
+  assert.equal(
+    composeTrajectorySystemPrompt(header),
+    "BASE\n\nAGENT\n\nTASKS\n\nTOOL RULES",
+  );
+  const firstTokenAt = calls.findIndex(([kind]) => kind === "firstToken");
+  const stepEndAt = calls.findIndex(([kind]) => kind === "stepEnd");
+  assert.ok(firstTokenAt >= 0 && firstTokenAt < stepEndAt);
+  const stepEnd = calls[stepEndAt][1].info;
+  assert.equal(stepEnd.provider, "deepseek");
+  assert.equal(stepEnd.model, "deepseek-reasoner");
+  assert.equal(stepEnd.api, "openai-completions");
+});
+
+test("agent dev skips memory extraction when final history persistence fails", async () => {
+  const finalAssistant = {
+    ...abortedAssistant,
+    content: [{ type: "text", text: "durable answer" }],
+    stopReason: "stop",
+  };
+  runAssistantWithToolsScenario = async (params) => {
+    params.onTurnStart?.(1);
+    params.onAssistantMessage?.(finalAssistant, 1);
+    return {
+      assistant: finalAssistant,
+      messages: [finalAssistant],
+      emittedMessages: [finalAssistant],
+    };
+  };
+
+  try {
+    for (const failure of ["false", "throw"]) {
+      const state = conversationState.createConversationStateFromContext({
+        systemPrompt: "",
+        messages: [],
+      });
+      const order = [];
+      memoryExtractionRequestScenario = async () => {
+        order.push("memory-extraction");
+        return {
+          ok: true,
+          acceptedCount: 0,
+          rejectedCount: 0,
+          writtenSlugs: [],
+          emittedMessages: [],
+        };
+      };
+      const run = runAgentConversationTurn(
+        createCompletedAgentDevTurnParams({
+          state,
+          async persistConversationWithHistorySync() {
+            order.push("history-failed");
+            if (failure === "throw") {
+              throw new Error("history unavailable");
+            }
+            return false;
+          },
+        }),
+      );
+
+      if (failure === "throw") {
+        await assert.rejects(run, /history unavailable/);
+      } else {
+        await run;
+      }
+      assert.deepEqual(order, ["history-failed"]);
+    }
+  } finally {
+    runAssistantWithToolsScenario = replayCancelledHistoryScenario;
+    memoryExtractionRequestScenario = async () => ({
+      ok: true,
+      acceptedCount: 0,
+      rejectedCount: 0,
+      writtenSlugs: [],
+      emittedMessages: [],
+    });
+  }
+});
+
+test("agent dev persists the answer before memory extraction and its visible status", async () => {
+  const finalAssistant = {
+    ...abortedAssistant,
+    content: [{ type: "text", text: "durable answer" }],
+    stopReason: "stop",
+  };
+  const extractionAssistant = {
+    ...finalAssistant,
+    provider: "liveagent",
+    api: "liveagent-memory",
+    model: "gpt-5",
+    content: [{ type: "text", text: "Memory updated" }],
+    timestamp: 5,
+  };
+  const state = conversationState.createConversationStateFromContext({
+    systemPrompt: "",
+    messages: [],
+  });
+  const order = [];
+  const persistedStates = [];
+  const appliedStates = [];
+  runAssistantWithToolsScenario = async (params) => {
+    params.onTurnStart?.(1);
+    params.onAssistantMessage?.(finalAssistant, 1);
+    return {
+      assistant: finalAssistant,
+      messages: [finalAssistant],
+      emittedMessages: [finalAssistant],
+    };
+  };
+  memoryExtractionRequestScenario = async (params) => {
+    order.push("memory-extraction");
+    params.visibleEvents?.onTurnStart?.(2);
+    params.visibleEvents?.onTextDelta?.("Memory updated", 2);
+    params.visibleEvents?.onAssistantMessage?.(extractionAssistant, 2);
+    return {
+      ok: true,
+      acceptedCount: 1,
+      rejectedCount: 0,
+      writtenSlugs: ["user-preference"],
+      emittedMessages: [extractionAssistant],
+    };
+  };
+
+  try {
+    await runAgentConversationTurn(
+      createCompletedAgentDevTurnParams({
+        state,
+        applyConversationState(nextState) {
+          appliedStates.push(nextState);
+        },
+        async persistConversationWithHistorySync(params) {
+          order.push(`history-${persistedStates.length + 1}`);
+          persistedStates.push(params.state);
+          return true;
+        },
+      }),
+    );
+  } finally {
+    runAssistantWithToolsScenario = replayCancelledHistoryScenario;
+    memoryExtractionRequestScenario = async () => ({
+      ok: true,
+      acceptedCount: 0,
+      rejectedCount: 0,
+      writtenSlugs: [],
+      emittedMessages: [],
+    });
+  }
+
+  assert.deepEqual(order, ["history-1", "memory-extraction", "history-2"]);
+  assert.equal(persistedStates.length, 2);
+  assert.notEqual(persistedStates[0], persistedStates[1]);
+  assert.equal(
+    persistedStates[0].transcript.items.at(-1).rounds.some(
+      (round) => round.meta?.contextRelevant === false,
+    ),
+    false,
+  );
+  assert.equal(
+    persistedStates[1].transcript.items.at(-1).rounds.some(
+      (round) => round.meta?.contextRelevant === false,
+    ),
+    true,
+  );
+  assert.equal(appliedStates.at(-1), persistedStates[1]);
+});
 
 test("agent turn preserves suppressed parent Agent trace for cancellation persistence", async () => {
   let liveRounds = [];
@@ -211,6 +563,7 @@ test("agent turn preserves suppressed parent Agent trace for cancellation persis
     compaction: {
       async maybeCompactPreSend() {},
       beginRequest: noOp,
+      observeContextMessages: () => 0,
       shouldProtectMidStream: () => false,
       async compactDuringRun() {
         return { context: null, shouldDisableProtection: false };
@@ -382,6 +735,7 @@ test("AskUserQuestion becomes visible only when execution starts while ordinary 
       compaction: {
         async maybeCompactPreSend() {},
         beginRequest: noOp,
+        observeContextMessages: () => 0,
         shouldProtectMidStream() {
           protectionChecks += 1;
           return false;

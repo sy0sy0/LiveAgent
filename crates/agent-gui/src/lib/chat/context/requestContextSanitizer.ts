@@ -1,7 +1,7 @@
 import type { Context, Message, TextContent, ToolResultMessage } from "@earendil-works/pi-ai";
+import { normalizeHostedSearchBlock } from "@liveagent/ui/lib/chat/hostedSearch";
 import { isSubagentCardToolCall } from "../../subagents/card";
 import type { DisplayImageItemDetails, DisplayImageResultDetails } from "../../tools/builtinTypes";
-import { normalizeHostedSearchBlock } from "../messages/hostedSearch";
 import { isOnlyDsmlOrphanCloseTags, stripDsmlToolCallMarkup } from "../runner/deepSeekDsml";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -131,12 +131,10 @@ function sanitizeTextBlocksForModelContext(message: Message): Message {
       return [{ ...block, text }];
     }
 
-    if (block.type === "thinking" && typeof block.thinking === "string") {
-      const thinking = sanitizeModelText(block.thinking);
-      if (thinking !== block.thinking) changed = true;
-      if (!thinking.trim()) return [];
-      return [{ ...block, thinking }];
-    }
+    // Signed Anthropic thinking is opaque protocol state. Even text-like cleanup
+    // (including DSML stripping or surrogate replacement) invalidates its
+    // signature, so thinking/redacted-thinking blocks must pass through intact.
+    if (block.type === "thinking") return [block];
 
     return [block];
   });

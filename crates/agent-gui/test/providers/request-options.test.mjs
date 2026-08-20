@@ -26,39 +26,6 @@ function createMockAssistantStream() {
   };
 }
 
-function createDeepSeekAnthropicModel(id = "deepseek-v4-flash") {
-  return {
-    id,
-    name: id,
-    api: "anthropic-messages",
-    provider: "anthropic",
-    baseUrl: "https://api.deepseek.com/anthropic",
-    reasoning: true,
-    input: ["text"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 128000,
-    maxTokens: 4096,
-  };
-}
-
-function loadProvidersWithCapturedAnthropicStream() {
-  const state = {};
-  const localLoader = createTsModuleLoader({
-    mocks: {
-      "@earendil-works/pi-ai/api/anthropic-messages": {
-        stream(model, context, options) {
-          state.captured = { model, context, options };
-          return createMockAssistantStream();
-        },
-      },
-    },
-  });
-  return {
-    localProviders: localLoader.loadModule("src/lib/providers/llm.ts"),
-    state,
-  };
-}
-
 test("llm facade preserves provider runtime exports", () => {
   const expectedFunctionExports = [
     "assistantMessageToText",
@@ -83,6 +50,7 @@ test("llm facade preserves provider runtime exports", () => {
     "parseModelValue",
     "providerSupportsNativeWebSearch",
     "resolveProviderCacheRetention",
+    "resolvePromptCacheHintMode",
     "streamAssistantMessage",
     "streamSimpleByApi",
     "toModelValue",
@@ -114,6 +82,22 @@ test("proxy base URL builder validates upstream URLs and carries origin separate
   assert.throws(
     () => proxy.buildProxyBaseUrl("codex", "not-a-url", "http://proxy"),
     /absolute URL/,
+  );
+});
+
+test("proxy base URL builder carries an exact upstream URL in full URL mode", () => {
+  assert.deepEqual(
+    proxy.buildProxyBaseUrl(
+      "codex",
+      "https://relay.example.com/custom/complete?region=cn",
+      "http://127.0.0.1:18080/",
+      { isFullUrl: true },
+    ),
+    {
+      baseUrl: "http://127.0.0.1:18080/proxy/codex",
+      upstreamOrigin: "https://relay.example.com",
+      upstreamUrl: "https://relay.example.com/custom/complete?region=cn",
+    },
   );
 });
 
@@ -219,6 +203,14 @@ test("provider request helpers normalize auth, metadata, errors, and model value
   assert.equal(
     providers.providerSupportsNativeWebSearch("gemini", "google-generative-ai"),
     true,
+  );
+  assert.equal(
+    providers.providerSupportsNativeWebSearch("deepseek", "deepseek-responses"),
+    true,
+  );
+  assert.equal(
+    providers.providerSupportsNativeWebSearch("deepseek", "openai-completions"),
+    false,
   );
   assert.equal(
     providers.providerSupportsNativeWebSearch("codex", "openai-completions"),
@@ -532,230 +524,56 @@ test("Codex Chat Completions streams forward reasoning effort", async () => {
   assert.equal(captured.options.toolChoice, "auto");
 });
 
-test("DeepSeek OpenAI payload adapter maps reasoning=max to reasoning_effort=max (regression)", async () => {
-  let captured;
+test("third-party Codex Responses auto sends the session prompt cache key on the wire", async () => {
+  const realOpenAIResponses = await import(
+    new URL(
+      "../../node_modules/@earendil-works/pi-ai/dist/api/openai-responses.js",
+      import.meta.url,
+    ).href
+  );
   const localLoader = createTsModuleLoader({
     mocks: {
-      "@earendil-works/pi-ai/api/openai-completions": {
-        stream(model, context, options) {
-          captured = { model, context, options };
-          return createMockAssistantStream();
-        },
+      "@earendil-works/pi-ai/api/openai-responses": {
+        stream: realOpenAIResponses.stream,
       },
     },
   });
   const localProviders = localLoader.loadModule("src/lib/providers/llm.ts");
+  const baseUrl = "https://relay.example.test/v1";
   const model = localProviders.createModelFromConfig(
     "codex",
-    "deepseek-v4-pro",
-    "https://api.deepseek.com",
-    "openai-completions",
+    "gpt-5",
+    baseUrl,
+    "openai-responses",
   );
-
-  const result = localProviders.streamSimpleByApi(
+  let capturedPayload;
+  const options = localProviders.finalizeProviderStreamOptions({
+    providerId: "codex",
+    baseUrl,
     model,
-    { messages: [] },
-    { reasoning: "max", toolChoice: "auto" },
-  );
-  assert.equal(typeof result.result, "function");
-  assert.equal(typeof captured.options.onPayload, "function");
-  assert.equal(
-    captured.options.reasoningEffort,
-    "max",
-    "clampOpenAIReasoningEffort should preserve max for deepseek-v4-pro",
-  );
-
-  const adapted = await captured.options.onPayload(
-    {
-      messages: [
-        {
-          role: "assistant",
-          content: null,
-          tool_calls: [
-            {
-              id: "call_1",
-              type: "function",
-              function: { name: "Read", arguments: "{}" },
-            },
-          ],
-        },
-      ],
+    promptCacheHintMode: "auto",
+    options: {
+      apiKey: "sk-test",
+      sessionId: "conversation-1234",
+      cacheRetention: "short",
     },
-    model,
-  );
-
-  assert.deepEqual(adapted.thinking, { type: "enabled" });
-  assert.equal(
-    adapted.reasoning_effort,
-    "max",
-    "wire reasoning_effort should be max when UI selects max",
-  );
-  assert.equal(adapted.messages[0].reasoning_content, "");
-});
-
-test("DeepSeek Anthropic streamSimpleByApi strips aborted tool calls before conversion", () => {
-  const { localProviders, state } = loadProvidersWithCapturedAnthropicStream();
-  const model = createDeepSeekAnthropicModel();
-  const call = {
-    type: "toolCall",
-    id: "call_00_nLOhBvpTvol41FPkbuXA2605",
-    name: "web_search",
-    arguments: { query: "weibo-like-someone" },
-  };
-
-  const result = localProviders.streamSimpleByApi(
-    model,
-    {
-      messages: [
-        { role: "user", content: "search", timestamp: 1 },
-        {
-          role: "assistant",
-          api: "anthropic-messages",
-          provider: "anthropic",
-          model: "deepseek-v4-flash",
-          content: [{ type: "text", text: "Searching" }, call],
-          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
-          stopReason: "aborted",
-          timestamp: 2,
-        },
-      ],
+    debugLogger: {
+      logRequest(entry) {
+        capturedPayload = entry.payload;
+        throw new Error("__capture_stop__");
+      },
     },
-    {},
-  );
-
-  assert.equal(typeof result.result, "function");
-  assert.deepEqual(
-    state.captured.context.messages[1].content.map((block) => block.type),
-    ["text"],
-  );
-  assert.equal(state.captured.context.messages[1].stopReason, "stop");
-});
-
-test("DeepSeek Anthropic streamSimpleByApi preserves structured tool payload blocks", async () => {
-  const { localProviders, state } = loadProvidersWithCapturedAnthropicStream();
-  const model = createDeepSeekAnthropicModel();
-
-  const result = localProviders.streamSimpleByApi(model, { messages: [] }, {});
-  assert.equal(typeof result.result, "function");
-  assert.equal(typeof state.captured.options.onPayload, "function");
-
-  const repaired = await state.captured.options.onPayload(
-    {
-      messages: [
-        { role: "user", content: "search" },
-        {
-          role: "assistant",
-          content: [
-            { type: "text", text: "Searching" },
-            {
-              type: "tool_use",
-              id: "call_00_uZnge7Q4VzkEWduraWXP2609",
-              name: "Read",
-              input: { path: "README.md" },
-            },
-          ],
-        },
-        { role: "user", content: "continue" },
-      ],
-    },
-    model,
-  );
-
-  assert.deepEqual(
-    repaired.messages[1].content.map((block) => block.type),
-    ["thinking", "text", "tool_use"],
-  );
-  assert.deepEqual(repaired.thinking, { type: "disabled" });
-  assert.equal(repaired.messages[1].content[0].signature, "");
-  assert.equal(repaired.messages[1].content[2].id, "call_00_uZnge7Q4VzkEWduraWXP2609");
-  assert.deepEqual(repaired.messages[2], {
-    role: "user",
-    content: "continue",
   });
-  assert.equal(
-    repaired.messages.some((message) =>
-      message.content?.some?.(
-        (block) => block.type === "tool_use" || block.type === "tool_result",
-      ),
-    ),
-    true,
-  );
-});
 
-test("DeepSeek Anthropic streamSimpleByApi preserves completed multi-tool history", () => {
-  const { localProviders, state } = loadProvidersWithCapturedAnthropicStream();
-  const model = createDeepSeekAnthropicModel();
-  const bashA = {
-    type: "toolCall",
-    id: "call_00_ktXYHUFf9l425bsRQ5nv0526",
-    name: "Bash",
-    arguments: { command: "curl -s https://example.test/a" },
-  };
-  const bashB = {
-    type: "toolCall",
-    id: "call_01_ioRsTy54g6ycIuCEuFY52808",
-    name: "Bash",
-    arguments: { command: "curl -s https://example.test/b" },
-  };
-
-  const result = localProviders.streamSimpleByApi(
+  const stream = localProviders.streamSimpleByApi(
     model,
-    {
-      messages: [
-        { role: "user", content: "search", timestamp: 1 },
-        {
-          role: "assistant",
-          api: "anthropic-messages",
-          provider: "anthropic",
-          model: "deepseek-v4-flash",
-          content: [
-            { type: "thinking", thinking: "Need more data", thinkingSignature: "sig-a" },
-            { type: "text", text: "I will fetch more files." },
-            bashA,
-            bashB,
-          ],
-          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
-          stopReason: "toolUse",
-          timestamp: 2,
-        },
-        {
-          role: "toolResult",
-          toolCallId: bashA.id,
-          toolName: "Bash",
-          content: [{ type: "text", text: "result a" }],
-          isError: false,
-          timestamp: 3,
-        },
-        {
-          role: "toolResult",
-          toolCallId: bashB.id,
-          toolName: "Bash",
-          content: [{ type: "text", text: "result b" }],
-          isError: false,
-          timestamp: 4,
-        },
-        { role: "user", content: "continue", timestamp: 5 },
-      ],
-    },
-    {},
+    { messages: [{ role: "user", content: "hello", timestamp: 1 }] },
+    options,
   );
+  await stream.result();
 
-  assert.equal(typeof result.result, "function");
-  assert.equal(
-    state.captured.context.messages.some((message) => message.role === "toolResult"),
-    true,
-  );
-  assert.equal(
-    state.captured.context.messages.some(
-      (message) =>
-        message.role === "assistant" &&
-        message.content.some((block) => block.type === "toolCall"),
-    ),
-    true,
-  );
-  assert.equal(state.captured.context.messages[1].stopReason, "toolUse");
-  assert.equal(state.captured.context.messages[2].toolCallId, bashA.id);
-  assert.equal(state.captured.context.messages[3].toolCallId, bashB.id);
+  assert.ok(capturedPayload);
+  assert.equal(capturedPayload.prompt_cache_key, "conversation-1234");
 });
 
 test("gemini model base URL normalizes full generate endpoints", () => {
@@ -794,6 +612,7 @@ test("gemini model list normalization uses models array metadata", () => {
       id: "gemini-3.5-flash",
       contextWindow: 1_048_576,
       maxOutputToken: 65_536,
+      limitsSource: "provider",
     },
   ]);
 });
@@ -904,6 +723,108 @@ test("provider native web search injection is opt-in", async () => {
   assert.equal(geminiResult, geminiPayload);
 });
 
+test("DeepSeek Responses native web search is injected once and can be disabled", async () => {
+  const model = {
+    api: "deepseek-responses",
+    provider: "deepseek",
+    id: "deepseek-v4-flash",
+  };
+  const enabledOptions = providers.finalizeProviderStreamOptions({
+    providerId: "deepseek",
+    baseUrl: "https://api.deepseek.com",
+    nativeWebSearch: true,
+    model,
+    options: {},
+  });
+
+  const injected = await enabledOptions.onPayload({ input: "hello" }, model);
+  assert.deepEqual(injected.tools, [{ type: "web_search" }]);
+
+  const preserved = await enabledOptions.onPayload(
+    { input: "hello", tools: [{ type: "web_search_2025_08_26" }] },
+    model,
+  );
+  assert.deepEqual(preserved.tools, [{ type: "web_search_2025_08_26" }]);
+
+  const disabledOptions = providers.finalizeProviderStreamOptions({
+    providerId: "deepseek",
+    baseUrl: "https://api.deepseek.com",
+    nativeWebSearch: false,
+    model,
+    options: {},
+  });
+  const disabled = await disabledOptions.onPayload({ input: "hello" }, model);
+  assert.equal(disabled.tools, undefined);
+});
+
+test("DeepSeek full URL requests normalize legacy endpoints to /responses", async () => {
+  const localLoader = createTsModuleLoader({
+    mocks: {
+      "@liveagent/app/shims/tauriCore": {
+        async invoke(command) {
+          assert.equal(command, "proxy_get_server_info");
+          return { baseUrl: "http://127.0.0.1:18080", token: "proxy-token" };
+        },
+      },
+    },
+  });
+  const localProviders = localLoader.loadModule("src/lib/providers/llm.ts");
+  const prepared = await localProviders.prepareProviderRequest("deepseek", {
+    baseUrl: "https://relay.example.com/custom/chat/completions?region=cn",
+    isFullUrl: true,
+    apiKey: "secret",
+    requestFormat: "deepseek-responses",
+  });
+
+  assert.equal(prepared.baseUrl, "http://127.0.0.1:18080/proxy/deepseek");
+  assert.equal(
+    prepared.headers["x-liveagent-upstream-url"],
+    "https://relay.example.com/custom/v1/responses?region=cn",
+  );
+  assert.equal(prepared.headers["x-liveagent-upstream-origin"], "https://relay.example.com");
+});
+
+test("DeepSeek relay base URLs append /v1 while official DeepSeek stays at the root", async () => {
+  const localLoader = createTsModuleLoader({
+    mocks: {
+      "@liveagent/app/shims/tauriCore": {
+        async invoke(command) {
+          assert.equal(command, "proxy_get_server_info");
+          return { baseUrl: "http://127.0.0.1:18080", token: "proxy-token" };
+        },
+      },
+    },
+  });
+  const localProviders = localLoader.loadModule("src/lib/providers/llm.ts");
+
+  const official = await localProviders.prepareProviderRequest("deepseek", {
+    baseUrl: "https://api.deepseek.com",
+    apiKey: "secret",
+  });
+  assert.equal(official.baseUrl, "http://127.0.0.1:18080/proxy/deepseek");
+  assert.equal(official.headers["x-liveagent-upstream-origin"], "https://api.deepseek.com");
+  assert.equal(official.headers["x-liveagent-upstream-url"], undefined);
+
+  const officialWithVersion = await localProviders.prepareProviderRequest("deepseek", {
+    baseUrl: "https://api.deepseek.com/v1",
+    apiKey: "secret",
+  });
+  assert.equal(officialWithVersion.baseUrl, "http://127.0.0.1:18080/proxy/deepseek");
+
+  const relay = await localProviders.prepareProviderRequest("deepseek", {
+    baseUrl: "https://relay.example.com",
+    apiKey: "secret",
+  });
+  assert.equal(relay.baseUrl, "http://127.0.0.1:18080/proxy/deepseek/v1");
+  assert.equal(relay.headers["x-liveagent-upstream-origin"], "https://relay.example.com");
+
+  const relayWithVersion = await localProviders.prepareProviderRequest("deepseek", {
+    baseUrl: "https://relay.example.com/v1",
+    apiKey: "secret",
+  });
+  assert.equal(relayWithVersion.baseUrl, "http://127.0.0.1:18080/proxy/deepseek/v1");
+});
+
 test("provider payload finalization enables native web search for hosted search providers", async () => {
   const codexOptions = providers.finalizeProviderStreamOptions({
     providerId: "codex",
@@ -985,8 +906,8 @@ test("provider payload finalization enables native web search for hosted search 
     { type: "web_search_20250305", name: "web_search" },
   ]);
 
-  // Modern Anthropic models get the paired web_fetch server tool alongside
-  // web_search; legacy/unknown catalog entries (above) keep search-only.
+  // Keep the stable GA tool for modern models too. This is accepted by the
+  // official API and avoids dated-tool incompatibilities in Anthropic relays.
   const anthropicModernPayload = await anthropicOptions.onPayload(
     { messages: [{ role: "user", content: "hello" }] },
     {
@@ -997,13 +918,26 @@ test("provider payload finalization enables native web search for hosted search 
     },
   );
   assert.deepEqual(anthropicModernPayload.tools, [
-    { type: "web_search_20260318", name: "web_search" },
+    { type: "web_search_20250305", name: "web_search" },
+  ]);
+
+  const anthropicRelayOptions = providers.finalizeProviderStreamOptions({
+    providerId: "claude_code",
+    baseUrl: "https://relay.example.test/v1",
+    nativeWebSearch: true,
+    options: {},
+  });
+  const anthropicRelayPayload = await anthropicRelayOptions.onPayload(
+    { messages: [{ role: "user", content: "hello" }] },
     {
-      type: "web_fetch_20260318",
-      name: "web_fetch",
-      max_uses: 10,
-      max_content_tokens: 50_000,
+      api: "anthropic-messages",
+      provider: "anthropic",
+      id: "claude-sonnet-5",
+      compat: { forceAdaptiveThinking: true },
     },
+  );
+  assert.deepEqual(anthropicRelayPayload.tools, [
+    { type: "web_search_20250305", name: "web_search" },
   ]);
 
   const geminiOptions = providers.finalizeProviderStreamOptions({
@@ -1017,156 +951,6 @@ test("provider payload finalization enables native web search for hosted search 
     { api: "google-generative-ai", provider: "google", id: "gemini-3.5-pro" },
   );
   assert.deepEqual(geminiPayload.config.tools, [{ googleSearch: {} }]);
-});
-
-test("DeepSeek Anthropic endpoint enables DSML tool-call stream repair", () => {
-  const deepseekOptions = providers.finalizeProviderStreamOptions({
-    providerId: "claude_code",
-    baseUrl: "https://api.deepseek.com/anthropic",
-    options: {},
-    model: {
-      api: "anthropic-messages",
-      provider: "anthropic",
-      id: "deepseek-chat",
-    },
-  });
-  assert.equal(deepseekOptions.deepSeekDsmlToolCallRepair, true);
-  assert.equal(deepseekOptions.deepSeekProviderAdapter, true);
-  assert.equal(deepseekOptions.deepSeekAnthropicPayloadToolBlockFlattening, undefined);
-
-  const anthropicOptions = providers.finalizeProviderStreamOptions({
-    providerId: "claude_code",
-    baseUrl: "https://api.anthropic.com/v1",
-    options: {},
-    model: {
-      api: "anthropic-messages",
-      provider: "anthropic",
-      id: "claude-sonnet-4-5",
-    },
-  });
-  assert.equal(anthropicOptions.deepSeekDsmlToolCallRepair, undefined);
-});
-
-test("DeepSeek Anthropic payload adapter attaches from base URL even before model is known", async () => {
-  const options = providers.finalizeProviderStreamOptions({
-    providerId: "claude_code",
-    baseUrl: "https://api.deepseek.com/anthropic",
-    options: {},
-  });
-
-  assert.equal(options.deepSeekDsmlToolCallRepair, true);
-  assert.equal(options.deepSeekProviderAdapter, true);
-  const adapted = await options.onPayload(
-    {
-      messages: [
-        { role: "user", content: "search" },
-        {
-          role: "assistant",
-          content: [
-            { type: "text", text: "Searching" },
-            {
-              type: "tool_use",
-              id: "call_00_nLOhBvpTvol41FPkbuXA2605",
-              name: "Read",
-              input: { path: "README.md" },
-            },
-          ],
-        },
-        { role: "user", content: "continue" },
-      ],
-    },
-    { api: "anthropic-messages", provider: "anthropic", id: "deepseek-v4-flash" },
-  );
-
-  assert.deepEqual(
-    adapted.messages[1].content.map((block) => block.type),
-    ["thinking", "text", "tool_use"],
-  );
-  assert.deepEqual(adapted.thinking, { type: "disabled" });
-  assert.equal(adapted.messages[1].content[2].id, "call_00_nLOhBvpTvol41FPkbuXA2605");
-  assert.equal(
-    adapted.messages.some((message) =>
-      message.content?.some?.(
-        (block) => block.type === "tool_use" || block.type === "tool_result",
-      ),
-    ),
-    true,
-  );
-});
-
-test("DeepSeek Anthropic payload adapter preserves mixed tool_use and tool_result blocks", async () => {
-  const options = providers.finalizeProviderStreamOptions({
-    providerId: "claude_code",
-    baseUrl: "https://api.deepseek.com/anthropic",
-    options: {},
-    model: {
-      api: "anthropic-messages",
-      provider: "anthropic",
-      id: "deepseek-v4-flash",
-    },
-  });
-
-  const adapted = await options.onPayload(
-    {
-      messages: [
-        { role: "user", content: "search" },
-        {
-          role: "assistant",
-          content: [
-            { type: "text", text: "Searching" },
-            {
-              type: "tool_use",
-              id: "dsml-tool-call-023b41c5",
-              name: "builtin_web_search",
-              input: { additionalContext: "first query" },
-            },
-            {
-              type: "tool_use",
-              id: "call-read-1",
-              name: "Read",
-              input: { path: "README.md" },
-            },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "continue" },
-            {
-              type: "tool_result",
-              tool_use_id: "dsml-tool-call-68ce79de",
-              content: "late existing result",
-            },
-            {
-              type: "tool_result",
-              tool_use_id: "call-read-1",
-              content: "read result",
-            },
-          ],
-        },
-      ],
-    },
-    { api: "anthropic-messages", provider: "anthropic", id: "deepseek-chat" },
-  );
-
-  assert.deepEqual(
-    adapted.messages[1].content.map((block) => block.type),
-    ["thinking", "text", "tool_use", "tool_use"],
-  );
-  assert.equal(adapted.messages[1].content[2].id, "dsml-tool-call-023b41c5");
-  assert.deepEqual(
-    adapted.messages[2].content.map((block) => block.type),
-    ["text", "tool_result", "tool_result"],
-  );
-  assert.equal(adapted.messages[2].content[2].content, "read result");
-  assert.equal(
-    adapted.messages.some((message) =>
-      message.content?.some?.(
-        (block) => block.type === "tool_use" || block.type === "tool_result",
-      ),
-    ),
-    true,
-  );
 });
 
 test("provider native web search avoids unsupported OpenAI minimal reasoning", async () => {
@@ -1404,70 +1188,251 @@ test("resolveProviderCacheRetention maps provider settings and per-request overr
   // 请求级 override（压缩/标题等辅助请求）永远优先于供应商偏好。
   assert.equal(resolve("claude_code", true, "none", "long"), "none");
   assert.equal(resolve("codex", undefined), "short");
-  assert.equal(resolve("codex", false), "none");
+  assert.equal(resolve("codex", false), "short");
   assert.equal(resolve("codex", true, "none"), "none");
   // long 档位仅对 Anthropic 生效。
   assert.equal(resolve("codex", true, undefined, "long"), "short");
   assert.equal(resolve("gemini", true), undefined);
 });
 
-test("codex payloads get a stable prompt_cache_key on relay hosts", async () => {
-  const options = providers.finalizeProviderStreamOptions({
-    providerId: "codex",
-    baseUrl: "https://relay.example/v1",
-    options: { sessionId: "conv-1234", cacheRetention: "short" },
-  });
-
-  const completionsPayload = await options.onPayload(
-    { messages: [] },
-    { api: "openai-completions", provider: "openai", id: "relay-model" },
+test("codex automatic cache hint resolution follows request format before endpoint hints", () => {
+  const resolve = providers.resolvePromptCacheHintMode;
+  assert.equal(resolve("auto", "https://api.openai.com/v1", "openai-completions"), "openai-key");
+  assert.equal(
+    resolve(undefined, "https://openrouter.ai/api/v1", "openai-completions"),
+    "openrouter-session",
   );
-  assert.equal(completionsPayload.prompt_cache_key, "conv-1234");
-
-  const responsesPayload = await options.onPayload(
-    { input: "hello" },
-    { api: "openai-responses", provider: "openai", id: "relay-model" },
+  assert.equal(resolve("auto", "https://relay.example/v1", "openai-completions"), "none");
+  // Responses 链路对齐 Codex CLI:所有端点都发会话级 key(PR#436 的有意选择,
+  // 逃生通道是供应商级/模型级显式设 none)。
+  assert.equal(resolve("auto", "https://relay.example/v1", "openai-responses"), "openai-key");
+  assert.equal(resolve("auto", "https://openrouter.ai/api/v1", "openai-responses"), "openai-key");
+  assert.equal(resolve("auto", "not-a-url", "openai-completions"), "none");
+  assert.equal(
+    resolve("openrouter-session", "https://relay.example/v1", "openai-responses"),
+    "openrouter-session",
   );
-  assert.equal(responsesPayload.prompt_cache_key, "conv-1234");
 });
 
-test("codex prompt_cache_key injection respects retention, existing keys, and length", async () => {
-  const disabled = providers.finalizeProviderStreamOptions({
+test("codex automatic cache hints follow the endpoint capability matrix", async () => {
+  for (const api of ["openai-completions", "openai-responses"]) {
+    const official = providers.finalizeProviderStreamOptions({
+      providerId: "codex",
+      baseUrl: "https://api.openai.com/v1",
+      promptCacheHintMode: "auto",
+      model: { api, provider: "openai", id: "gpt-5" },
+      options: { sessionId: "conv-1234", cacheRetention: "short" },
+    });
+    const payload = await official.onPayload(
+      api === "openai-completions" ? { messages: [] } : { input: "hello" },
+      { api, provider: "openai", id: "gpt-5" },
+    );
+    assert.equal(payload.prompt_cache_key, "conv-1234");
+  }
+
+  for (const baseUrl of [
+    "https://relay.example/v1",
+    "https://integrate.api.nvidia.com/v1",
+    "https://api.deepseek.com/v1",
+    "https://api.groq.com/openai/v1",
+    "https://api.moonshot.cn/v1",
+  ]) {
+    const responses = providers.finalizeProviderStreamOptions({
+      providerId: "codex",
+      baseUrl,
+      promptCacheHintMode: "auto",
+      model: { api: "openai-responses", provider: "openai", id: "compatible-model" },
+      options: { sessionId: "conv-1234", cacheRetention: "short" },
+    });
+    const payload = await responses.onPayload(
+      { input: "hello" },
+      { api: "openai-responses", provider: "openai", id: "compatible-model" },
+    );
+    assert.equal(responses.cacheRetention, "short", baseUrl);
+    assert.equal(payload.prompt_cache_key, "conv-1234", baseUrl);
+  }
+
+  for (const baseUrl of [
+    "https://relay.example/v1",
+    "https://integrate.api.nvidia.com/v1",
+    "https://api.deepseek.com/v1",
+    "https://api.groq.com/openai/v1",
+    "https://api.moonshot.cn/v1",
+  ]) {
+    const compatible = providers.finalizeProviderStreamOptions({
+      providerId: "codex",
+      baseUrl,
+      promptCacheHintMode: "auto",
+      model: { api: "openai-completions", provider: "openai", id: "compatible-model" },
+      options: {
+        sessionId: "conv-1234",
+        onPayload: async (payload) => ({
+          ...payload,
+          prompt_cache_key: "library-key",
+          prompt_cache_retention: "24h",
+          prompt_cache_options: { enabled: true },
+        }),
+      },
+    });
+    const payload = await compatible.onPayload(
+      { messages: [] },
+      { api: "openai-completions", provider: "openai", id: "compatible-model" },
+    );
+    assert.equal(Object.hasOwn(payload, "prompt_cache_key"), false, baseUrl);
+    assert.equal(Object.hasOwn(payload, "prompt_cache_retention"), false, baseUrl);
+    assert.equal(Object.hasOwn(payload, "prompt_cache_options"), false, baseUrl);
+  }
+
+  const openRouter = providers.finalizeProviderStreamOptions({
+    providerId: "codex",
+    baseUrl: "https://openrouter.ai/api/v1",
+    promptCacheHintMode: "auto",
+    model: { api: "openai-completions", provider: "openai", id: "openrouter-model" },
+    options: { sessionId: "conv-1234" },
+  });
+  const openRouterPayload = await openRouter.onPayload(
+    { messages: [], prompt_cache_key: "library-key" },
+    { api: "openai-completions", provider: "openai", id: "openrouter-model" },
+  );
+  assert.equal(openRouter.headers["x-session-id"], "conv-1234");
+  assert.equal(Object.hasOwn(openRouterPayload, "prompt_cache_key"), false);
+});
+
+test("codex explicit cache hints respect overrides, user values, and limits", async () => {
+  const explicitOpenAI = providers.finalizeProviderStreamOptions({
     providerId: "codex",
     baseUrl: "https://relay.example/v1",
-    options: { sessionId: "conv-1234", cacheRetention: "none" },
+    promptCacheHintMode: "openai-key",
+    options: { sessionId: "k".repeat(80), cacheRetention: "short" },
   });
-  const disabledPayload = await disabled.onPayload(
+  const clampedPayload = await explicitOpenAI.onPayload(
     { messages: [] },
     { api: "openai-completions", provider: "openai", id: "relay-model" },
   );
-  assert.equal(disabledPayload.prompt_cache_key, undefined);
+  assert.equal(clampedPayload.prompt_cache_key, "k".repeat(64));
 
   const preset = providers.finalizeProviderStreamOptions({
     providerId: "codex",
-    baseUrl: "https://relay.example/v1",
+    baseUrl: "https://api.openai.com/v1",
+    promptCacheHintMode: "auto",
     options: {
       sessionId: "conv-1234",
-      cacheRetention: "short",
       onPayload: async (payload) => ({ ...payload, prompt_cache_key: "explicit-key" }),
     },
   });
   const presetPayload = await preset.onPayload(
     { messages: [] },
-    { api: "openai-completions", provider: "openai", id: "relay-model" },
+    { api: "openai-completions", provider: "openai", id: "gpt-5" },
   );
   assert.equal(presetPayload.prompt_cache_key, "explicit-key");
 
-  const clamped = providers.finalizeProviderStreamOptions({
+  for (const { promptCacheHintMode, model } of [
+    { promptCacheHintMode: "openai-key" },
+    { promptCacheHintMode: "none" },
+    {
+      promptCacheHintMode: "auto",
+      model: { api: "openai-responses", provider: "openai", id: "gpt-5" },
+    },
+  ]) {
+    const disabled = providers.finalizeProviderStreamOptions({
+      providerId: "codex",
+      baseUrl: "https://api.openai.com/v1",
+      promptCacheHintMode,
+      model,
+      options: { sessionId: "conv-1234", cacheRetention: "none" },
+    });
+    const payload = await disabled.onPayload(
+      { messages: [], prompt_cache_key: "library-key" },
+      { api: "openai-completions", provider: "openai", id: "gpt-5" },
+    );
+    assert.equal(Object.hasOwn(payload, "prompt_cache_key"), false);
+  }
+
+  const explicitNoCacheModel = {
+    api: "openai-responses",
+    provider: "openai",
+    id: "gpt-5.6-sol",
+    compat: { supportsExplicitPromptCacheMode: true },
+  };
+  const explicitNoCache = providers.finalizeProviderStreamOptions({
+    providerId: "codex",
+    baseUrl: "https://api.openai.com/v1",
+    promptCacheHintMode: "auto",
+    model: explicitNoCacheModel,
+    options: {
+      sessionId: "conv-1234",
+      cacheRetention: "none",
+      onPayload: async (payload) => ({
+        ...payload,
+        prompt_cache_key: "library-key",
+        prompt_cache_retention: "24h",
+        prompt_cache_options: { mode: "explicit" },
+      }),
+    },
+  });
+  const explicitNoCachePayload = await explicitNoCache.onPayload(
+    { input: "hello" },
+    explicitNoCacheModel,
+  );
+  assert.equal(Object.hasOwn(explicitNoCachePayload, "prompt_cache_key"), false);
+  assert.equal(Object.hasOwn(explicitNoCachePayload, "prompt_cache_retention"), false);
+  assert.deepEqual(explicitNoCachePayload.prompt_cache_options, { mode: "explicit" });
+
+  const relayExplicitNoCache = providers.finalizeProviderStreamOptions({
     providerId: "codex",
     baseUrl: "https://relay.example/v1",
-    options: { sessionId: "k".repeat(80), cacheRetention: "short" },
+    promptCacheHintMode: "auto",
+    model: explicitNoCacheModel,
+    options: {
+      sessionId: "conv-1234",
+      cacheRetention: "none",
+      onPayload: async (payload) => ({
+        ...payload,
+        prompt_cache_options: { mode: "explicit" },
+      }),
+    },
   });
-  const clampedPayload = await clamped.onPayload(
-    { messages: [] },
-    { api: "openai-completions", provider: "openai", id: "relay-model" },
+  const relayExplicitNoCachePayload = await relayExplicitNoCache.onPayload(
+    { input: "hello" },
+    explicitNoCacheModel,
   );
-  assert.equal(clampedPayload.prompt_cache_key, "k".repeat(64));
+  assert.equal(Object.hasOwn(relayExplicitNoCachePayload, "prompt_cache_options"), false);
+
+  // mode=none 必须把 retention 一并压成 none：pi-ai 会按 retention 生成缓存
+  // 提示（如 OpenRouter anthropic/* 的 cache_control 断点），剥 payload 拦不住。
+  const explicitNone = providers.finalizeProviderStreamOptions({
+    providerId: "codex",
+    baseUrl: "https://openrouter.ai/api/v1",
+    promptCacheHintMode: "none",
+    options: { sessionId: "conv-1234", cacheRetention: "short" },
+  });
+  assert.equal(explicitNone.cacheRetention, "none");
+  assert.equal(explicitNone.headers?.["x-session-id"], undefined);
+
+  // pi-ai 恒显式写 prompt_cache_key: undefined；值为 undefined 时无须拷贝剥离。
+  const undefinedKeyPayload = { messages: [], prompt_cache_key: undefined };
+  const passthrough = await explicitNone.onPayload(undefinedKeyPayload, {
+    api: "openai-completions",
+    provider: "openai",
+    id: "openrouter-model",
+  });
+  assert.equal(passthrough, undefinedKeyPayload);
+
+  const explicitOpenRouter = providers.finalizeProviderStreamOptions({
+    providerId: "codex",
+    baseUrl: "https://relay.example/v1",
+    promptCacheHintMode: "openrouter-session",
+    options: { sessionId: "s".repeat(300) },
+  });
+  assert.equal(explicitOpenRouter.headers["x-session-id"], "s".repeat(256));
+
+  const customHeader = providers.finalizeProviderStreamOptions({
+    providerId: "codex",
+    baseUrl: "https://openrouter.ai/api/v1",
+    promptCacheHintMode: "auto",
+    options: { headers: { "X-Session-ID": "user-session" }, sessionId: "conv-1234" },
+  });
+  assert.deepEqual(customHeader.headers, { "X-Session-ID": "user-session" });
 });
 
 test("runtime models always carry zero pricing (billing removed)", () => {

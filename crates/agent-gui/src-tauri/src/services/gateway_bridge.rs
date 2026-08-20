@@ -7,17 +7,26 @@ use crate::commands::{
     chat_file_links::open_chat_file_link_for_conversation,
     chat_history,
     chat_history::ChatHistoryMessageRef,
+    checkpoint,
     fs::{
         fs_create_dir_sync, fs_delete_sync, fs_list_dirs_sync, fs_list_sync, fs_mention_list_sync,
         fs_read_editable_text_sync, fs_read_workspace_image_sync, fs_rename_sync, fs_roots_sync,
         fs_write_text_sync,
     },
     git::{git_gateway_clone_task_action_sync, GitCloneTaskRegistry},
+    root_grants::{
+        workspace_root_grants_apply, workspace_root_grants_list, workspace_root_grants_revoke,
+        WorkspaceRootAccess, WorkspaceRootGrant, WorkspaceRootGrantDraft,
+    },
     settings::{load_providers, open_db},
     system::{
-        system_create_project_folder_sync, system_import_uploaded_readable_files_sync,
-        system_list_skill_files_sync, system_read_skill_metadata_sync, system_read_skill_text_sync,
-        system_read_uploaded_image_preview_sync, SystemReadableFileUploadInput,
+        system_create_project_folder_sync, system_import_directory_abort_sync,
+        system_import_directory_chunk_sync, system_import_directory_commit_sync,
+        system_import_directory_start_sync, system_import_directory_sync,
+        system_import_uploaded_readable_files_sync, system_list_skill_files_sync,
+        system_read_skill_metadata_sync, system_read_skill_text_sync,
+        system_read_uploaded_image_preview_sync, SystemImportDirectoryInputFile,
+        SystemReadableFileUploadInput,
     },
 };
 use crate::services::automation::{
@@ -57,6 +66,52 @@ pub async fn handle_provider_usage(
             .await
     };
     provider_usage_response(result)
+}
+
+pub async fn handle_checkpoint(
+    request: proto::CheckpointRequest,
+) -> Result<proto::CheckpointResponse, String> {
+    let action = request.action.trim().to_string();
+    let result_json = match action.as_str() {
+        "list" => {
+            serde_json::to_string(&checkpoint::checkpoint_list(request.conversation_id).await?)
+                .map_err(|error| format!("serialize checkpoint list failed: {error}"))?
+        }
+        "diff" => serde_json::to_string(
+            &checkpoint::checkpoint_diff_stats(
+                request.conversation_id,
+                request.turn_seq,
+                request.authorized_roots,
+            )
+            .await?,
+        )
+        .map_err(|error| format!("serialize checkpoint diff failed: {error}"))?,
+        "rewind" => {
+            let expected = request
+                .expected
+                .into_iter()
+                .map(|entry| checkpoint::CheckpointExpectedEntry {
+                    key: entry.key,
+                    current_hash: entry.current_hash,
+                })
+                .collect();
+            serde_json::to_string(
+                &checkpoint::checkpoint_rewind_code(
+                    request.conversation_id,
+                    request.turn_seq,
+                    request.authorized_roots,
+                    expected,
+                )
+                .await?,
+            )
+            .map_err(|error| format!("serialize checkpoint rewind failed: {error}"))?
+        }
+        _ => return Err(format!("unsupported checkpoint action: {action}")),
+    };
+    Ok(proto::CheckpointResponse {
+        action,
+        result_json,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,6 +263,76 @@ pub async fn handle_history_workdirs() -> Result<proto::HistoryWorkdirsResponse,
                 updated_at: item.updated_at,
             })
             .collect(),
+    })
+}
+
+/// 轨迹按需拉取：事件窗口、Prompt 分段和子代理运行各用独立字段。
+///
+/// 三种只读诊断查询合并在一个信封臂里，因为调用方与生命周期完全一致（都只在
+/// WebUI 打开轨迹页后发生），同时保持 section id 与 subagent run id 的协议语义分离。
+pub async fn handle_trajectory_fetch(
+    request: proto::TrajectoryFetchRequest,
+) -> Result<proto::TrajectoryFetchResponse, String> {
+    let conversation_id = request.conversation_id.clone();
+    if request.include_subagent_runs {
+        let runs = chat_history::trajectory_get_subagent_runs_inner(
+            conversation_id.clone(),
+            request.subagent_run_ids,
+        )
+        .await?;
+        return Ok(proto::TrajectoryFetchResponse {
+            conversation_id,
+            events_json: String::new(),
+            truncated: false,
+            sections: Vec::new(),
+            oldest_segment_index: 0,
+            returned_segment_count: 0,
+            total_segment_count: 0,
+            has_more_before: false,
+            subagent_runs_json: runs.runs_json,
+        });
+    }
+    if !request.section_ids.is_empty() {
+        let sections =
+            chat_history::trajectory_get_sections(conversation_id.clone(), request.section_ids)
+                .await?;
+        return Ok(proto::TrajectoryFetchResponse {
+            conversation_id,
+            events_json: String::new(),
+            truncated: false,
+            sections: sections
+                .into_iter()
+                .map(|section| proto::TrajectorySectionPayload {
+                    section_id: section.section_id,
+                    slot: section.slot,
+                    content: section.content,
+                    bytes: section.bytes,
+                })
+                .collect(),
+            oldest_segment_index: 0,
+            returned_segment_count: 0,
+            total_segment_count: 0,
+            has_more_before: false,
+            subagent_runs_json: String::new(),
+        });
+    }
+
+    let events = chat_history::trajectory_get_window_inner(
+        conversation_id.clone(),
+        i64::from(request.max_segments),
+        request.before_segment_index.map(i64::from),
+    )
+    .await?;
+    Ok(proto::TrajectoryFetchResponse {
+        conversation_id,
+        events_json: events.events_json,
+        truncated: events.truncated,
+        sections: Vec::new(),
+        oldest_segment_index: i32::try_from(events.oldest_segment_index).unwrap_or(i32::MAX),
+        returned_segment_count: i32::try_from(events.returned_segment_count).unwrap_or(i32::MAX),
+        total_segment_count: i32::try_from(events.total_segment_count).unwrap_or(i32::MAX),
+        has_more_before: events.has_more_before,
+        subagent_runs_json: String::new(),
     })
 }
 
@@ -384,14 +509,116 @@ pub async fn handle_provider_list() -> Result<proto::ProviderListResponse, Strin
 pub async fn handle_provider_models(
     request: proto::ProviderModelsRequest,
 ) -> Result<proto::ProviderModelsResponse, String> {
+    let provider_type = request.provider_type.trim().to_string();
+    let request_api_key = request.api_key.trim().to_string();
+    let config = if request_api_key.is_empty() {
+        let provider_id = request.provider_id.trim().to_string();
+        let expected_provider_type = provider_type.clone();
+        let is_full_url = request.is_full_url;
+        tauri::async_runtime::spawn_blocking(move || {
+            let conn = open_db()?;
+            resolve_stored_provider_models_config(
+                &provider_id,
+                &expected_provider_type,
+                is_full_url,
+                load_providers(&conn)?,
+            )
+        })
+        .await
+        .map_err(|error| format!("读取供应商 API Key 任务失败：{error}"))??
+    } else {
+        ProviderModelsRequestConfig {
+            provider_type,
+            base_url: request.base_url.trim().to_string(),
+            api_key: request_api_key,
+            use_system_proxy: request.use_system_proxy,
+            models_url: Some(request.models_url.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            is_full_url: request.is_full_url.unwrap_or(false),
+        }
+    };
     let models_json = crate::services::provider_models::fetch_provider_models(
-        request.provider_type.trim(),
-        request.base_url.trim(),
-        request.api_key.trim(),
-        request.use_system_proxy,
+        &config.provider_type,
+        &config.base_url,
+        &config.api_key,
+        config.use_system_proxy,
+        config.models_url.as_deref(),
+        config.is_full_url,
     )
     .await?;
     Ok(proto::ProviderModelsResponse { models_json })
+}
+
+#[derive(Debug, PartialEq)]
+struct ProviderModelsRequestConfig {
+    provider_type: String,
+    base_url: String,
+    api_key: String,
+    use_system_proxy: bool,
+    models_url: Option<String>,
+    is_full_url: bool,
+}
+
+fn resolve_stored_provider_models_config(
+    provider_id: &str,
+    expected_provider_type: &str,
+    is_full_url: Option<bool>,
+    providers: Option<Value>,
+) -> Result<ProviderModelsRequestConfig, String> {
+    let provider_id = provider_id.trim();
+    if provider_id.is_empty() {
+        return Err("请先填写 API Key".to_string());
+    }
+    let providers = providers
+        .and_then(|value| value.as_array().cloned())
+        .ok_or_else(|| "未找到已保存的供应商".to_string())?;
+    let provider = providers
+        .into_iter()
+        .find(|provider| provider.get("id").and_then(Value::as_str) == Some(provider_id))
+        .ok_or_else(|| "未找到已保存的供应商".to_string())?;
+    let stored_provider_type = provider
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if stored_provider_type != expected_provider_type.trim() {
+        return Err("供应商类型与已保存配置不匹配".to_string());
+    }
+    let api_key = provider
+        .get("apiKey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "已保存的供应商未配置 API Key".to_string())?;
+    let base_url = provider
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let models_url = provider
+        .get("modelsUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    Ok(ProviderModelsRequestConfig {
+        provider_type: stored_provider_type.to_string(),
+        base_url,
+        api_key,
+        use_system_proxy: provider
+            .get("useSystemProxy")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        models_url,
+        is_full_url: is_full_url.unwrap_or_else(|| {
+            provider
+                .get("isFullUrl")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        }),
+    })
 }
 
 pub async fn handle_skill_files_list() -> Result<proto::SkillFilesListResponse, String> {
@@ -452,6 +679,65 @@ pub async fn handle_fs_roots() -> Result<proto::FsRootsResponse, String> {
                 })
                 .collect(),
         })
+}
+
+fn workspace_root_grant_to_proto(grant: WorkspaceRootGrant) -> proto::WorkspaceRootGrant {
+    proto::WorkspaceRootGrant {
+        id: grant.id,
+        project_id: grant.project_id,
+        project_path_key: grant.project_path_key,
+        alias: grant.alias,
+        display_path: grant.display_path,
+        canonical_path: grant.canonical_path,
+        access: grant.access.as_str().to_string(),
+        state: grant.state.as_str().to_string(),
+        created_at: grant.created_at,
+        updated_at: grant.updated_at,
+    }
+}
+
+pub async fn handle_workspace_root_grants(
+    request: proto::WorkspaceRootGrantsRequest,
+) -> Result<proto::WorkspaceRootGrantsResponse, String> {
+    let action = request.action.trim();
+    let grants = match action {
+        "list" => {
+            if !request.grants.is_empty() {
+                return Err("列出目录授权时不能携带授权草稿".to_string());
+            }
+            workspace_root_grants_list(request.project_id, request.project_path).await?
+        }
+        "apply" => {
+            let drafts = request
+                .grants
+                .into_iter()
+                .map(|grant| {
+                    Ok(WorkspaceRootGrantDraft {
+                        id: grant.id,
+                        alias: grant.alias,
+                        display_path: grant.display_path,
+                        access: WorkspaceRootAccess::parse(grant.access.trim())?,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            workspace_root_grants_apply(request.project_id, request.project_path, drafts).await?
+        }
+        "revoke" => {
+            if !request.project_path.trim().is_empty() || !request.grants.is_empty() {
+                return Err("撤销目录授权时只能提供项目 id".to_string());
+            }
+            workspace_root_grants_revoke(request.project_id).await?;
+            Vec::new()
+        }
+        _ => return Err(format!("不支持的目录授权操作：{action}")),
+    };
+
+    Ok(proto::WorkspaceRootGrantsResponse {
+        grants: grants
+            .into_iter()
+            .map(workspace_root_grant_to_proto)
+            .collect(),
+    })
 }
 
 pub async fn handle_fs_list_dirs(
@@ -637,6 +923,8 @@ pub async fn handle_fs_write_text(
             request.mode,
             expected_mtime_ms,
             expected_content_hash,
+            // WebUI 文件管理器的直接写入,不属于对话轮,不做检查点捕获。
+            None,
         )
     })
     .await
@@ -685,14 +973,16 @@ pub async fn handle_fs_rename(
 pub async fn handle_fs_delete(
     request: proto::FsDeleteRequest,
 ) -> Result<proto::FsDeleteResponse, String> {
-    tauri::async_runtime::spawn_blocking(move || fs_delete_sync(request.workdir, request.path))
-        .await
-        .map_err(|e| format!("gateway fs delete join failed: {e}"))?
-        .map_err(|e| e.message)
-        .map(|response| proto::FsDeleteResponse {
-            path: response.path,
-            kind: response.kind,
-        })
+    tauri::async_runtime::spawn_blocking(move || {
+        fs_delete_sync(request.workdir, request.path, None)
+    })
+    .await
+    .map_err(|e| format!("gateway fs delete join failed: {e}"))?
+    .map_err(|e| e.message)
+    .map(|response| proto::FsDeleteResponse {
+        path: response.path,
+        kind: response.kind,
+    })
 }
 
 pub async fn handle_git_request(
@@ -752,6 +1042,64 @@ pub async fn handle_upload_readable_files(
             })
             .collect(),
         skipped: response.skipped,
+    })
+}
+
+pub async fn handle_import_directory(
+    request: proto::ImportDirectoryRequest,
+) -> Result<proto::ImportDirectoryResponse, String> {
+    let transfer_id = request.transfer_id.clone();
+    let operation = proto::ImportDirectoryOperation::try_from(request.operation)
+        .map_err(|_| format!("不支持的目录导入操作：{}", request.operation))?;
+    let outcome = tauri::async_runtime::spawn_blocking(move || match operation {
+        proto::ImportDirectoryOperation::Start => system_import_directory_start_sync(
+            request.transfer_id,
+            request.name,
+            request.target,
+            request.total_files,
+            request.total_bytes,
+        ),
+        proto::ImportDirectoryOperation::WriteChunk => system_import_directory_chunk_sync(
+            request.transfer_id,
+            request.relative_path,
+            request.offset,
+            request.chunk,
+            request.file_complete,
+        ),
+        proto::ImportDirectoryOperation::Commit => {
+            system_import_directory_commit_sync(request.transfer_id)
+        }
+        proto::ImportDirectoryOperation::Abort => {
+            system_import_directory_abort_sync(request.transfer_id)?;
+            Ok(crate::commands::system::SystemImportDirectoryOutcome {
+                root_path: String::new(),
+                file_count: 0,
+                skipped: Vec::new(),
+                received_bytes: 0,
+            })
+        }
+        proto::ImportDirectoryOperation::Unspecified => {
+            #[allow(deprecated)]
+            let files = request
+                .files
+                .into_iter()
+                .map(|file| SystemImportDirectoryInputFile {
+                    relative_path: file.relative_path,
+                    content: file.content,
+                })
+                .collect();
+            system_import_directory_sync(request.name, request.target, files)
+        }
+    })
+    .await
+    .map_err(|e| format!("gateway import directory join failed: {e}"))??;
+
+    Ok(proto::ImportDirectoryResponse {
+        root_path: outcome.root_path,
+        file_count: i32::try_from(outcome.file_count).unwrap_or(i32::MAX),
+        skipped: outcome.skipped,
+        transfer_id,
+        received_bytes: outcome.received_bytes,
     })
 }
 
@@ -1055,6 +1403,8 @@ fn is_builtin_share_tool_name(name: &str) -> bool {
             | "Image"
             | "List"
             | "ManagedProcess"
+            | "ProcessStop"
+            | "ProcessWait"
             | "McpManager"
             | "MemoryManager"
             | "Read"
@@ -1400,6 +1750,7 @@ fn sanitize_provider_summary(provider: &Value) -> Result<Value, String> {
         "requestFormat",
         "reasoning",
         "promptCachingEnabled",
+        "promptCacheHintMode",
         "nativeWebSearchEnabled",
     ] {
         if let Some(value) = source.get(key) {
@@ -1417,7 +1768,7 @@ mod tests {
     use super::{
         flatten_history_messages_json, flatten_history_messages_json_window,
         is_builtin_share_tool_name, parse_runs_limit, redact_builtin_tool_content_json,
-        sanitize_provider_summaries,
+        resolve_stored_provider_models_config, sanitize_provider_summaries,
     };
     use crate::commands::chat_history::{
         self, history_message_content_hash, ChatHistoryMessageRef, ChatHistorySegmentRecord,
@@ -1475,15 +1826,78 @@ mod tests {
                 "apiKey": "secret-key",
                 "models": [],
                 "activeModels": [],
+                "promptCacheHintMode": "openrouter-session",
                 "nativeWebSearchEnabled": false
             }
         ])))
         .expect("sanitize provider summaries");
 
         assert_eq!(result[0]["id"], "provider-a");
+        assert_eq!(result[0]["promptCacheHintMode"], "openrouter-session");
         assert_eq!(result[0]["nativeWebSearchEnabled"], false);
         assert_eq!(result[0]["apiKey"], Value::Null);
         assert_eq!(result[0]["baseUrl"], Value::Null);
+    }
+
+    #[test]
+    fn provider_models_resolves_redacted_webui_config_from_matching_provider() {
+        let providers = json!([{
+            "id": "provider-a",
+            "type": "codex",
+            "baseUrl": "https://stored.example.com/v1/responses",
+            "apiKey": "stored-secret",
+            "isFullUrl": true,
+            "modelsUrl": "https://stored.example.com/models",
+            "useSystemProxy": true
+        }]);
+        assert_eq!(
+            resolve_stored_provider_models_config("provider-a", "codex", None, Some(providers))
+                .expect("stored provider config"),
+            super::ProviderModelsRequestConfig {
+                provider_type: "codex".to_string(),
+                base_url: "https://stored.example.com/v1/responses".to_string(),
+                api_key: "stored-secret".to_string(),
+                use_system_proxy: true,
+                models_url: Some("https://stored.example.com/models".to_string()),
+                is_full_url: true,
+            }
+        );
+    }
+
+    #[test]
+    fn provider_models_applies_webui_full_url_mode_to_stored_endpoint() {
+        let providers = json!([{
+            "id": "provider-a",
+            "type": "codex",
+            "baseUrl": "https://stored.example.com/v1/responses",
+            "apiKey": "stored-secret",
+            "isFullUrl": false
+        }]);
+        let config = resolve_stored_provider_models_config(
+            "provider-a",
+            "codex",
+            Some(true),
+            Some(providers),
+        )
+        .expect("stored provider config with draft full URL mode");
+
+        assert_eq!(config.base_url, "https://stored.example.com/v1/responses");
+        assert_eq!(config.api_key, "stored-secret");
+        assert!(config.is_full_url);
+    }
+
+    #[test]
+    fn provider_models_rejects_mismatched_stored_provider_type() {
+        let providers = json!([{
+            "id": "provider-a",
+            "type": "claude_code",
+            "apiKey": "stored-secret"
+        }]);
+        assert_eq!(
+            resolve_stored_provider_models_config("provider-a", "codex", None, Some(providers))
+                .expect_err("provider type mismatch"),
+            "供应商类型与已保存配置不匹配"
+        );
     }
 
     #[test]

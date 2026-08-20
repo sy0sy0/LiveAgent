@@ -1,15 +1,18 @@
-import { memo } from "react";
-
-import type { HistoryMessageRef } from "../../../lib/chat/conversation/conversationState";
-import type { PendingUploadedFile } from "../../../lib/chat/messages/uploadedFiles";
+import { EditableUserMessageBubble } from "@liveagent/ui/components/chat/EditableUserMessageBubble";
+import {
+  type PendingUploadedFile,
+  splitUserAttachmentsForDisplay,
+} from "@liveagent/ui/lib/chat/uploadedFiles";
 import {
   type CommitDetailsLoader,
   UserMessageContent,
-} from "../../../lib/chat/messages/userMessageContent";
-import { EditableUserMessageBubble } from "./EditableUserMessageBubble";
+} from "@liveagent/ui/lib/chat/userMessageContent";
+import { cn } from "@liveagent/ui/lib/shared/utils";
+import { memo } from "react";
+import { loadComposerUploadedImagePreview } from "../../../agent-ui-adapters/composerImagePreview";
+import type { HistoryMessageRef } from "../../../lib/chat/conversation/conversationState";
 import { UserRowFooter } from "./RowActions";
 import type { UserRow } from "./rowModel";
-import { splitUserAttachmentsForDisplay } from "./transcriptUtils";
 import { UserAttachmentCards } from "./UserAttachmentCards";
 
 export type UserMessageRowProps = {
@@ -54,7 +57,9 @@ export const UserMessageRow = memo(function UserMessageRow(props: UserMessageRow
         initialText={item.text}
         attachments={item.attachments}
         workspaceRoot={workspaceRoot}
-        compactedClass={compactedClass}
+        className={compactedClass}
+        preserveViewportScrollOnFocus
+        onLoadUploadedImagePreview={loadComposerUploadedImagePreview}
         onCancel={onCancelEdit}
         onSubmit={(newText, nextAttachments) => {
           onCancelEdit();
@@ -66,10 +71,16 @@ export const UserMessageRow = memo(function UserMessageRow(props: UserMessageRow
 
   return (
     <div
-      className={`chat-user-bubble-wrap group relative ml-auto max-w-[min(85%,calc(50em+2rem))] ${compactedClass}`}
+      className={cn(
+        "chat-user-bubble-wrap group relative ml-auto max-w-[min(85%,calc(50em+2rem))]",
+        compactedClass,
+      )}
     >
       <div
-        className={`${animateEntrance ? "chat-bubble-enter " : ""}chat-user-bubble ml-auto w-fit max-w-full rounded-2xl rounded-br-md bg-[hsl(var(--chat-user-bg))] px-4 py-2.5 font-chat text-[calc(14.5px*var(--zone-font-scale,1))] leading-relaxed text-[hsl(var(--chat-user-fg))]`}
+        className={cn(
+          animateEntrance && "chat-bubble-enter",
+          "chat-user-bubble ml-auto w-fit max-w-full rounded-2xl rounded-br-md bg-[hsl(var(--chat-user-bg))] px-4 py-2.5 font-chat text-[calc(14.5px*var(--zone-font-scale,1))] leading-relaxed text-[hsl(var(--chat-user-fg))]",
+        )}
       >
         <UserAttachmentCards files={visibleFiles} workspaceRoot={workspaceRoot} />
         {item.text ? (
@@ -85,6 +96,7 @@ export const UserMessageRow = memo(function UserMessageRow(props: UserMessageRow
         text={item.text}
         timestamp={item.timestamp}
         hasStableRef={!!effectiveMessageRef}
+        messageId={effectiveMessageRef?.messageId}
         onStartEdit={onStartEdit}
       />
     </div>

@@ -1,3 +1,4 @@
+import { buildHistoryMessageRefPayload } from "@liveagent/ui/lib/chat/historyMessageRef";
 import type { ConversationViewState, HistoryMessageRef } from "../conversationState";
 import type { RetryAttemptRecord } from "../liveTranscriptStore";
 
@@ -21,20 +22,9 @@ type QueueUserMessageOptions = {
   messageRef?: HistoryMessageRef;
 };
 
-// Wire shape mirror of the gateway's ChatMessageRef (snake_case), matching
-// the webui's buildHistoryMessageRefPayload byte for byte.
-function buildGatewayMessageRefPayload(ref: HistoryMessageRef): Record<string, unknown> {
-  return {
-    segment_index: ref.segmentIndex,
-    message_index: ref.messageIndex,
-    segment_id: ref.segmentId,
-    message_id: ref.messageId,
-    role: ref.role,
-    content_hash: ref.contentHash,
-  };
-}
-
 type GatewayBridgeSendResult = Promise<void> | void;
+
+export type ManualCompactionTerminalStatus = "compacted" | "failed" | "busy" | "skipped";
 
 type GatewayBridgeEventControllerParams = {
   conversationId: string;
@@ -64,7 +54,12 @@ export type GatewayBridgeEventController = {
   queueTitle: (nextTitle: string, allowAfterClose?: boolean) => void;
   queueToolStatus: (status: string | null, isCompaction?: boolean) => void;
   queueRetryAttempts: (attempts: readonly RetryAttemptRecord[]) => void;
-  queueCheckpoint: (state: ConversationViewState) => void;
+  queueCheckpoint: (state: ConversationViewState, contextUsageTokens?: number) => void;
+  queueManualCompactionResult: (
+    operationId: string,
+    status: ManualCompactionTerminalStatus,
+    message?: string,
+  ) => void;
   emitError: (message: string, conversationIdOverride?: string) => void;
   close: () => Promise<void>;
   hasForwardedText: () => boolean;
@@ -138,11 +133,11 @@ export function createGatewayBridgeEventController(
         ),
         conversation_id: params.conversationId,
         ...(options?.messageRef
-          ? { message_ref: buildGatewayMessageRefPayload(options.messageRef) }
+          ? { message_ref: buildHistoryMessageRefPayload(options.messageRef) }
           : {}),
         ...(options?.baseMessageRef
           ? {
-              base_message_ref: buildGatewayMessageRefPayload(options.baseMessageRef),
+              base_message_ref: buildHistoryMessageRefPayload(options.baseMessageRef),
               reason: "edit_resend",
             }
           : {}),
@@ -176,7 +171,7 @@ export function createGatewayBridgeEventController(
     },
     queueToolStatus,
     queueRetryAttempts,
-    queueCheckpoint(state: ConversationViewState) {
+    queueCheckpoint(state: ConversationViewState, contextUsageTokens?: number) {
       const activeSegment = state.segments[state.activeSegmentIndex];
       const summary = activeSegment?.summary;
       if (!summary?.content.trim()) return;
@@ -199,8 +194,28 @@ export function createGatewayBridgeEventController(
             model: summary.summaryMeta.generatedBy.model,
             promptVersion: summary.summaryMeta.generatedBy.promptVersion,
           },
+          ...(typeof contextUsageTokens === "number" && contextUsageTokens > 0
+            ? { contextUsageTokens: Math.floor(contextUsageTokens) }
+            : {}),
         },
       });
+    },
+    queueManualCompactionResult(operationId, status, message) {
+      // 终态结果事件经可靠 ingress 送达；queueEvent 可能返回投递 Promise，
+      // 丢弃它会让 ingress 失败无人捕获。对 Promise 显式 catch，同步返回值
+      // （enabled=false 或同步 sink）自然跳过。
+      const sendResult = queueEvent({
+        type: "manual_compaction_result",
+        operationId: operationId.trim(),
+        status,
+        ...(message?.trim() ? { message: message.trim() } : {}),
+        conversation_id: params.conversationId,
+      });
+      if (sendResult && typeof (sendResult as Promise<void>).then === "function") {
+        (sendResult as Promise<void>).catch((error) => {
+          console.warn("manual compaction result event failed", error);
+        });
+      }
     },
     emitError(message: string, conversationIdOverride?: string) {
       queueEvent({

@@ -1,10 +1,13 @@
+use std::collections::HashSet;
+
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::commands::settings::{
-    load_gateway_settings_sync_snapshot, open_db, redact_gateway_settings_sync_payload,
-    PROVIDER_API_KEY_UPDATES_FIELD, PROVIDER_USAGE_QUERY_SECRET_UPDATES_FIELD, SSH_PATCH_FIELD,
-    SSH_SECRET_UPDATES_FIELD, SYSTEM_PROXY_PASSWORD_UPDATE_FIELD,
+    load_gateway_settings_sync_snapshot, load_stt_raw, open_db,
+    redact_gateway_settings_sync_payload, PROVIDER_API_KEY_UPDATES_FIELD,
+    PROVIDER_USAGE_QUERY_SECRET_UPDATES_FIELD, SSH_PATCH_FIELD, SSH_SECRET_UPDATES_FIELD,
+    STT_SECRET_SYNC_FIELD, STT_SECRET_UPDATE_FIELD, SYSTEM_PROXY_PASSWORD_UPDATE_FIELD,
 };
 
 use super::*;
@@ -92,6 +95,85 @@ pub(crate) fn merge_settings_update_into_snapshot(
     Ok(Value::Object(merged))
 }
 
+pub(crate) fn attach_stt_secret_sync(
+    mut snapshot: Value,
+    raw_stt: Option<Value>,
+) -> Result<Value, String> {
+    let settings = snapshot
+        .as_object_mut()
+        .ok_or_else(|| "gateway settings sync payload must be an object".to_string())?;
+    settings.remove(STT_SECRET_SYNC_FIELD);
+    if let Some(stt) = raw_stt {
+        settings.insert(STT_SECRET_SYNC_FIELD.to_string(), stt);
+    }
+    Ok(snapshot)
+}
+
+pub(crate) async fn attach_current_stt_secret_sync(snapshot: Value) -> Result<Value, String> {
+    let raw_stt = tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db()?;
+        load_stt_raw(&conn)
+    })
+    .await
+    .map_err(|e| format!("load private STT sync join failed: {e}"))??;
+    attach_stt_secret_sync(snapshot, raw_stt)
+}
+
+fn workspace_project_ids(
+    payload: &Value,
+    payload_label: &str,
+) -> Result<Option<HashSet<String>>, String> {
+    let map = payload
+        .as_object()
+        .ok_or_else(|| format!("{payload_label} must be an object"))?;
+    let Some(system) = map.get("system") else {
+        return Ok(None);
+    };
+    let system = system
+        .as_object()
+        .ok_or_else(|| format!("{payload_label}.system must be an object"))?;
+    let Some(projects) = system.get("workspaceProjects") else {
+        return Ok(None);
+    };
+    let projects = projects
+        .as_array()
+        .ok_or_else(|| format!("{payload_label}.system.workspaceProjects must be an array"))?;
+
+    let mut ids = HashSet::with_capacity(projects.len());
+    for project in projects {
+        let id = project
+            .as_object()
+            .and_then(|item| item.get("id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "{payload_label}.system.workspaceProjects entries must include a non-empty id"
+                )
+            })?;
+        ids.insert(id.to_string());
+    }
+    Ok(Some(ids))
+}
+
+pub(crate) fn removed_workspace_project_ids(
+    current_snapshot: &Value,
+    update: &Value,
+) -> Result<Vec<String>, String> {
+    let Some(updated_ids) = workspace_project_ids(update, "gateway settings update")? else {
+        return Ok(Vec::new());
+    };
+    let current_ids =
+        workspace_project_ids(current_snapshot, "current settings snapshot")?.unwrap_or_default();
+    let mut removed = current_ids
+        .difference(&updated_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    removed.sort();
+    Ok(removed)
+}
+
 pub(crate) fn build_settings_sync_envelope(payload: Value) -> Result<proto::AgentEnvelope, String> {
     Ok(proto::AgentEnvelope {
         request_id: format!("settings-sync-{}", Uuid::new_v4()),
@@ -122,6 +204,7 @@ pub(crate) fn build_local_settings_update_event_payload(payload: Value) -> Resul
         event.remove(PROVIDER_USAGE_QUERY_SECRET_UPDATES_FIELD);
     let ssh_secret_updates = event.remove(SSH_SECRET_UPDATES_FIELD);
     let system_proxy_password_update = event.remove(SYSTEM_PROXY_PASSWORD_UPDATE_FIELD);
+    let stt_secret_update = event.remove(STT_SECRET_UPDATE_FIELD);
     event.remove("remote");
     let mut public_event = match redact_gateway_settings_sync_payload(Value::Object(event))? {
         Value::Object(map) => map,
@@ -142,6 +225,9 @@ pub(crate) fn build_local_settings_update_event_payload(payload: Value) -> Resul
     if let Some(update) = system_proxy_password_update {
         public_event.insert(SYSTEM_PROXY_PASSWORD_UPDATE_FIELD.to_string(), update);
     }
+    if let Some(update) = stt_secret_update {
+        public_event.insert(STT_SECRET_UPDATE_FIELD.to_string(), update);
+    }
     Ok(Value::Object(public_event))
 }
 
@@ -158,6 +244,7 @@ pub(crate) fn build_local_settings_update_event_payload_with_ssh(
         event.remove(PROVIDER_USAGE_QUERY_SECRET_UPDATES_FIELD);
     let ssh_secret_updates = event.remove(SSH_SECRET_UPDATES_FIELD);
     let system_proxy_password_update = event.remove(SYSTEM_PROXY_PASSWORD_UPDATE_FIELD);
+    let stt_secret_update = event.remove(STT_SECRET_UPDATE_FIELD);
     event.remove("remote");
     event.remove(SSH_PATCH_FIELD);
     event.insert("ssh".to_string(), ssh);
@@ -179,6 +266,9 @@ pub(crate) fn build_local_settings_update_event_payload_with_ssh(
     }
     if let Some(update) = system_proxy_password_update {
         public_event.insert(SYSTEM_PROXY_PASSWORD_UPDATE_FIELD.to_string(), update);
+    }
+    if let Some(update) = stt_secret_update {
+        public_event.insert(STT_SECRET_UPDATE_FIELD.to_string(), update);
     }
     Ok(Value::Object(public_event))
 }

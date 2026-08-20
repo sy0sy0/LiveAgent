@@ -4,15 +4,6 @@ import {
   submitAskUserQuestionAnswers,
   usePendingToolApproval,
 } from "@liveagent/adapters/assistantBubble";
-import {
-  deriveFileChangeStats,
-  FILE_TOOL_TEXT_FIELDS,
-  previewText,
-  summarizeToolCall,
-  type ToolResultMessage,
-  type ToolTraceItem,
-  toolResultMessageToText,
-} from "@liveagent/app/lib/chat/assistantBubbleAdapter";
 import { AskUserQuestionCard } from "@liveagent/ui/components/chat/AskUserQuestionCard";
 import { AssistantStatus } from "@liveagent/ui/components/chat/AssistantStatus";
 import { FileChangeBadge } from "@liveagent/ui/components/chat/FileChangeBadge";
@@ -25,12 +16,22 @@ import {
   parseAskUserQuestionResultDetails,
   sanitizeAskUserQuestionItems,
 } from "@liveagent/ui/lib/chat/askUserQuestion";
+import {
+  deriveFileChangeStats,
+  FILE_TOOL_TEXT_FIELDS,
+  previewText,
+  summarizeToolCall,
+  type ToolResultMessage,
+  type ToolTraceItem,
+  toolResultMessageToText,
+} from "@liveagent/ui/lib/chat/assistantBubbleAdapter";
 import { cn } from "@liveagent/ui/lib/shared/utils";
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { ChevronRight } from "../../IconSet";
 import {
   areStableValuesEqual,
   getBuiltinResultKind,
+  getShellSessionDisplayDetails,
   getSubagentInlineSummary,
   getToolDisplayName,
   getToolDisplayTitle,
@@ -39,6 +40,17 @@ import {
   isSubagentCardToolCall,
 } from "./assistantBubbleUtils";
 import { ToolArgsDisplay, ToolResultDisplay } from "./ToolResultDisplay";
+
+// 折叠摘要里行内命令的展示上限:远超任何实际窗口一行可容纳的字符数,视觉
+// 省略仍由 CSS truncate 决定;仅防御超长单行命令(如内联脚本)把常驻 DOM
+// 与原生 title 撑爆。完整命令在展开区可查看。
+const INLINE_COMMAND_PREVIEW_MAX_CHARS = 600;
+
+function capInlineCommandPreview(text: string) {
+  return text.length > INLINE_COMMAND_PREVIEW_MAX_CHARS
+    ? `${text.slice(0, INLINE_COMMAND_PREVIEW_MAX_CHARS)}…`
+    : text;
+}
 
 function ToolCallItem({
   item,
@@ -54,6 +66,14 @@ function ToolCallItem({
   const { t } = useLocale();
   const result = item.toolResult;
   const builtinResultKind = getBuiltinResultKind(result);
+  const isBash = item.toolCall.name === "Bash";
+  const isShellSessionControl =
+    item.toolCall.name === "ProcessWait" || item.toolCall.name === "ProcessStop";
+  const isShellSessionTool = isBash || isShellSessionControl;
+  const shellSessionDetails = isShellSessionTool ? getShellSessionDisplayDetails(result) : null;
+  const shellSessionStatus = shellSessionDetails?.status;
+  const shellSessionFailed = shellSessionStatus === "failed" || shellSessionStatus === "timed_out";
+  const displayIsRunning = Boolean(isRunning);
   const isRedactedToolContent = redactToolContent && isBuiltinShareToolName(item.toolCall.name);
   const isAskUser = !isRedactedToolContent && item.toolCall.name === ASK_USER_QUESTION_TOOL_NAME;
   const askDetails = isAskUser ? parseAskUserQuestionResultDetails(result?.details) : null;
@@ -93,7 +113,6 @@ function ToolCallItem({
     !isAskUser &&
     (!isSubagentCard || !result) &&
     (isStreamingFilePreviewTool ? !result : hasArgs);
-  const isBash = item.toolCall.name === "Bash";
   const isManagedProcess = item.toolCall.name === "ManagedProcess";
   const inlineCommand =
     !isRedactedToolContent &&
@@ -102,6 +121,11 @@ function ToolCallItem({
       ? item.toolCall.arguments.command.trim()
       : "";
   const firstLine = inlineCommand ? inlineCommand.split("\n")[0] : "";
+  // 折叠行的行内命令:视觉截断交给 CSS(truncate 按实际可用宽度出省略号),
+  // 不再按固定字符数硬切(#444)。DOM 文本与原生 title 各留一个远超可视宽度
+  // 的上限,防止超长单行命令把常驻摘要行与悬浮提示撑到不可用。
+  const firstLinePreview = capInlineCommandPreview(firstLine);
+  const inlineCommandTitle = inlineCommand ? capInlineCommandPreview(inlineCommand) : "";
   const toolArgsSummary =
     isRedactedToolContent || isBash || inlineCommand
       ? ""
@@ -133,15 +157,24 @@ function ToolCallItem({
           ? t("chat.askUser.waiting")
           : t("chat.askUser.preparing")
         : t("chat.tool.running")
-      : result
-        ? result.isError
-          ? t("chat.tool.failed")
-          : t("chat.tool.success")
-        : t("chat.tool.waiting");
+      : shellSessionStatus === "running"
+        ? t("chat.tool.running")
+        : shellSessionStatus === "cancelled"
+          ? t("chat.tool.stopped")
+          : shellSessionStatus === "completed"
+            ? t("chat.tool.success")
+            : shellSessionFailed
+              ? t("chat.tool.failed")
+              : result
+                ? result.isError
+                  ? t("chat.tool.failed")
+                  : t("chat.tool.success")
+                : t("chat.tool.waiting");
 
-  const statusTextClass = result?.isError
-    ? "text-[hsl(var(--chat-error))]"
-    : "text-muted-foreground/60";
+  const statusTextClass =
+    result?.isError || shellSessionFailed
+      ? "text-[hsl(var(--chat-error))]"
+      : "text-muted-foreground/60";
 
   useEffect(() => {
     if (readOnly || isRedactedToolContent) return;
@@ -175,7 +208,7 @@ function ToolCallItem({
             (styled per the block container) matches the summary text */}
         <div
           className="min-w-0 truncate font-mono text-[calc(11px*var(--zone-font-scale,1))] leading-5 text-muted-foreground/55"
-          title={!isBash && !inlineCommand && toolArgsSummary ? toolArgsSummary : undefined}
+          title={inlineCommandTitle || toolArgsSummary || undefined}
         >
           <span className="font-sans text-[calc(13px*var(--zone-font-scale,1))] font-normal text-muted-foreground/80 group-hover/tool:text-foreground">
             {title.name}
@@ -187,10 +220,9 @@ function ToolCallItem({
             ) : null}
           </span>
 
-          {firstLine ? (
+          {firstLinePreview ? (
             <span className="ml-1.5">
-              <span className="text-muted-foreground/30">$</span>{" "}
-              {firstLine.length > 48 ? `${firstLine.slice(0, 48)}…` : firstLine}
+              <span className="text-muted-foreground/30">$</span> {firstLinePreview}
             </span>
           ) : toolArgsSummary ? (
             <span className="ml-1.5">{toolArgsSummary}</span>
@@ -203,7 +235,7 @@ function ToolCallItem({
       </div>
 
       <div className="flex shrink-0 items-center gap-2">
-        {isRunning ? (
+        {displayIsRunning ? (
           <AssistantStatus
             className="min-h-0 gap-1.5 text-[calc(11px*var(--zone-font-scale,1))] text-muted-foreground/60"
             iconClassName="h-3 w-3"
@@ -229,7 +261,7 @@ function ToolCallItem({
   const body = (
     <LazyCollapse
       open={effectiveOpen}
-      retainWhileClosed={retainRunningToolContent && Boolean(isRunning)}
+      retainWhileClosed={retainRunningToolContent && displayIsRunning}
     >
       {() => (
         <div className="space-y-3 pb-2 pl-[22px] pt-1">
@@ -273,12 +305,12 @@ function ToolCallItem({
                   if (!/\S/.test(resultText)) return null;
                   if (builtinResultKind && builtinResultKind !== "read_image") return null;
 
-                  if (isBash || readOnly) {
+                  if (isShellSessionTool || readOnly) {
                     return (
                       <ToolScrollablePre
                         className={cn(
                           "max-h-56",
-                          isBash
+                          isShellSessionTool
                             ? "bg-zinc-950/85 text-zinc-300/90 dark:bg-zinc-900/80"
                             : "bg-black/[0.02] dark:bg-white/[0.03]",
                         )}

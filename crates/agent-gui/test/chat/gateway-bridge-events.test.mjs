@@ -195,6 +195,50 @@ test("gateway bridge retry attempts ride tool_status with the current status and
   );
 });
 
+test("gateway bridge emits correlated manual compaction terminal results", () => {
+  const { controller, sent } = createController();
+
+  controller.queueManualCompactionResult(" operation-1 ", "failed", " summary failed ");
+
+  assert.deepEqual(sent, [
+    {
+      requestId: "request-1",
+      event: {
+        type: "manual_compaction_result",
+        operationId: "operation-1",
+        status: "failed",
+        message: "summary failed",
+        conversation_id: "conversation-1",
+      },
+    },
+  ]);
+});
+
+test("gateway bridge manual compaction result swallows a rejected transport promise", async () => {
+  const rejection = new Error("ingress rejected");
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => {
+    warnings.push(args);
+  };
+  try {
+    const controller = createGatewayBridgeEventController({
+      conversationId: "conversation-1",
+      requestId: "request-1",
+      enabled: true,
+      sendEvent: () => Promise.reject(rejection),
+    });
+    // The terminal result must not surface the transport failure synchronously,
+    // and the discarded delivery promise must be caught (no unhandled rejection).
+    controller.queueManualCompactionResult("operation-1", "compacted");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(warnings.length, 1);
+    assert.equal(warnings[0][1], rejection);
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
 test("gateway bridge close blocks normal events but allows forced title updates", () => {
   const { controller, sent } = createController();
 
@@ -312,7 +356,7 @@ test("gateway bridge checkpoint emits compaction summary payload", () => {
     },
   };
 
-  controller.queueCheckpoint(state);
+  controller.queueCheckpoint(state, 12_345);
 
   assert.deepEqual(sent, [
     {
@@ -335,6 +379,7 @@ test("gateway bridge checkpoint emits compaction summary payload", () => {
             model: "gpt-test",
             promptVersion: "summary-v2",
           },
+          contextUsageTokens: 12_345,
         },
       },
     },

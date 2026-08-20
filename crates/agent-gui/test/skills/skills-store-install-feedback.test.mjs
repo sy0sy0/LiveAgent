@@ -5,10 +5,14 @@ import test from "node:test";
 const pageSources = [
   {
     label: "共享 Skills Hub",
-    source: readFileSync(
-      new URL("../../../agent-ui/src/pages/skills-hub/SkillsHubPage.tsx", import.meta.url),
-      "utf8",
-    ),
+    source: ["SkillsHubPage.tsx", "SkillsStoreView.tsx"]
+      .map((file) =>
+        readFileSync(
+          new URL(`../../../agent-ui/src/pages/skills-hub/${file}`, import.meta.url),
+          "utf8",
+        ),
+      )
+      .join("\n"),
   },
 ];
 

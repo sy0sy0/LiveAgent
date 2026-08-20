@@ -19,9 +19,10 @@ import {
   resolveAnthropicWireModelId,
 } from "../anthropicModels";
 import {
-  applyDeepSeekModelDefaults,
-  resolveDeepSeekOpenAICompletionsOverrides,
-} from "../deepSeekProviderAdapter";
+  DEEPSEEK_RESPONSES_API,
+  isOfficialDeepSeekBaseUrl,
+  normalizeDeepSeekResponsesBaseUrl,
+} from "../deepSeekNative";
 import { isXaiProviderTarget } from "./xaiResponsesPayload";
 
 // ---------------------------------------------------------------------------
@@ -33,6 +34,14 @@ import { isXaiProviderTarget } from "./xaiResponsesPayload";
 /** Grok / xAI wire 值：官方 effort 无 minimal，向上取 low。 */
 const XAI_THINKING_WIRE_VALUES: ThinkingLevelMap = {
   minimal: "low",
+};
+
+/** DeepSeek Responses accepts none/low/high/max; medium/xhigh map to high. */
+const DEEPSEEK_THINKING_WIRE_VALUES: ThinkingLevelMap = {
+  off: "none",
+  minimal: "low",
+  medium: "high",
+  xhigh: "high",
 };
 
 function resolveModelThinkingFields(
@@ -220,11 +229,6 @@ function resolveCodexOpenAICompletionsOverrides(params: {
   const isOpenRouter = compatBaseUrl.includes("openrouter.ai");
   const isGroq = compatBaseUrl.includes("groq.com");
   const isChutes = compatBaseUrl.includes("chutes.ai");
-  const isDeepSeek =
-    compatBaseUrl.includes("deepseek.com") || normalizedModelId.includes("deepseek");
-  if (isDeepSeek) {
-    return resolveDeepSeekOpenAICompletionsOverrides();
-  }
   const isKnownNonOpenAIModel =
     normalizedModelId.includes("qwen") ||
     normalizedModelId.includes("gpt-oss") ||
@@ -247,6 +251,7 @@ function resolveCodexOpenAICompletionsOverrides(params: {
   const compat: OpenAICompletionsCompat = {
     supportsStore: false,
     supportsDeveloperRole: false,
+    supportsFinishReason: false,
   };
 
   if (isXai || isZai) {
@@ -331,6 +336,28 @@ export function createModelFromConfig(
   // pi-ai 目录命中时只取其 thinkingLevelMap 的 wire 改写值，可用性不听它的。
   const thinking = resolveModelThinking(providerId, modelId);
 
+  if (providerId === "deepseek") {
+    return {
+      id: modelId,
+      name: modelId,
+      api: DEEPSEEK_RESPONSES_API,
+      provider: "deepseek",
+      baseUrl: normalizeDeepSeekResponsesBaseUrl(baseUrl, {
+        officialHost: isOfficialDeepSeekBaseUrl(upstreamBaseUrl?.trim() || baseUrl),
+      }),
+      ...resolveModelThinkingFields(thinking, DEEPSEEK_THINKING_WIRE_VALUES),
+      input: ["text"],
+      cost: zeroCost,
+      contextWindow,
+      maxTokens,
+      compat: {
+        supportsDeveloperRole: true,
+        supportsLongCacheRetention: false,
+        supportsStrictMode: false,
+      },
+    } as Model<any>;
+  }
+
   if (providerId === "codex" || providerId === "xai") {
     const { baseUrl: normalizedBaseUrl, preferredApi } = normalizeCodexBaseUrl(baseUrl);
     // 正式 xai 供应商，或 Codex 直连 api.x.ai：固定 Responses（agentic 搜索等）。
@@ -338,7 +365,6 @@ export function createModelFromConfig(
       providerId,
       baseUrl: upstreamBaseUrl?.trim() || baseUrl,
     });
-    // DeepSeek 不再按模型 ID 强制协议；requestFormat 优先，DeepSeek 适配只在最终走 completions 时生效。
     const api = isXaiTarget ? "openai-responses" : inferCodexApi(requestFormat, preferredApi);
     const responsesCompat =
       api === "openai-responses"
@@ -349,32 +375,24 @@ export function createModelFromConfig(
         : undefined;
     const known = resolveKnownModel("openai", modelId, normalizedBaseUrl);
     if (known && known.api === api) {
-      return applyDeepSeekModelDefaults(
-        {
-          ...known,
-          contextWindow,
-          maxTokens,
-          cost: zeroCost,
-          ...resolveModelThinkingFields(
-            thinking,
-            isXaiTarget ? XAI_THINKING_WIRE_VALUES : known.thinkingLevelMap,
-          ),
-          ...(responsesCompat
-            ? {
-                compat: {
-                  ...(known.compat ?? {}),
-                  ...responsesCompat,
-                },
-              }
-            : {}),
-        },
-        {
-          providerId,
-          baseUrl: normalizedBaseUrl,
-          upstreamBaseUrl,
-          modelId,
-        },
-      );
+      return {
+        ...known,
+        contextWindow,
+        maxTokens,
+        cost: zeroCost,
+        ...resolveModelThinkingFields(
+          thinking,
+          isXaiTarget ? XAI_THINKING_WIRE_VALUES : known.thinkingLevelMap,
+        ),
+        ...(responsesCompat
+          ? {
+              compat: {
+                ...(known.compat ?? {}),
+                ...responsesCompat,
+              },
+            }
+          : {}),
+      };
     }
 
     const completionsOverrides =
@@ -405,12 +423,7 @@ export function createModelFromConfig(
     } else if (completionsOverrides) {
       custom.compat = completionsOverrides.compat;
     }
-    return applyDeepSeekModelDefaults(custom, {
-      providerId,
-      baseUrl: normalizedBaseUrl,
-      upstreamBaseUrl,
-      modelId,
-    });
+    return custom;
   }
 
   if (providerId === "gemini") {
@@ -443,21 +456,13 @@ export function createModelFromConfig(
 
   const known = resolveKnownAnthropicModel(modelId, baseUrl, upstreamBaseUrl);
   if (known) {
-    return applyDeepSeekModelDefaults(
-      {
-        ...known,
-        contextWindow,
-        maxTokens,
-        cost: zeroCost,
-        ...resolveModelThinkingFields(thinking, known.thinkingLevelMap),
-      },
-      {
-        providerId,
-        baseUrl,
-        upstreamBaseUrl,
-        modelId,
-      },
-    );
+    return {
+      ...known,
+      contextWindow,
+      maxTokens,
+      cost: zeroCost,
+      ...resolveModelThinkingFields(thinking, known.thinkingLevelMap),
+    };
   }
 
   const customCompat = deriveAnthropicCompatForCustomModel(modelId);
@@ -474,10 +479,5 @@ export function createModelFromConfig(
     maxTokens,
     ...(customCompat ? { compat: customCompat } : {}),
   };
-  return applyDeepSeekModelDefaults(custom, {
-    providerId,
-    baseUrl,
-    upstreamBaseUrl,
-    modelId,
-  });
+  return custom;
 }

@@ -1,63 +1,28 @@
 import type { Context, Message, Usage } from "@earendil-works/pi-ai";
 
+import {
+  estimateTextTokens,
+  estimateTextTokenUnits,
+  MESSAGE_ENVELOPE_TOKENS,
+  stringifiedTokenUnits,
+} from "@liveagent/ui/lib/chat/contextUsage";
 import { isCompactionAssistantMessage } from "../conversation/conversationState";
+import { readMessageContextUsage, writeAssistantContextUsage } from "./contextUsageMetadata";
 
-const CHARS_PER_TOKEN = 4;
-// CJK 文字的 token 密度远高于西文：主流 tokenizer（o200k/cl100k/Claude）大约
-// 每 1.4~1.7 个汉字 1 token。按 chars/4 估会低估约 2.5~3 倍，导致压缩触发
-// 严重偏晚甚至撞上下文上限。取 0.7 token/字作为偏保守（宁早勿晚）的估计。
-const CJK_TOKENS_PER_CHAR = 0.7;
-// 逐消息估算只统计正文字符，补一个小常量近似 JSON 包裹（role/键名/引号）的开销。
-const MESSAGE_ENVELOPE_TOKENS = 8;
+// CJK 感知的文本估算、消息包裹常量与非文本值序列化估算全部取自共享层
+//（用量环的检查点估值与 WebUI 倒扫复用同一口径，调参只改共享层）；
+// 这里 re-export 文本估算保持既有调用方与测试不动。
+export { estimateTextTokens, estimateTextTokenUnits };
+
+// liveAgentContextUsage 印章的不变量：totalTokens 只记录 usage 派生的权威值
+//（fixedTokens 随印章携带，供跨端 rebase 补偿 system/tools 开销变化），绝不写
+// 估算——印章随会话持久化且读取侧优先于 usage，一旦写入估算便永久遮蔽后到的
+// 真实读数，且没有任何纠正路径。
 
 // 消息在本代码库中是不可变值对象（状态变更只新建数组），因此估算结果可跨
 // state/segment/临时 state 按对象身份缓存，热路径不再重复序列化。
 const messageTokenCache = new WeakMap<object, number>();
 const toolsTokenCache = new WeakMap<object, number>();
-
-// CJK 统一表意文字（含扩展 A）、假名、谚文、兼容表意/形式与全角标点。
-// 这些区段全部落在 BMP，按 UTF-16 code unit 判断即可；增补平面字符
-// （emoji 等）按两个西文字符计入 chars/4 路径。
-function isCjkCodeUnit(code: number): boolean {
-  return (
-    (code >= 0x2e80 && code <= 0x9fff) ||
-    (code >= 0xac00 && code <= 0xd7af) ||
-    (code >= 0x1100 && code <= 0x11ff) ||
-    (code >= 0xf900 && code <= 0xfaff) ||
-    (code >= 0xfe30 && code <= 0xfe4f) ||
-    (code >= 0xff00 && code <= 0xffef)
-  );
-}
-
-/**
- * 文本的分数 token 估算（不 trim、不取整）。按字符类别累加：CJK 字符按
- * CJK_TOKENS_PER_CHAR，其余按 1/CHARS_PER_TOKEN。可加性成立：对任意切分，
- * 分段估算之和恒等于整体估算，因此流式增量可按 delta 累加。
- */
-export function estimateTextTokenUnits(text: string): number {
-  let cjkChars = 0;
-  for (let index = 0; index < text.length; index += 1) {
-    if (isCjkCodeUnit(text.charCodeAt(index))) cjkChars += 1;
-  }
-  return (text.length - cjkChars) / CHARS_PER_TOKEN + cjkChars * CJK_TOKENS_PER_CHAR;
-}
-
-export function estimateTextTokens(text: string): number {
-  const normalized = text.trim();
-  if (!normalized) return 0;
-  return Math.ceil(estimateTextTokenUnits(normalized));
-}
-
-function stringifiedTokenUnits(value: unknown): number {
-  if (typeof value === "string") return estimateTextTokenUnits(value);
-  if (value == null) return 0;
-  try {
-    const serialized = JSON.stringify(value);
-    return serialized ? estimateTextTokenUnits(serialized) : 0;
-  } catch {
-    return estimateTextTokenUnits(String(value));
-  }
-}
 
 function estimateMessageTokenUnits(message: Message): number {
   let units = 0;
@@ -125,6 +90,12 @@ export function estimateToolsTokens(tools: Context["tools"]): number {
   return tokens;
 }
 
+export function deriveContextTokens(context: Context, options?: { fixedTokens?: number }): number {
+  const ledger = new TokenLedger();
+  ledger.rebase(context, options);
+  return ledger.total();
+}
+
 export function getUsageTotalTokens(usage: Usage | undefined): number | undefined {
   if (!usage) return undefined;
 
@@ -148,44 +119,71 @@ export function getMessageObservedTokens(message: Message): number | undefined {
   // （布尔化避免类型谓词在 else 分支把 AssistantMessage 收窄成 never。）
   const isCheckpoint: boolean = isCompactionAssistantMessage(message);
   if (isCheckpoint) return undefined;
-  return getUsageTotalTokens(message.usage);
+  return readMessageContextUsage(message)?.totalTokens ?? getUsageTotalTokens(message.usage);
 }
 
 export type TokenLedgerSnapshot = {
   fixedTokens: number;
   observedTokens: number;
   trailingTokens: number;
+  // 仅在无 usage 锚点时维护（total() 也只在该情形读取）；有锚点时恒为 fixedTokens。
+  estimatedTotalTokens: number;
   hasObservedUsage: boolean;
+  hasFixedTokenAnchor: boolean;
   totalTokens: number;
 };
 
 /**
  * 每会话上下文规模账本：observed（最近一次真实 usage，已含 system/tools/全部历史）
- * + trailing（其后消息的估算增量）。无 usage 锚点时退回 fixed（system+tools 估算）
- * + trailing。所有读数 O(1)，重建仅在每次请求开始时 O(n) 一次。
+ * + trailing（其后消息的估算增量）。有 usage 锚点时读数恒为 observed + trailing——
+ * 估算口径有意偏保守（高估），绝不允许覆盖真实读数；仅在完全没有 usage 锚点时
+ * 退回 fixed（system+tools 估算）+ 逐消息估算。所有读数 O(1)，重建仅在每次请求
+ * 开始时执行一次。
  */
 export class TokenLedger {
   private fixedTokens = 0;
   private observedTokens = 0;
   private trailingTokens = 0;
+  private estimatedTotalTokens = 0;
   private hasObservedUsage = false;
+  private hasFixedTokenAnchor = false;
 
-  rebase(context: Context): void {
-    this.fixedTokens =
+  rebase(context: Context, options?: { fixedTokens?: number }): void {
+    const estimatedFixedTokens =
       estimateTextTokens(context.systemPrompt ?? "") + estimateToolsTokens(context.tools);
+    this.fixedTokens =
+      typeof options?.fixedTokens === "number" &&
+      Number.isFinite(options.fixedTokens) &&
+      options.fixedTokens >= 0
+        ? Math.floor(options.fixedTokens)
+        : estimatedFixedTokens;
     this.observedTokens = 0;
     this.trailingTokens = 0;
+    this.estimatedTotalTokens = this.fixedTokens;
     this.hasObservedUsage = false;
+    this.hasFixedTokenAnchor = false;
 
     const messages = context.messages;
     let anchorIndex = -1;
     for (let index = messages.length - 1; index >= 0; index -= 1) {
-      const observed = getMessageObservedTokens(messages[index]);
+      const message = messages[index];
+      const observed = getMessageObservedTokens(message);
       if (typeof observed === "number") {
-        this.observedTokens = observed;
+        const anchored = readMessageContextUsage(message);
+        this.observedTokens = anchored
+          ? Math.max(0, observed + this.fixedTokens - anchored.fixedTokens)
+          : observed;
         this.hasObservedUsage = true;
+        this.hasFixedTokenAnchor = anchored !== undefined;
         anchorIndex = index;
         break;
+      }
+    }
+    // estimatedTotalTokens 仅在无锚点时维护：有锚点时 total() 不读它，跳过
+    // 全量估算循环让重建成本随锚点后的消息数而非全历史增长。
+    if (anchorIndex < 0) {
+      for (const message of messages) {
+        this.estimatedTotalTokens += estimateMessageTokens(message);
       }
     }
     for (let index = anchorIndex + 1; index < messages.length; index += 1) {
@@ -195,11 +193,27 @@ export class TokenLedger {
 
   addMessages(messages: readonly Message[]): void {
     for (const message of messages) {
+      if (!this.hasObservedUsage) {
+        this.estimatedTotalTokens += estimateMessageTokens(message);
+      }
       const observed = getMessageObservedTokens(message);
       if (typeof observed === "number") {
+        if (
+          message.role === "assistant" &&
+          !isCompactionAssistantMessage(message) &&
+          readMessageContextUsage(message) === undefined
+        ) {
+          // 印章只盖 usage 派生的权威值（见文件头部不变量）；无 usage 的
+          // assistant 消息不盖章，走下方 trailing 估算路径。
+          writeAssistantContextUsage(message, {
+            totalTokens: observed,
+            fixedTokens: this.fixedTokens,
+          });
+        }
         // 新 usage 已覆盖它之前的全部上下文，trailing 归零重新累计。
         this.observedTokens = observed;
         this.hasObservedUsage = true;
+        this.hasFixedTokenAnchor = readMessageContextUsage(message) !== undefined;
         this.trailingTokens = 0;
         continue;
       }
@@ -208,8 +222,11 @@ export class TokenLedger {
   }
 
   total(): number {
-    const base = this.hasObservedUsage ? this.observedTokens : this.fixedTokens;
-    return base + this.trailingTokens;
+    // 有 usage 锚点时恒信 observed + trailing：估算（尤其 base64 图片按序列化
+    // 字符数、CJK 按 0.7 tok/char）有意高估，与真实读数取 max 会让环读数与
+    // 自动压缩被估算劫持。估算只在完全没有 usage 锚点时兜底。
+    if (!this.hasObservedUsage) return this.estimatedTotalTokens;
+    return this.observedTokens + this.trailingTokens;
   }
 
   /**
@@ -226,7 +243,9 @@ export class TokenLedger {
       fixedTokens: this.fixedTokens,
       observedTokens: this.observedTokens,
       trailingTokens: this.trailingTokens,
+      estimatedTotalTokens: this.estimatedTotalTokens,
       hasObservedUsage: this.hasObservedUsage,
+      hasFixedTokenAnchor: this.hasFixedTokenAnchor,
       totalTokens: this.total(),
     };
   }

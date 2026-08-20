@@ -3,20 +3,19 @@
 // ChatPage), the conversation-rename UI state, the delete flow, and the
 // error-code → i18n mapping. NOT mirrored — the web end has its own container.
 
-import { ChatHistorySidebar } from "@liveagent/ui/components/chat/ChatHistorySidebar";
+import {
+  buildChatHistorySidebarBaseProps,
+  buildChatHistorySidebarConversationProps,
+  buildChatHistorySidebarWorkspaceProps,
+  ChatHistorySidebar,
+  type ChatHistorySidebarContainerSource,
+} from "@liveagent/ui/components/chat/ChatHistorySidebar";
 import { useLocale } from "@liveagent/ui/i18n/index";
 import type { SidebarBatchDeleteOptions } from "@liveagent/ui/lib/sidebar/batchDelete";
 import { deleteSidebarConversations } from "@liveagent/ui/lib/sidebar/batchDelete";
-import {
-  selectConversations,
-  selectListState,
-  selectProjectActivityInputs,
-  selectRunningConversationIds,
-  sidebarShallowEqual,
-} from "@liveagent/ui/lib/sidebar/selectors";
-import type { SidebarSnapshot, SidebarStore } from "@liveagent/ui/lib/sidebar/store";
+import type { SidebarStore } from "@liveagent/ui/lib/sidebar/store";
 import type { SidebarConversation } from "@liveagent/ui/lib/sidebar/types";
-import { useSidebarSelector } from "@liveagent/ui/lib/sidebar/useSidebarSelector";
+import { useSidebarContainerState } from "@liveagent/ui/lib/sidebar/useSidebarContainerState";
 import { sortWorkspaceProjectsByActivity } from "@liveagent/ui/lib/workspaceProjects";
 import { useCallback, useMemo, useState } from "react";
 import {
@@ -27,85 +26,50 @@ import {
 } from "../../../agent-ui-adapters/sidebarChrome";
 import type { AppUpdateController } from "../../../lib/appUpdates";
 import { normalizeConversationTitle } from "../../../lib/chat/page/chatPageHelpers";
-import type { WorkspaceProject } from "../../../lib/settings";
+import type { WorkspaceProject, WorkspaceProjectGroup } from "../../../lib/settings";
 import {
   moveConversationsToWorkspace,
   moveConversationToWorkspace,
 } from "./conversationWorkspaceMove";
 
-type ChatSidebarContainerProps = {
+type ChatSidebarContainerProps = ChatHistorySidebarContainerSource & {
   store: SidebarStore;
-  currentConversationId: string;
-  isOpen: boolean;
-  fontScale?: number;
-  activeView: "chat" | "skills-hub" | "mcp-hub";
-  showProjects: boolean;
-  // Merged (settings ∪ history workdirs) but unsorted — the container sorts
-  // with the store's activity/running inputs.
-  projects: WorkspaceProject[];
-  activeProjectId?: string;
-  missingProjectPathKeys: ReadonlySet<string>;
-  projectRenamingId: string | null;
-  projectRenameDraft: string;
-  projectsCollapsed: boolean;
-  recentCollapsed: boolean;
-  onProjectsCollapsedChange: (collapsed: boolean) => void;
-  onRecentCollapsedChange: (collapsed: boolean) => void;
-  onCreateProject: () => void;
-  onSelectProject: (project: WorkspaceProject) => void;
-  onNewConversationForProject: (project: WorkspaceProject) => void;
-  onBrowseProjectInFileTree: (project: WorkspaceProject) => void;
+  workspaceProjectGroups: WorkspaceProjectGroup[];
+  onCreateWorkspaceGroup: (name: string) => void;
+  onRenameWorkspaceGroup: (groupId: string, name: string) => void;
+  onDeleteWorkspaceGroup: (groupId: string) => void;
+  onMoveProjectToGroup: (projectPath: string, groupId: string | null) => void;
+  onToggleWorkspaceGroupCollapsed: (groupId: string) => void;
   onBrowseProjectInSystemFileManager: (project: WorkspaceProject) => void;
-  onConfigureProjectResources: (project: WorkspaceProject) => void;
-  onStartRenamingProject: (project: WorkspaceProject) => void;
-  onProjectRenameDraftChange: (value: string) => void;
-  onCommitProjectRename: () => void;
-  onCancelProjectRename: () => void;
-  onSetProjectPinned: (project: WorkspaceProject, isPinned: boolean) => void;
-  onRemoveProject: (project: WorkspaceProject) => void;
-  onArchiveProject: (project: WorkspaceProject) => void;
-  onUnarchiveProject: (project: WorkspaceProject) => void;
-  archivedProjectPathKeys?: ReadonlySet<string>;
-  onNewConversation: () => void;
-  onSelectConversation: (id: string) => void;
   // Invoked after the store confirmed a deletion; ChatPage cleans artifacts
   // and replaces the current conversation when needed.
   onConversationDeleted: (id: string) => void;
   onConversationCwdChanged: (id: string, cwd: string) => void;
-  canShareConversations: boolean;
-  sharedConversationCount: number;
-  onShareConversation: (item: SidebarConversation) => void;
-  onOpenSharedConversations: () => void;
-  onCloseSidebar: () => void;
-  onOpenSettings: () => void;
+  onConversationWorkbenchDragIntent?: (
+    item: SidebarConversation,
+    event: { pointerId: number; clientX: number; clientY: number },
+  ) => void;
+  onConversationOpenInWorkbenchSplit?: (item: SidebarConversation) => void;
+  onProjectWorkbenchDragIntent?: (
+    project: WorkspaceProject,
+    event: { pointerId: number; clientX: number; clientY: number },
+  ) => void;
   appUpdate?: AppUpdateController;
-  onOpenSkillsHub: () => void;
-  onOpenMcpHub: () => void;
 };
-
-function selectMutations(snapshot: SidebarSnapshot) {
-  return snapshot.mutations;
-}
-
-function selectMutationErrors(snapshot: SidebarSnapshot) {
-  return snapshot.mutationErrors;
-}
 
 export function ChatSidebarContainer(props: ChatSidebarContainerProps) {
   const { store, projects, onConversationDeleted, onConversationCwdChanged } = props;
   const { t } = useLocale();
 
-  const items = useSidebarSelector(store, selectConversations);
-  const listState = useSidebarSelector(store, selectListState, sidebarShallowEqual);
-  const scopeKey = useSidebarSelector(store, (snapshot) => snapshot.scopeKey);
-  const runningConversationIds = useSidebarSelector(store, selectRunningConversationIds);
-  const busyConversationIds = useSidebarSelector(store, selectMutations);
-  const mutationErrors = useSidebarSelector(store, selectMutationErrors);
-  const projectActivityInputs = useSidebarSelector(
-    store,
-    selectProjectActivityInputs,
-    sidebarShallowEqual,
-  );
+  const {
+    items,
+    listState,
+    scopeKey,
+    runningConversationIds,
+    mutations: busyConversationIds,
+    mutationErrors,
+    projectActivityInputs,
+  } = useSidebarContainerState(store);
 
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
@@ -220,69 +184,38 @@ export function ChatSidebarContainer(props: ChatSidebarContainerProps) {
 
   return (
     <ChatHistorySidebar
-      items={items}
-      currentConversationId={props.currentConversationId}
-      runningConversationIds={runningConversationIds}
-      busyConversationIds={busyConversationIds}
-      listStatus={listState.status}
-      scopeKey={scopeKey}
-      totalItems={listState.totalCount}
-      hasMore={listState.hasMore}
-      isLoadingMore={listState.isLoadingMore}
-      errorMessage={errorMessage}
-      actionErrorMessage={actionErrorMessage}
-      onDismissActionError={handleDismissActionError}
-      renamingId={renamingId}
-      renameDraft={renameDraft}
-      isOpen={props.isOpen}
-      fontScale={props.fontScale}
-      activeView={props.activeView}
-      showProjects={props.showProjects}
-      projects={sortedProjects}
-      activeProjectId={props.activeProjectId}
-      missingProjectPathKeys={props.missingProjectPathKeys}
-      runningProjectPathKeys={projectActivityInputs.runningWorkdirPathKeys}
-      projectRenamingId={props.projectRenamingId}
-      projectRenameDraft={props.projectRenameDraft}
-      projectsCollapsed={props.projectsCollapsed}
-      recentCollapsed={props.recentCollapsed}
-      onProjectsCollapsedChange={props.onProjectsCollapsedChange}
-      onRecentCollapsedChange={props.onRecentCollapsedChange}
-      onCreateProject={props.onCreateProject}
-      onSelectProject={props.onSelectProject}
-      onNewConversationForProject={props.onNewConversationForProject}
-      onBrowseProjectInFileTree={props.onBrowseProjectInFileTree}
-      onBrowseProjectInSystemFileManager={props.onBrowseProjectInSystemFileManager}
-      onConfigureProjectResources={props.onConfigureProjectResources}
-      onStartRenamingProject={props.onStartRenamingProject}
-      onProjectRenameDraftChange={props.onProjectRenameDraftChange}
-      onCommitProjectRename={props.onCommitProjectRename}
-      onCancelProjectRename={props.onCancelProjectRename}
-      onSetProjectPinned={props.onSetProjectPinned}
-      onRemoveProject={props.onRemoveProject}
-      onArchiveProject={props.onArchiveProject}
-      onUnarchiveProject={props.onUnarchiveProject}
-      archivedProjectPathKeys={props.archivedProjectPathKeys}
-      onNewConversation={props.onNewConversation}
-      onSelectConversation={props.onSelectConversation}
-      onStartRenaming={handleStartRenaming}
-      onRenameDraftChange={setRenameDraft}
-      onCommitRename={handleCommitRename}
-      onCancelRename={handleCancelRename}
-      onSetPinned={handleSetPinned}
-      onMoveToWorkspace={handleMoveToWorkspace}
-      onMoveConversationsToWorkspace={handleMoveConversationsToWorkspace}
-      canShareConversations={props.canShareConversations}
-      sharedConversationCount={props.sharedConversationCount}
-      onShareConversation={props.onShareConversation}
-      onOpenSharedConversations={props.onOpenSharedConversations}
-      onDeleteConversation={handleDeleteConversation}
-      onDeleteConversations={handleDeleteConversations}
-      onLoadMore={handleLoadMore}
-      onCloseSidebar={props.onCloseSidebar}
-      onOpenSettings={props.onOpenSettings}
-      onOpenSkillsHub={props.onOpenSkillsHub}
-      onOpenMcpHub={props.onOpenMcpHub}
+      {...buildChatHistorySidebarBaseProps(props, {
+        items,
+        runningConversationIds,
+        busyConversationIds,
+        listState,
+        scopeKey,
+        errorMessage,
+        actionErrorMessage,
+        onDismissActionError: handleDismissActionError,
+        renamingId,
+        renameDraft,
+      })}
+      {...buildChatHistorySidebarWorkspaceProps(
+        props,
+        sortedProjects,
+        projectActivityInputs.runningWorkdirPathKeys,
+      )}
+      {...buildChatHistorySidebarConversationProps(props, {
+        onStartRenaming: handleStartRenaming,
+        onRenameDraftChange: setRenameDraft,
+        onCommitRename: handleCommitRename,
+        onCancelRename: handleCancelRename,
+        onSetPinned: handleSetPinned,
+        onMoveToWorkspace: handleMoveToWorkspace,
+        onMoveConversationsToWorkspace: handleMoveConversationsToWorkspace,
+        onDeleteConversation: handleDeleteConversation,
+        onDeleteConversations: handleDeleteConversations,
+        onLoadMore: handleLoadMore,
+      })}
+      onConversationWorkbenchDragIntent={props.onConversationWorkbenchDragIntent}
+      onConversationOpenInWorkbenchSplit={props.onConversationOpenInWorkbenchSplit}
+      onProjectWorkbenchDragIntent={props.onProjectWorkbenchDragIntent}
       headerTop={<DesktopSidebarTitleBar />}
       brand={<DesktopSidebarBrand />}
       hideCloseButton={hideDesktopSidebarCloseButton()}

@@ -17,11 +17,22 @@ import {
 
 const PENDING_CREATE_ACTIVATION_TIMEOUT_MS = 15_000;
 
+const EMPTY_LEASED_SESSIONS: ReadonlySet<string> = new Set();
+
 type UseRightDockSessionsOptions = {
   client: TerminalClient;
   cwd: string;
   externalSessions?: TerminalSession[];
   externalSessionsLoaded?: boolean;
+  /**
+   * Sessions currently displayed elsewhere (leased by a workbench pane). A
+   * leased session is treated as living in its pane: it is hidden from the
+   * dock's terminal tabs entirely and returns to the dock when the pane
+   * detaches (lease released). This is also what keeps the output stream
+   * single-consumer — the dock never mounts an XTermViewport for a session
+   * that has a pane.
+   */
+  leasedSessionIds?: ReadonlySet<string>;
   isOpen: boolean;
   projectPathKey: string;
   projectState: RightDockProjectState;
@@ -42,6 +53,7 @@ export function useRightDockSessions(options: UseRightDockSessionsOptions) {
     cwd,
     externalSessions,
     externalSessionsLoaded,
+    leasedSessionIds,
     isOpen,
     onProjectStateChange,
     onSessionsChange,
@@ -70,14 +82,28 @@ export function useRightDockSessions(options: UseRightDockSessionsOptions) {
     () =>
       sessions.filter(
         (session) =>
-          session.kind !== "ssh" && terminalSessionBelongsToProject(session, projectPathKey),
+          session.kind !== "ssh" &&
+          terminalSessionBelongsToProject(session, projectPathKey) &&
+          // 拖入画板(持有租约)的会话从 dock 消失,detach 释放租约后自动回归:
+          // 终端在任一时刻只出现在一个宿主里。
+          !leasedSessionIds?.has(session.id),
       ),
-    [projectPathKey, sessions],
+    [leasedSessionIds, projectPathKey, sessions],
   );
   const sshSessions = useMemo(
     () => sessions.filter((session) => session.kind === "ssh"),
     [sessions],
   );
+  // SSH overlay 仍需要租约集合做自己的视口互斥(shell tab 占位),这里只
+  // 收敛为"仍存活的租用会话"交给 overlay 消费。
+  const leasedSessions = useMemo<ReadonlySet<string>>(() => {
+    if (!leasedSessionIds || leasedSessionIds.size === 0) return EMPTY_LEASED_SESSIONS;
+    const live = new Set<string>();
+    for (const session of sessions) {
+      if (leasedSessionIds.has(session.id)) live.add(session.id);
+    }
+    return live;
+  }, [leasedSessionIds, sessions]);
   const activeSession = useMemo(
     () =>
       localSessions.find((session) => session.id === projectState.activeTabId) ??
@@ -320,29 +346,42 @@ export function useRightDockSessions(options: UseRightDockSessionsOptions) {
       if (closingSessionIds.has(session.id)) return;
       setError(null);
       setClosingSessionIds((current) => new Set(current).add(session.id));
+      // The close is this client's gesture, so it also owns moving the
+      // active tab off the dead session; remote clients only fall back at
+      // render time and never write.
+      const finalizeClose = () => {
+        forgetTerminalSession(session.id);
+        onProjectStateChange((current) => {
+          const tabOrder = current.tabOrder.filter((id) => id !== session.id);
+          if (current.activeTabId !== session.id) {
+            return tabOrder.length === current.tabOrder.length ? current : { ...current, tabOrder };
+          }
+          const fallback = rightDockNeighborTabId(current.tabOrder, session.id);
+          return {
+            ...current,
+            ...(fallback ? { activeTabId: fallback } : {}),
+            tabOrder,
+          };
+        });
+      };
       void client
         .close(session.id, session.projectPathKey)
-        .then(() => {
-          forgetTerminalSession(session.id);
-          // The close is this client's gesture, so it also owns moving the
-          // active tab off the dead session; remote clients only fall back at
-          // render time and never write.
-          onProjectStateChange((current) => {
-            const tabOrder = current.tabOrder.filter((id) => id !== session.id);
-            if (current.activeTabId !== session.id) {
-              return tabOrder.length === current.tabOrder.length
-                ? current
-                : { ...current, tabOrder };
-            }
-            const fallback = rightDockNeighborTabId(current.tabOrder, session.id);
-            return {
-              ...current,
-              ...(fallback ? { activeTabId: fallback } : {}),
-              tabOrder,
-            };
-          });
+        .then(finalizeClose)
+        .catch(async (err) => {
+          // A ghost tab (frontend record the backend no longer knows — e.g. a
+          // missed `closed` event) fails close forever; without this check the
+          // tab becomes permanently uncloseable. Verify against the live list
+          // and treat "already gone" as a successful close.
+          const alive = await client
+            .list()
+            .then((live) => live.some((entry) => entry.id === session.id))
+            .catch(() => true);
+          if (!alive) {
+            finalizeClose();
+            return;
+          }
+          setError(err instanceof Error ? err.message : String(err));
         })
-        .catch((err) => setError(err instanceof Error ? err.message : String(err)))
         .finally(() =>
           setClosingSessionIds((current) => {
             if (!current.has(session.id)) return current;
@@ -389,6 +428,7 @@ export function useRightDockSessions(options: UseRightDockSessionsOptions) {
     handleCloseRequest,
     handleInitialTerminalSnapshotConsumed,
     initialTerminalSnapshotsRef,
+    leasedSessions,
     loading,
     localSessions,
     pendingCloseSession,

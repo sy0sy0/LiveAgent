@@ -1,3 +1,4 @@
+import { Terminal } from "@liveagent/ui/components/IconSet";
 import type { ConfirmDialogOptions } from "@liveagent/ui/components/ui/confirm-dialog";
 import {
   applyTerminalEventToSessions,
@@ -7,9 +8,9 @@ import type { TerminalSession } from "@liveagent/ui/lib/terminal/types";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { type Dispatch, type SetStateAction, useCallback, useEffect, useState } from "react";
-import { Terminal } from "../../../components/icons";
 import { tauriTerminalClient } from "../../../lib/terminal/tauriTerminalClient";
 import { asErrorMessage } from "../chatPageUtils";
+import { terminalAppExitGuard } from "../workbench/terminalPaneRuntime";
 
 type UseProjectTerminalsParams = {
   terminalProjectPathKey: string;
@@ -69,6 +70,21 @@ export function useProjectTerminals(params: UseProjectTerminalsParams) {
     });
   }, [terminalProjectPathKey]);
 
+  // 幽灵会话自愈:前端列表可能残留后端已不存在的记录(closed 事件丢失、
+  // dock 写回竞态等)。终端视口报错时按后端权威列表校验一次;确认消失则
+  // 整表刷新,幽灵从 dock 与 Pane 同步退场。会话仍在则视为瞬时错误,不动列表。
+  const verifyTerminalSessionAlive = useCallback((sessionId: string) => {
+    const key = sessionId.trim();
+    if (!key) return;
+    void tauriTerminalClient
+      .list()
+      .then((live) => {
+        if (live.some((session) => session.id === key)) return;
+        setTerminalSessions(sortTerminalSessions(live));
+      })
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | null = null;
@@ -108,9 +124,13 @@ export function useProjectTerminals(params: UseProjectTerminalsParams) {
           tone: "warning",
         }));
       if (!confirmed || cancelled) return;
+      // 退出路径的 close_all 会广播 closed;先置位护栏,ChatPage 的
+      // closed→关 Pane 联动停摆,布局落盘保住全部终端 Pane。
+      terminalAppExitGuard.mark();
       try {
         await invoke("app_confirmed_exit");
       } catch (error) {
+        terminalAppExitGuard.reset();
         if (!cancelled) {
           setErrorMessage(asErrorMessage(error, "退出 LiveAgent 失败"));
         }
@@ -138,5 +158,6 @@ export function useProjectTerminals(params: UseProjectTerminalsParams) {
     setTerminalSessions,
     terminalSessionsLoaded,
     handleRightDockSessionsChange,
+    verifyTerminalSessionAlive,
   };
 }

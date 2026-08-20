@@ -3,14 +3,15 @@ import test from "node:test";
 import { createTsModuleLoader } from "../helpers/load-ts-module.mjs";
 
 const loader = createTsModuleLoader();
-const uploadedFiles = loader.loadModule("src/lib/chat/messages/uploadedFiles.ts");
+const assistantStatus = loader.loadModule("@liveagent/ui/lib/chat/assistantStatus.ts");
+const uploadedFiles = loader.loadModule("@liveagent/ui/lib/chat/uploadedFiles.ts");
 const conversationState = loader.loadModule("src/lib/chat/conversation/conversationState.ts");
 const uiMessages = loader.loadModule("src/lib/chat/messages/uiMessages.ts");
-const hostedSearch = loader.loadModule("src/lib/chat/messages/hostedSearch.ts");
+const hostedSearch = loader.loadModule("@liveagent/ui/lib/chat/hostedSearch.ts");
 const seedToolCalls = loader.loadModule("src/lib/chat/runner/seedToolCalls.ts");
 const chatHelpers = loader.loadModule("src/lib/chat/page/chatPageHelpers.ts");
 const gatewayToolPreview = loader.loadModule("src/pages/chat/turns/gatewayToolPreview.ts");
-const toolPreview = loader.loadModule("src/lib/chat/messages/toolPreview.ts");
+const toolPreview = loader.loadModule("@liveagent/ui/lib/chat/toolPreview.ts");
 
 const fileA = {
   relativePath: "src/App.tsx",
@@ -374,6 +375,7 @@ test("UI message builder groups assistant rounds and attaches matching tool resu
       api: "openai-responses",
       stopReason: "stop",
       usage: { totalTokens: 42 },
+      liveAgentContextUsage: { totalTokens: 84, fixedTokens: 20 },
       timestamp: 4,
     },
   ];
@@ -387,6 +389,7 @@ test("UI message builder groups assistant rounds and attaches matching tool resu
   assert.equal(uiMessages.getRoundThinkingText(ui[1].rounds[0]), "checking");
   assert.equal(uiMessages.getRoundToolTrace(ui[1].rounds[0])[0].toolResult.content[0].text, "file contents");
   assert.equal(ui[1].rounds[1].meta.usageTotalTokens, 42);
+  assert.equal(ui[1].rounds[1].meta.contextUsageTokens, 84);
 });
 
 test("UI message builder preserves provider hosted search blocks", () => {
@@ -1833,7 +1836,22 @@ After`,
   assert.equal(seedToolCalls.stripSeedToolCallMarkup(assistant.content[0].text), "Before\n\nAfter");
 });
 
-test("seed tool call recovery converts flattened DeepSeek tool request text", () => {
+test("seed tool call recovery leaves signed Anthropic thinking untouched", () => {
+  const thinking = `before\n<seed:tool_call><function name="Read"></function></seed:tool_call>\nafter`;
+  const assistant = {
+    role: "assistant",
+    api: "anthropic-messages",
+    provider: "anthropic",
+    model: "claude-sonnet-4-6",
+    content: [{ type: "thinking", thinking, thinkingSignature: "sig" }],
+    timestamp: 1,
+  };
+
+  assert.equal(seedToolCalls.recoverAssistantSeedToolCalls(assistant), null);
+  assert.equal(assistant.content[0].thinking, thinking);
+});
+
+test("seed tool call recovery does not infer flattened text from DeepSeek metadata", () => {
   const assistant = {
     role: "assistant",
     api: "anthropic-messages",
@@ -1863,21 +1881,12 @@ After`,
   };
 
   const recovered = seedToolCalls.recoverAssistantSeedToolCalls(assistant);
-  assert.ok(recovered);
-  assert.equal(recovered.toolCalls.length, 1);
-  assert.equal(recovered.toolCalls[0].id, "call_00_recovered");
-  assert.equal(recovered.toolCalls[0].name, "Read");
-  assert.deepEqual(recovered.toolCalls[0].arguments, {
-    path: "src/App.tsx",
-    line: 12,
-    flags: { raw: true },
-  });
-  assert.equal(recovered.assistant.content[0].text, "Before\n\nAfter");
+  assert.equal(recovered, null);
+  // 旧 DeepSeek 适配的 flattened 文本恢复已随定向适配一并删除：strip 只处理
+  // seed 标记，历史扁平化文本原样保留。
   assert.equal(
-    seedToolCalls.stripSeedToolCallMarkup(assistant.content[0].text, {
-      recoverFlattenedText: true,
-    }),
-    "Before\n\nAfter",
+    seedToolCalls.stripSeedToolCallMarkup(assistant.content[0].text),
+    assistant.content[0].text,
   );
 });
 
@@ -2027,7 +2036,7 @@ test("visible live tool calls are marked running as soon as their cards appear",
   assert.deepEqual(parentOnly.runningToolCallIds, []);
 });
 
-test("seed tool call recovery strips repeated historical tool call text without duplicating native calls", () => {
+test("seed tool call recovery preserves repeated flattened text beside native calls", () => {
   const assistant = {
     role: "assistant",
     api: "anthropic-messages",
@@ -2059,20 +2068,14 @@ After`,
   };
 
   const recovered = seedToolCalls.recoverAssistantSeedToolCalls(assistant);
-  assert.ok(recovered);
-  assert.equal(recovered.toolCalls.length, 0);
-  assert.equal(recovered.assistant.content.length, 2);
-  assert.equal(recovered.assistant.content[0].text, "Before\n\nAfter");
-  assert.equal(recovered.assistant.content[1].id, "call_00_native_grep");
+  assert.equal(recovered, null);
   assert.equal(
-    seedToolCalls.stripSeedToolCallMarkup(assistant.content[0].text, {
-      recoverFlattenedText: true,
-    }),
-    "Before\n\nAfter",
+    seedToolCalls.stripSeedToolCallMarkup(assistant.content[0].text),
+    assistant.content[0].text,
   );
 });
 
-test("seed tool call recovery strips bare tool_name text without duplicating native calls", () => {
+test("seed tool call recovery preserves bare tool_name text beside native calls", () => {
   const assistant = {
     role: "assistant",
     api: "anthropic-messages",
@@ -2110,20 +2113,14 @@ After`,
   };
 
   const recovered = seedToolCalls.recoverAssistantSeedToolCalls(assistant);
-  assert.ok(recovered);
-  assert.equal(recovered.toolCalls.length, 0);
-  assert.equal(recovered.assistant.content.length, 2);
-  assert.equal(recovered.assistant.content[0].text, "Before\n\nAfter");
-  assert.equal(recovered.assistant.content[1].id, "call_00_native_route_grep");
+  assert.equal(recovered, null);
   assert.equal(
-    seedToolCalls.stripSeedToolCallMarkup(assistant.content[0].text, {
-      recoverFlattenedText: true,
-    }),
-    "Before\n\nAfter",
+    seedToolCalls.stripSeedToolCallMarkup(assistant.content[0].text),
+    assistant.content[0].text,
   );
 });
 
-test("seed tool call recovery strips malformed labeled DeepSeek historical tool text", () => {
+test("seed tool call recovery preserves malformed labeled DeepSeek historical text", () => {
   const assistant = {
     role: "assistant",
     api: "anthropic-messages",
@@ -2159,19 +2156,10 @@ arguments:
   };
 
   const recovered = seedToolCalls.recoverAssistantSeedToolCalls(assistant);
-  assert.ok(recovered);
-  assert.equal(recovered.toolCalls.length, 0);
-  assert.equal(recovered.assistant.content.length, 2);
-  assert.equal(recovered.assistant.content[0].text.includes("Historical assistant"), false);
-  assert.equal(recovered.assistant.content[0].text.includes("tool_name: Bash"), false);
-  assert.equal(
-    recovered.assistant.content[0].text,
-    "**Edit / Write 正常。** 继续测试 **Bash、MemoryManager 和管道类工具**：",
-  );
-  assert.equal(recovered.assistant.content[1].id, "call_01_native_bash");
+  assert.equal(recovered, null);
 });
 
-test("seed tool call recovery strips DeepSeek orphan DSML close text after native calls", () => {
+test("seed tool call recovery preserves orphan DSML close text based only on DeepSeek metadata", () => {
   const dsml = "\uFF5C\uFF5CDSML\uFF5C\uFF5C";
   const assistant = {
     role: "assistant",
@@ -2202,14 +2190,7 @@ test("seed tool call recovery strips DeepSeek orphan DSML close text after nativ
   };
 
   const recovered = seedToolCalls.recoverAssistantSeedToolCalls(assistant);
-  assert.ok(recovered);
-  assert.equal(recovered.toolCalls.length, 0);
-  assert.deepEqual(
-    recovered.assistant.content.map((block) => block.type),
-    ["text", "toolCall"],
-  );
-  assert.equal(recovered.assistant.content[0].text.includes("DSML"), false);
-  assert.equal(recovered.assistant.content[1].id, "call_00_native_edit");
+  assert.equal(recovered, null);
 });
 
 test("seed tool call recovery preserves non-DeepSeek flattened tool text", () => {
@@ -2269,9 +2250,7 @@ After`,
   const recovered = seedToolCalls.recoverAssistantSeedToolCalls(assistant);
   assert.equal(recovered, null);
   assert.equal(
-    seedToolCalls.stripSeedToolCallMarkup(assistant.content[0].text, {
-      recoverFlattenedText: true,
-    }),
+    seedToolCalls.stripSeedToolCallMarkup(assistant.content[0].text),
     assistant.content[0].text,
   );
 });
@@ -2326,8 +2305,11 @@ test("chat page helpers keep model options stable and normalize status/title edg
   assert.match(chatHelpers.buildConversationTitlePrompt("hello", "zh-CN"), /简体中文标题/);
   assert.match(chatHelpers.buildConversationTitlePrompt("hello", "en-US"), /within 10 words/i);
   assert.equal(chatHelpers.buildFallbackConversationTitle("x".repeat(60)), `${"x".repeat(48)}...`);
-  assert.equal(chatHelpers.normalizeLiveToolStatus("第 2 轮：模型生成中..."), chatHelpers.VIBING_STATUS);
-  assert.equal(chatHelpers.normalizeLiveToolStatus("Running"), "Running");
+  assert.equal(
+    assistantStatus.normalizeLiveToolStatus("第 2 轮：模型生成中..."),
+    assistantStatus.VIBING_STATUS,
+  );
+  assert.equal(assistantStatus.normalizeLiveToolStatus("Running"), "Running");
   assert.equal(chatHelpers.isAbortLikeError(new Error("AbortError: aborted")), true);
   assert.equal(chatHelpers.isAbortLikeError("network failed"), false);
 });

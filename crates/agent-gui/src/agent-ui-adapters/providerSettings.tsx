@@ -1,4 +1,22 @@
+import {
+  CheckCircle2,
+  ChevronDown,
+  Download,
+  Key,
+  Loader2,
+  RefreshCw,
+} from "@liveagent/ui/components/IconSet";
 import { Button } from "@liveagent/ui/components/ui/button";
+import {
+  Dialog,
+  DialogActions,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@liveagent/ui/components/ui/dialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -7,6 +25,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@liveagent/ui/components/ui/dropdown-menu";
+import { useLocale } from "@liveagent/ui/i18n/index";
 import { cn } from "@liveagent/ui/lib/shared/utils";
 import {
   createDraftModelConfig,
@@ -15,18 +34,8 @@ import {
 } from "@liveagent/ui/pages/settings/providerUtils";
 import { invoke } from "@tauri-apps/api/core";
 import { useMemo, useState } from "react";
-import { createPortal } from "react-dom";
 import ccswitchLogoUrl from "../../src-tauri/icons/custom/ccswitch.png";
 import cherryStudioLogoUrl from "../../src-tauri/icons/custom/cherrystudio.png";
-import {
-  CheckCircle2,
-  ChevronDown,
-  Download,
-  Key,
-  Loader2,
-  RefreshCw,
-  X,
-} from "../components/icons";
 import type { ProviderModelConfig } from "../lib/settings";
 import {
   type AppSettings,
@@ -49,6 +58,8 @@ type CcsProviderImportItem = {
   providerType: ProviderId;
   name: string;
   baseUrl: string;
+  isFullUrl: boolean;
+  modelsUrl?: string;
   apiKey: string;
   requestFormat: CodexRequestFormat;
   models?: string[];
@@ -104,7 +115,10 @@ function ccsProviderIsTransferable(item: CcsProviderImportItem) {
   );
 }
 
-function providerFromCcs(item: CcsProviderImportItem, existingIds: Set<string>): CustomProvider {
+export function providerFromCcs(
+  item: CcsProviderImportItem,
+  existingIds: Set<string>,
+): CustomProvider {
   const baseId =
     `ccswitch-${item.sourceId}`
       .toLowerCase()
@@ -121,6 +135,10 @@ function providerFromCcs(item: CcsProviderImportItem, existingIds: Set<string>):
     name: `${item.name.replace(/[（(]ccswitch[）)]/i, "").trim()}（ccswitch）`,
     type: item.providerType,
     baseUrl: item.baseUrl,
+    isFullUrl: item.isFullUrl,
+    ...(item.providerType !== "gemini" && item.modelsUrl?.trim()
+      ? { modelsUrl: item.modelsUrl.trim() }
+      : {}),
     apiKey: item.apiKey,
     apiKeyConfigured: item.apiKey.trim().length > 0,
     models,
@@ -132,7 +150,10 @@ function providerFromCcs(item: CcsProviderImportItem, existingIds: Set<string>):
           ? item.requestFormat
           : undefined,
     reasoning: "off",
-    promptCachingEnabled: item.providerType !== "gemini" && item.providerType !== "xai",
+    promptCachingEnabled:
+      item.providerType !== "gemini" &&
+      item.providerType !== "xai" &&
+      item.providerType !== "deepseek",
     nativeWebSearchEnabled: true,
     useSystemProxy: false,
     usageQuery: getDefaultUsageQueryConfig(),
@@ -163,7 +184,7 @@ function cherryEffectiveApiKey(item: CherryProviderImportItem, existing?: Custom
   return existing?.apiKey?.trim() ? existing.apiKey : item.apiKey;
 }
 
-function providerFromCherry(
+export function providerFromCherry(
   item: CherryProviderImportItem,
   allItems: CherryProviderImportItem[],
   existing?: CustomProvider,
@@ -175,6 +196,8 @@ function providerFromCherry(
     name: existing?.name ?? cherryProviderName(item, allItems),
     type: item.providerType,
     baseUrl: item.baseUrl,
+    isFullUrl: existing?.isFullUrl ?? false,
+    ...(existing?.modelsUrl ? { modelsUrl: existing.modelsUrl } : {}),
     apiKey,
     apiKeyConfigured: apiKey.trim().length > 0,
     models: existing?.models ?? [],
@@ -187,8 +210,10 @@ function providerFromCherry(
           : undefined,
     reasoning: existing?.reasoning ?? "off",
     promptCachingEnabled:
-      existing?.promptCachingEnabled ??
-      (item.providerType !== "gemini" && item.providerType !== "xai"),
+      item.providerType === "deepseek"
+        ? false
+        : (existing?.promptCachingEnabled ??
+          (item.providerType !== "gemini" && item.providerType !== "xai")),
     nativeWebSearchEnabled: existing?.nativeWebSearchEnabled ?? true,
     useSystemProxy: existing?.useSystemProxy ?? false,
     usageQuery: existing?.usageQuery ?? getDefaultUsageQueryConfig(),
@@ -243,28 +268,24 @@ function CcsImportModal(props: {
     });
   }
 
-  return createPortal(
-    <div className="fixed inset-0 z-[70] flex items-center justify-center p-4">
-      <button
-        type="button"
-        aria-label="关闭 CC Switch 导入"
-        className="absolute inset-0 bg-black/60 backdrop-blur-sm"
-        onClick={importing ? undefined : onClose}
-      />
-      <div className="relative z-10 flex h-[min(34rem,85vh)] w-full max-w-xl flex-col overflow-hidden rounded-2xl border bg-background shadow-2xl">
-        <div className="flex items-center gap-3 border-b px-6 py-4">
+  return (
+    <Dialog open onOpenChange={(open) => !open && !importing && onClose()}>
+      <DialogContent
+        className="flex h-[min(34rem,85dvh)] max-w-xl flex-col p-0"
+        closeDisabled={importing}
+        closeLabel="关闭"
+        showCloseButton
+      >
+        <DialogHeader className="flex-row items-center gap-3 px-6">
           {sourceLogo("ccswitch", "h-9 w-9")}
           <div className="min-w-0 flex-1">
-            <div className="text-sm font-semibold">从 CC Switch 导入</div>
-            <div className="mt-0.5 text-xs text-muted-foreground">
+            <DialogTitle className="text-sm leading-normal">从 CC Switch 导入</DialogTitle>
+            <DialogDescription className="mt-0.5 text-xs">
               导入当前供应商类型的配置，并在后台获取模型列表
-            </div>
+            </DialogDescription>
           </div>
-          <Button variant="ghost" size="icon" onClick={onClose} disabled={importing}>
-            <X className="h-4 w-4" />
-          </Button>
-        </div>
-        <div className="min-h-0 flex-1 divide-y overflow-y-auto">
+        </DialogHeader>
+        <DialogBody className="divide-y p-0 max-[820px]:p-0">
           {rows.length > 0 ? (
             rows.map((item) => {
               const identity = ccsImportIdentity({
@@ -306,33 +327,34 @@ function CcsImportModal(props: {
               当前类型未发现可导入配置
             </div>
           )}
-        </div>
+        </DialogBody>
         {result ? (
           <div className="flex items-start gap-2 border-t px-6 py-3 text-xs text-emerald-600">
             <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
             <span>{result}</span>
           </div>
         ) : null}
-        <div className="flex items-center justify-end gap-2 border-t px-6 py-4">
-          <Button variant="outline" onClick={onClose} disabled={importing}>
-            关闭
-          </Button>
-          <Button
-            className="gap-1.5"
-            onClick={() => onImport(selectedItems)}
-            disabled={importing || selectedItems.length === 0}
-          >
-            {importing ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <Download className="h-3.5 w-3.5" />
-            )}
-            导入 {selectedItems.length} 项
-          </Button>
-        </div>
-      </div>
-    </div>,
-    document.body,
+        <DialogFooter className="px-6">
+          <DialogActions>
+            <Button variant="outline" onClick={onClose} disabled={importing}>
+              关闭
+            </Button>
+            <Button
+              className="gap-1.5"
+              onClick={() => onImport(selectedItems)}
+              disabled={importing || selectedItems.length === 0}
+            >
+              {importing ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Download className="h-3.5 w-3.5" />
+              )}
+              导入 {selectedItems.length} 项
+            </Button>
+          </DialogActions>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -340,8 +362,10 @@ export function ProviderSettingsExtension(props: {
   activeTab: ProviderId;
   settings: AppSettings;
   setSettings: SetSettingsFn;
+  triggerClassName?: string;
 }) {
-  const { activeTab, settings, setSettings } = props;
+  const { activeTab, settings, setSettings, triggerClassName } = props;
+  const { t } = useLocale();
   const [menuOpen, setMenuOpen] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [ccsResponse, setCcsResponse] = useState<CcsProvidersResponse | null>(null);
@@ -392,11 +416,17 @@ export function ProviderSettingsExtension(props: {
             provider.apiKey,
             {
               useSystemProxy: provider.useSystemProxy,
+              isFullUrl: provider.isFullUrl,
+              modelsUrl: provider.modelsUrl,
             },
           );
           return { id: provider.id, models, ok: true };
         } catch {
-          return { id: provider.id, models: [] as ProviderModelConfig[], ok: false };
+          return {
+            id: provider.id,
+            models: [] as ProviderModelConfig[],
+            ok: false,
+          };
         }
       }),
     );
@@ -407,7 +437,11 @@ export function ProviderSettingsExtension(props: {
           const result = results.find((item) => item.id === provider.id);
           if (!result?.ok) return provider;
           const models = mergeFetchedModels(result.models, provider.models);
-          return { ...provider, models, activeModels: models.map((model) => model.id) };
+          return {
+            ...provider,
+            models,
+            activeModels: models.map((model) => model.id),
+          };
         }),
       ),
     );
@@ -486,7 +520,11 @@ export function ProviderSettingsExtension(props: {
           const result = results.find((item) => item.id === provider.id);
           if (!result?.ok) return provider;
           const models = mergeFetchedModels(result.models, provider.models);
-          return { ...provider, models, activeModels: models.map((model) => model.id) };
+          return {
+            ...provider,
+            models,
+            activeModels: models.map((model) => model.id),
+          };
         }),
       ),
     );
@@ -537,64 +575,66 @@ export function ProviderSettingsExtension(props: {
 
   return (
     <>
-      <DropdownMenu open={menuOpen} onOpenChange={handleMenuOpenChange}>
-        <DropdownMenuTrigger
-          render={
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-9 gap-1.5"
-              title={message ?? "从桌面开发工具导入供应商"}
+      <span className="settings-provider-action-slot">
+        <DropdownMenu open={menuOpen} onOpenChange={handleMenuOpenChange}>
+          <DropdownMenuTrigger
+            render={
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className={cn("settings-provider-action", triggerClassName)}
+                title={message ?? t("settings.importProvidersHint")}
+                aria-label={t("settings.importProvidersHint")}
+              />
+            }
+          >
+            {scanning ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Download className="h-3.5 w-3.5" />
+            )}
+            <span className="settings-provider-action-label">{t("settings.importProviders")}</span>
+            <ChevronDown
+              className={cn("h-3.5 w-3.5 shrink-0 transition-transform", menuOpen && "rotate-180")}
             />
-          }
-        >
-          {scanning ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          ) : (
-            <Download className="h-3.5 w-3.5" />
-          )}
-          导入
-          <ChevronDown
-            className={cn("h-3.5 w-3.5 transition-transform", menuOpen && "rotate-180")}
-          />
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-80">
-          <DropdownMenuLabel>桌面配置同步</DropdownMenuLabel>
-          <DropdownMenuItem onSelect={() => void scan()} disabled={scanning} className="gap-2">
-            <RefreshCw className={cn("h-4 w-4", scanning && "animate-spin")} />
-            重新扫描本地配置
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem
-            disabled={scanning || ccsCount === 0}
-            onSelect={() => setCcsModalOpen(true)}
-            className="gap-3 py-2.5"
-          >
-            {sourceLogo("ccswitch", "h-8 w-8")}
-            <span className="min-w-0 flex-1">
-              <span className="block font-medium">CC Switch</span>
-              <span className="block truncate text-xs text-muted-foreground">
-                当前类型发现 {ccsCount} 项配置
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-80">
+            <DropdownMenuLabel>桌面配置同步</DropdownMenuLabel>
+            <DropdownMenuItem onSelect={() => void scan()} disabled={scanning} className="gap-2">
+              <RefreshCw className={cn("h-4 w-4", scanning && "animate-spin")} />
+              重新扫描本地配置
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              disabled={scanning || ccsCount === 0}
+              onSelect={() => setCcsModalOpen(true)}
+              className="gap-3 py-2.5"
+            >
+              {sourceLogo("ccswitch", "h-8 w-8")}
+              <span className="min-w-0 flex-1">
+                <span className="block font-medium">CC Switch</span>
+                <span className="block truncate text-xs text-muted-foreground">
+                  当前类型发现 {ccsCount} 项配置
+                </span>
               </span>
-            </span>
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            disabled={scanning || cherryCount === 0}
-            onSelect={() => setCherryModalOpen(true)}
-            className="gap-3 py-2.5"
-          >
-            {sourceLogo("cherry", "h-8 w-8")}
-            <span className="min-w-0 flex-1">
-              <span className="block font-medium">Cherry Studio</span>
-              <span className="block truncate text-xs text-muted-foreground">
-                当前类型发现 {cherryCount} 项可同步配置
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              disabled={scanning || cherryCount === 0}
+              onSelect={() => setCherryModalOpen(true)}
+              className="gap-3 py-2.5"
+            >
+              {sourceLogo("cherry", "h-8 w-8")}
+              <span className="min-w-0 flex-1">
+                <span className="block font-medium">Cherry Studio</span>
+                <span className="block truncate text-xs text-muted-foreground">
+                  当前类型发现 {cherryCount} 项可同步配置
+                </span>
               </span>
-            </span>
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
-
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </span>
       {ccsModalOpen ? (
         <CcsImportModal
           activeTab={activeTab}

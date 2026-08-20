@@ -1,4 +1,5 @@
 import { ChatEmptyState } from "@liveagent/ui/components/chat/ChatEmptyState";
+import { ChevronDown, Copy } from "@liveagent/ui/components/IconSet";
 import { useLocale } from "@liveagent/ui/i18n/index";
 import { buildFloorEntries } from "@liveagent/ui/lib/chat-floor-nav/floorModel";
 import { BOTTOM_REATTACH_ZONE_PX } from "@liveagent/ui/lib/chat-scroll/scrollFollowCore";
@@ -21,7 +22,6 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
-import { ChevronDown, Copy } from "../../../components/icons";
 import { useMenuExitPresence } from "../../../lib/shared/menuMotion";
 import { RowInteractionProvider, useRowInteractionStore } from "./rowInteraction";
 import { TranscriptList, type TranscriptNavHandle } from "./TranscriptList";
@@ -35,6 +35,10 @@ import {
 } from "./transcriptUtils";
 
 export type { ChatTranscriptProps } from "./transcriptTypes";
+
+// Short and medium conversations paint directly. Only large transcripts keep
+// the convergence gate that prevents a visible estimate-to-measure jump.
+const DEFER_REVEAL_HISTORY_ITEM_THRESHOLD = 120;
 
 export const ChatTranscript = memo(function ChatTranscript(props: ChatTranscriptProps) {
   const {
@@ -162,15 +166,19 @@ export const ChatTranscript = memo(function ChatTranscript(props: ChatTranscript
     branchPendingMessageId: branchPendingMessageId ?? null,
   });
 
-  // A freshly opened conversation stays behind the loading overlay until its
-  // first layout settles (TranscriptList reports convergence), then reveals
-  // in one shot — estimate→measure corrections never show as jumps.
+  // Large conversations stay behind the loading overlay until their first
+  // layout settles. Ordinary conversations paint immediately instead of
+  // paying a second loading-state transition after history is already ready.
+  const shouldDeferTranscriptReveal =
+    !isSending && historyItems.length >= DEFER_REVEAL_HISTORY_ITEM_THRESHOLD;
   const [settledConversationId, setSettledConversationId] = useState<string | null>(null);
   const handleFirstLayoutSettled = useCallback(() => {
     setSettledConversationId(conversationId);
   }, [conversationId]);
   const isTranscriptSettling =
-    shouldReserveTranscriptBottomSpace && settledConversationId !== conversationId;
+    shouldReserveTranscriptBottomSpace &&
+    shouldDeferTranscriptReveal &&
+    settledConversationId !== conversationId;
 
   useLayoutEffect(() => {
     followRef.current = scrollFollowHandle;
@@ -272,7 +280,10 @@ export const ChatTranscript = memo(function ChatTranscript(props: ChatTranscript
   return (
     <div
       ref={transcriptRootRef}
-      className="relative min-h-0 flex-1"
+      // `@container`: transcript overlays (FloorNavRail 等) size against the
+      // pane, not the viewport — a narrow pane in a wide split window must
+      // degrade like a narrow window.
+      className="@container relative min-h-0 flex-1"
       // Preferred (persisted) width, so a fresh mount paints at the user's
       // width instead of the default. TranscriptWidthControls narrows this
       // same variable to the stage in a layout effect — see its header.
@@ -288,9 +299,17 @@ export const ChatTranscript = memo(function ChatTranscript(props: ChatTranscript
         data-scroll-viewport
         className="h-full w-full overflow-y-auto [overflow-anchor:none]"
       >
-        <div className="mx-auto w-full max-w-[var(--chat-transcript-content-width)] px-5 py-4 [overflow-anchor:none]">
+        <div
+          className={cn(
+            "mx-auto w-full max-w-[var(--chat-transcript-content-width)] px-5 py-4 [overflow-anchor:none]",
+            // Empty states center against the scroll viewport (the pane), not
+            // the window: a viewport-height min-height overflows half-height
+            // panes in vertical splits and shifts the hero content.
+            (showNoModelsState || showStartChatState) && "flex min-h-full flex-col",
+          )}
+        >
           {showNoModelsState || showStartChatState ? (
-            <div className="flex min-h-[calc(100vh-220px)] flex-col items-center justify-center">
+            <div className="flex flex-1 flex-col items-center justify-center pb-24">
               {/* Keyed per conversation so the hero entrance replays when
                   switching between empty conversations, not just on mount. */}
               <ChatEmptyState
@@ -304,7 +323,10 @@ export const ChatTranscript = memo(function ChatTranscript(props: ChatTranscript
           ) : null}
 
           <div
-            className={`select-text transition-opacity duration-150 ${isTranscriptSettling ? "opacity-0" : "opacity-100"}`}
+            className={cn(
+              "select-text transition-opacity duration-150",
+              isTranscriptSettling ? "opacity-0" : "opacity-100",
+            )}
           >
             <RowInteractionProvider value={rowInteractionStore}>
               {/* Keyed remount per conversation: per-conversation state
@@ -332,7 +354,9 @@ export const ChatTranscript = memo(function ChatTranscript(props: ChatTranscript
                 onAnchorUserRowChange={setActiveFloorKey}
                 onResendFromEdit={onResendFromEdit}
                 onBranchConversation={onBranchConversation}
-                onFirstLayoutSettled={handleFirstLayoutSettled}
+                onFirstLayoutSettled={
+                  shouldDeferTranscriptReveal ? handleFirstLayoutSettled : undefined
+                }
               />
             </RowInteractionProvider>
           </div>
@@ -375,7 +399,7 @@ export const ChatTranscript = memo(function ChatTranscript(props: ChatTranscript
               ref={transcriptContextMenuRef}
               role="menu"
               className={cn(
-                "editor-context-menu fixed z-[120] w-max min-w-[9.5rem] max-w-[calc(100vw-1.5rem)] select-none overflow-hidden rounded-lg border border-border/70 bg-popover p-1.5 text-popover-foreground shadow-[0_20px_60px_-20px_rgba(15,23,42,0.35)]",
+                "editor-context-menu layer-popover fixed w-max min-w-[9.5rem] max-w-[calc(100vw-1.5rem)] select-none overflow-hidden rounded-lg border border-border/70 bg-popover p-1.5 text-popover-foreground shadow-[0_20px_60px_-20px_rgba(15,23,42,0.35)]",
                 isContextMenuExiting && "editor-context-menu-exit",
               )}
               style={{

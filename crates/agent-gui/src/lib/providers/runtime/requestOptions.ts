@@ -9,6 +9,10 @@ import {
 import { type PreparedProxyRequest, prepareProxyRequest } from "@liveagent/ui/lib/providers/proxy";
 import { createUuid } from "@liveagent/ui/lib/shared/id";
 import type { CodexRequestFormat, ProviderId, ReasoningLevel } from "../../settings";
+import {
+  normalizeDeepSeekResponsesBaseUrl,
+  normalizeDeepSeekResponsesEndpoint,
+} from "../deepSeekNative";
 import { normalizeSessionId } from "./common";
 import type { ProviderRuntimeConfig } from "./types";
 
@@ -78,9 +82,15 @@ export async function prepareProviderRequest(
   runtime: ProviderRuntimeConfig,
   options?: { sessionId?: string },
 ): Promise<PreparedProxyRequest> {
+  const upstreamBaseUrl =
+    providerId === "deepseek"
+      ? runtime.isFullUrl
+        ? normalizeDeepSeekResponsesEndpoint(runtime.baseUrl)
+        : normalizeDeepSeekResponsesBaseUrl(runtime.baseUrl)
+      : runtime.baseUrl;
   return prepareProxyRequest(
     providerId,
-    runtime.baseUrl.trim(),
+    upstreamBaseUrl.trim(),
     mergeCustomHeaders(
       buildProviderRequestHeaders(
         providerId,
@@ -90,7 +100,10 @@ export async function prepareProviderRequest(
       ),
       runtime.customHeaders,
     ),
-    { useSystemProxy: runtime.useSystemProxy === true },
+    {
+      useSystemProxy: runtime.useSystemProxy === true,
+      isFullUrl: runtime.isFullUrl === true,
+    },
   );
 }
 
@@ -106,9 +119,10 @@ export function resolveProviderCacheRetention(
   requestOverride?: CacheRetention,
   providerPreference?: CacheRetention,
 ): CacheRetention | undefined {
-  // OpenAI 侧的"缓存"体现为稳定的 prompt_cache_key 路由提示；开关关闭时
-  // 显式返回 none，阻止 pi-ai 按 sessionId 默认下发。
+  // Codex 的 wire 策略由 promptCacheHintMode 处理；这里保留 short 让供应商级
+  // none 仍可被单模型覆盖。请求级 none 则始终优先，供标题/压缩等辅助请求禁用。
   if (providerId !== "claude_code" && providerId !== "codex") return undefined;
+  if (providerId === "codex") return requestOverride ?? "short";
   if (promptCachingEnabled === false) return "none";
   // 请求级 override 优先（压缩/标题等辅助请求强制 none）。
   if (requestOverride) return requestOverride;

@@ -1,5 +1,5 @@
 import { HubTitleBar, usesOverlayTitleBar } from "@liveagent/adapters/hubChrome";
-import { PanelLeft } from "@liveagent/app/components/icons";
+import { PanelLeft } from "@liveagent/ui/components/IconSet";
 import type { ReactNode } from "react";
 import { useLocale } from "../../i18n";
 import { cn } from "../../lib/shared/utils";
@@ -33,21 +33,27 @@ export function HubBackdrop(props: { tone?: "amber" | "violet" | "neutral" }) {
 }
 
 export function HubHeader(props: {
-  icon: ReactNode;
+  icon?: ReactNode;
   title: string;
   subtitle?: string;
   tone?: "amber" | "violet" | "neutral";
   actions?: ReactNode;
+  prominent?: boolean;
   sidebarOpen: boolean;
   onOpenSidebar: () => void;
 }) {
-  const { icon, title, subtitle, actions, sidebarOpen, onOpenSidebar } = props;
+  const { icon, title, subtitle, actions, prominent = false, sidebarOpen, onOpenSidebar } = props;
   const { t } = useLocale();
   const showSidebarButton = !sidebarOpen && !usesOverlayTitleBar;
   return (
     <>
       <HubTitleBar />
-      <div className="hub-header relative z-10 px-5 pt-6 pb-3 sm:px-6 lg:px-8 xl:px-10">
+      <div
+        className={cn(
+          "hub-header relative z-10 px-5 sm:px-6 lg:px-8 xl:px-10",
+          prominent ? "pb-5 pt-8" : "pb-3 pt-6",
+        )}
+      >
         {showSidebarButton ? (
           <Button
             type="button"
@@ -62,19 +68,33 @@ export function HubHeader(props: {
         ) : null}
         <div
           className={cn(
-            "mx-auto flex w-full max-w-[1320px] items-center gap-4",
+            "mx-auto flex w-full max-w-[1320px] gap-4",
+            prominent ? "items-end" : "items-center",
             showSidebarButton && "pl-11 lg:pl-0",
           )}
         >
-          <div className="hub-header-icon flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-border/40 bg-background/70 text-foreground/80 shadow-[0_1px_0_rgba(255,255,255,0.55)_inset] dark:border-white/[0.08] dark:bg-white/[0.05] dark:shadow-[0_1px_0_rgba(255,255,255,0.05)_inset] backdrop-blur-xl">
-            {icon}
-          </div>
+          {icon ? (
+            <div className="hub-header-icon flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-border bg-background text-foreground shadow-xs">
+              {icon}
+            </div>
+          ) : null}
           <div className="min-w-0 flex-1">
-            <h1 className="text-[21px] font-semibold leading-tight tracking-tight text-foreground">
+            <h1
+              className={cn(
+                "font-semibold leading-tight tracking-tight text-foreground",
+                prominent ? "text-[28px]" : "text-[21px]",
+              )}
+            >
               {title}
             </h1>
             {subtitle ? (
-              <p className="mt-0.5 truncate text-[12px] text-muted-foreground" title={subtitle}>
+              <p
+                className={cn(
+                  "truncate text-muted-foreground",
+                  prominent ? "mt-1.5 text-sm" : "mt-0.5 text-[12px]",
+                )}
+                title={subtitle}
+              >
                 {subtitle}
               </p>
             ) : null}

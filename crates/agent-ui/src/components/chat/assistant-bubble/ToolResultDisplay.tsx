@@ -1,9 +1,22 @@
+import { EditDiffView } from "@liveagent/ui/components/chat/EditDiffView";
+import { FileToolArgsDisplay } from "@liveagent/ui/components/chat/FileToolArgs";
+import {
+  type MetaTag,
+  MetaTags,
+  PathDisplay,
+  ToolFactGrid,
+  ToolScrollablePre,
+  ToolSurface,
+  ToolSurfaceLabel,
+} from "@liveagent/ui/components/chat/ToolSurfaces";
+import { Markdown } from "@liveagent/ui/components/Markdown";
 import {
   type DeleteResultDetails,
   deriveFileToolPreview,
   type EditResultDetails,
   type GlobResultDetails,
   type GrepResultDetails,
+  isDynamicMcpToolName,
   type ListResultDetails,
   type McpManagerResultDetails,
   previewText,
@@ -19,19 +32,7 @@ import {
   toolCallArgsForDisplay,
   toolResultMessageToText,
   type WriteResultDetails,
-} from "@liveagent/app/lib/chat/assistantBubbleAdapter";
-import { EditDiffView } from "@liveagent/ui/components/chat/EditDiffView";
-import { FileToolArgsDisplay } from "@liveagent/ui/components/chat/FileToolArgs";
-import {
-  type MetaTag,
-  MetaTags,
-  PathDisplay,
-  ToolFactGrid,
-  ToolScrollablePre,
-  ToolSurface,
-  ToolSurfaceLabel,
-} from "@liveagent/ui/components/chat/ToolSurfaces";
-import { Markdown } from "@liveagent/ui/components/Markdown";
+} from "@liveagent/ui/lib/chat/assistantBubbleAdapter";
 import type {
   SubagentBatchDetails,
   SubagentCardDetails,
@@ -63,6 +64,18 @@ type ShellResultDetails = {
   duration_ms: number;
 };
 
+type ShellSessionResultDetails = {
+  session_id: string;
+  status: string;
+  cursor?: number;
+  has_more?: boolean;
+  exit_code?: number | null;
+  duration_ms: number;
+  shell?: string;
+  timeout_ms?: number | null;
+  output_truncated?: boolean;
+};
+
 function isShellResultDetails(value: unknown): value is ShellResultDetails {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
@@ -74,6 +87,16 @@ function isShellResultDetails(value: unknown): value is ShellResultDetails {
     typeof candidate.stdout_truncated === "boolean" &&
     typeof candidate.stderr_truncated === "boolean" &&
     typeof candidate.timed_out === "boolean" &&
+    typeof candidate.duration_ms === "number"
+  );
+}
+
+function isShellSessionResultDetails(value: unknown): value is ShellSessionResultDetails {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.session_id === "string" &&
+    typeof candidate.status === "string" &&
     typeof candidate.duration_ms === "number"
   );
 }
@@ -99,13 +122,24 @@ function buildPagedResultTags(params: {
   ];
 }
 
+// Longest string that still reads well inside a fact-grid cell (~3 wrapped
+// lines); longer values switch the whole display to the complete JSON view.
+const GENERIC_GRID_VALUE_MAX_CHARS = 200;
+
 /** Extract tool-specific display info */
-function getToolDisplay(toolCall: { name: string; arguments?: Record<string, unknown> }) {
+function getToolDisplay(toolCall: ToolTraceItem["toolCall"]) {
   const args = toolCall.arguments || {};
   const name = toolCall.name;
   const path = typeof args.path === "string" ? (args.path as string) : null;
   const pattern = typeof args.pattern === "string" ? (args.pattern as string) : null;
   const tags: MetaTag[] = [];
+
+  // Dynamic MCP tools carry arbitrary commands and nested payloads; their
+  // expanded view must show the complete (display-sanitized) arguments, not
+  // the primitive-only fact grid (#444).
+  if (isDynamicMcpToolName(name)) {
+    return { type: "raw" as const, path: null, pattern: null, tags };
+  }
 
   switch (name) {
     case "Read":
@@ -203,13 +237,23 @@ function getToolDisplay(toolCall: { name: string; arguments?: Record<string, unk
         : { type: "generic" as const, path: null, pattern: null, tags };
     }
     default: {
-      // Generic: collect all string/number/boolean args
+      // Generic args: short primitives keep the compact fact grid; anything
+      // long or nested falls through to the complete JSON view — the expanded
+      // area must never lose argument content irreversibly (#444). Iterating
+      // the display projection keeps synthetic __-keys hidden and oversized
+      // strings capped with an explicit length marker.
       const entries: MetaTag[] = [];
-      for (const [k, v] of Object.entries(args)) {
-        if (typeof v === "string")
-          entries.push({ label: k, value: v.length > 60 ? `${v.slice(0, 60)}…` : v });
-        else if (typeof v === "number" || typeof v === "boolean")
-          entries.push({ label: k, value: String(v) });
+      for (const [key, value] of Object.entries(toolCallArgsForDisplay(toolCall))) {
+        if (typeof value === "string") {
+          if (value.length > GENERIC_GRID_VALUE_MAX_CHARS) {
+            return { type: "raw" as const, path: null, pattern: null, tags };
+          }
+          entries.push({ label: key, value });
+        } else if (typeof value === "number" || typeof value === "boolean") {
+          entries.push({ label: key, value: String(value) });
+        } else if (value !== null && value !== undefined) {
+          return { type: "raw" as const, path: null, pattern: null, tags };
+        }
       }
       return { type: "generic" as const, path: null, pattern: null, tags: entries };
     }
@@ -333,11 +377,14 @@ export function ToolArgsDisplay({ item }: { item: ToolTraceItem }) {
     return <ToolFactGrid tags={display.tags} />;
   }
 
-  // Fallback: raw JSON, cached by argument identity — settled tool args are
-  // immutable, so virtualizer remounts reuse the stringified form.
+  // Fallback: complete JSON — dynamic MCP tools and generic args carrying
+  // long or nested values. The surface is height-bounded and wraps long
+  // lines; oversized fields arrive pre-capped with an explicit marker from
+  // toolCallArgsForDisplay. Cached by argument identity — settled tool args
+  // are immutable, so virtualizer remounts reuse the stringified form.
   return (
     <ToolSurface className="overflow-hidden px-0 py-0">
-      <ToolScrollablePre className="max-h-44 rounded-none">
+      <ToolScrollablePre className="max-h-56 whitespace-pre-wrap break-words rounded-none">
         {getRawArgsDisplayText(toolCall)}
       </ToolScrollablePre>
     </ToolSurface>
@@ -411,6 +458,41 @@ export function ToolResultDisplay({
   const text = extractResultText(result);
   const images = getToolResultImages(result);
   const shellDetails = isShellResultDetails(result.details) ? result.details : null;
+  const shellSessionDetails = isShellSessionResultDetails(result.details) ? result.details : null;
+  const isShellSessionTool =
+    item.toolCall.name === "Bash" ||
+    item.toolCall.name === "ProcessWait" ||
+    item.toolCall.name === "ProcessStop";
+
+  if (isShellSessionTool && shellSessionDetails) {
+    return (
+      <ToolSurface>
+        <MetaTags
+          tags={[
+            { label: "session", value: shellSessionDetails.session_id },
+            { label: "status", value: shellSessionDetails.status },
+            ...(typeof shellSessionDetails.cursor === "number"
+              ? [{ label: "cursor", value: String(shellSessionDetails.cursor) }]
+              : []),
+            ...(shellSessionDetails.has_more ? [{ label: "more", value: "true" }] : []),
+            ...(typeof shellSessionDetails.exit_code === "number"
+              ? [{ label: "exit", value: String(shellSessionDetails.exit_code) }]
+              : []),
+            { label: "session duration", value: `${shellSessionDetails.duration_ms} ms` },
+            ...(shellSessionDetails.shell
+              ? [{ label: "shell", value: shellSessionDetails.shell }]
+              : []),
+            ...(typeof shellSessionDetails.timeout_ms === "number"
+              ? [{ label: "timeout_ms", value: String(shellSessionDetails.timeout_ms) }]
+              : []),
+            ...(shellSessionDetails.output_truncated
+              ? [{ label: "session output", value: "truncated" }]
+              : []),
+          ]}
+        />
+      </ToolSurface>
+    );
+  }
 
   if (item.toolCall.name === "Bash") {
     if (!shellDetails) return null;
@@ -586,7 +668,7 @@ export function ToolResultDisplay({
           />
         </ToolSurface>
         {!details.reusedExisting && images.length > 0 ? (
-          <div className="overflow-hidden rounded-[10px] border border-black/[0.06] bg-white/[0.55] p-2 dark:border-white/[0.08] dark:bg-white/[0.04]">
+          <div className="overflow-hidden rounded-lg border border-black/[0.06] bg-white/[0.55] p-2 dark:border-white/[0.08] dark:bg-white/[0.04]">
             {images.map((image, index) => (
               <ToolResultImagePreview
                 key={`${details.path}-${index}`}
@@ -745,7 +827,7 @@ export function ToolResultDisplay({
             {details.entries.map((entry) => (
               <div
                 key={`${entry.kind}-${entry.path}`}
-                className="flex items-start gap-2 rounded-[8px] px-1.5 py-1 text-[calc(11px*var(--zone-font-scale,1))] leading-[1.5] even:bg-black/[0.02] dark:even:bg-white/[0.03]"
+                className="flex items-start gap-2 rounded-md px-1.5 py-1 text-[calc(11px*var(--zone-font-scale,1))] leading-[1.5] even:bg-black/[0.02] dark:even:bg-white/[0.03]"
               >
                 <span className="mt-[1px] shrink-0 text-[calc(10px*var(--zone-font-scale,1))] font-semibold uppercase text-muted-foreground/35">
                   {entry.kind}
@@ -783,7 +865,7 @@ export function ToolResultDisplay({
               <PathDisplay
                 key={entry}
                 path={entry}
-                className="block rounded-[8px] px-1.5 py-1 break-all font-mono text-[calc(11px*var(--zone-font-scale,1))] leading-[1.5] even:bg-black/[0.02] dark:even:bg-white/[0.03]"
+                className="block rounded-md px-1.5 py-1 break-all font-mono text-[calc(11px*var(--zone-font-scale,1))] leading-[1.5] even:bg-black/[0.02] dark:even:bg-white/[0.03]"
               />
             ))}
           </div>
@@ -814,7 +896,7 @@ export function ToolResultDisplay({
               {details.files.map((file) => (
                 <div
                   key={file.path}
-                  className="space-y-1 rounded-[8px] px-1.5 py-1 even:bg-black/[0.02] dark:even:bg-white/[0.03]"
+                  className="space-y-1 rounded-md px-1.5 py-1 even:bg-black/[0.02] dark:even:bg-white/[0.03]"
                 >
                   <PathDisplay
                     path={file.path}
@@ -837,7 +919,7 @@ export function ToolResultDisplay({
             {details.matches.map((match, index) => (
               <div
                 key={`${match.path}:${match.line}:${index}`}
-                className="rounded-[8px] border border-black/[0.05] bg-white/[0.55] p-2 dark:border-white/[0.06] dark:bg-white/[0.03]"
+                className="rounded-md border border-black/[0.05] bg-white/[0.55] p-2 dark:border-white/[0.06] dark:bg-white/[0.03]"
               >
                 <div className="flex items-start gap-2">
                   <PathDisplay
@@ -1043,7 +1125,7 @@ export function ToolResultDisplay({
           </div>
         ) : null}
         {details.bodyPreview ? (
-          <div className="rounded-[8px] border border-black/[0.05] bg-white/[0.45] px-2.5 py-2 text-[calc(11.5px*var(--zone-font-scale,1))] leading-[1.6] dark:border-white/[0.07] dark:bg-white/[0.03]">
+          <div className="rounded-md border border-black/[0.05] bg-white/[0.45] px-2.5 py-2 text-[calc(11.5px*var(--zone-font-scale,1))] leading-[1.6] dark:border-white/[0.07] dark:bg-white/[0.03]">
             <Markdown content={details.bodyPreview} />
           </div>
         ) : null}
@@ -1054,7 +1136,7 @@ export function ToolResultDisplay({
   if (images.length > 0) {
     return (
       <div className="space-y-2">
-        <div className="overflow-hidden rounded-[10px] border border-black/[0.06] bg-white/[0.55] p-2 dark:border-white/[0.08] dark:bg-white/[0.04]">
+        <div className="overflow-hidden rounded-lg border border-black/[0.06] bg-white/[0.55] p-2 dark:border-white/[0.08] dark:bg-white/[0.04]">
           {images.map((image, index) => (
             <ToolResultImagePreview
               key={`${item.toolCall.id}-${index}`}

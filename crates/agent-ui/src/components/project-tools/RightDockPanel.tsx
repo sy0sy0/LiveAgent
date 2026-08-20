@@ -1,11 +1,14 @@
-import { X } from "@liveagent/app/components/icons";
-import type {
-  RightDockFileTreeState,
-  RightDockFileTreeStatePatch,
-  RightDockProjectState,
-  SshHostConfig,
+import {
+  closeRightDockBackgroundTasksTabState,
+  openRightDockBackgroundTasksTabState,
+  type RightDockBackgroundTasksState,
+  type RightDockFileTreeState,
+  type RightDockFileTreeStatePatch,
+  type RightDockProjectState,
+  type SshHostConfig,
 } from "@liveagent/app/lib/settings";
 import { openUrl } from "@liveagent/app/shims/tauriOpener";
+import { X } from "@liveagent/ui/components/IconSet";
 import type {
   GitCommitContextPayload,
   GitFileContextPayload,
@@ -25,6 +28,7 @@ import {
   useRef,
   useState,
 } from "react";
+import type { ProjectToolTextGenerationClient } from "../../lib/ai/projectToolTextGeneration";
 import { ensureManagedProcessInit, useManagedProcesses } from "../../lib/managed-process/store";
 import { cn } from "../../lib/shared/utils";
 import type { TerminalClient, TerminalSession } from "../../lib/terminal/types";
@@ -40,7 +44,6 @@ import {
 import { RightDockChooser, RightDockCreateMenu } from "./RightDockLauncher";
 import { RightDockTabStrip } from "./RightDockTabStrip";
 import {
-  BACKGROUND_TASKS_TAB_ID,
   dirname,
   expandedPathsForFileTreePath,
   formatTerminalSessionTitle,
@@ -60,6 +63,11 @@ type RightDockPanelProps = {
   cwd: string;
   sessions?: TerminalSession[];
   sessionsLoaded?: boolean;
+  /**
+   * 被工作台 Pane 租用的会话:tab 保留并标记,视口换成"聚焦面板"占位。
+   * 视口互斥(绝不同时挂两个 XTermViewport)是这里唯一的硬不变量。
+   */
+  leasedSessionIds?: ReadonlySet<string>;
   width: number;
   theme: "light" | "dark";
   disabledMessage?: string;
@@ -72,6 +80,7 @@ type RightDockPanelProps = {
   gitClient?: GitClient | null;
   gitWriteEnabled?: boolean;
   gitDisabledMessage?: string;
+  textGenerationClient?: ProjectToolTextGenerationClient | null;
   tunnelClient?: LocalTunnelClient | null;
   tunnelEnabled?: boolean;
   tunnelDisabledMessage?: string;
@@ -85,6 +94,20 @@ type RightDockPanelProps = {
   onSshProjectHostIdsChange?: (hostIds: string[]) => void;
   onOpenSshSession?: (session: TerminalSession, kind?: "bash" | "sftp") => void;
   onSessionsChange?: (sessions: TerminalSession[]) => void;
+  /** 存在时终端 tab 可拖出 dock(工作台宿主);默认无行为。 */
+  onTerminalTabDragStart?: (
+    session: TerminalSession,
+    event: { pointerId: number; clientX: number; clientY: number },
+  ) => void;
+  /** 存在时空态"新建终端"入口可拖出到工作台画板;点击行为不变。 */
+  onNewTerminalDragStart?: (event: { pointerId: number; clientX: number; clientY: number }) => void;
+  /** 终端 tab 右键菜单「在工作台打开」;省略时菜单不出现(拖拽仍可用)。 */
+  onOpenTerminalInWorkbench?: (session: TerminalSession) => void;
+  /**
+   * dock 视口报错时上抛 sessionId,由宿主按后端权威列表校验:会话确认
+   * 消失(幽灵记录)则整表刷新,坏 tab 自动退场;仍存活的瞬时错误不动列表。
+   */
+  onSessionGhost?: (sessionId: string) => void;
   onInsertFileMention?: (path: string, kind: "file" | "dir") => void;
   onOpenFile?: (path: string, imagePaths?: string[]) => void;
   onInsertCodeReviewSkill?: () => void;
@@ -341,6 +364,7 @@ export const RightDockPanel = memo(function RightDockPanel(props: RightDockPanel
     cwd,
     sessions: externalSessions,
     sessionsLoaded: externalSessionsLoaded,
+    leasedSessionIds,
     width,
     theme,
     disabledMessage,
@@ -353,6 +377,7 @@ export const RightDockPanel = memo(function RightDockPanel(props: RightDockPanel
     gitClient,
     gitWriteEnabled = true,
     gitDisabledMessage,
+    textGenerationClient,
     tunnelClient,
     tunnelEnabled = true,
     tunnelDisabledMessage,
@@ -364,6 +389,10 @@ export const RightDockPanel = memo(function RightDockPanel(props: RightDockPanel
     onSshProjectHostIdsChange,
     onOpenSshSession,
     onSessionsChange,
+    onTerminalTabDragStart,
+    onNewTerminalDragStart,
+    onOpenTerminalInWorkbench,
+    onSessionGhost,
     onInsertFileMention,
     onOpenFile,
     onInsertCodeReviewSkill,
@@ -417,6 +446,7 @@ export const RightDockPanel = memo(function RightDockPanel(props: RightDockPanel
     cwd,
     externalSessions,
     externalSessionsLoaded,
+    leasedSessionIds,
     isOpen,
     onProjectStateChange,
     onSessionsChange,
@@ -429,21 +459,27 @@ export const RightDockPanel = memo(function RightDockPanel(props: RightDockPanel
   // hook-level `error` stays reserved for list/create failures.
   const [terminalErrors, setTerminalErrors] = useState<ReadonlyMap<string, string>>(new Map());
 
-  const handleTerminalError = useCallback((sessionId: string, message: string | null) => {
-    setTerminalErrors((current) => {
-      const existing = current.get(sessionId);
-      if (message === null) {
-        if (existing === undefined) return current;
+  const handleTerminalError = useCallback(
+    (sessionId: string, message: string | null) => {
+      setTerminalErrors((current) => {
+        const existing = current.get(sessionId);
+        if (message === null) {
+          if (existing === undefined) return current;
+          const next = new Map(current);
+          next.delete(sessionId);
+          return next;
+        }
+        if (existing === message) return current;
         const next = new Map(current);
-        next.delete(sessionId);
+        next.set(sessionId, message);
         return next;
-      }
-      if (existing === message) return current;
-      const next = new Map(current);
-      next.set(sessionId, message);
-      return next;
-    });
-  }, []);
+      });
+      // attach 持续失败最常见的根因是幽灵会话(后端已丢、前端列表还在)。
+      // 上抛给宿主做权威校验;瞬时错误在校验中会被识别为仍存活而不动列表。
+      if (message) onSessionGhost?.(sessionId);
+    },
+    [onSessionGhost],
+  );
 
   useEffect(() => {
     // Closed/forgotten sessions leave the live list; drop their error buckets.
@@ -471,16 +507,22 @@ export const RightDockPanel = memo(function RightDockPanel(props: RightDockPanel
       console.error("managed process init failed", error);
     });
   }, []);
-  // Session-local visibility: the tab stays derived and never writes
-  // persisted right-dock settings for existence. Closing is hide-only — it
-  // snapshots the current task ids and touches no process state; a task id
-  // outside that snapshot (a newly started one) re-derives the tab.
-  const [backgroundTasksOpened, setBackgroundTasksOpened] = useState(false);
-  const [backgroundTasksDismissedIds, setBackgroundTasksDismissedIds] =
-    useState<ReadonlySet<string> | null>(null);
+  // Visibility intent lives in the synced right-dock project state so that
+  // opening/closing the tab on one client mirrors to the others. Closing is
+  // hide-only — it snapshots the current task ids and touches no process
+  // state; a task id outside that snapshot (a newly started one) re-derives
+  // the tab everywhere. Without a project bucket to persist into (no
+  // projectPathKey), a session-local fallback keeps the launcher working.
+  const [localBackgroundTasks, setLocalBackgroundTasks] = useState<RightDockBackgroundTasksState>({
+    opened: false,
+    dismissedIds: [],
+  });
+  const backgroundTasksState = projectPathKey ? projectState.backgroundTasks : localBackgroundTasks;
   const backgroundTasksVisible =
-    backgroundTasksOpened ||
-    managedProcessState.processes.some((process) => !backgroundTasksDismissedIds?.has(process.id));
+    backgroundTasksState.opened ||
+    managedProcessState.processes.some(
+      (process) => !backgroundTasksState.dismissedIds.includes(process.id),
+    );
   const backgroundTasksRunning = managedProcessState.processes.filter(
     (process) => process.running,
   ).length;
@@ -515,18 +557,24 @@ export const RightDockPanel = memo(function RightDockPanel(props: RightDockPanel
   }, [createTerminal]);
 
   const openBackgroundTasks = useCallback(() => {
-    setBackgroundTasksOpened(true);
-    setBackgroundTasksDismissedIds(null);
-    activateTab(BACKGROUND_TASKS_TAB_ID);
-  }, [activateTab]);
+    if (projectPathKey) {
+      onProjectStateChange(openRightDockBackgroundTasksTabState);
+      return;
+    }
+    // No project bucket: persisted writes (including tab activation) are
+    // no-ops, so only the session-local visibility flips.
+    setLocalBackgroundTasks({ opened: true, dismissedIds: [] });
+  }, [onProjectStateChange, projectPathKey]);
 
   const closeBackgroundTasks = useCallback(() => {
-    // Ephemeral only; the persisted activeTabId falls back at render time.
-    setBackgroundTasksOpened(false);
-    setBackgroundTasksDismissedIds(
-      new Set(managedProcessState.processes.map((process) => process.id)),
-    );
-  }, [managedProcessState.processes]);
+    // Hide-only; the persisted activeTabId falls back at render time.
+    const visibleIds = managedProcessState.processes.map((process) => process.id);
+    if (projectPathKey) {
+      onProjectStateChange((current) => closeRightDockBackgroundTasksTabState(current, visibleIds));
+      return;
+    }
+    setLocalBackgroundTasks({ opened: false, dismissedIds: visibleIds });
+  }, [managedProcessState.processes, onProjectStateChange, projectPathKey]);
 
   const {
     consumeSuppressedTabClick,
@@ -643,6 +691,7 @@ export const RightDockPanel = memo(function RightDockPanel(props: RightDockPanel
       clients: {
         terminal: client,
         git: gitClient,
+        textGeneration: textGenerationClient,
         tunnel: tunnelClient,
         workspaceActivity: workspaceActivityClient,
       },
@@ -717,6 +766,7 @@ export const RightDockPanel = memo(function RightDockPanel(props: RightDockPanel
       sshSessions,
       terminalDisabledMessage,
       terminalReady,
+      textGenerationClient,
       theme,
       tunnelClient,
       tunnelDisabledMessage,
@@ -742,14 +792,16 @@ export const RightDockPanel = memo(function RightDockPanel(props: RightDockPanel
         ref={panelRef}
         aria-hidden={!isOpen}
         inert={!isOpen}
+        data-app-frame-column="right-dock"
         data-state={isOpen ? "open" : "closed"}
         data-project-tools-resizing={isResizing ? "true" : undefined}
         className={cn(
-          "project-tools-panel zone-font-scale fixed inset-x-0 bottom-0 z-40 flex h-[min(72vh,34rem)] min-h-0 w-full shrink-0 flex-col overflow-hidden bg-background shadow-2xl transition-[opacity,transform] duration-200 ease-out motion-reduce:transition-none md:relative md:inset-auto md:z-10 md:h-full md:overflow-visible md:shadow-none",
+          "project-tools-panel zone-font-scale fixed inset-x-0 bottom-0 z-40 flex h-[min(72vh,34rem)] min-h-0 w-full shrink-0 flex-col overflow-hidden bg-background shadow-2xl transition-[width,opacity,transform] duration-200 ease-out motion-reduce:transition-none md:relative md:inset-auto md:z-10 md:h-full md:overflow-visible md:shadow-none",
           isOpen
             ? "pointer-events-auto translate-y-0 border-t border-border opacity-100 md:w-[var(--project-tools-panel-width)] md:translate-x-0 md:border-l md:border-t-0"
             : "pointer-events-none translate-y-full border-t border-transparent opacity-0 md:translate-x-3 md:translate-y-0 md:border-l-0 md:border-t-0",
           effectiveWidthCollapsed ? "md:w-0" : "md:w-[var(--project-tools-panel-width)]",
+          (isResizing || (collapseImmediately && !isOpen)) && "md:transition-none",
         )}
         style={{ ...panelStyle, "--zone-font-scale": fontScale } as CSSProperties}
       >
@@ -769,7 +821,7 @@ export const RightDockPanel = memo(function RightDockPanel(props: RightDockPanel
                 aria-label={t("projectTools.resizePanel")}
                 title={t("projectTools.resizePanel")}
                 className={cn(
-                  "group absolute inset-y-0 left-0 z-[90] hidden w-3 cursor-col-resize touch-none items-center justify-center border-0 bg-transparent p-0 md:flex",
+                  "group absolute inset-y-0 left-0 z-10 hidden w-3 cursor-col-resize touch-none items-center justify-center border-0 bg-transparent p-0 md:flex",
                   "focus-visible:outline-none",
                 )}
                 onMouseDown={handleResizeStart}
@@ -809,6 +861,8 @@ export const RightDockPanel = memo(function RightDockPanel(props: RightDockPanel
                       onActivateTerminalSession={activateTerminalSession}
                       onCloseToolTab={closeToolTab}
                       onCloseTerminalRequest={handleCloseRequest}
+                      onTerminalTabDragStart={onTerminalTabDragStart}
+                      onOpenTerminalInWorkbench={onOpenTerminalInWorkbench}
                     />
                   </div>
                   <RightDockTabsScrollbar scrollRef={tabsScrollRef} />
@@ -889,6 +943,7 @@ export const RightDockPanel = memo(function RightDockPanel(props: RightDockPanel
                   onCreateTerminal={createTerminal}
                   onStartTool={startToolTab}
                   onOpenBackgroundTasks={openBackgroundTasks}
+                  onNewTerminalDragStart={onNewTerminalDragStart}
                 />
               ) : (
                 <RightDockContent

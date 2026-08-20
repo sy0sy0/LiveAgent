@@ -7,6 +7,10 @@ import type {
 import { readEventRunId, readEventSeq } from "@/lib/chat/stream/streamTypes";
 import { type ChatEntry, normalizeLiveUploadedFiles, readHistoryMessageRef } from "@/lib/chatUi";
 import type { ChatEvent } from "@/lib/gatewayTypes";
+import {
+  absorbTrajectoryChatEvent,
+  resetLiveTrajectoryForRebase,
+} from "@/lib/trajectory/liveTrajectory";
 
 import { alignHistory } from "./historyAlignment";
 import {
@@ -24,6 +28,7 @@ import {
 } from "./turnReducer";
 import type {
   HistoryApplyMode,
+  ManualCompactionResult,
   RetryAttemptRecord,
   TranscriptRow,
   TranscriptSnapshot,
@@ -95,6 +100,7 @@ const EMPTY_SNAPSHOT: TranscriptSnapshot = {
   toolStatus: null,
   toolStatusIsCompaction: false,
   retryAttempts: EMPTY_RETRY_ATTEMPTS,
+  manualCompactionResult: null,
   needsHistoryRefresh: false,
   foldRevision: 0,
   revision: 0,
@@ -192,6 +198,7 @@ export function createTranscriptStore(options?: {
   let toolStatus: string | null = null;
   let toolStatusIsCompaction = false;
   let retryAttempts: readonly RetryAttemptRecord[] = EMPTY_RETRY_ATTEMPTS;
+  let manualCompactionResult: ManualCompactionResult | null = null;
   let foldRevision = 0;
   let localTurnSeq = 0;
   // Idempotency cursor: the highest log seq already applied. Re-subscribe
@@ -357,6 +364,7 @@ export function createTranscriptStore(options?: {
       toolStatus,
       toolStatusIsCompaction,
       retryAttempts,
+      manualCompactionResult,
       needsHistoryRefresh: rebaseDivergent || turns.some((turn) => turn.contentStale === true),
       foldRevision,
       revision: snapshot.revision + 1,
@@ -444,7 +452,7 @@ export function createTranscriptStore(options?: {
   };
 
   const setToolStatus = (status: string | null, isCompaction: boolean, flush?: boolean) => {
-    const next = status && status.trim() ? status.trim() : null;
+    const next = status?.trim() ? status.trim() : null;
     const nextCompaction = Boolean(next) && isCompaction;
     if (toolStatus === next && toolStatusIsCompaction === nextCompaction) {
       return;
@@ -601,7 +609,7 @@ export function createTranscriptStore(options?: {
       // Reuse the trailing orphan turn so run-less deltas coalesce into one
       // exchange instead of fragmenting into a turn per event.
       const last = turns[turns.length - 1];
-      if (last && last.key.startsWith("run:orphan") && !last.folded) {
+      if (last?.key.startsWith("run:orphan") && !last.folded) {
         turn = last;
       }
     }
@@ -711,7 +719,7 @@ export function createTranscriptStore(options?: {
       folded: turn.folded,
       terminalContentRevision: revision,
       contentConfirmed: contentComplete,
-      contentStale: contentComplete ? false : true,
+      contentStale: !contentComplete,
       inferredLossErrorEntryId: undefined,
     };
     replaceTurn(turn, next);
@@ -905,6 +913,9 @@ export function createTranscriptStore(options?: {
 
   function applyOne(event: ConversationStreamEvent) {
     editResendStash = null;
+    // 轨迹不在 run snapshot 里，必须先于 transcript cursor 分流。其自身按完整事件
+    // 身份去重，因此重连重放不会重复，也不会被 snapshot.asOfSeq 错误吞掉。
+    if (absorbTrajectoryChatEvent(event)) return;
     const seq = readEventSeq(event);
     if (seq > 0) {
       if (seq <= lastSeq) {
@@ -973,6 +984,7 @@ export function createTranscriptStore(options?: {
         return;
       }
       case "rebased": {
+        resetLiveTrajectoryForRebase(event.conversation_id ?? "");
         applyRebased(event);
         return;
       }
@@ -1017,6 +1029,32 @@ export function createTranscriptStore(options?: {
         if (activeRun && activeRun.runId === runId) {
           activeRun = { ...activeRun, toolStatus, toolStatusIsCompaction };
         }
+        return;
+      }
+      case "manual_compaction_result": {
+        // 本分支是 switch 里唯一直读载荷形状的地方，必须与相邻 case 一样防御式
+        // 解构：可靠 ingress journal 会重放本帧，缺字段的畸形帧若抛 TypeError 会
+        // 在每次重订阅时复现并打断整条应用链。operationId 非字符串/空、status 不在
+        // 白名单内、message 非字符串——一律降级（丢帧或空串），永不抛错。
+        const rawOperationId = (event as { operationId?: unknown }).operationId;
+        const operationId = typeof rawOperationId === "string" ? rawOperationId.trim() : "";
+        if (!operationId) return;
+        const rawStatus = (event as { status?: unknown }).status;
+        if (
+          rawStatus !== "compacted" &&
+          rawStatus !== "failed" &&
+          rawStatus !== "busy" &&
+          rawStatus !== "skipped"
+        ) {
+          return;
+        }
+        const rawMessage = (event as { message?: unknown }).message;
+        manualCompactionResult = {
+          operationId,
+          status: rawStatus,
+          message: typeof rawMessage === "string" ? rawMessage.trim() : "",
+        };
+        schedule(true);
         return;
       }
       default: {

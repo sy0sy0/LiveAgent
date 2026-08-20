@@ -313,6 +313,10 @@ export function createDefaultCompactionMock(compactionCalls) {
 
     beginRequest() {}
 
+    observeContextMessages() {
+      return 0;
+    }
+
     shouldProtectMidStream() {
       return false;
     }
@@ -464,6 +468,7 @@ export async function createSubagentHarness(options = {}) {
       return createToolResult(toolCall.id, toolCall.name, `base:${toolCall.name}`);
     },
     metadataByName,
+    additionalRoots: options.additionalRoots,
     createSubagentToolRegistry: options.omitChildRegistry
       ? undefined
       : async (workdir) => {

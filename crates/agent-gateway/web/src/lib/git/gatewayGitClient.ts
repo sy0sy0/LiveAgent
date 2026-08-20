@@ -5,8 +5,10 @@ import {
   normalizeGitDiffResponse,
   normalizeGitLogResponse,
   normalizeGitOperationResponse,
+  normalizeGitRemoveWorktreeResponse,
   normalizeGitRepositoryDiscovery,
   normalizeGitRepositoryState,
+  normalizeGitWorktreeResponse,
 } from "@liveagent/ui/lib/git/types";
 import type { GatewayWebSocketClientLike } from "@/lib/gatewaySocket";
 
@@ -43,6 +45,17 @@ export function createGatewayGitClient(api: GatewayWebSocketClientLike): GitClie
     async createBranch(workdir, branch, startPoint) {
       return normalizeGitOperationResponse(
         await api.gitRequest("create_branch", workdir, { branch, startPoint }),
+        workdir,
+      );
+    },
+    async createWorktree(workdir, options) {
+      return normalizeGitWorktreeResponse(
+        await api.gitRequest("create_worktree", workdir, {
+          branch: options.branch,
+          directoryName: options.directoryName,
+          parentDirectory: options.parentDirectory,
+          startPoint: options.startPoint,
+        }),
         workdir,
       );
     },
@@ -134,6 +147,16 @@ export function createGatewayGitClient(api: GatewayWebSocketClientLike): GitClie
     async renameBranch(workdir, branch, newBranch) {
       return normalizeGitOperationResponse(
         await api.gitRequest("rename_branch", workdir, { branch, newBranch }),
+        workdir,
+      );
+    },
+    async removeWorktree(workdir, worktreePath, options = {}) {
+      return normalizeGitRemoveWorktreeResponse(
+        await api.gitRequest("remove_worktree", workdir, {
+          worktreePath,
+          force: options.force,
+          deleteBranch: options.deleteBranch,
+        }),
         workdir,
       );
     },

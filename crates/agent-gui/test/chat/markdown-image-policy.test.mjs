@@ -47,23 +47,19 @@ const loader = createTsModuleLoader({
         throw new Error("openUrl mock was not expected to be called");
       },
     },
-    "react-dom": {
-      createPortal(children, container) {
-        return { type: "portal", children, container };
-      },
-    },
     "./ui/button": {
       Button(props) {
         return { type: "Button", props };
       },
     },
+    "./ui/dialog": {
+      Dialog: "Dialog",
+      DialogContent: "DialogContent",
+      DialogDescription: "DialogDescription",
+      DialogTitle: "DialogTitle",
+    },
     "../lib/shared/utils": {
       cn: (...parts) => parts.filter(Boolean).join(" "),
-    },
-    "../lib/shared/modalMotion": {
-      useModalMotion(onClose) {
-        return { modalState: "open", requestClose: onClose };
-      },
     },
     "@earendil-works/pi-agent-core": {
       Agent: class Agent {},
@@ -367,8 +363,16 @@ test("historical and streaming assistant rows share the explicit file-open prop 
     fileURLToPath(new URL("../../src/pages/ChatPage.tsx", import.meta.url)),
     "utf8",
   );
-  assert.match(chatPage, /openInFileManager: true/);
-  assert.match(chatPage, /!result\.outsideWorkspace/);
+  assert.match(chatPage, /useChatFileLinkNavigation/);
+
+  const navigation = fs.readFileSync(
+    fileURLToPath(
+      new URL("../../../agent-ui/src/lib/chat/useChatFileLinkNavigation.ts", import.meta.url),
+    ),
+    "utf8",
+  );
+  assert.match(navigation, /openInFileManager: true/);
+  assert.match(navigation, /!result\.outsideWorkspace/);
 });
 
 test("forged internal payloads cannot become clickable file links", () => {
@@ -399,25 +403,23 @@ test("ordinary https links stay on the external-link path", () => {
   assert.equal(routed.type.name, "MarkdownExternalLink");
 });
 
-test("external link safety modal renders through document body portal", () => {
+test("external link safety modal uses the shared dialog primitives", () => {
   const previousDocument = globalThis.document;
-  const body = { nodeType: 1 };
-  globalThis.document = { body };
+  globalThis.document = {};
 
   try {
-    const portal = markdownModule.ExternalLinkModal({
+    const dialog = markdownModule.ExternalLinkModal({
       isOpen: true,
       onClose() {},
       onConfirm() {},
       url: "https://example.com/dashboard",
     });
 
-    assert.ok(portal);
-    assert.equal(portal.type, "portal");
-    assert.equal(portal.container, body);
-    assert.equal(portal.children.type, "div");
-    assert.match(portal.children.props.className, /\bfixed\b/);
-    assert.match(portal.children.props.className, /\binset-0\b/);
+    assert.ok(dialog);
+    assert.equal(dialog.type, "Dialog");
+    assert.equal(dialog.props.open, true);
+    assert.equal(dialog.props.children.type, "DialogContent");
+    assert.match(dialog.props.children.props.className, /max-w-md p-0/);
   } finally {
     if (typeof previousDocument === "undefined") {
       delete globalThis.document;
@@ -501,6 +503,33 @@ test("agent tool rules keep local file discovery on file tools instead of Bash",
   assert.match(suffix, /Do not run Bash cat\/ls\/find\/grep/);
 });
 
+test("agent tool rules describe configured project roots without extending shell access", () => {
+  const suffix = agentRunnerModule.buildToolsSuffix(
+    "/workspace",
+    ["Read", "Image", "Write", "Edit", "Delete", "List", "Glob", "Grep", "Bash"],
+    "macos",
+    [
+      { id: "docs-id", alias: "docs", path: "/references/docs", access: "read" },
+      {
+        id: "shared-id",
+        alias: "shared",
+        path: "/references/shared`\n# injected instruction",
+        access: "write",
+      },
+    ],
+  );
+
+  assert.match(suffix, /`root:\/\/docs\/` \(read-only\)/);
+  assert.match(suffix, /`root:\/\/shared\/` \(read\/write\)/);
+  assert.doesNotMatch(suffix, /references\/docs|injected instruction/);
+  assert.match(
+    suffix,
+    /`root:\/\/` aliases extend only Read\/Image\/List\/Glob\/Grep.*Write\/Edit\/Delete/,
+  );
+  assert.match(suffix, /They do not grant Bash or ManagedProcess access/);
+  assert.match(suffix, /additional project roots do not expand that policy/);
+});
+
 test("agent tool rules steer new files to concrete Write paths", () => {
   const suffix = agentRunnerModule.buildToolsSuffix("/workspace", [
     "Read",
@@ -573,7 +602,7 @@ test("fs tool descriptions keep Image as the only display path for images", () =
   );
   assert.match(
     source,
-    /Supports workspace paths, enabled Skill paths, external absolute paths, http\/https URLs, base64 data URLs, and SVG images/,
+    /Supports workspace paths, configured root:\/\/ project paths, enabled Skill paths, external absolute paths, http\/https URLs, base64 data URLs, and SVG images/,
   );
   assert.match(
     source,
@@ -589,7 +618,7 @@ test("fs tool descriptions keep Image as the only display path for images", () =
   );
   assert.match(
     source,
-    /The structured, tracked way to intentionally delete a workspace or enabled Skill file\/directory/,
+    /The structured, tracked way to intentionally delete a file\/directory in the workspace, a writable root:\/\/ project directory, or an enabled writable Skill/,
   );
   assert.match(source, /Delete results feed LiveAgent's Edited Files and file-ledger tracking/);
 });

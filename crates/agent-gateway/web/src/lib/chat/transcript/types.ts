@@ -1,6 +1,7 @@
+import type { RetryAttemptRecord } from "@liveagent/ui/lib/chat/retryAttempts";
+import type { PendingUploadedFile } from "@liveagent/ui/lib/chat/uploadedFiles";
 import type { HistoryMessageRef } from "@/lib/chat/conversationState";
 import type { StreamRunActivity } from "@/lib/chat/stream/streamTypes";
-import type { PendingUploadedFile } from "@/lib/chat/uploadedFiles";
 import type { ChatEntry, GatewayTranscriptRound } from "@/lib/chatUi";
 
 export type UserChatEntry = Extract<ChatEntry, { kind: "user" }>;
@@ -8,11 +9,8 @@ export type UserChatEntry = Extract<ChatEntry, { kind: "user" }>;
 // One failed-and-retried network attempt of the live run's model request,
 // mirrored from the desktop's stream-retry layer over the tool_status event.
 // attempt/maxAttempts are retry ordinals (1..5 of 5), not total attempts.
-export type RetryAttemptRecord = {
-  attempt: number;
-  maxAttempts: number;
-  errorMessage: string;
-};
+// 类型真源在共享包 lib/chat/retryAttempts；此处 re-export 供既有导入路径。
+export type { RetryAttemptRecord } from "@liveagent/ui/lib/chat/retryAttempts";
 
 // A turn is one prompt/response exchange of the live stream: the user bubble
 // (a single slot — a second user_message for the same run can only upsert it,
@@ -61,6 +59,12 @@ export type Turn = {
 
 export type TranscriptRowOrigin = "history" | "stream";
 
+export type ManualCompactionResult = {
+  operationId: string;
+  status: "compacted" | "failed" | "busy" | "skipped";
+  message: string;
+};
+
 // One rendered transcript row of the single virtualized row list; keys are
 // unique by construction so an entry can never render twice.
 export type TranscriptRow =
@@ -93,6 +97,7 @@ export type TranscriptRow =
         model: string;
         promptVersion?: string;
       };
+      contextUsageTokens?: number;
       timestamp?: number;
     }
   | { key: string; origin: TranscriptRowOrigin; kind: "error"; text: string };
@@ -122,6 +127,7 @@ export type TranscriptSnapshot = {
   // Live run's stream-retry history (cleared at run boundaries and whenever
   // the desktop starts a fresh network attempt).
   retryAttempts: readonly RetryAttemptRecord[];
+  manualCompactionResult: ManualCompactionResult | null;
   // At least one settled streamed turn may be incomplete and should keep
   // retrying the quiet history enrich while the conversation is idle.
   needsHistoryRefresh: boolean;

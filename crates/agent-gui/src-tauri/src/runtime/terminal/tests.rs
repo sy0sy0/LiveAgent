@@ -1096,3 +1096,176 @@ fn private_key_decode_error_explains_missing_passphrase() {
         "wrong-passphrase message should hint at the passphrase: {message}"
     );
 }
+
+#[test]
+fn canonicalize_workdir_within_accepts_paths_inside_the_project() {
+    let project = tempfile::tempdir().expect("project root");
+    let nested = project.path().join("packages").join("app");
+    std::fs::create_dir_all(&nested).expect("create nested workdir");
+    let root = project.path().display().to_string();
+
+    let resolved = canonicalize_workdir_within(&nested.display().to_string(), &root)
+        .expect("nested workdir is inside the project");
+    let canonical_root = canonicalize_workdir(&root).expect("canonical project root");
+    assert!(resolved.starts_with(&canonical_root));
+
+    let at_root =
+        canonicalize_workdir_within(&root, &root).expect("project root itself is in range");
+    assert_eq!(at_root, canonical_root);
+}
+
+#[test]
+fn canonicalize_workdir_within_rejects_paths_outside_the_project() {
+    let project = tempfile::tempdir().expect("project root");
+    let outside = tempfile::tempdir().expect("outside root");
+    let root = project.path().display().to_string();
+
+    let sibling = canonicalize_workdir_within(&outside.path().display().to_string(), &root)
+        .expect_err("sibling directory is rejected");
+    assert!(
+        sibling.contains("outside the current project"),
+        "unexpected error: {sibling}"
+    );
+
+    let escaped = project.path().join("..");
+    let traversal = canonicalize_workdir_within(&escaped.display().to_string(), &root)
+        .expect_err("parent traversal is rejected");
+    assert!(
+        traversal.contains("outside the current project"),
+        "unexpected error: {traversal}"
+    );
+
+    let absolute = canonicalize_workdir_within("/etc", &root)
+        .expect_err("unrelated absolute path is rejected");
+    assert!(
+        absolute.contains("outside the current project"),
+        "unexpected error: {absolute}"
+    );
+
+    let home = canonicalize_workdir_within("~", &root).expect_err("home directory is rejected");
+    assert!(
+        home.contains("outside the current project") || home.contains("workdir"),
+        "unexpected error: {home}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn canonicalize_workdir_within_rejects_symlink_escapes() {
+    let project = tempfile::tempdir().expect("project root");
+    let outside = tempfile::tempdir().expect("outside root");
+    let link = project.path().join("escape");
+    std::os::unix::fs::symlink(outside.path(), &link).expect("create escaping symlink");
+
+    let error = canonicalize_workdir_within(
+        &link.display().to_string(),
+        &project.path().display().to_string(),
+    )
+    .expect_err("symlink pointing outside the project is rejected");
+    assert!(
+        error.contains("outside the current project"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn canonicalize_workdir_within_requires_a_project_root() {
+    let project = tempfile::tempdir().expect("project root");
+
+    let error = canonicalize_workdir_within(&project.path().display().to_string(), "   ")
+        .expect_err("blank project root is rejected");
+    assert_eq!(error, "project_path_key is required");
+}
+
+#[test]
+fn registry_create_requires_project_path_key() {
+    let registry = Arc::new(TerminalSessionRegistry::default());
+    let tempdir = tempfile::tempdir().expect("tempdir");
+
+    let error = registry
+        .create(
+            tempdir.path().display().to_string(),
+            None,
+            None,
+            None,
+            Some(80),
+            Some(24),
+        )
+        .expect_err("create without a project key is rejected");
+    assert_eq!(error, "project_path_key is required");
+    assert_eq!(registry.running_session_count(), 0);
+}
+
+#[test]
+fn registry_create_rejects_cwd_outside_the_project() {
+    let registry = Arc::new(TerminalSessionRegistry::default());
+    let project = tempfile::tempdir().expect("project root");
+    let outside = tempfile::tempdir().expect("outside root");
+
+    let error = registry
+        .create(
+            outside.path().display().to_string(),
+            Some(project.path().display().to_string()),
+            None,
+            None,
+            Some(80),
+            Some(24),
+        )
+        .expect_err("cwd outside the claimed project is rejected");
+    assert!(
+        error.contains("outside the current project"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(registry.running_session_count(), 0);
+}
+
+#[test]
+fn mark_finished_broadcasts_exit_only_for_the_first_finisher() {
+    // close() 与 PTY reader 线程在终止时都会调 mark_finished;若两次都广播
+    // exit,输掉竞态的那次会在 closed 之后送达,前端将把刚关闭的会话复活成
+    // 幽灵(attach 必败的 dock tab)。首个 finisher 独占广播。
+    let registry = Arc::new(TerminalSessionRegistry::default());
+    insert_test_ssh_session(
+        &registry,
+        "ssh-exit-once",
+        "/tmp/project",
+        false,
+        SSH_STATUS_CONNECTED,
+    );
+    let (rx, _guard) = registry.subscribe();
+
+    registry.mark_finished("ssh-exit-once");
+    registry.mark_finished("ssh-exit-once");
+
+    let mut exit_events = 0;
+    while let Ok(event) = rx.try_recv() {
+        if event.payload.kind == "exit" {
+            exit_events += 1;
+        }
+    }
+    assert_eq!(exit_events, 1, "duplicate mark_finished must not re-broadcast exit");
+}
+
+#[test]
+fn close_emits_exit_then_closed_without_a_trailing_exit() {
+    let registry = Arc::new(TerminalSessionRegistry::default());
+    insert_test_ssh_session(
+        &registry,
+        "ssh-close-order",
+        "/tmp/project",
+        false,
+        SSH_STATUS_CONNECTED,
+    );
+    let (rx, _guard) = registry.subscribe();
+
+    registry
+        .close("ssh-close-order".to_string())
+        .expect("close test session");
+    // 模拟 reader 线程迟到的 mark_finished:会话已移除,必须完全静默。
+    registry.mark_finished("ssh-close-order");
+
+    let kinds: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+        .map(|event| event.payload.kind)
+        .collect();
+    assert_eq!(kinds, vec!["exit".to_string(), "closed".to_string()]);
+}

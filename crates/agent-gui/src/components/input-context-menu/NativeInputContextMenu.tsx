@@ -1,3 +1,4 @@
+import { ClipboardPaste, Copy, ScanText, Scissors } from "@liveagent/ui/components/IconSet";
 import { useLocale } from "@liveagent/ui/i18n/index";
 import { cn } from "@liveagent/ui/lib/shared/utils";
 import {
@@ -12,7 +13,6 @@ import {
 import { createPortal } from "react-dom";
 import { useMenuExitPresence } from "../../lib/shared/menuMotion";
 import { readClipboardText } from "../../lib/system/clipboardText";
-import { ClipboardPaste, Copy, ScanText, Scissors } from "../icons";
 import {
   clampMenuPosition,
   computeMenuItems,
@@ -401,7 +401,7 @@ export function useNativeInputContextMenu(): {
             ref={menuRef}
             role="menu"
             className={cn(
-              "editor-context-menu fixed z-[10000] w-max min-w-[9.5rem] max-w-[calc(100vw-1.5rem)] select-none overflow-hidden rounded-lg border border-border/70 bg-popover p-1.5 text-popover-foreground shadow-[0_20px_60px_-20px_rgba(15,23,42,0.35)]",
+              "editor-context-menu layer-popover fixed w-max min-w-[9.5rem] max-w-[calc(100vw-1.5rem)] select-none overflow-hidden rounded-lg border border-border/70 bg-popover p-1.5 text-popover-foreground shadow-[0_20px_60px_-20px_rgba(15,23,42,0.35)]",
               isExiting && "editor-context-menu-exit",
             )}
             style={{ left: renderedSnapshot.x, top: renderedSnapshot.y }}

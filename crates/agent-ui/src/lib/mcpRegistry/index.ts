@@ -64,7 +64,7 @@ const SMITHERY_API_BASE = "https://api.smithery.ai";
 const SMITHERY_WEB_BASE = "https://smithery.ai/servers";
 const GLAMA_API_BASE = "https://glama.ai";
 
-const DEFAULT_LIMIT = 18;
+const DEFAULT_LIMIT = 24;
 
 export const MCP_REGISTRY_SOURCE_OPTIONS: Array<{
   value: McpRegistrySource;

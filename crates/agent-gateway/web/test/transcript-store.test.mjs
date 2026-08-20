@@ -11,6 +11,11 @@ const loader = createWebModuleLoader({
 const { createTranscriptStore } = loader.loadModule(
   "src/lib/chat/transcript/transcriptStore.ts",
 );
+const {
+  clearLiveTrajectory,
+  liveTrajectoryEvents,
+  liveTrajectoryRefreshRevision,
+} = loader.loadModule("src/lib/trajectory/liveTrajectory.ts");
 
 function runStarted(runId, seq, extra = {}) {
   return { type: "run_started", conversation_id: "conv-1", run_id: runId, seq, ...extra };
@@ -86,6 +91,157 @@ function messageRef(messageId, messageIndex = 0) {
     contentHash: `hash-${messageId}`,
   };
 }
+
+test("trajectory replay bypasses the transcript cursor and deduplicates itself", () => {
+  clearLiveTrajectory("conv-1");
+  const store = createTranscriptStore();
+  store.applyEvent(runStarted("run-1", 10));
+  const event = {
+    type: "trajectory",
+    conversation_id: "conv-1",
+    run_id: "run-1",
+    seq: 5,
+    event: { k: "step_start", t: 1, s: 1, at: 100 },
+  };
+  store.applyEvent(event);
+  store.applyEvent({ ...event, event: { ...event.event } });
+  assert.equal(liveTrajectoryEvents("conv-1").length, 1);
+});
+
+test("only a rebased event accepted by the seq gate clears live trajectory", () => {
+  clearLiveTrajectory("conv-1");
+  const store = createTranscriptStore();
+  store.applyEvent(runStarted("run-1", 10));
+  store.applyEvent({
+    type: "trajectory",
+    conversation_id: "conv-1",
+    run_id: "run-1",
+    seq: 5,
+    event: { k: "user", t: 1, at: 100 },
+  });
+  const before = liveTrajectoryRefreshRevision("conv-1");
+
+  store.applyEvent({ type: "rebased", conversation_id: "conv-1", seq: 5 });
+  assert.equal(liveTrajectoryEvents("conv-1").length, 1);
+  assert.equal(liveTrajectoryRefreshRevision("conv-1"), before);
+
+  store.applyEvent({ type: "rebased", conversation_id: "conv-1", seq: 11 });
+  assert.equal(liveTrajectoryEvents("conv-1").length, 0);
+  assert.equal(liveTrajectoryRefreshRevision("conv-1"), before + 1);
+});
+
+test("manual compaction terminal events retain status and stay conversation-scoped", () => {
+  const targetStore = createTranscriptStore();
+  const otherStore = createTranscriptStore();
+  const statuses = ["compacted", "failed", "busy", "skipped"];
+
+  for (const [index, status] of statuses.entries()) {
+    targetStore.applyEvent({
+      type: "manual_compaction_result",
+      conversation_id: "conv-1",
+      seq: index + 1,
+      operationId: `operation-${index}`,
+      status,
+      message: status === "compacted" ? undefined : `message-${status}`,
+    });
+    targetStore.flush();
+    assert.deepEqual(targetStore.getSnapshot().manualCompactionResult, {
+      operationId: `operation-${index}`,
+      status,
+      message: status === "compacted" ? "" : `message-${status}`,
+    });
+  }
+
+  assert.equal(otherStore.getSnapshot().manualCompactionResult, null);
+});
+
+test("manual compaction terminal frames tolerate malformed payloads (defect #1)", () => {
+  const store = createTranscriptStore();
+  // 唯一直读载荷形状的分支必须防御式解构：可靠 ingress journal 会重放本帧，缺
+  // 字段/畸形帧一旦抛错会在每次重订阅时复现。以下畸形帧全部丢弃且绝不抛错。
+  assert.doesNotThrow(() => {
+    // 无 operationId。
+    store.applyEvent({ type: "manual_compaction_result", conversation_id: "conv-1", seq: 1 });
+    // operationId 非字符串。
+    store.applyEvent({
+      type: "manual_compaction_result",
+      conversation_id: "conv-1",
+      seq: 2,
+      operationId: 123,
+      status: "failed",
+    });
+    // status 不在白名单。
+    store.applyEvent({
+      type: "manual_compaction_result",
+      conversation_id: "conv-1",
+      seq: 3,
+      operationId: "op-bogus-status",
+      status: "bogus",
+    });
+    // operationId 仅空白。
+    store.applyEvent({
+      type: "manual_compaction_result",
+      conversation_id: "conv-1",
+      seq: 4,
+      operationId: "   ",
+      status: "failed",
+    });
+    store.flush();
+  });
+  assert.equal(store.getSnapshot().manualCompactionResult, null);
+
+  // 合法帧仍正常受理；message 非字符串降级为空串。
+  store.applyEvent({
+    type: "manual_compaction_result",
+    conversation_id: "conv-1",
+    seq: 5,
+    operationId: "op-ok",
+    status: "failed",
+    message: 42,
+  });
+  store.flush();
+  assert.deepEqual(store.getSnapshot().manualCompactionResult, {
+    operationId: "op-ok",
+    status: "failed",
+    message: "",
+  });
+});
+
+test("assistant meta merge never wipes an existing anchor with a later own-undefined key (defect #2)", () => {
+  const store = createTranscriptStore();
+  store.applyEvent(userMessage("run-1", 1, "hello"));
+  store.applyEvent(runStarted("run-1", 2));
+  // 首帧携带 contextUsageTokens 锚点。
+  store.applyEvent({
+    type: "token",
+    conversation_id: "conv-1",
+    run_id: "run-1",
+    seq: 3,
+    round: 0,
+    text: "answer ",
+    contextUsageTokens: 150_000,
+  });
+  store.flush();
+
+  // 同轮后续帧带其他 meta 字段但不带 contextUsageTokens：旧代码会用 own-undefined
+  // 键把锚点抹掉；修复后锚点保留，新字段并入。
+  store.applyEvent({
+    type: "token",
+    conversation_id: "conv-1",
+    run_id: "run-1",
+    seq: 4,
+    round: 0,
+    text: "more",
+    model: "claude-sonnet",
+  });
+  store.flush();
+
+  const snapshot = store.getSnapshot();
+  const assistantRow = allRows(snapshot).find((row) => row.kind === "assistant");
+  assert.ok(assistantRow, "expected an assistant row");
+  assert.equal(assistantRow.rounds[0].meta.contextUsageTokens, 150_000);
+  assert.equal(assistantRow.rounds[0].meta.model, "claude-sonnet");
+});
 
 test("run lifecycle: reply renders in the live flow and folds at the next run_started", () => {
   const store = createTranscriptStore();
@@ -914,7 +1070,13 @@ test("reset sync rebuilds the active turn from a runtime snapshot", () => {
       runId: "run-2",
       revision: 5,
       entriesJson: JSON.stringify([
-        { id: "snap-1", kind: "assistant", text: "rebuilt from snapshot", round: 0 },
+        {
+          id: "snap-1",
+          kind: "assistant",
+          text: "rebuilt from snapshot",
+          round: 0,
+          meta: { contextUsageTokens: 150_000, contextRelevant: false },
+        },
       ]),
       toolStatus: "Vibing",
       toolStatusIsCompaction: false,
@@ -930,6 +1092,9 @@ test("reset sync rebuilds the active turn from a runtime snapshot", () => {
   const text = allRows(snapshot).map((row) => rowText(row)).join("");
   assert.match(text, /rebuilt from snapshot/);
   assert.doesNotMatch(text, /will be lost/);
+  const assistantRow = allRows(snapshot).find((row) => row.kind === "assistant");
+  assert.equal(assistantRow.rounds[0].meta.contextUsageTokens, 150_000);
+  assert.equal(assistantRow.rounds[0].meta.contextRelevant, false);
 });
 
 test("active sync trims a history-first copy of the running exchange", () => {
@@ -2353,4 +2518,80 @@ test("ref-bearing replay converges regardless of history/replay arrival order", 
     ["v3"],
     "replay-first converges to the final version",
   );
+});
+
+test("manual compaction checkpoint stays a single card after the next exchange's history merge", () => {
+  const { parseHistoryMessagesJson } = loader.loadModule("src/lib/chatUi.ts");
+  const store = createTranscriptStore();
+
+  // 手动压缩 run：无 user_message，只有 checkpoint token（gatewayBridgeEvents
+  // 的 queueCheckpoint 形状）+ historyRequired 终态。
+  store.applyEvent(runStarted("run-compact", 1));
+  store.applyEvent({
+    type: "token",
+    conversation_id: "conv-1",
+    run_id: "run-compact",
+    seq: 2,
+    text: "summary body",
+    provider: "liveagent",
+    model: "summary",
+    api: "liveagent-compaction",
+    checkpoint: {
+      summaryId: "sum-1",
+      segmentIndex: 1,
+      coveredMessageCount: 4,
+      timestamp: 1000,
+      generatedBy: { providerId: "anthropic", model: "claude", promptVersion: "v1" },
+      contextUsageTokens: 1234,
+    },
+  });
+  store.applyEvent(
+    runFinished("run-compact", 3, "completed", {
+      content_complete: false,
+      history_required: true,
+      entries_json: "[]",
+    }),
+  );
+  store.flush();
+  assert.equal(
+    allRows(store.getSnapshot()).filter((row) => row.kind === "checkpoint").length,
+    1,
+    "one checkpoint card right after compaction",
+  );
+
+  // 下一轮发送落定。
+  store.applyEvent(runStarted("run-2", 4));
+  store.applyEvent(userMessage("run-2", 5, "next prompt", { message_id: "user-2" }));
+  store.applyEvent(token("run-2", 6, "reply"));
+  store.applyEvent(runFinished("run-2", 7));
+  store.flush();
+
+  // 历史刷新把同一检查点（同 summaryId）并进折叠区：压缩 turn 无用户消息
+  // 锚点、无法被对齐覆盖，其检查点副本必须在行构建层被内容身份去重。
+  const historyEntries = parseHistoryMessagesJson(
+    JSON.stringify([
+      {
+        role: "summary",
+        id: "sum-1",
+        content: "summary body",
+        timestamp: 1000,
+        summaryMeta: {
+          coveredMessageCount: 4,
+          generatedBy: { providerId: "anthropic", model: "claude", promptVersion: "v1" },
+          stats: { sourceMessageCount: 4, contextTokensAfter: 1234 },
+        },
+      },
+      { role: "user", id: "user-2", content: "next prompt", timestamp: 2000 },
+      { role: "assistant", content: "reply", timestamp: 3000 },
+    ]),
+  );
+  for (const mode of ["enrich", "replace"]) {
+    store.applyHistorySnapshot(historyEntries, { mode });
+    store.flush();
+    const snapshot = store.getSnapshot();
+    const checkpoints = allRows(snapshot).filter((row) => row.kind === "checkpoint");
+    assert.equal(checkpoints.length, 1, `${mode}: duplicate checkpoint cards`);
+    assert.equal(checkpoints[0].key, "checkpoint-sum-1", `${mode}: stable content-identity key`);
+    assertUniqueKeys(snapshot);
+  }
 });

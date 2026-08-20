@@ -3,11 +3,11 @@ import {
   TranscriptUserMessageActions,
 } from "@liveagent/ui/components/chat/TranscriptMessageActions";
 import { useLocale } from "@liveagent/ui/i18n/index";
+import type { PendingUploadedFile } from "@liveagent/ui/lib/chat/uploadedFiles";
 import type {
   HistoryMessageRef,
   RenderUserMessage,
 } from "../../../lib/chat/conversation/conversationState";
-import type { PendingUploadedFile } from "../../../lib/chat/messages/uploadedFiles";
 import { useRowInteraction } from "./rowInteraction";
 import { useCopiedFlag } from "./useCopiedFlag";
 
@@ -63,11 +63,12 @@ export type UserRowFooterProps = {
   text: string;
   timestamp: number;
   hasStableRef: boolean;
+  messageId?: string;
   onStartEdit: (key: string) => void;
 };
 
 export function UserRowFooter(props: UserRowFooterProps) {
-  const { itemKey, text, timestamp, hasStableRef, onStartEdit } = props;
+  const { itemKey, text, timestamp, hasStableRef, messageId, onStartEdit } = props;
   const { t } = useLocale();
   const { copied, markCopied } = useCopiedFlag();
   const { isSending } = useRowInteraction();
@@ -85,6 +86,7 @@ export function UserRowFooter(props: UserRowFooterProps) {
       onEdit={() => {
         if (hasStableRef) onStartEdit(itemKey);
       }}
+      rewindTurnId={messageId}
     />
   );
 }
